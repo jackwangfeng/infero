@@ -1684,6 +1684,16 @@ extern "C" __global__ void attn_decode_gqa_f32(
             const int part = lane % ATTN_DECODE_LPK;
             const float* qr = sq + g * d_head + part * (d_head / ATTN_DECODE_LPK);
             const __half* kh = kr + part * (d_head / ATTN_DECODE_LPK);
+            // One accumulator on purpose. This is a chain of 64 dependent FMAs
+            // and breaking it into four independent ones — which is the textbook
+            // fix, and which is where the 7.3 us a layer that deleting the
+            // arithmetic removes appears to live — measures *worse* on both
+            // cards: 65.5 us a layer against 57.4 on a Blackwell, 299.9 against
+            // 289.2 on an A4000. Holding four accumulators and four `float2`
+            // temporaries live costs registers, and this kernel is waiting on
+            // memory latency rather than on the chain, so occupancy is what it
+            // spends them on. The arithmetic is exposed, but not because of the
+            // chain.
             float dot = 0.0f;
             for (int w = 0; w < quads / ATTN_DECODE_LPK; ++w) {
                 const uint4 raw = *(const uint4*)(const void*)(kh + w * 8);
