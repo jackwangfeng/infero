@@ -167,6 +167,8 @@ impl Kernels {
             "attn_output_f32",
             "silu_mul_split_f16_f32",
             "attn_flash_reduce_f16_f32",
+            "rope_qk_packed_f32",
+            "store_kv2_packed_f16",
         ] {
             self.dev.kernels().get("tuili_ops", ops_src(), name)?;
         }
@@ -680,6 +682,139 @@ impl Kernels {
             .arg(&il);
         self.dev.profile().time("rope_qk", self.dev.stream(), || {
             unsafe { b.launch(cfg) }.context("rope_qk")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// [`Self::rope_qk`] reading out of the stacked projection's output row.
+    ///
+    /// `packed` holds `q`, `k` and `v` a `stride` apart per token, which is what
+    /// the fused `qkv` matmul writes. `q` lands in its own buffer because
+    /// attention reads it contiguously; `k` is rotated in place for
+    /// [`Self::store_kv2_packed`] to read next to `v`. Saves the unpacking copy
+    /// — 1.5 MB and a launch a layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_qk_packed(
+        &self,
+        q_dst: &mut CudaViewMut<'_, f32>,
+        packed: &mut CudaViewMut<'_, f32>,
+        stride: usize,
+        q_off: usize,
+        k_off: usize,
+        positions: &CudaView<'_, i32>,
+        freq_factors: &CudaView<'_, f32>,
+        n_tokens: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        d_head: usize,
+        theta_base: f32,
+        freq_scale: f32,
+        interleaved: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            d_head.is_multiple_of(2),
+            "d_head {d_head} must be even for rope"
+        );
+        anyhow::ensure!(
+            packed.len() >= (n_tokens - 1) * stride + k_off + n_kv_heads * d_head,
+            "packed qkv holds {} elements, short for {n_tokens} rows of {stride}",
+            packed.len()
+        );
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_ops", ops_src(), "rope_qk_packed_f32")?;
+        let half = (d_head / 2) as u32;
+        let block = half.clamp(1, 128);
+        let cfg = LaunchConfig {
+            grid_dim: (
+                half.div_ceil(block),
+                (n_heads + n_kv_heads) as u32,
+                n_tokens as u32,
+            ),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (st, qo, ko) = (stride as i32, q_off as i32, k_off as i32);
+        let (h, kh, dh, il) = (
+            n_heads as i32,
+            n_kv_heads as i32,
+            d_head as i32,
+            i32::from(interleaved),
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(q_dst)
+            .arg(packed)
+            .arg(&st)
+            .arg(&qo)
+            .arg(&ko)
+            .arg(positions)
+            .arg(freq_factors)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&theta_base)
+            .arg(&freq_scale)
+            .arg(&il);
+        self.dev.profile().time("rope_qk", self.dev.stream(), || {
+            unsafe { b.launch(cfg) }.context("rope_qk_packed")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// [`Self::store_kv2`] reading `k` and `v` out of the same packed row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_kv2_packed(
+        &self,
+        k_cache: &mut CudaViewMut<'_, f16>,
+        v_cache: &mut CudaViewMut<'_, f16>,
+        packed: &CudaView<'_, f32>,
+        stride: usize,
+        k_off: usize,
+        v_off: usize,
+        slots: &CudaView<'_, i32>,
+        n_kv_heads: usize,
+        d_head: usize,
+        n_slots: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_ops", ops_src(), "store_kv2_packed_f16")?;
+        let block = (d_head as u32).clamp(1, 256);
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (d_head as u32).div_ceil(block),
+                2 * n_kv_heads as u32,
+                n_tokens as u32,
+            ),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (st, ko, vo) = (stride as i32, k_off as i32, v_off as i32);
+        let (kh, dh, ms, nt) = (
+            n_kv_heads as i32,
+            d_head as i32,
+            n_slots as i32,
+            n_tokens as i32,
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(k_cache)
+            .arg(v_cache)
+            .arg(packed)
+            .arg(&st)
+            .arg(&ko)
+            .arg(&vo)
+            .arg(slots)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ms)
+            .arg(&nt);
+        self.dev.profile().time("store_kv", self.dev.stream(), || {
+            unsafe { b.launch(cfg) }.context("store_kv2_packed")?;
             Ok(())
         })?;
         Ok(())

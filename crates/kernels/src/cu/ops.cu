@@ -376,6 +376,80 @@ extern "C" __global__ void store_kv_f16(__half* __restrict__ pool,
 // below `n_kv_heads` is K, above it is V. At a batch of one each call was
 // eight blocks of a hundred and twenty-eight threads, which is less work than
 // the launch that carries it.
+// RoPE straight out of the fused projection's output, which removes the copy
+// that used to unpack it.
+//
+// The stacked `qkv` matmul writes one row per token — `q` then `k` then `v`, a
+// `stride` apart — and `split_qkv` existed to scatter that into three
+// contiguous buffers so this kernel and `store_kv2` could index them the easy
+// way. That is a 1.5 MB round trip a layer for nothing: the indexing is the
+// same arithmetic with a stride in it.
+//
+// `q` is written out to its own buffer because attention reads it contiguously;
+// `k` is rotated in place, where `store_kv2_packed_f16` picks it up next to the
+// `v` it never had to move at all.
+extern "C" __global__ void rope_qk_packed_f32(float* __restrict__ q_dst,
+                                             float* __restrict__ packed,
+                                             int stride, int q_off, int k_off,
+                                             const int* __restrict__ positions,
+                                             const float* __restrict__ freq_factors,
+                                             int n_heads, int n_kv_heads,
+                                             int d_head, float theta_base,
+                                             float freq_scale, int interleaved) {
+    const int half = d_head / 2;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= half) return;
+
+    const int y = blockIdx.y;
+    const int token = blockIdx.z;
+    const bool is_q = y < n_heads;
+    const int head = is_q ? y : y - n_heads;
+
+    const float pos = (float)positions[token] * freq_scale;
+    const float inv_freq = __powf(theta_base, -2.0f * (float)i / (float)d_head);
+    const float angle = pos * inv_freq / freq_factors[i];
+    float sin_a, cos_a;
+    __sincosf(angle, &sin_a, &cos_a);
+
+    const float* src = packed + (size_t)token * stride
+                     + (is_q ? q_off : k_off) + (size_t)head * d_head;
+    float* dst = is_q ? q_dst + ((size_t)token * n_heads + head) * d_head
+                      : packed + (size_t)token * stride + k_off
+                            + (size_t)head * d_head;
+    const int ia = interleaved ? 2 * i : i;
+    const int ib = interleaved ? 2 * i + 1 : i + half;
+    const float a = src[ia], b = src[ib];
+    dst[ia] = a * cos_a - b * sin_a;
+    dst[ib] = a * sin_a + b * cos_a;
+}
+
+// `store_kv2_f16` reading `k` and `v` out of the fused projection's row.
+extern "C" __global__ void store_kv2_packed_f16(__half* __restrict__ k_pool,
+                                               __half* __restrict__ v_pool,
+                                               const float* __restrict__ packed,
+                                               int stride, int k_off, int v_off,
+                                               const int* __restrict__ slots,
+                                               int n_kv_heads, int d_head,
+                                               int n_slots, int n_tokens) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= d_head) return;
+    const int y = blockIdx.y;
+    const int token = blockIdx.z;
+    if (token >= n_tokens) return;
+
+    const int slot = slots[token];
+    if (slot < 0 || slot >= n_slots) return;
+
+    const bool is_k = y < n_kv_heads;
+    const int head = is_k ? y : y - n_kv_heads;
+    __half* pool = is_k ? k_pool : v_pool;
+
+    const size_t dst = ((size_t)head * n_slots + slot) * d_head + i;
+    const size_t s = (size_t)token * stride + (is_k ? k_off : v_off)
+                   + (size_t)head * d_head + i;
+    pool[dst] = __float2half(packed[s]);
+}
+
 extern "C" __global__ void store_kv2_f16(__half* __restrict__ k_pool,
                                          __half* __restrict__ v_pool,
                                          const float* __restrict__ k_src,

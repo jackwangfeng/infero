@@ -1258,6 +1258,8 @@ impl Model {
         // Set below, where the decode combine either writes the output
         // projection's f16 activation or reports that it did not.
         let mut attn_f16 = false;
+        // Whether q/k/v stayed in the stacked projection's output row.
+        let mut packed_qkv = false;
 
         // One Q8_1 form for all three projections, produced by the norm that
         // writes their input. They read the same normalized residual, so
@@ -1361,15 +1363,26 @@ impl Model {
                 shared,
                 shared_f16,
             )?;
-            self.kern.split_qkv(
-                &mut self.act.q.slice_mut(..n * d),
-                &mut self.act.k.slice_mut(..n * kv_dim),
-                &mut self.act.v.slice_mut(..n * kv_dim),
-                &self.act.gate.slice(..n * fused_w),
-                d,
-                kv_dim,
-                n,
-            )?;
+            // Nothing has to be unpacked: `rope_qk_packed` reads `q` and `k`
+            // out of this row and `store_kv2_packed` reads `k` and `v`, so the
+            // scatter into three buffers is 1.5 MB and a launch a layer for an
+            // index change. Biases and the quantized KV path still want the
+            // unpacked form, and neither is on this model's decode path.
+            packed_qkv = l.bq.is_none()
+                && l.bk.is_none()
+                && l.bv.is_none()
+                && self.tq.is_none();
+            if !packed_qkv {
+                self.kern.split_qkv(
+                    &mut self.act.q.slice_mut(..n * d),
+                    &mut self.act.k.slice_mut(..n * kv_dim),
+                    &mut self.act.v.slice_mut(..n * kv_dim),
+                    &self.act.gate.slice(..n * fused_w),
+                    d,
+                    kv_dim,
+                    n,
+                )?;
+            }
             for (bias, out, cols) in [
                 (&l.bq, &mut self.act.q, d),
                 (&l.bk, &mut self.act.k, kv_dim),
@@ -1406,7 +1419,26 @@ impl Model {
         }
         }
 
-        {
+        let fused_w = d + 2 * kv_dim;
+        if packed_qkv {
+            let (q, packed) = (&mut self.act.q, &mut self.act.gate);
+            self.kern.rope_qk_packed(
+                &mut q.slice_mut(..n * d),
+                &mut packed.slice_mut(..n * fused_w),
+                fused_w,
+                0,
+                d,
+                &self.act.positions.slice(..n),
+                &self.w.rope_freqs.as_view(),
+                n,
+                cfg.n_heads,
+                cfg.n_kv_heads,
+                cfg.d_head,
+                cfg.rope_theta,
+                cfg.rope_freq_scale,
+                cfg.interleaved_rope,
+            )?;
+        } else {
             let (q, k) = (&mut self.act.q, &mut self.act.k);
             self.kern.rope_qk(
                 &mut q.slice_mut(..n * d),
@@ -1434,7 +1466,23 @@ impl Model {
 
         match self.tq.as_mut() {
             None => {
-                {
+                if packed_qkv {
+                    let packed = self.act.gate.slice(..n * fused_w);
+                    let (kc, vc) = pool.dense_mut(layer);
+                    self.kern.store_kv2_packed(
+                        &mut kc.as_view_mut(),
+                        &mut vc.as_view_mut(),
+                        &packed,
+                        fused_w,
+                        d,
+                        d + kv_dim,
+                        &self.act.slots.slice(..n),
+                        n_kv_heads,
+                        d_head,
+                        dims.n_slots,
+                        n,
+                    )?;
+                } else {
                     let (kc, vc) = pool.dense_mut(layer);
                     self.kern.store_kv2(
                         &mut kc.as_view_mut(),
