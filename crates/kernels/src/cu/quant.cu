@@ -154,6 +154,18 @@ DEQUANT_KERNEL(dequant_q4_K_f16, deq_q4_K)
 DEQUANT_KERNEL(dequant_q6_K_f16, deq_q6_K)
 DEQUANT_KERNEL(dequant_q4_g128_f16, deq_q4_g128)
 
+// The split Q8_0 layout: `total` int8 quants, then one scale per 32. The
+// boundary is at `total` because the quants are one byte each.
+extern "C" __global__ void dequant_q8_0s_f16(__half* __restrict__ out,
+                                             const void* __restrict__ w,
+                                             size_t total) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int8_t* q = (const int8_t*)w;
+    const __half* sc = (const __half*)(const void*)(q + total);
+    out[i] = __float2half(__half2float(sc[i / QK8_0]) * (float)q[i]);
+}
+
 // The transposed Q4_G128 layout, for the cuBLAS prefill path.
 //
 // Quants first — one 64-byte block per (row, 128 weights), the 4x4 matrix of
@@ -289,6 +301,36 @@ extern "C" __global__ void gemv_q8_0(float* __restrict__ out,
 #pragma unroll
         for (int i = 0; i < Q8_0_PER_THREAD; ++i) {
             GEMV_SPREAD(d * (float)blk->qs[sub + i], base + i)
+        }
+    }
+    GEMV_EPILOGUE
+}
+
+// The same mat-vec over the split layout: `k` contiguous int8 a row, then one
+// scale per 32. A thread's run of weights is contiguous here where the packed
+// form put a 2-byte scale in the middle of every 32, so the load can be as wide
+// as the unroll — which is the whole point of the layout. See
+// `mmq_load_w_q8_0s`.
+extern "C" __global__ void gemv_q8_0s(float* __restrict__ out,
+                                      const void* __restrict__ w,
+                                      const float* __restrict__ x, int k, int n,
+                                      int n_tokens) {
+    GEMV_PROLOGUE
+    const int nb = k / QK8_0;
+    const int per_block = QK8_0 / Q8_0_PER_THREAD;
+    const int chunks = nb * per_block;
+    const int8_t* q = (const int8_t*)w + (size_t)row * k;
+    const __half* sc = (const __half*)(const void*)((const int8_t*)w + (size_t)n * k)
+                       + (size_t)row * nb;
+
+    for (int c = threadIdx.x; c < chunks; c += blockDim.x) {
+        const int b = c / per_block;
+        const int sub = (c % per_block) * Q8_0_PER_THREAD;
+        const int base = b * QK8_0 + sub;
+        const float d = __half2float(sc[b]);
+#pragma unroll
+        for (int i = 0; i < Q8_0_PER_THREAD; ++i) {
+            GEMV_SPREAD(d * (float)q[base + i], base + i)
         }
     }
     GEMV_EPILOGUE

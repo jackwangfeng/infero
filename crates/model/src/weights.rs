@@ -128,6 +128,14 @@ pub struct Weights {
     pub output_norm: Vector,
     /// Absent when the model ties the output projection to the embeddings.
     pub output: Option<Matrix>,
+    /// The same matrix in [`WeightType::Q8_0S`], for the batched path.
+    ///
+    /// Only the AWQ loader builds it, because only there does tuili choose the
+    /// vocab projection's layout. Held *as well as* `output`: the batch-1
+    /// mat-vec reads the packed form, and teaching it the split one is a
+    /// separate change from proving the split one is faster. 532 MiB on an 8B
+    /// model, so it is gated on there being room.
+    pub output_split: Option<Matrix>,
     /// Per-dimension RoPE frequency divisors, `d_head / 2` of them. All ones
     /// unless the file carries `rope_freqs.weight`.
     pub rope_freqs: Vector,
@@ -239,6 +247,9 @@ impl Weights {
             layers,
             output_norm,
             output,
+            // A GGUF file's vocab projection comes in whatever the file chose;
+            // the split layout is only for the one tuili quantizes itself.
+            output_split: None,
             rope_freqs,
             device_bytes,
             host_bytes,
@@ -498,13 +509,48 @@ pub fn load_awq(
     } else {
         let h = w.tensor("lm_head.weight")?;
         let (n, k) = (h.shape[0], h.shape[1]);
-        let q = quantize_f16_to_q8_0(h.as_f16()?, k).context("quantizing lm_head")?;
-        tracing::info!(
-            from_mib = h.data.len() >> 20,
-            to_mib = q.len() >> 20,
-            "vocab projection quantized to Q8_0"
-        );
-        Some(upload(&q, WeightType::Q8_0, k, n, &mut device_bytes)?)
+        // `TUILI_LM_HEAD=f16` keeps the matrix as it came, which prices the Q8_0
+        // path against twice the bytes. On a card with a small L2 the quantized
+        // path reads 558 MB at 90 GB/s, and the question is whether that is the
+        // bytes or the layout: a Q8_0 block is 34 bytes, so its quants are only
+        // ever halfword-aligned and `mmq_load_w_q8_0` reads them two at a time.
+        if std::env::var("TUILI_LM_HEAD").as_deref() == Ok("f16") {
+            tracing::info!(mib = h.data.len() >> 20, "vocab projection kept f16");
+            Some(upload(h.data, WeightType::F16, k, n, &mut device_bytes)?)
+        } else {
+            let q = quantize_f16_to_q8_0(h.as_f16()?, k).context("quantizing lm_head")?;
+            tracing::info!(
+                from_mib = h.data.len() >> 20,
+                to_mib = q.len() >> 20,
+                "vocab projection quantized to Q8_0"
+            );
+            Some(upload(&q, WeightType::Q8_0, k, n, &mut device_bytes)?)
+        }
+    };
+    // And the split layout for the batched path, when there is room for both.
+    // `TUILI_LM_HEAD=packed` keeps only the packed one, which is the A/B.
+    let output_split = match (&output, std::env::var("TUILI_LM_HEAD").as_deref()) {
+        (Some(o), Ok("packed")) => {
+            let _ = o;
+            None
+        }
+        (Some(o), _) if o.ty == WeightType::Q8_0 => {
+            let h = w.tensor("lm_head.weight")?;
+            let (n, k) = (h.shape[0], h.shape[1]);
+            let free = dev.mem_info().map(|(f, _)| f).unwrap_or(0);
+            let want = n * k * 17 / 16;
+            if want * 3 < free {
+                let q = tuili_kernels::awq::quantize_f16_to_q8_0_split(h.as_f16()?, k)
+                    .context("quantizing lm_head, split")?;
+                tracing::info!(mib = q.len() >> 20, "vocab projection also split");
+                Some(upload(&q, WeightType::Q8_0S, k, n, &mut device_bytes)?)
+            } else {
+                tracing::info!(want_mib = want >> 20, free_mib = free >> 20,
+                               "no room for the split vocab projection");
+                None
+            }
+        }
+        _ => None,
     };
     device_bytes += freq_factors.len() * 4;
     let rope_freqs = dev.stream().clone_htod(freq_factors)?;
@@ -555,6 +601,7 @@ pub fn load_awq(
         layers,
         output_norm,
         output,
+        output_split,
         rope_freqs,
         device_bytes,
         host_bytes: 0,

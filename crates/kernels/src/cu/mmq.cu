@@ -176,6 +176,53 @@ __device__ __forceinline__ void mmq_load_w_q8_0(int8_t* ws, float* wd, float* wm
     }
 }
 
+// Q8_0 with the quants and the scales in separate regions.
+//
+// `mmq_load_w_q8_0` above reads two bytes at a time and says why: a `block_q8_0`
+// is 34 bytes, so `qs` is only ever halfword-aligned and a word load would fault
+// on odd blocks. That is a layout problem, not a kernel one, and the vocab
+// projection is the one matrix tuili quantizes itself — so the layout is ours to
+// choose. Here a row's quants are one contiguous run of `k` bytes and the scales
+// follow in a trailing region, which makes the tile load sixteen bytes a thread.
+//
+// It matters where L2 is small. On an A4000 the packed form reads 558 MB at 90
+// GB/s against the card's 448, and the vocab projection is 18% of a batch-32
+// step; on a Blackwell, whose 128 MB of L2 covers the whole matrix, the two
+// layouts measured 789 GB/s against 837 and this would be worth nothing.
+//
+// Same bytes, same accumulation order, so the logits are unchanged and the
+// batch-invariance the comment above `MMQ_SET` claims still holds.
+__device__ __forceinline__ void mmq_load_w_q8_0s(int8_t* ws, float* wd, float* wm,
+                                                 const int8_t* __restrict__ q,
+                                                 const __half* __restrict__ sc,
+                                                 int k_total, int kb_total, int kb0,
+                                                 int row0, int n, int rows, int tid,
+                                                 int nthreads) {
+    for (int i = tid; i < rows * MMQ_GROUPS; i += nthreads) {
+        const int r = i / MMQ_GROUPS;
+        const int g = i % MMQ_GROUPS;
+        const int gr = row0 + r;
+        const int kb = kb0 + g;
+        wd[i] = (gr < n && kb < kb_total)
+                    ? __half2float(sc[(size_t)gr * kb_total + kb])
+                    : 0.0f;
+        wm[i] = 0.0f;
+    }
+    // Sixteen at a time. A row starts at `gr * k_total` and `k` is a multiple of
+    // 32, so every address below is 16-byte aligned by construction.
+    for (int i = tid; i < rows * (MMQ_K / 16); i += nthreads) {
+        const int r = i / (MMQ_K / 16);
+        const int e = (i % (MMQ_K / 16)) * 16;
+        const int gr = row0 + r;
+        const int ka = kb0 * 32 + e;
+        uint4 v = make_uint4(0, 0, 0, 0);
+        if (gr < n && ka + 16 <= k_total) {
+            v = *(const uint4*)(const void*)(q + (size_t)gr * k_total + ka);
+        }
+        *(uint4*)(void*)(ws + r * MMQ_STRIDE + e) = v;
+    }
+}
+
 // Q4_K: unsigned nibbles go into the tile as 0..15 and the 6-bit scale/min pair
 // per group goes into wd/wm. The min becomes `-dmin*m`, applied against the
 // activation's stored sum rather than through the MMA.
@@ -491,6 +538,15 @@ __device__ __forceinline__ void mmq_load_w_q6_K(int8_t* ws, float* wd, float* wm
         MMQ_BODY(WARPS, TILES, 1, MMQ_W_Q8_0)                                  \
     }                                                                          \
     extern "C" __global__ __launch_bounds__((WARPS) * WARP_SIZE) void          \
+    mmq##SUFFIX##_q8_0s(float* __restrict__ out, const void* __restrict__ wv,  \
+                        const void* __restrict__ xv, int k, int n,             \
+                        int n_tokens) {                                        \
+        const int8_t* wq = (const int8_t*)wv;                                  \
+        const __half* wsc = (const __half*)(const void*)(wq + (size_t)n * k);  \
+        const block_q8_1* xq = (const block_q8_1*)xv;                          \
+        MMQ_BODY(WARPS, TILES, 1, MMQ_W_Q8_0S)                                 \
+    }                                                                          \
+    extern "C" __global__ __launch_bounds__((WARPS) * WARP_SIZE) void          \
     mmq##SUFFIX##_q4_K(float* __restrict__ out, const void* __restrict__ wv,   \
                        const void* __restrict__ xv, int k, int n,              \
                        int n_tokens) {                                         \
@@ -519,6 +575,9 @@ __device__ __forceinline__ void mmq_load_w_q6_K(int8_t* ws, float* wd, float* wm
 #define MMQ_W_Q8_0(WS, WD, WM, KT)                                             \
     mmq_load_w_q8_0(WS, WD, WM, wq, kb_total, (KT) * MMQ_GROUPS, row0, n,      \
                     mrows, tid, nthreads)
+#define MMQ_W_Q8_0S(WS, WD, WM, KT)                                            \
+    mmq_load_w_q8_0s(WS, WD, WM, wq, wsc, k, k / 32, (KT) * MMQ_GROUPS, row0, n, \
+                     mrows, tid, nthreads)
 #define MMQ_W_Q4_K(WS, WD, WM, KT)                                             \
     mmq_load_w_q4_K(WS, WD, WM, wq, k / QK_K, KT, row0, n, mrows, tid, nthreads)
 #define MMQ_W_Q6_K(WS, WD, WM, KT)                                             \

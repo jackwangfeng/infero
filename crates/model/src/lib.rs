@@ -964,7 +964,15 @@ impl Model {
             d,
             rms_eps,
         )?;
-        let head = self.w.output.as_ref().unwrap_or(&self.w.token_embd);
+        // The batched path prefers the split layout when the loader built one:
+        // same values, same order, but a row's quants are contiguous so the tile
+        // loader reads sixteen bytes at a time instead of two. See
+        // `mmq_load_w_q8_0s`. The mat-vec keeps the packed form.
+        let packed_head = self.w.output.as_ref().unwrap_or(&self.w.token_embd);
+        let head = match self.w.output_split.as_ref() {
+            Some(sp) if n_logit_rows > 1 => sp,
+            _ => packed_head,
+        };
         // Never cuBLAS here: the vocab projection is by far the largest matrix,
         // and dequantizing it for a handful of rows would cost more than the
         // mat-vec itself.

@@ -183,8 +183,16 @@ impl Kernels {
                 )?;
                 continue;
             }
-            for prefix in ["gemv", "gather_rows", "dequant"] {
-                let name = match prefix {
+            // The split Q8_0 layout is the batched vocab projection and
+            // nothing else: it has a mat-vec and a dequantization, but it is
+            // never an embedding table, so there is no row gather for it.
+            let prefixes: &[&str] = if ty == WeightType::Q8_0S {
+                &["gemv", "dequant"]
+            } else {
+                &["gemv", "gather_rows", "dequant"]
+            };
+            for prefix in prefixes {
+                let name = match *prefix {
                     "dequant" => format!("dequant_{}_f16", ty.suffix()),
                     _ => format!("{prefix}_{}", ty.suffix()),
                 };
@@ -1769,7 +1777,9 @@ impl Kernels {
     /// Whether the integer mat-vec has a dot product for this encoding.
     ///
     /// The rest still go through the float path; adding one is a matter of
-    /// porting its `vec_dot_*_q8_1` from llama.cpp.
+    /// porting its `vec_dot_*_q8_1` from llama.cpp. The split Q8_0 layout is
+    /// absent on purpose: it exists for the batched vocab projection, and a
+    /// single row never reaches it.
     pub fn has_mmvq(ty: WeightType) -> bool {
         matches!(
             ty,
@@ -2014,6 +2024,7 @@ impl Kernels {
         matches!(
             ty,
             WeightType::Q8_0
+                | WeightType::Q8_0S
                 | WeightType::Q4K
                 | WeightType::Q6K
                 | WeightType::Q4G128

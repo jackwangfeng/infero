@@ -23,6 +23,13 @@ pub enum WeightType {
     /// one output row at a time. This is what an AWQ checkpoint is repacked
     /// into at load; see [`crate::awq`].
     Q4G128,
+    /// [`WeightType::Q8_0`] with the quants and the scales in separate regions:
+    /// `k` contiguous int8 a row, then one `f16` scale per 32. Same bytes, and
+    /// the same values in the same order — but a row's quants are one run, so the
+    /// tile loader reads sixteen at a time where a 34-byte block forces two. Only
+    /// the vocab projection uses it, because it is the one matrix tuili quantizes
+    /// itself and so the only one whose layout is ours to choose.
+    Q8_0S,
     /// [`WeightType::Q4G128`] with the 4-byte words inside each nibble run
     /// transposed and the scales moved to a trailing region, so a tensor-core
     /// lane's whole weight fragment is one aligned 16-byte read. Same total
@@ -31,7 +38,7 @@ pub enum WeightType {
 }
 
 impl WeightType {
-    pub const ALL: [WeightType; 11] = [
+    pub const ALL: [WeightType; 12] = [
         WeightType::F32,
         WeightType::F16,
         WeightType::Q4_0,
@@ -43,6 +50,7 @@ impl WeightType {
         WeightType::Q6K,
         WeightType::Q4G128,
         WeightType::Q4G128T,
+        WeightType::Q8_0S,
     ];
 
     pub fn from_ggml(t: GgmlType) -> Result<Self> {
@@ -73,6 +81,7 @@ impl WeightType {
             WeightType::Q5_0 => "q5_0",
             WeightType::Q5_1 => "q5_1",
             WeightType::Q8_0 => "q8_0",
+            WeightType::Q8_0S => "q8_0s",
             WeightType::Q4K => "q4_K",
             WeightType::Q6K => "q6_K",
             WeightType::Q4G128 => "q4_g128",
@@ -87,7 +96,8 @@ impl WeightType {
             | WeightType::Q4_1
             | WeightType::Q5_0
             | WeightType::Q5_1
-            | WeightType::Q8_0 => 32,
+            | WeightType::Q8_0
+            | WeightType::Q8_0S => 32,
             WeightType::Q4K | WeightType::Q6K => 256,
             WeightType::Q4G128 | WeightType::Q4G128T => 128,
         }
@@ -101,7 +111,8 @@ impl WeightType {
             WeightType::Q4_1 => 20,
             WeightType::Q5_0 => 22,
             WeightType::Q5_1 => 24,
-            WeightType::Q8_0 => 34,
+            // Counted as a block for accounting only; the bytes are split.
+            WeightType::Q8_0 | WeightType::Q8_0S => 34,
             WeightType::Q4K => 144,
             WeightType::Q6K => 210,
             // `__half2` of {scale, scale * zero} then 128 nibbles.
@@ -151,6 +162,7 @@ impl std::fmt::Display for WeightType {
             WeightType::Q5_0 => "Q5_0",
             WeightType::Q5_1 => "Q5_1",
             WeightType::Q8_0 => "Q8_0",
+            WeightType::Q8_0S => "Q8_0S",
             WeightType::Q4K => "Q4_K",
             WeightType::Q6K => "Q6_K",
             WeightType::Q4G128 => "Q4_G128",
@@ -172,6 +184,12 @@ mod tests {
             // AWQ checkpoint is repacked into, and nothing in a GGUF file ever
             // carries one. Both hold 128 nibbles and a scale pair per block,
             // however they arrange them, so the byte count is the same.
+            // Q8_0S is ours as well: same bytes as Q8_0, arranged differently.
+            if w == WeightType::Q8_0S {
+                assert_eq!(w.block_size(), 32);
+                assert_eq!(w.type_size(), WeightType::Q8_0.type_size());
+                continue;
+            }
             if w == WeightType::Q4G128 || w == WeightType::Q4G128T {
                 assert_eq!(w.block_size() * 4 + 4 * 8, w.type_size() * 8);
                 continue;
@@ -186,7 +204,7 @@ mod tests {
                 WeightType::Q8_0 => GgmlType::Q8_0,
                 WeightType::Q4K => GgmlType::Q4K,
                 WeightType::Q6K => GgmlType::Q6K,
-                WeightType::Q4G128 | WeightType::Q4G128T => {
+                WeightType::Q4G128 | WeightType::Q4G128T | WeightType::Q8_0S => {
                     unreachable!("handled above")
                 }
             };

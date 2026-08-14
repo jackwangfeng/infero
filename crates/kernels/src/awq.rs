@@ -313,6 +313,66 @@ pub fn unpack_row_t(packed: &[u8], k: usize, n: usize, row: usize) -> Vec<f32> {
 /// the only thing that matters is the argmax over 128k logits.
 ///
 /// Q8_0 is 32 weights to one `f16` scale, `d = max|w| / 127`.
+/// The same quantization, with the quants and the scales in separate regions.
+///
+/// Layout: `n * k` int8, then `n * (k/32)` `f16` scales, both row-major. Same
+/// values and same order as [`quantize_f16_to_q8_0`] — only the arrangement
+/// differs, so the matmul's accumulation order and therefore its logits do not.
+///
+/// The point is the tile load. A `block_q8_0` interleaves a 2-byte scale with
+/// every 32 quants, so a row's quants are never more than halfword-aligned and
+/// `mmq_load_w_q8_0` reads them two bytes at a time; contiguous, they go sixteen
+/// at a time. See `mmq_load_w_q8_0s`.
+pub fn quantize_f16_to_q8_0_split(src: &[half::f16], k: usize) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        k.is_multiple_of(32),
+        "row length {k} is not a multiple of the 32-weight block"
+    );
+    anyhow::ensure!(
+        src.len().is_multiple_of(k),
+        "{} values do not divide into rows of {k}",
+        src.len()
+    );
+    const BLOCK: usize = 32;
+    let rows = src.len() / k;
+    let nb = k / BLOCK;
+    let mut out = vec![0u8; rows * k + rows * nb * 2];
+    let (quants, scales) = out.split_at_mut(rows * k);
+
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(rows.max(1));
+    let per = rows.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (t, (qc, sc)) in quants
+            .chunks_mut(per * k)
+            .zip(scales.chunks_mut(per * nb * 2))
+            .enumerate()
+        {
+            let src = &src;
+            scope.spawn(move || {
+                for r in 0..(qc.len() / k) {
+                    let row = t * per + r;
+                    for b in 0..nb {
+                        let x = &src[row * k + b * BLOCK..][..BLOCK];
+                        let amax = x.iter().fold(0.0f32, |m, v| m.max(f32::from(*v).abs()));
+                        let d = amax / 127.0;
+                        let inv = if d != 0.0 { 1.0 / d } else { 0.0 };
+                        let dh = half::f16::from_f32(d).to_le_bytes();
+                        sc[(r * nb + b) * 2] = dh[0];
+                        sc[(r * nb + b) * 2 + 1] = dh[1];
+                        for (i, v) in x.iter().enumerate() {
+                            let q = (f32::from(*v) * inv).round().clamp(-127.0, 127.0);
+                            qc[r * k + b * BLOCK + i] = (q as i8) as u8;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    Ok(out)
+}
+
 pub fn quantize_f16_to_q8_0(src: &[half::f16], k: usize) -> Result<Vec<u8>> {
     anyhow::ensure!(
         k.is_multiple_of(32),

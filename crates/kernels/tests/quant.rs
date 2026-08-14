@@ -590,3 +590,112 @@ fn batched_matvec_tracks_the_float_gemv() -> Result<()> {
     Ok(())
 }
 
+/// The split Q8_0 layout against the packed one, on the same numbers.
+///
+/// The two encodings hold the same quants and the same scales — the split form
+/// only moves the scales out of the middle of every 32 weights and into a table
+/// at the end, so a thread's run of weights is contiguous. Nothing about the
+/// arithmetic or its order changes, so the answers must agree *exactly*: a
+/// tolerance here would hide precisely the bug this layout can have, which is a
+/// row or block landing at the wrong offset. Peak-relative closeness would
+/// survive a scale table that is off by one block; equality would not.
+#[test]
+fn the_split_q8_0_layout_matches_the_packed_one() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    let Some(f) = open("qwen2.5-0.5b-instruct-fp16.gguf") else {
+        return Ok(());
+    };
+    let info = f.tensor(TENSOR)?;
+    let (kk, n) = (info.dims[0] as usize, info.dims[1] as usize);
+    let raw = f.data(info);
+    let src: Vec<f16> = raw
+        .chunks_exact(2)
+        .map(|b| f16::from_le_bytes([b[0], b[1]]))
+        .collect();
+    assert_eq!(src.len(), kk * n);
+
+    let packed = Loaded {
+        bytes: stream.clone_htod(&tuili_kernels::awq::quantize_f16_to_q8_0(&src, kk)?)?,
+        ty: WeightType::Q8_0,
+        k: kk,
+        n,
+    };
+    let split = Loaded {
+        bytes: stream
+            .clone_htod(&tuili_kernels::awq::quantize_f16_to_q8_0_split(&src, kk)?)?,
+        ty: WeightType::Q8_0S,
+        k: kk,
+        n,
+    };
+
+    // Token counts that are not multiples of the 16-token tile: the edge rows
+    // are where a bounds slip would hide.
+    for n_tokens in [1usize, 5, 16, 19, 33, 64] {
+        let x = pseudo_random(n_tokens * kk, 0x8055 + n_tokens as u64);
+        let want = run_gemv(&k, &packed, &x, n_tokens)?;
+        let got = run_gemv(&k, &split, &x, n_tokens)?;
+        assert_eq!(
+            got, want,
+            "gemv t={n_tokens}: split and packed disagree at {:?}",
+            max_abs_diff(&got, &want)
+        );
+
+        let dx = stream.clone_htod(&x)?;
+        let qb = Kernels::q8_1_bytes(kk);
+        let mut q8_1 = stream.alloc_zeros::<u8>(n_tokens * qb)?;
+        for t in 0..n_tokens {
+            k.quantize_q8_1(
+                &mut q8_1.slice_mut(t * qb..(t + 1) * qb),
+                &dx.slice(t * kk..(t + 1) * kk),
+                kk,
+            )?;
+        }
+        let mut a = stream.alloc_zeros::<f32>(n_tokens * n)?;
+        let mut b = stream.alloc_zeros::<f32>(n_tokens * n)?;
+        k.mmq(
+            &mut a.as_view_mut(),
+            &packed.bytes.as_view(),
+            WeightType::Q8_0,
+            &q8_1.as_view(),
+            kk,
+            n,
+            n_tokens,
+        )?;
+        k.mmq(
+            &mut b.as_view_mut(),
+            &split.bytes.as_view(),
+            WeightType::Q8_0S,
+            &q8_1.as_view(),
+            kk,
+            n,
+            n_tokens,
+        )?;
+        let (wa, wb) = (stream.clone_dtoh(&a)?, stream.clone_dtoh(&b)?);
+        k.device().synchronize()?;
+        let (abs, at) = max_abs_diff(&wb, &wa);
+        eprintln!("  t={n_tokens:<3} mmq max diff {abs:e} at {at}");
+        assert_eq!(wb, wa, "mmq t={n_tokens}: max diff {abs:e} at row {at}");
+    }
+
+    // And the dequantization, which the f16 prefill path would read.
+    let total = kk * n;
+    let mut da = stream.alloc_zeros::<f16>(total)?;
+    let mut db = stream.alloc_zeros::<f16>(total)?;
+    k.dequant_to_f16(
+        &mut da.as_view_mut(),
+        &packed.bytes.as_view(),
+        WeightType::Q8_0,
+        total,
+    )?;
+    k.dequant_to_f16(
+        &mut db.as_view_mut(),
+        &split.bytes.as_view(),
+        WeightType::Q8_0S,
+        total,
+    )?;
+    let (ha, hb) = (stream.clone_dtoh(&da)?, stream.clone_dtoh(&db)?);
+    k.device().synchronize()?;
+    assert!(ha == hb, "dequant: split and packed disagree");
+    Ok(())
+}
