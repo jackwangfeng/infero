@@ -1719,6 +1719,17 @@ extern "C" __global__ void attn_kv_probe_f32(float* __restrict__ sink,
 //   * `O += P V` likewise, except a B fragment now wants `[dim][key]`, so V is
 //     transposed on the way into shared.
 //
+// It is off by default, and the reason is precision rather than speed. A tensor
+// core takes f16 operands, so the softmax weights go through half on their way
+// into the value product where the scalar kernel keeps them in f32 —
+// FlashAttention makes the same trade. That is about 6e-4 relative on an output
+// element, which is small until it meets `tests/batching.rs`: the chunk count
+// depends on the batch width, so the summation order does too, and an error ten
+// times larger than the scalar path's is enough to flip a greedy token between a
+// batched and a solo decode. The engine documents that invariance, so this path
+// stays opt-in until the split is made batch-independent or the invariance is
+// renegotiated.
+//
 // The one gift in the layout: the `S` accumulator lands in exactly the registers
 // the `P` A-fragment wants. Lane `l` holds rows `l/4` and columns `(l%4)*2+{0,1}`
 // of each 8-key tile, and an A fragment wants rows `l/4` and k `(l%4)*2+{0,1}`

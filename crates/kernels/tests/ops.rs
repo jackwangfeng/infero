@@ -690,6 +690,12 @@ fn attn_decode_matches_the_three_kernels() -> Result<()> {
     // turns on a different exit — the kernel normalizes and writes the answer
     // itself instead of handing partials to the combine pass. 8 KV heads by 128
     // tokens is 1024 blocks, past `sm_count * 4` on anything this runs on.
+    // Two shapes of model, not one: Llama-3.1's 4 query heads a KV head over
+    // 128 dimensions, and Qwen2.5-0.5B's *seven* over 64. A group that does not
+    // divide the MMA's sixteen rows, and a head that does not fill its lanes,
+    // are exactly where an off-by-one in a fragment index hides — and where the
+    // batching tests caught one that these shapes had not.
+    for (n_heads, n_kv_heads, d_head) in [(8usize, 2usize, 128usize), (14, 2, 64)] {
     for (n_tokens, kv_len) in [
         (5usize, 100usize),
         (3, 32),
@@ -697,11 +703,13 @@ fn attn_decode_matches_the_three_kernels() -> Result<()> {
         (2, 7),
         (6, 256),
         (128, 100),
+        (64, 64),
+        (33, 40),
     ] {
         let dims = AttnDims {
-            n_heads: 8,
-            n_kv_heads: 2,
-            d_head: 128,
+            n_heads,
+            n_kv_heads,
+            d_head,
             n_slots: 512,
             n_tokens,
         };
@@ -716,13 +724,25 @@ fn attn_decode_matches_the_three_kernels() -> Result<()> {
             .into_iter()
             .map(f16::from_f32)
             .collect();
-        // Each token a different distance into its own history, and the last
-        // one masked back far enough to leave whole chunks with nothing.
-        let positions: Vec<i32> = (0..n_tokens)
-            .map(|t| (kv_len as i32 - 1 - (t as i32 * 7) % (kv_len as i32)).max(0))
-            .collect();
+        // Two masks, because they stress different exits. The decode-ish one
+        // puts every token a different distance into its own history; the
+        // prefill one is a single sequence at positions 0..n-1, where most
+        // tokens' histories end *before* a later chunk begins and a block has
+        // to record "nothing here" rather than compute it.
+        let prefill = n_tokens > kv_len / 2;
+        let positions: Vec<i32> = if prefill {
+            (0..n_tokens as i32).map(|t| t.min(kv_len as i32 - 1)).collect()
+        } else {
+            (0..n_tokens)
+                .map(|t| (kv_len as i32 - 1 - (t as i32 * 7) % (kv_len as i32)).max(0))
+                .collect()
+        };
         // Sequences interleaved through the pool, not laid out in runs.
-        let seq_of: Vec<i32> = (0..n_tokens as i32).map(|t| t % 2).collect();
+        let seq_of: Vec<i32> = if prefill {
+            vec![0i32; n_tokens]
+        } else {
+            (0..n_tokens as i32).map(|t| t % 2).collect()
+        };
         let table: Vec<i32> = (0..2)
             .flat_map(|s| (0..kv_len).map(move |p| ((p * 2 + s) % 512) as i32))
             .collect();
@@ -787,16 +807,29 @@ fn attn_decode_matches_the_three_kernels() -> Result<()> {
 
         // Both sum the same products in different orders, and the weights come
         // from `__expf` either way; the tolerance is for the reassociation.
+        //
+        // The tensor-core path gets ten times the slack, and it needs it for a
+        // reason worth stating: `mma.m16n8k16` takes f16 operands, so the
+        // softmax weights are rounded to half before the value product where the
+        // scalar kernel keeps them in f32. FlashAttention does the same. It costs
+        // about 6e-4 relative here, and it is why that path is not the default —
+        // see the note on `attn_decode_mma_f32`.
+        let tol = if std::env::var("TUILI_ATTN_MMA").as_deref() == Ok("1") {
+            2e-3
+        } else {
+            2e-4
+        };
         let (abs, at) = max_abs_diff(&got, &want);
         assert!(
-            abs < 2e-4,
-            "tokens {n_tokens} kv {kv_len}: max abs diff {abs} at {at} \
-             (got {}, want {})",
+            abs < tol,
+            "{n_heads}q/{n_kv_heads}kv x {d_head}, tokens {n_tokens} kv {kv_len}: \
+             max abs diff {abs} at {at} (got {}, want {})",
             got[at],
             want[at]
         );
         // Not vacuous: an all-zero output would pass any difference test.
         assert!(want.iter().any(|v| v.abs() > 1e-3), "reference is all zeros");
+    }
     }
     Ok(())
 }
