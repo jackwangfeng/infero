@@ -175,6 +175,47 @@ and a name-selected shape carries a launch configuration that has to be read
 from the name. Any sweep in this file that selected a shape by name before this
 commit is suspect for the same reason.
 
+## Is the load generator fair? Yes, to within 3%
+
+`bench.py` sends all 32 clients the same prompt at temperature 0, so all 32
+sequences generate the identical continuation. vLLM hashes KV in 16-token blocks
+and shares them, which looked like it could hand the other engine an L2-resident
+cache and most of the remaining gap. Measured, one prompt per client against one
+shared prompt, both engines, back to back:
+
+| | same prompt | distinct prompts |
+|---|---:|---:|
+| tuili | 4691 | 4691 |
+| vLLM | 5398 | 5248 (-2.8%) |
+
+So the sharing is worth 2.8% to vLLM and nothing to tuili, and the gap on the
+fairer load is **1.12x**. The reason the effect is small is that concurrent
+sequences do not dedupe mid-flight: a block is looked up when a *new* request
+prefills, not while thirty-two sequences are already running. Worth knowing
+before reading anything else here — I spent a while on the assumption that this
+was the answer.
+
+## Attention: 81% of a pure-read ceiling on this card
+
+`bwidth_attn.rs` on the Blackwell, batch 32, history 512, 32q/8kv x 128:
+
+| | us a layer | GB/s of KV |
+|---|---:|---:|
+| the three kernels | 58.3 | 1152 |
+| `attn_decode_gqa_f32` | 57.4 | 1169 |
+| `attn_kv_probe_f32` — read the bytes and do nothing | 46.6 | 1440 |
+
+A perfect kernel that only reads KV would save 10.8 us a layer, 0.35 ms a step,
+**5%**. That is the whole envelope for attention on this card, and it prices
+every idea about it before the idea is tried.
+
+`attn_decode_mma_f32`, the tensor-core version, is *worth 7% on an A4000 and
+costs 7.4% here* (4342/4361 tok/s against 4697, layers 6.56 ms against 6.06). It
+stays opt-in behind `TUILI_ATTN_MMA=1`, now for two reasons rather than one — it
+also breaks batch invariance, since P is f16 for the tensor core. Which way the
+arithmetic trade goes evidently depends on the card, so the entry that priced
+`m16n8k16` at 3% was pricing it on the wrong machine.
+
 ## What has not been paying
 
 Ranked by how much time went into it. All of these are recorded with numbers at
