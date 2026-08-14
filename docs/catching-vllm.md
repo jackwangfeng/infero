@@ -655,12 +655,26 @@ probe's 1345, Marlin's 1247 and this kernel's 1164 — with the roofline at 1792
 The copy granularity matters and the depth does not: 512-byte boxes beat
 256-byte ones by 4%, and three stages beat six.
 
-That prices the rewrite. This kernel reaches 87% of its own probe (1164 of 1345);
-a TMA kernel at the same 87% of 1419 is 1235 GB/s, which takes the GEMM from
-3.32 ms to 3.13 and the engine to about **5160** — still short. At 95%, which
-warp specialization makes plausible because the consumer warps never issue a
-load, it is 1348 GB/s, 2.87 ms, and about **5370** — level with vLLM's 5403 and
-not past it.
+Then the same probe was given the GEMM's arithmetic — every 16-byte fragment
+unpacked into eight `half2` and two `mma.m16n8k16` against an A fragment kept in
+shared — because the question is not what TMA copies, it is what survives
+computing on what TMA copies:
+
+| box / stages | copy only | with the MMAs |
+|---|---:|---:|
+| 512x64 B, 3 x 32 KiB | 1413 | **1356** |
+| 1024x32 B, 3 x 32 KiB | 1395 | 1356 |
+| 256x64 B, 6 x 16 KiB | 1355 | 1354 |
+
+**96% of the copy-only ceiling survives the arithmetic**, against the 87% this
+kernel keeps of its own `cp.async` probe. So warp specialization's benefit is
+real and measured, not assumed — the consumer warps never issue a load, so they
+never stall on one.
+
+It is also not enough. 1356 GB/s against this kernel's 1164 is +16.5%, which
+takes the GEMM from 3.32 ms to 2.85 and the engine from 5012 to about **5395** —
+against vLLM's 5403. The ceiling of the whole direction, measured with its
+arithmetic in place, is a **tie**.
 
 **So the honest projection for a multi-day rewrite is a tie, not a win**, and
 that is worth knowing before starting rather than after. Beating vLLM here needs

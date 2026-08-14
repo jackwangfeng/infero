@@ -171,6 +171,20 @@ fn tma_bulk_tensor_loads_a_tile() -> Result<()> {
 /// `mmq_load_w_q4_g128t` sees — through a six-stage pipeline, over four cycled
 /// buffers so nothing is L2-resident.
 const PIPE_SRC: &str = r#"
+#include <cuda_fp16.h>
+struct mma_c_f32 { float x[4]; };
+struct mma_a_f16 { unsigned x[4]; };
+struct mma_b_f16 { unsigned x[2]; };
+__device__ __forceinline__ void mma_f16(mma_c_f32& d, const mma_a_f16& a,
+                                        const mma_b_f16& b) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(d.x[0]), "+f"(d.x[1]), "+f"(d.x[2]), "+f"(d.x[3])
+        : "r"(a.x[0]), "r"(a.x[1]), "r"(a.x[2]), "r"(a.x[3]), "r"(b.x[0]),
+          "r"(b.x[1]));
+}
+
 struct __align__(64) TmaDesc { unsigned char bytes[128]; };
 
 #define TMA_BOX_IN BOX_IN_   /* u32 elements */
@@ -275,6 +289,128 @@ extern "C" __global__ void tma_stream_sum(float* __restrict__ out,
     }
     if (acc == 1.2345e-30f) out[0] = acc;
 }
+
+/* The same pipeline with the GEMM's arithmetic in the consumer: every 16-byte
+   weight fragment unpacked into eight `half2` the way `mmq_load_w_q4_g128t`
+   does, and two `mma.m16n8k16` per fragment against an A fragment that stays in
+   shared. The answer is garbage on purpose — this is priced for its instruction
+   mix, not its output — and the point is the ratio to the copy-only number
+   above. The current kernel reaches 87% of its own copy-only probe; if TMA
+   feeding holds a higher fraction, warp specialization is worth building. */
+extern "C" __global__ void tma_stream_mma(float* __restrict__ out,
+                                         const __grid_constant__ TmaDesc desc,
+                                         int row_tiles, int col_tiles) {
+    extern __shared__ __align__(128) unsigned char smem[];
+    unsigned char* tiles = smem;
+    unsigned long long* mbar =
+        (unsigned long long*)(void*)(smem + TMA_STAGES * TMA_TILE);
+    /* A stays resident, as it does in the real kernel's activation ring. */
+    unsigned int* ash = (unsigned int*)(void*)(smem + TMA_STAGES * TMA_TILE + 64);
+
+    const unsigned int mbar0 = (unsigned int)__cvta_generic_to_shared(mbar);
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int s = 0; s < TMA_STAGES; ++s) {
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" ::"r"(
+                mbar0 + (unsigned)(s * 8)));
+        }
+        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    }
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) ash[i] = 0x3c003c00u;
+    __syncthreads();
+
+    const int total = row_tiles * col_tiles;
+    const int per = (total + (int)gridDim.x - 1) / (int)gridDim.x;
+    const int begin = per * (int)blockIdx.x;
+    const int end = min(total, begin + per);
+    const int lane = threadIdx.x % 32;
+
+    int issued = begin;
+    for (int s = 0; s < TMA_STAGES && issued < end; ++s, ++issued) {
+        if (threadIdx.x == 0) {
+            const unsigned int t =
+                (unsigned int)__cvta_generic_to_shared(tiles + s * TMA_TILE);
+            const unsigned int m = mbar0 + (unsigned)(s * 8);
+            const int bx = (issued % col_tiles) * TMA_BOX_IN;
+            const int by = (issued / col_tiles) * TMA_BOX_ROWS;
+            asm volatile(
+                "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(
+                    m),
+                "r"(TMA_TILE));
+            asm volatile(
+                "cp.async.bulk.tensor.2d.shared::cluster.global"
+                ".mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];\n" ::"r"(
+                    t),
+                "l"(&desc), "r"(bx), "r"(by), "r"(m)
+                : "memory");
+        }
+    }
+
+    mma_c_f32 c0 = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    int phase[TMA_STAGES];
+#pragma unroll
+    for (int s = 0; s < TMA_STAGES; ++s) phase[s] = 0;
+
+    mma_a_f16 a;
+    a.x[0] = ash[lane * 4 + 0];
+    a.x[1] = ash[lane * 4 + 1];
+    a.x[2] = ash[lane * 4 + 2];
+    a.x[3] = ash[lane * 4 + 3];
+
+    for (int i = begin; i < end; ++i) {
+        const int s = (i - begin) % TMA_STAGES;
+        const unsigned int m = mbar0 + (unsigned)(s * 8);
+        if (threadIdx.x == 0) {
+            asm volatile(
+                "{\n.reg .pred p;\n"
+                "WAITM:\n"
+                "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
+                "@p bra.uni DONEM;\n"
+                "bra.uni WAITM;\n"
+                "DONEM:\n}\n" ::"r"(m),
+                "r"(phase[s])
+                : "memory");
+        }
+        __syncthreads();
+        const uint4* t4 = (const uint4*)(const void*)(tiles + s * TMA_TILE);
+        /* One fragment a lane a pass, unpacked and multiplied. */
+#pragma unroll 2
+        for (int e = threadIdx.x; e < TMA_TILE / 16; e += (int)blockDim.x) {
+            const uint4 v = t4[e];
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                const unsigned q = ((const unsigned*)&v)[w];
+                mma_b_f16 b;
+                /* The low and high nibble halves, as `half2` pairs. */
+                b.x[0] = (q & 0x0F0F0F0Fu) | 0x64006400u;
+                b.x[1] = ((q >> 4) & 0x0F0F0F0Fu) | 0x64006400u;
+                mma_f16(c0, a, b);
+            }
+        }
+        __syncthreads();
+        phase[s] ^= 1;
+        if (issued < end) {
+            if (threadIdx.x == 0) {
+                const unsigned int t =
+                    (unsigned int)__cvta_generic_to_shared(tiles + s * TMA_TILE);
+                const int bx = (issued % col_tiles) * TMA_BOX_IN;
+                const int by = (issued / col_tiles) * TMA_BOX_ROWS;
+                asm volatile(
+                    "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(
+                        m),
+                    "r"(TMA_TILE));
+                asm volatile(
+                    "cp.async.bulk.tensor.2d.shared::cluster.global"
+                    ".mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], "
+                    "[%4];\n" ::"r"(t),
+                    "l"(&desc), "r"(bx), "r"(by), "r"(m)
+                    : "memory");
+            }
+            ++issued;
+        }
+    }
+    if (c0.x[0] == 1.2345e-30f) out[0] = c0.x[0];
+}
 "#;
 
 #[test]
@@ -319,7 +455,9 @@ fn tma_streams_weights_against_the_cp_async_probe() -> Result<()> {
         (256, 64, 1),
     ] {
     let tile = box_in * 4 * box_rows;
-    let shared = stages * tile + stages * 8;
+    // Tiles, then the barriers, then 1 KiB for the resident A fragments the
+    // compute variant multiplies against.
+    let shared = stages * tile + 64 + 1024;
     let (col_tiles, row_tiles) = (row_bytes / (box_in * 4), rows / box_rows);
 
     let mut descs = Vec::new();
@@ -360,9 +498,11 @@ fn tma_streams_weights_against_the_cp_async_probe() -> Result<()> {
     let module: &'static str = Box::leak(
         format!("tuili_tma_pipe_{box_in}_{box_rows}_{stages}").into_boxed_str(),
     );
+    let leaked: &'static str = Box::leak(src.into_boxed_str());
+    for kernel in ["tma_stream_sum", "tma_stream_mma"] {
     let f = match dev
         .kernels()
-        .get(module, Box::leak(src.into_boxed_str()), "tma_stream_sum")
+        .get(module, leaked, kernel)
     {
         Ok(f) => f,
         Err(e) => {
@@ -399,14 +539,15 @@ fn tma_streams_weights_against_the_cp_async_probe() -> Result<()> {
     dev.synchronize()?;
     let secs = t0.elapsed().as_secs_f64() / 20.0;
     eprintln!(
-        "  box {:>4}x{box_rows:<3} {stages} stages of {:>3} KiB ({:>3} KiB shared)  \
-         {:>6.1} us  {:>5.0} GB/s",
+        "  box {:>4}x{box_rows:<3} {stages} stages of {:>3} KiB  {:<15} {:>6.1} us  \
+         {:>5.0} GB/s",
         box_in * 4,
         tile >> 10,
-        shared >> 10,
+        kernel,
         secs * 1e6,
         bytes as f64 / secs / 1e9
     );
+    }
     }
     Ok(())
 }
