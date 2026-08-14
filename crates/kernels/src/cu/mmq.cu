@@ -666,14 +666,27 @@ __device__ __forceinline__ int mmq_g_high(int g) { return (g % 4) / 2; }
    everything, b-1 waits for b-2, and the grid serializes into a chain. Marlin's
    slices are one row group each, so its chain is one add long.
  
-   Two things would have to change together to make it pay. The straddled head
-   group has to be processed *last*, so the waits form a short cascade after
-   every block's independent work; and the lock path has to be refused unless
-   `iters >= k_tiles`, or a run shorter than a row group puts three blocks in a
-   chain again — which is exactly what the narrow projections do at this grid
-   (`iters` 3 against `k_tiles` 16 on a Blackwell). That leaves only `gate_up`
-   eligible, two thirds of the memset bytes and a quarter of the launches, so
-   about 0.7% for a spin-wait in the hot kernel. Not taken.
+   Both of the things that would have to change together were then written and
+   measured too. The straddled head group processed *last*, so the waits form a
+   short cascade after every block's independent work — the head never waits, so
+   this does remove the chain — and the lock path refused unless
+   `iters >= k_tiles`, which bounds a row group to two contributors and leaves
+   `gate_up` as the only eligible matrix at this grid.
+
+   It is correct at every shape and token count, it does not hang, and it is
+   **3.3% slower**: 4848 tok/s against 5012, `layers_ms` 5.880 against 5.671.
+
+   The cost is not the locks. The same binary with `TUILI_MMQ_LOCKS=0` — the
+   reordering kept, the memset back — measures 4862, so **splitting the run into
+   two passes is itself worth -3%**, against the 2.2% the memsets cost. The
+   `MMQ_Y_LOADW` hand-over carries a k-tile of weights across row-group
+   iterations, and a second pass restarts that pipeline; the nested loop also
+   costs registers where this kernel has none to spare.
+
+   So the memset stays, and the reason is worth stating plainly: this partition
+   balances 448 row groups over 376 blocks by splitting some of them, splitting
+   requires accumulation, accumulation requires either a zeroed target or an
+   order, and every way of imposing an order costs more than the zeroing does.
  
    The first version also hung the server on its first long prompt while all 170
    assertions passed: `blockIdx.y` is the token-tile dimension, so a prefill

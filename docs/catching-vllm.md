@@ -273,6 +273,24 @@ a prefill launch has sixteen slices sharing one counter per row group, and the
 residency a spin-wait depends on is the whole grid rather than `gridDim.x`. Any
 test for a cross-block protocol has to run more than one token tile.
 
+**Then the fix for the chain was written too, and it also lost.** Process the
+straddled head group last — the head never waits, so that really does remove the
+chain — and refuse the lock path unless `iters >= k_tiles`, which bounds a row
+group to two contributors. Correct at every shape, no hang, and 3.3% slower:
+4848 tok/s against 5012.
+
+The locks were not what cost it. The same binary with `TUILI_MMQ_LOCKS=0` — the
+reordering kept, the memset back — measures 4862, so the two-pass run is worth
+**-3% on its own**, against the 2.2% the memsets cost. `MMQ_Y_LOADW` carries a
+k-tile of weights across row-group iterations and a second pass restarts that
+pipeline.
+
+Which settles the memset, and the shape of the answer is worth keeping: this
+partition balances 448 row groups over 376 blocks by splitting some of them,
+splitting needs accumulation, accumulation needs either a zeroed target or an
+order, and every way of imposing an order has now been measured to cost more
+than the zeroing.
+
 ## There is nothing left in scheduling: 98.5% of a step is a kernel running
 
 This file has carried a "GPU idle 1.23 ms" line and a note about graph launches
