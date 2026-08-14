@@ -377,6 +377,43 @@ real win — a quarter of attention's traffic — though it would still be a
 different configuration from the vLLM run it is being compared against, and the
 comparison would have to say so.
 
+## Attention: three ways to cheapen the arithmetic, three that do nothing
+
+Deleting the arithmetic from `attn_decode_gqa_f32` leaves 38.8 us of its 46.1,
+so 7.3 us a layer is arithmetic. That number is real and it does not convert —
+three independent ways of making the same arithmetic cheaper have now been
+measured, and none of them moves the engine:
+
+| | isolated | served |
+|---|---|---|
+| `m16n8k16` (`attn_decode_mma_f32`) | +15% at both tile sizes | -7.4% |
+| four accumulators instead of one | 65.5 us against 57.4 | not reached |
+| `__hfma2`, one instruction a pair | 55.3 against 59.2 | **5009 against 5012** |
+
+The last is the sharpest, because it is the one that worked in the probe. A
+third of the instructions, an f16 accumulator flushed every eight products,
+2.1e-4 of error on outputs of order 0.26 — and in the served engine `layers_ms`
+moves from 5.120 to 5.114, which is nothing. The harness itself varies 3% run to
+run (the same build measured 57.4 earlier the same day), so the 6.6% it reported
+was mostly noise.
+
+**What is left when the multiply gets cheaper is the latency the multiply was
+hiding.** Whatever this kernel is short of, it is not instruction issue — and
+that retires the whole family of "cut attention's arithmetic" ideas, which is
+where three sessions of attention work have been aimed.
+
+Also retired, in the same measurement session: **the KV page size**. The
+hypothesis was that one-token slots make a gather where vLLM's sixteen-token
+blocks make a 4 KB run, and that `attn_kv_probe`'s 46.6 us therefore measures
+this engine's layout rather than the card. Swept with `TUILI_ATTN_PAGE` at
+batch 32 and history 512: probe 46.7 / 46.6 / 46.6 / 46.6 / 46.6 / 46.6 for
+pages of 1 / 8 / 16 / 32 / 64 / 512, and the kernel 59.0 / 58.0 / 58.0 / 58.3 /
+58.5 / 58.2. Flat. A key is 256 bytes — already the granularity DRAM wants — and
+at 32 sequences by 8 KV heads there is no shortage of streams. So 1440 GB/s is
+the card, vLLM's 1264 at the same history is *below* it rather than through it,
+and attention is worth 2.2% against vLLM rather than the 8% a broken ceiling
+would have implied.
+
 ## Is the load generator fair? Yes, to within 3%
 
 `bench.py` sends all 32 clients the same prompt at temperature 0, so all 32

@@ -1540,6 +1540,24 @@ extern "C" __global__ void attn_flash_gqa_f32(
 //
 // Partials in `attn_flash_reduce_f32`'s layout, so the combine pass is shared
 // with the older fused path.
+/* The `__hfma2` score loop: a third of the instructions, an f16 accumulator
+   flushed every eight products, and an answer that is close rather than
+   identical — 2.1e-4 absolute on outputs of order 0.26, which is 0.08% and
+   which `attn_decode_matches_the_three_kernels` rejects at its 2e-4 bound.
+ 
+   Measured and left off, because the instructions were not what the engine was
+   waiting for. The probe says 55.3 us a layer against 59.2 at history 512 — but
+   that harness varies 3% run to run (the same build measured 57.4 earlier
+   today), and in the served engine it is *nothing*: 5009 tok/s against 5012,
+   `layers_ms` 5.114 against 5.120.
+ 
+   That is the third way of making this kernel's arithmetic cheaper, after
+   `m16n8k16` and breaking the FMA chain, and the third that does not move the
+   engine. The 7.3 us a layer that *deleting* the arithmetic removes is real and
+   does not convert: what is left when the multiply gets cheaper is the latency
+   the multiply was hiding. Whatever attention is short of here, it is not
+   instruction issue. */
+#define ATTN_DECODE_H2 0
 #define ATTN_DECODE_TILE 16
 #define ATTN_DECODE_LPK (WARP_SIZE / ATTN_DECODE_TILE)
 #define ATTN_DECODE_PAD 8
@@ -1563,10 +1581,21 @@ extern "C" __global__ void attn_decode_gqa_f32(
     float* sq = (float*)attn_smem;
     __half* sk = (__half*)(sq + group * d_head);
     __half* sv = sk + ATTN_DECODE_TILE * row;
+#if ATTN_DECODE_H2
+    /* Q again as halves, for the `__hfma2` score loop below: one instruction a
+       pair of products instead of a conversion and two FMAs. A kilobyte at
+       Llama-3.1's shape, written once a block. */
+    __half* sqh = sv + ATTN_DECODE_TILE * row;
+#endif
 
     for (int i = threadIdx.x; i < group * d_head; i += blockDim.x) {
-        sq[i] = q[((size_t)token * n_heads + kv_head * group + i / d_head) * d_head
-                  + i % d_head];
+        const float qv =
+            q[((size_t)token * n_heads + kv_head * group + i / d_head) * d_head
+              + i % d_head];
+        sq[i] = qv;
+#if ATTN_DECODE_H2
+        sqh[i] = __float2half(qv);
+#endif
     }
 
     const int last = positions[token];
@@ -1695,6 +1724,37 @@ extern "C" __global__ void attn_decode_gqa_f32(
             // spends them on. The arithmetic is exposed, but not because of the
             // chain.
             float dot = 0.0f;
+#if ATTN_DECODE_H2
+            /* `__hfma2` retires two products an instruction where the f32 form
+               spends a conversion and two FMAs on the same pair — three
+               instructions to one. The f16 accumulator is flushed to f32 every
+               eight products so the summation depth stays short: the score is
+               O(10) and f16 resolves 0.004 there, so eight of them is about
+               0.016 before the 0.088 scale, which moves an attention weight by
+               a part in a thousand. Not bit-identical, which is why this is a
+               switch and its output is checked rather than assumed. */
+            const __half2* qh2 =
+                (const __half2*)(const void*)(sqh + g * d_head
+                                              + part * (d_head / ATTN_DECODE_LPK));
+            __half2 acc2 = __floats2half2_rn(0.0f, 0.0f);
+            for (int w = 0; w < quads / ATTN_DECODE_LPK; ++w) {
+                const uint4 raw = *(const uint4*)(const void*)(kh + w * 8);
+                const __half2* h2 = (const __half2*)(const void*)&raw;
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    acc2 = __hfma2(qh2[w * 4 + u], h2[u], acc2);
+                }
+                {
+                    const float2 f = __half22float2(acc2);
+                    dot += f.x + f.y;
+                    acc2 = __floats2half2_rn(0.0f, 0.0f);
+                }
+            }
+            {
+                const float2 f = __half22float2(acc2);
+                dot += f.x + f.y;
+            }
+#else
             for (int w = 0; w < quads / ATTN_DECODE_LPK; ++w) {
                 const uint4 raw = *(const uint4*)(const void*)(kh + w * 8);
                 const __half2* h2 = (const __half2*)(const void*)&raw;
@@ -1704,6 +1764,7 @@ extern "C" __global__ void attn_decode_gqa_f32(
                     dot += qr[w * 8 + 2 * u] * f.x + qr[w * 8 + 2 * u + 1] * f.y;
                 }
             }
+#endif
 #pragma unroll
             for (int st = 1; st < ATTN_DECODE_LPK; st <<= 1) {
                 dot += __shfl_xor_sync(0xffffffff, dot, st, WARP_SIZE);

@@ -1612,7 +1612,13 @@ impl Kernels {
                 + T * (dims.d_head + 8) * 2
                 + dims.d_head * (T + 2) * 2) as u32
         } else {
-            (group * dims.d_head * 4 + 2 * 16 * (dims.d_head + 8) * 2) as u32
+            // Query rows as f32, one 16-key tile each of K and V, and room for
+            // the half copy of Q that `ATTN_DECODE_H2` uses — a kilobyte, always
+            // reserved so the host does not have to know which way the kernel
+            // was compiled.
+            (group * dims.d_head * 4
+                + 2 * 16 * (dims.d_head + 8) * 2
+                + group * dims.d_head * 2) as u32
         };
         let single = i32::from(n_chunks == 1);
         let cfg = LaunchConfig {
