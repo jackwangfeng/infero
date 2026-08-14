@@ -2087,8 +2087,20 @@ impl Kernels {
             // Q8_0 and Q8_0S, which the zero-filled bandwidth harness could not
             // see and `the_split_q8_0_layout_matches_the_packed_one` does. The
             // 23% is real if that shape is ever fixed.
+            // Only the plain family's spellings: `mmq`, `mmq<tiles>` and
+            // `mmqw<warps>[_<tiles>]`. An `mmqy`-style name pinned for the
+            // layer matmuls has no instantiation here, and accepting it landed
+            // as `mmqy1w8s2_q8_0s not found` at the first decode step.
             match std::env::var("TUILI_MMQ_VARIANT") {
-                Ok(v) if v.starts_with("mmq") => Box::leak(v.into_boxed_str()),
+                Ok(v)
+                    if v == "mmq"
+                        || v.strip_prefix("mmq").is_some_and(|r| {
+                            r.chars().next().is_some_and(|c| c.is_ascii_digit())
+                        })
+                        || v.starts_with("mmqw") =>
+                {
+                    Box::leak(v.into_boxed_str())
+                }
                 _ => "mmq",
             }
         } else if ty != WeightType::Q4G128 {
@@ -2706,6 +2718,12 @@ impl Kernels {
     /// Llama-family layer has, which is as much as one model can say.
     pub fn mmq_f16_variant_for_shape(ty: WeightType, n: usize) -> Option<&'static str> {
         let v = Self::mmq_f16_variant_for(ty)?;
+        // An explicitly pinned variant is pinned: without this the shape rule
+        // below silently overrides it on the widest matrix, so pinning
+        // `mmqy1w8s2` to measure the rule measured the rule.
+        if std::env::var_os("TUILI_MMQ_VARIANT").is_some() {
+            return Some(v);
+        }
         if n >= 20_000 && v == "mmqy1w8s2" {
             return Some("mmqy2w8s2");
         }

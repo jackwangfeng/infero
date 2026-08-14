@@ -145,6 +145,16 @@ const MMVQ_REPEAT_MAX: usize = 12;
 /// changes no result.
 const GRAPH_KV_BUCKET: usize = 64;
 
+/// The bucket, overridable so the trade can be measured: coarser buckets mean
+/// fewer captures and more masked KV read per step, finer ones the reverse.
+fn graph_kv_bucket() -> usize {
+    std::env::var("TUILI_KV_BUCKET")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(GRAPH_KV_BUCKET)
+}
+
 /// How a captured graph is instantiated, and whether it is uploaded up front.
 ///
 /// A replay is not free. Traced under load at a batch of 32, the gap between
@@ -884,7 +894,7 @@ impl Model {
         // The pool is part of the key: a graph holds that pool's device
         // pointers, and replaying it against another pool would read the wrong
         // KV cache — which is exactly what a fresh `Session` per sequence does.
-        let key = (pool.id(), n_tokens, kv_len.next_multiple_of(GRAPH_KV_BUCKET));
+        let key = (pool.id(), n_tokens, kv_len.next_multiple_of(graph_kv_bucket()));
         let graphable = self.use_graph && self.offload.is_none() && key.2 <= self.max_seq;
 
         match self.graphs.get(&key) {

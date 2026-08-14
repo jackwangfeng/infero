@@ -383,3 +383,98 @@ fn the_weight_read_against_the_same_bytes_coalesced() -> Result<()> {
     }
     Ok(())
 }
+
+/// Each of a layer's four projections at its own shape, in weight bytes a
+/// second.
+///
+/// The traced engine says the three narrow ones cost 52.5 us a layer together
+/// against `gate_up`'s 54.6 — for half the weight bytes. Per row that is 3.66 ns
+/// against 1.90, so either the narrow shapes are 1.9x less efficient or the
+/// trace was measuring something else. This asks the kernel directly, at the
+/// shapes and the batch width the engine actually runs.
+///
+/// Four buffers cycled, so no launch reads a resident matrix. `TUILI_MMQ_BPS`
+/// and `TUILI_MMQ_VARIANT` are read by the kernel launcher, so a sweep is
+/// `for b in 1 2 4 8; do TUILI_MMQ_BPS=$b cargo test ...`.
+#[test]
+fn each_projection_at_its_own_shape() -> Result<()> {
+    let dev = match Device::new(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skipping: no cuda device ({e})");
+            return Ok(());
+        }
+    };
+    let kern = Kernels::new(dev.clone());
+    let stream = dev.stream();
+    let tokens: usize = std::env::var("TUILI_MMQ_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32);
+    let k = 4096usize;
+    let x16 = stream.alloc_zeros::<half::f16>(tokens * k)?;
+    eprintln!(
+        "\n  llama-3.1-8b layer projections, {tokens} tokens, {} SMs",
+        dev.sm_count()
+    );
+    for (name, n) in [
+        ("qkv     ", 6144usize),
+        ("o       ", 4096),
+        ("gate_up ", 28672),
+        ("down    ", 4096),
+    ] {
+        let nb = k / 128;
+        let bytes = n * nb * 68;
+        let pools: Vec<_> = (0..4)
+            .map(|_| stream.alloc_zeros::<u8>(bytes))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut out = stream.alloc_zeros::<f32>(tokens * n)?;
+        // The shape rule picks `mmqy2w8s2` only above 20k rows. A wider row
+        // group is the one knob that cuts the activation re-reads — they scale
+        // with the row-group count and the weights do not — so ask every shape
+        // at every row-group width the family instantiates.
+        let chosen = Kernels::mmq_f16_variant_for_shape(tuili_kernels::WeightType::Q4G128T, n)
+            .unwrap_or("mmqy1w8s2");
+        for v in ["mmqy1w8s2", "mmqy2w8s2", "mmqy4w8s2", "mmqy1w16s2", "mmqy2w16s2"] {
+        let mut run = |i: usize| -> Result<()> {
+            kern.mmq_f16(
+                v,
+                &mut out.as_view_mut(),
+                &pools[i % 4].as_view(),
+                &x16.as_view(),
+                k,
+                n,
+                tokens,
+            )
+        };
+        for i in 0..4 {
+            run(i)?;
+        }
+        dev.synchronize()?;
+        let t0 = Instant::now();
+        for i in 0..20 {
+            run(i)?;
+        }
+        dev.synchronize()?;
+        let secs = t0.elapsed().as_secs_f64() / 20.0;
+        // What the k-tiling re-reads: every (row group, k chunk) unit stages the
+        // token tile's activations for its chunk, so the activation traffic
+        // scales with the row-group count and the weights do not.
+        let nblk: usize = v[4..5].parse().unwrap_or(1);
+        let warps: usize = v[6..].split('s').next().unwrap_or("8").parse().unwrap_or(8);
+        let rows_per_block = nblk * warps * 8;
+        let units = n.div_ceil(rows_per_block) * k.div_ceil(256);
+        let act = units * tokens * 256 * 2;
+        eprintln!(
+            "  {name} n={n:<6} {v:<11}{} {:>7.1} us  {:>5.0} GB/s of weights  {:>5.0} total ({} MiB of activations, {:.1}x the weights)",
+            if v == chosen { "*" } else { " " },
+            secs * 1e6,
+            bytes as f64 / secs / 1e9,
+            (bytes + act) as f64 / secs / 1e9,
+            act >> 20,
+            act as f64 / bytes as f64
+        );
+        }
+    }
+    Ok(())
+}
