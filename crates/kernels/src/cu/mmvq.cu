@@ -625,6 +625,26 @@ MMVQ_T_KERNEL(mmvqt16_q4_g128t, TQ_DOT_G128T, 4, 1, 128, 16)
 //
 // `x` is updated in place because the residual stream is what the *next*
 // sublayer adds to; only the normalized copies are new.
+// Splitting this across the device was written, measured and reverted.
+//
+// One block a row is 32 blocks on a 188-SM card, and the pair of norms then move
+// 2.25 MB a layer at 634 GB/s — a third of what the card can do, which is the
+// same shape of problem the greedy sampler had. A row's mean of squares is a
+// reduction, so it splits into two passes over a fixed eight slices: the first
+// adds the residual and leaves each slice's partial sum behind, the second reads
+// all eight and scales its own slice. No atomics, nothing to zero, and batch
+// invariance intact because the slice count does not depend on the batch width.
+//
+// It is 0.6% *slower*: `layers_ms` 5.695 against 5.671, 4982 tok/s against 5012.
+//
+// The difference from the sampler is what the cost is made of. There, the whole
+// 175 us was one scan and the reduction over it was free, so more blocks was
+// pure gain. Here the cost is traffic — and a second pass re-reads `x`, which is
+// 22% more of it — while the per-block work shrinks to two elements a thread,
+// too little to hide the latency the extra blocks were bought for. The
+// single-pass kernel already has 16k threads holding 32 bytes each in flight;
+// what it does not have is a way to start scaling before the row's sum exists.
+//
 extern "C" __global__ void add_rms_norm_f16_f32(float* __restrict__ out,
                                                 __half* __restrict__ hout,
                                                 float* __restrict__ x,

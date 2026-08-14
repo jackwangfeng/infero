@@ -299,6 +299,38 @@ underestimates a step by about 0.9 ms, because the per-kernel averages `nsys
 stats` reports mix in the narrower launches of the batch's tail. Take the busy
 time and divide by the step count.
 
+## The same trick twice, and the second time it lost
+
+The greedy sampler was 175 us because one block had a row. Two kernels a layer
+have the same shape — `add_rms_norm_f16_f32` gives a block a row, so 32 blocks
+move 2.25 MB at 634 GB/s, a third of the card — so the same split was written for
+them: two passes over a fixed eight slices, the first adding the residual and
+leaving per-slice sums, the second reading all eight and scaling its own slice.
+No atomics, nothing to zero, batch invariance intact because the slice count does
+not depend on the batch.
+
+**0.6% slower.** `layers_ms` 5.695 against 5.671, 4982 tok/s against 5012.
+
+The two cases differ in what the cost is made of, and that is the transferable
+part:
+
+* the sampler's 175 us was *one scan*, and the reduction over it was free — so
+  more blocks was pure gain, and it went to 20 us;
+* the norm's 3.6 us is *traffic*, and a second pass re-reads `x` — 22% more of it
+  — while the work per block falls to two elements a thread, too little to hide
+  the latency the extra blocks were bought for.
+
+"Underused device" is not a diagnosis on its own. The question is whether the
+kernel is short of *work in flight* or short of *bytes to move*, and only the
+first one splits.
+
+Same session, same reasoning, opposite answers. The attention story is the third
+of these: `attn_decode_gqa_f32` spends 7.3 of its 46 us a layer on arithmetic —
+measured by deleting it — and the tensor-core decomposition that removes exactly
+that arithmetic is 15% slower on this card at both a 64-key tile and a 32-key
+one, because at decode only `group` of the sixteen M rows are live and the V
+transpose is on top of the padding.
+
 ## Is the load generator fair? Yes, to within 3%
 
 `bench.py` sends all 32 clients the same prompt at temperature 0, so all 32

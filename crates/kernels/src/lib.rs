@@ -1583,8 +1583,21 @@ impl Kernels {
         // Query rows, and one 16-key tile each of K and V — or, for the MMA
         // shape, sixteen f16 query rows, a 64-key tile, and the transposed V.
         let shared = if mma {
-            (16 * (dims.d_head + 8) * 2 + 64 * (dims.d_head + 8) * 2 + dims.d_head * 66 * 2)
-                as u32
+            // Must match `ATTN_MMA_TILE` in `ops.cu`: sixteen f16 query rows, a
+            // key tile of K, and V transposed into a `d_head x (tile + pad)`
+            // block. At a 64-key tile that is 37.8 KB against the default
+            // kernel's 10.5, which is where its blocks an SM go.
+            // 64 measured against 32 on a Blackwell, in `bwidth_attn.rs` at
+            // batch 32 and 512 of history: the small tile is 66.1 us a layer
+            // against the default kernel's 57.4, and the large one loses by the
+            // same 15% in the served engine. Halving the shared memory does not
+            // rescue this path — at decode only `group` of the sixteen M rows
+            // are live, so the tensor cores spend three quarters of their work
+            // on padding, and the V transpose is on top of that.
+            const T: usize = 64;
+            (16 * (dims.d_head + 8) * 2
+                + T * (dims.d_head + 8) * 2
+                + dims.d_head * (T + 2) * 2) as u32
         } else {
             (group * dims.d_head * 4 + 2 * 16 * (dims.d_head + 8) * 2) as u32
         };
