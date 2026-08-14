@@ -645,6 +645,42 @@ __device__ __forceinline__ int mmq_g_block(int g) { return g / 4; }
 __device__ __forceinline__ int mmq_g_run(int g) { return g % 2; }
 __device__ __forceinline__ int mmq_g_high(int g) { return (g % 4) / 2; }
 
+/* Marlin's per-tile lock does not port to this partition. Written, measured,
+   reverted.
+ 
+   The output has to start at zero because a run that straddles a row group
+   accumulates, and those memsets are 132 a step and about 0.12 ms of a 6.4 ms
+   step — invisible in a kernel profile, which is why they survived this long.
+   Marlin removes the equivalent with a counter per output tile: the block
+   holding a tile's first k-chunk stores, the rest wait for their predecessor
+   and add behind it. Ported here — `locks[nt]` counting the k-tiles already in
+   `out`, `ld.global.acquire.gpu` to spin and `fence.acq_rel.gpu` to release,
+   gated on `occupancy_max_active_blocks_per_multiprocessor` so a waiter cannot
+   spin on an unscheduled block — it is *correct* and three times slower: 311
+   tok/s against 1050, `layers_ms` 92 against 26.
+ 
+   The reason is the shape of the partition rather than the mechanism. A block
+   here owns a long run — about five row groups on an A4000, one k-tile short of
+   two on a Blackwell — and its *first* row group is the one straddled with the
+   *previous* block's *last*. So block b waits for block b-1 to finish
+   everything, b-1 waits for b-2, and the grid serializes into a chain. Marlin's
+   slices are one row group each, so its chain is one add long.
+ 
+   Two things would have to change together to make it pay. The straddled head
+   group has to be processed *last*, so the waits form a short cascade after
+   every block's independent work; and the lock path has to be refused unless
+   `iters >= k_tiles`, or a run shorter than a row group puts three blocks in a
+   chain again — which is exactly what the narrow projections do at this grid
+   (`iters` 3 against `k_tiles` 16 on a Blackwell). That leaves only `gate_up`
+   eligible, two thirds of the memset bytes and a quarter of the launches, so
+   about 0.7% for a spin-wait in the hot kernel. Not taken.
+ 
+   The first version also hung the server on its first long prompt while all 170
+   assertions passed: `blockIdx.y` is the token-tile dimension, so a prefill
+   launch has sixteen slices sharing one counter per row group, and the
+   residency the waiting depends on is the whole grid rather than `gridDim.x`.
+   A correctness test for this belongs at more than one token tile. */
+
 /* One k-slice is a plain store; several have to be summed, and `atomicAdd`
    costs less than a partial buffer and a second pass over it. The caller
    zeroes `out` when it splits. Float addition is not associative, so a split

@@ -2908,7 +2908,7 @@ impl Kernels {
     /// 26.9/28.3, all losses; `gate_up` at 28672 wide, 45.5 against 41.6, a
     /// repeatable 8.6%. The threshold sits between the two widest shapes a
     /// Llama-family layer has, which is as much as one model can say.
-    pub fn mmq_f16_variant_for_shape(ty: WeightType, n: usize) -> Option<&'static str> {
+    pub fn mmq_f16_variant_for_shape(ty: WeightType, _n: usize) -> Option<&'static str> {
         let v = Self::mmq_f16_variant_for(ty)?;
         // An explicitly pinned variant is pinned: without this the shape rule
         // below silently overrides it on the widest matrix, so pinning

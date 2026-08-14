@@ -254,8 +254,23 @@ occupancy in the abstract, it is about the grid dividing the device.
 
 Removing the memset therefore needs ordered accumulation — Marlin's per-tile
 lock, where the block holding a row group's first k-chunk stores and the rest
-add behind it — keeping the striped grid. That is the largest single item left,
-and it is worth 1.9%.
+add behind it — keeping the striped grid. **That was written, measured and
+reverted**: correct, and three times slower (311 tok/s against 1050, `layers_ms`
+92 against 26).
+
+The mechanism is fine; the partition is not shaped for it. A block here owns a
+run of about five row groups, and its *first* row group is the one straddled with
+the *previous* block's *last* — so block b waits for b-1 to finish everything, b-1
+waits for b-2, and the grid serializes into a chain. Marlin's slices are one row
+group each, so its chain is one add long. See the note above `MMQ_PUT2` in
+`mmq.cu` for what would have to change together to make it pay, and why that
+leaves only `gate_up` eligible and about 0.7% on the table.
+
+It also hung the server on its first long prompt with all 170 assertions
+passing, which is the second lesson: `blockIdx.y` is the token-tile dimension, so
+a prefill launch has sixteen slices sharing one counter per row group, and the
+residency a spin-wait depends on is the whole grid rather than `gridDim.x`. Any
+test for a cross-block protocol has to run more than one token tile.
 
 ## Is the load generator fair? Yes, to within 3%
 
