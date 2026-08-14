@@ -1,7 +1,7 @@
 # Where the gap to vLLM is, and what has already been tried
 
-State at the end of the session that produced this file: **4599 tok/s against
-vLLM's 5418 at a batch of 32 — 1.18x behind**, on a Blackwell RTX PRO 6000 with
+State at the end of the session that produced this file: **4697 tok/s against
+vLLM's 5418 at a batch of 32 — 1.15x behind**, on a Blackwell RTX PRO 6000 with
 Llama-3.1-8B AWQ. The session before it read 4218.9 against 5454.2; the load
 generator is noisy to about ±5% and both engines were re-measured today, back to
 back, so those are the numbers to compare against.
@@ -17,7 +17,8 @@ served engine rather than on a kernel:
 | its tile cut from 32 keys to 16 | 4392 (+1.1%) |
 | the residual add folded into the norm that follows it | inside the noise, 32 fewer launches a step |
 | a k-tile of weights prefetched into registers | 4449 (+0.7%) |
-| the grid constant re-swept after it: 2 blocks an SM, not 4 | **4599 (+3.4%)** |
+| the grid constant re-swept after it: 2 blocks an SM, not 4 | 4599 (+3.4%) |
+| the vocab projection's scales split out of its quants (Q8_0S) | **4697 (+2.1%)** |
 
 Both engines were re-measured at the end, on the same box, minutes apart:
 tuili 4599 / 4603 / 4593 / 4604 / 4594, vLLM 5387 / 5477 / 5391. Take the
@@ -51,6 +52,14 @@ which of these it is:
   *every* history from 128 to 512, because ~28 us of it is the Python call. Its
   kernel takes 29.6 us inside its own engine.
 
+* **Confirm the binary is the one you built.** A remote `cargo build` whose
+  output was piped through `grep -E "^error"` printed nothing and looked clean;
+  `cargo` was not on the `PATH` of a non-interactive shell, and the filter ate
+  the message. Two A/B runs then measured a binary from before the change and
+  agreed to three digits — which is what a null result looks like, and was the
+  only reason I checked the timestamp. Compare `ls -l target/release/tuili`
+  against the source mtime before believing a remote number.
+
 The measurement that settles arguments is `nsys` on both engines under the same
 load, and then the kernel-summary tail of the trace. Kernel durations there are
 device-side and comparable; the *gaps* between them are inflated by node-level
@@ -65,7 +74,7 @@ Both engines, `~/bench.py` at 32 clients, 512 tokens a request, traced with
 |---|---:|---:|
 | layer GEMMs | 3.617 ms | 3.290 ms |
 | attention | ~1.50 | 1.065 |
-| vocab projection | 0.699 | 0.705 |
+| vocab projection | 0.699 -> 0.489 | 0.705 |
 | sampling | 0.176 | 0.097 |
 | everything else | ~0.60 | ~0.48 |
 | **GPU busy** | **6.95** | **5.63** |
@@ -106,6 +115,65 @@ three narrow matmuls. They cost 2 GiB on an 8B model because the originals are
 kept for the batch-1 mat-vec. Dropping them means teaching the mat-vec to read a
 column range of a stacked matrix, whose scales live past all of its quants —
 two disjoint byte ranges, not one. Worth doing, not yet done.
+
+## The vocab projection was an encoding, not a bandwidth
+
+It read 558 MB a step at 90 GB/s on an A4000 and 780 GB/s on the Blackwell, and
+the reflex reading — a big matrix, so a bandwidth wall — was wrong. A packed
+Q8_0 block is 34 bytes: two of scale in the *middle* of every 32 quants. So a
+thread's run of weights is never wider than 32 bytes and, past the first block,
+never 16-byte aligned. `mmq_load_w_q8_0` reads it two bytes at a time because
+that is all the layout allows.
+
+`WeightType::Q8_0S` holds the same numbers with the scales moved to a table
+after the quants. Same 558 MB, so nothing about the bytes changes; a row becomes
+contiguous and the tile load becomes one `uint4`:
+
+| | A4000 | Blackwell |
+|---|---:|---:|
+| packed Q8_0, isolated | 5619 us, 99 GB/s | 716 us, 780 GB/s |
+| split Q8_0S, isolated | 3142 us, 178 GB/s | 470 us, 1186 GB/s |
+| the phase, served | 6.17 -> 3.53 ms | 0.728 -> 0.489 ms |
+| throughput | 956 -> 1059 (+11%) | 4529 -> 4697 (+3.7%) |
+
+Both A/Bs are one binary against `TUILI_LM_HEAD=packed`, which still selects the
+old form. The A4000 pays four times more for the same mistake because its L2 is
+4 MB against 128, which is the general shape of this: **the small card exposes
+layout, the big card hides it.** Two of the three landed wins this session were
+found on the 1.5x-slower machine.
+
+Batch 1 keeps the packed matrix. A single row reads the same bytes whatever the
+layout, so `has_mmvq` excludes Q8_0S deliberately rather than for want of a
+kernel, and it is never an embedding table, so the warm-up skips its row gather
+the way `Q4G128T`'s is skipped.
+
+Worth noting what the *other* engine spends here: vLLM keeps `lm_head` in f16
+and reads 1.05 GB a step against this path's 532 MiB. The vocab projection is a
+phase tuili wins on bytes and was losing on layout, and the remaining 1186 vs
+1265 GB/s against `q4_g128t` is the last of it. Going further would mean a
+4-bit head, which trades quality for a number — not the same kind of win.
+
+### A 23% improvement that was a wrong answer
+
+Sweeping all eight instantiated shapes of the integer GEMM over this matrix,
+`mmqw8` measured 213 GB/s against the default shape's 173. It was computing
+NaNs. `mmq_variant` built the grid from `MMQ_MAX_ROWS / 8` warps for any
+explicitly named plain shape, so an eight-warp kernel was launched with 128
+threads, and the bandwidth harness reads zero-filled buffers, where a kernel
+that indexes wrongly still finishes fast and reports beautifully. The one- and
+two-warp shapes had been failing to launch at all for the same reason, which I
+first read as "unsupported at this shape".
+
+With the launch fixed the same kernel is 177 GB/s against 178 — the 23% *was*
+the bug. `the_split_q8_0_layout_matches_the_packed_one` now checks all sixteen
+(shape, encoding) pairs against the default shape's output and demands exact
+equality, which is the only assertion that would have caught it: peak-relative
+closeness survives a scale table off by one block.
+
+The two lessons are the same lesson. A timing harness cannot see correctness,
+and a name-selected shape carries a launch configuration that has to be read
+from the name. Any sweep in this file that selected a shape by name before this
+commit is suspect for the same reason.
 
 ## What has not been paying
 
@@ -300,7 +368,7 @@ The GEMM now matches Marlin. What is left, priced against a 6.97 ms step:
 |---|---|
 | attention's arithmetic, via `m16n8k16` | 3% |
 | the GEMM's memsets, via Marlin's locks | 1.9% |
-| the vocab projection at 128 rows a block | 2% |
+| ~~the vocab projection at 128 rows a block~~ | taken: 3.7%, see below |
 | the remaining small kernels | 1.4% |
 | **all of it** | **8%, to about 4970** |
 
