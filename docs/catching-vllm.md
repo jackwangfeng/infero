@@ -1,8 +1,8 @@
 # Where the gap to vLLM is, and what has already been tried
 
-State at the end of the session that produced this file: **4876 tok/s against
-vLLM's 5248 at a batch of 32 — 1.076x behind** on the distinct-prompt load
-(5398 and 1.107x on the shared-prompt one; see the fairness section), on a Blackwell RTX PRO 6000 with
+State at the end of the session that produced this file: **4890 tok/s against
+vLLM's 5403 at a batch of 32 — 1.105x behind**, both plateaus, measured back to
+back on the distinct-prompt load, on a Blackwell RTX PRO 6000 with
 Llama-3.1-8B AWQ. The session before it read 4218.9 against 5454.2; the load
 generator is noisy to about ±5% and both engines were re-measured today, back to
 back, so those are the numbers to compare against.
@@ -24,7 +24,7 @@ served engine rather than on a kernel:
 | `o_proj`'s written by the attention combine — `f32_to_f16` gone | 4765 (+0.9%) |
 | the FFN residual added by the next layer's attention norm | 4772 (+0.15%) |
 | one row-group width for every projection, not two | 4849 (+1.6%) |
-| q/k/v read where the stacked projection wrote them | **4876 (+0.6%)** |
+| q/k/v read where the stacked projection wrote them | **4890 (+0.6%)** |
 
 `layers_ms` at the end, as an interval average between two cumulative samples
 rather than the run's mean: **5.749 ms**, against 6.095 where this segment
@@ -64,6 +64,14 @@ which of these it is:
   *every* history from 128 to 512, because ~28 us of it is the Python call. Its
   kernel takes 29.6 us inside its own engine.
 
+* **Both engines ramp. Compare plateau to plateau, and say how many runs
+  each took.** tuili climbs over two or three benches because a decode graph is
+  captured per `(tokens, kv bucket)`; vLLM climbs too, and further — six
+  distinct-prompt runs back to back read 5320, 5387, 5369, 5420, 5458, 5472. A
+  three-run measurement of it landed at 5248, and comparing this engine's
+  five-run plateau against that number turned a 1.105x gap into a 1.076x one.
+  The engine numbers in this file are plateaus; the gap is stated against
+  vLLM's median plateau (5403), not its best.
 * **Confirm the binary is the one you built.** A remote `cargo build` whose
   output was piped through `grep -E "^error"` printed nothing and looked clean;
   `cargo` was not on the `PATH` of a non-interactive shell, and the filter ate
@@ -223,6 +231,31 @@ row; `v` never moves at all.
 
 What is left of the tail is two norms (6.4), rope (2.3), the attention combine
 (2.3), `store_kv2` (1.5) and the residual adds at the two ends of the stack.
+
+## Two partitions that lost, and why the second one should not have
+
+The GEMM's output has to start at zero whenever a block's run straddles a row
+group, because a straddling run cannot store — it accumulates. That memset is
+invisible in a kernel profile and it is not free: 132 of them a step, median
+928 ns, **about 0.12 ms of a 6.4 ms step**.
+
+Sizing the grid to the row groups instead makes every run whole and the memset
+unnecessary. It was measured at -15% when the wide matrices used a 128-row
+group, and the note here blamed the block count: `gate_up` fell from 752 blocks
+to 224. That explanation stopped applying when the narrow row group became the
+default — 448 row groups now, *more* blocks than the striped grid's 376 — so it
+was worth re-running. It still loses, by 7%: 4533 tok/s against 4890.
+
+The reason is the one the old note missed. 376 is `sm_count * 2` exactly, so the
+striped grid is two full waves. 448 is two full waves plus a third that is 38%
+occupied, and a ragged tail wave costs more than the memset it saves. Which is
+also why `TUILI_MMQ_BPS` sweeps to 2 and nothing else: the constant is not about
+occupancy in the abstract, it is about the grid dividing the device.
+
+Removing the memset therefore needs ordered accumulation — Marlin's per-tile
+lock, where the block holding a row group's first k-chunk stores and the rest
+add behind it — keeping the striped grid. That is the largest single item left,
+and it is worth 1.9%.
 
 ## Is the load generator fair? Yes, to within 3%
 
