@@ -350,6 +350,10 @@ pub struct Model {
     samp: Option<SampleBufs>,
     /// Device-time attribution for a step's three phases; see `PhaseEvents`.
     phase_ev: Option<PhaseEvents>,
+    /// Whether the last forward was a decode step — every row wanting logits and
+    /// bringing one token. `PhaseEvents` averages only those; a prefill costs
+    /// about ten times a decode and inflated `gpu_ms` when it did not.
+    last_decode_only: bool,
 }
 
 /// Device-side scratch for sampling. Sized once, at the batch and vocabulary
@@ -638,6 +642,7 @@ impl Model {
             logit_rows: 0,
             samp: None,
             phase_ev: PhaseEvents::new(&dev)?,
+            last_decode_only: false,
             logits_host,
         })
     }
@@ -800,6 +805,7 @@ impl Model {
             "batch of {n_tokens} tokens exceeds the {MAX_BATCH_TOKENS} a pass can carry"
         );
         let n_logit_rows = items.iter().filter(|i| i.wants_logits).count();
+        self.last_decode_only = n_tokens == n_logit_rows;
         anyhow::ensure!(
             n_logit_rows <= self.max_logit_rows,
             "{n_logit_rows} sequences want logits, the limit is {}",
@@ -1226,7 +1232,16 @@ impl Model {
         self.dev.synchronize()?;
         // The events are settled now, so the spans can be read without a wait
         // of their own. One line every 64 steps.
-        if let Some(pe) = &mut self.phase_ev {
+        //
+        // Decode steps only, the way `Scheduler`'s own window is. A prefill step
+        // costs about ten times a decode, so counting them here inflated
+        // `gpu_ms` — and comparing that inflated average against a wall step
+        // derived from throughput is how "3.2% of a step is not on the GPU"
+        // came to be published when the real figure is 1.2%. The test is that
+        // every row wants logits and brought exactly one token, which is what a
+        // decode step is.
+        let decode_only = self.last_decode_only;
+        if let Some(pe) = self.phase_ev.as_mut().filter(|_| decode_only) {
             let spans = [
                 pe.ev[0].elapsed_ms(&pe.ev[1])? as f64,
                 pe.ev[1].elapsed_ms(&pe.ev[2])? as f64,

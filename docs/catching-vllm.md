@@ -73,6 +73,11 @@ which of these it is:
   five-run plateau against that number turned a 1.105x gap into a 1.076x one.
   The engine numbers in this file are plateaus; the gap is stated against
   vLLM's median plateau (5403), not its best.
+* **Say which population an average is over.** `PhaseEvents` counted every
+  forward and `Scheduler`'s window counts only decode steps, and a prefill is
+  about ten times a decode — so the first `gpu_ms` was inflated and comparing it
+  against a throughput-derived step time invented 1.8 percentage points of host
+  overhead that did not exist. Both instruments now filter decode steps.
 * **Confirm the binary is the one you built.** A remote `cargo build` whose
   output was piped through `grep -E "^error"` printed nothing and looked clean;
   `cargo` was not on the `PATH` of a non-interactive shell, and the filter ate
@@ -680,14 +685,32 @@ arithmetic in place, is a **tie**.
 before starting rather than after. It is not the whole projection, though,
 because 3.2% of a step is not on the GPU at all.
 
-### The 3% that is not on the GPU
+### The 1.4% that is not on the GPU, after correcting the instrument
 
-`gpu_ms` is 6.177 against a 6.384 ms step (32 tokens at the 5012 plateau), so
-**0.207 ms of every step is not GPU work**. The scheduler's own breakdown says
-where it is not: `gap_ms` 0.00, `issue_ms` 0.04-0.20, `advance_ms` 0.03-0.04.
-Nothing is lost *between* steps. The host blocks on the sampled tokens —
-`sample_ms` is that wait — and only then launches the next step's graph, so the
-device idles across the launch.
+This section first said 3.2%, from `gpu_ms` 6.177 against a 6.384 ms step (32
+tokens at the 5012 plateau). Both numbers were right and the comparison was not:
+**`PhaseEvents` averaged every forward, prefill included**, and a prefill step
+costs about ten times a decode, while the 6.384 comes from throughput, which is
+diluted by those same prefills and by the tail where fewer than 32 sequences are
+running. Two averages over different populations.
+
+`PhaseEvents` now filters decode steps the way `Scheduler`'s window already did —
+every row wanting logits and bringing one token — and the honest budget is:
+
+| decode step | ms |
+|---|---:|
+| layers | 5.12 |
+| vocab projection | 0.488 |
+| sampling | 0.020 |
+| **GPU** | **5.64** |
+| host: issue | 0.04 |
+| host: advance | 0.04 |
+| host: gap between steps | 0.00 |
+
+So **0.08 ms of a 5.72 ms step is not GPU work — 1.4%**, and none of it is
+between steps: the host blocks on the sampled tokens (`sample_ms` in the
+scheduler's window is that wait) and only then launches the next step's graph, so
+the device idles across that launch.
 
 That dependency does not actually need the host. The next step's embedding gather
 indexes by token id, and those ids are already in device memory where the sampler
@@ -699,11 +722,11 @@ stream.
 It matters here because it *adds* to the GEMM number rather than competing with
 it:
 
-| | worth | kind |
+| | of a 5.72 ms step | kind |
 |---|---:|---|
-| TMA GEMM at its measured ceiling | +7.6% → ~5395 | a new kernel |
-| issuing N+1 without the token round trip | +3.2% → ~5170 | a scheduler change |
-| **both** | **+10.8% → ~5555** | **past vLLM's 5403** |
+| TMA GEMM at its measured ceiling (0.47 ms of GEMM) | +8.3% → ~5428 | a new kernel |
+| issuing N+1 without the token round trip (0.08 ms) | +1.4% → ~5082 | a scheduler change |
+| **both** | **+9.7% → ~5498** | **past vLLM's 5403** |
 
 So the honest projection is no longer "a tie at best": the rewrite alone ties,
 and the rewrite with the host off the critical path wins **at the same
