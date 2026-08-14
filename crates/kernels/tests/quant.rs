@@ -678,6 +678,68 @@ fn the_split_q8_0_layout_matches_the_packed_one() -> Result<()> {
         assert_eq!(wb, wa, "mmq t={n_tokens}: max diff {abs:e} at row {at}");
     }
 
+    // Every shape the integer family instantiates, both encodings, against the
+    // answer the default shape gives. The bandwidth harness reads zero-filled
+    // buffers, where a kernel that indexes wrongly still measures a beautiful
+    // number — so the shape sweep has to be checked here or not at all.
+    {
+        let n_tokens = 33usize;
+        let x = pseudo_random(n_tokens * kk, 0x9001);
+        let dx = stream.clone_htod(&x)?;
+        let qb = Kernels::q8_1_bytes(kk);
+        let mut q8_1 = stream.alloc_zeros::<u8>(n_tokens * qb)?;
+        for t in 0..n_tokens {
+            k.quantize_q8_1(
+                &mut q8_1.slice_mut(t * qb..(t + 1) * qb),
+                &dx.slice(t * kk..(t + 1) * kk),
+                kk,
+            )?;
+        }
+        let run = |v: &str, w: &Loaded| -> Result<Option<Vec<f32>>> {
+            let mut o = stream.alloc_zeros::<f32>(n_tokens * n)?;
+            if k.mmq_variant(
+                v,
+                &mut o.as_view_mut(),
+                &w.bytes.as_view(),
+                w.ty,
+                &q8_1.as_view(),
+                kk,
+                n,
+                n_tokens,
+            )
+            .is_err()
+            {
+                return Ok(None);
+            }
+            let h = stream.clone_dtoh(&o)?;
+            k.device().synchronize()?;
+            Ok(Some(h))
+        };
+        let base = run("mmq", &packed)?.expect("the default shape must launch");
+        let mut bad = Vec::new();
+        for v in [
+            "mmq", "mmq2", "mmqw1", "mmqw1_2", "mmqw2", "mmqw2_2", "mmqw8", "mmqw8_2",
+        ] {
+            for w in [&packed, &split] {
+                let Some(got) = run(v, w)? else {
+                    eprintln!("  {v:<9} {:<6} does not launch here", w.ty.to_string());
+                    continue;
+                };
+                let (abs, at) = max_abs_diff(&got, &base);
+                let ok = got == base;
+                eprintln!(
+                    "  {v:<9} {:<6} {}  max diff {abs:e} at {at}",
+                    w.ty.to_string(),
+                    if ok { "exact" } else { "WRONG" }
+                );
+                if !ok {
+                    bad.push(format!("{v}/{}", w.ty));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "shapes that disagree with the default: {bad:?}");
+    }
+
     // And the dequantization, which the f16 prefill path would read.
     let total = kk * n;
     let mut da = stream.alloc_zeros::<f16>(total)?;

@@ -2080,7 +2080,18 @@ impl Kernels {
             };
             return self.mmq_variant(v, out, w, ty, x_q8_1, k, n, n_tokens);
         }
-        let variant = if ty != WeightType::Q4G128 {
+        let variant = if ty == WeightType::Q8_0S {
+            // Four warps, the same as the other integer types. Eight looked
+            // 23% faster in `the_vocab_projection_in_both_encodings` and is
+            // wrong: `mmqw8`/`mmqw8_2` disagree with the default shape for both
+            // Q8_0 and Q8_0S, which the zero-filled bandwidth harness could not
+            // see and `the_split_q8_0_layout_matches_the_packed_one` does. The
+            // 23% is real if that shape is ever fixed.
+            match std::env::var("TUILI_MMQ_VARIANT") {
+                Ok(v) if v.starts_with("mmq") => Box::leak(v.into_boxed_str()),
+                _ => "mmq",
+            }
+        } else if ty != WeightType::Q4G128 {
             "mmq"
         } else {
             // `mmqp` is the epilogue probe: right pipeline, wrong answer. It
@@ -2139,6 +2150,27 @@ impl Kernels {
         } else {
             Self::mmq_tiles(n_tokens).min(2)
         };
+        // The plain integer family names its shape too, in two spellings the
+        // instantiations grew into: `mmq<tiles>` (four warps) and
+        // `mmqw<warps>[_<tiles>]`. The name is the only place that shape
+        // appears, so the launch has to read it. Without this the grid was
+        // built for four warps and whatever `mmq_tiles` said while the kernel
+        // had been compiled for eight and one — which is how `mmqw8` came to
+        // measure 213 GB/s of wrong answers, and why the one- and two-warp
+        // shapes refused to launch at all (128 threads into
+        // `__launch_bounds__(32)`).
+        let plain = variant.strip_prefix("mmqw").and_then(|rest| {
+            let (w, t) = match rest.split_once('_') {
+                Some((w, t)) => (w, t.parse::<u32>().ok()?),
+                None => (rest, 1),
+            };
+            Some((w.parse::<u32>().ok()?, t))
+        });
+        let plain = plain.or_else(|| match variant {
+            "mmq2" => Some((MMQ_MAX_ROWS / 8, 2)),
+            _ => None,
+        });
+        let tiles = plain.map_or(tiles, |(_, t)| t);
         // A wide-tile name carries its own shape: `<nblk>w<warps>`, and the
         // `cp.async` variant appends `s<stages>`, which only the kernel needs.
         // `mmqsr` before `mmqs`, which is an exact name rather than a prefix.
@@ -2174,6 +2206,7 @@ impl Kernels {
         }
         let warps = match (variant, wide) {
             (_, Some((_, w))) => w,
+            (_, None) if plain.is_some() => plain.unwrap().0,
             ("mmq", _) => self.mmq_warps(n, n_tokens),
             _ => MMQ_MAX_ROWS / 8,
         };

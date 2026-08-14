@@ -221,6 +221,7 @@ fn the_vocab_projection_in_both_encodings() -> Result<()> {
     let g128_bytes = n * (k / 128) * 68;
     let w8 = stream.alloc_zeros::<u8>(q8_bytes)?;
     let wg = stream.alloc_zeros::<u8>(g128_bytes)?;
+    let ws = stream.alloc_zeros::<u8>(q8_bytes)?;
     let x = stream.alloc_zeros::<u8>(tokens * Kernels::q8_1_bytes(k))?;
     let x16 = stream.alloc_zeros::<half::f16>(tokens * k)?;
     let mut out = stream.alloc_zeros::<f32>(tokens * n)?;
@@ -261,6 +262,34 @@ fn the_vocab_projection_in_both_encodings() -> Result<()> {
         },
         q8_bytes,
     )?;
+    // Every shape the integer family instantiates, because the default one
+    // (4 warps, 1 tile) was picked on a layer matrix and this row count is
+    // thirty times a layer's. The f16 path had the same surprise: sweeping
+    // warps turned a 7% loss into a win.
+    for v in [
+        "mmq", "mmq2", "mmqw1", "mmqw1_2", "mmqw2", "mmqw2_2", "mmqw8", "mmqw8_2",
+    ] {
+        eprint!("  q8_0s   {v:<9}");
+        // Not every shape is launchable at every n; say so and move on.
+        let r = time(
+            &mut || {
+                kern.mmq_variant(
+                    v,
+                    &mut out.as_view_mut(),
+                    &ws.as_view(),
+                    tuili_kernels::WeightType::Q8_0S,
+                    &x.as_view(),
+                    k,
+                    n,
+                    tokens,
+                )
+            },
+            q8_bytes,
+        );
+        if let Err(e) = r {
+            eprintln!("  unsupported at this shape ({e})");
+        }
+    }
     eprint!("  q4_g128t direct  ");
     time(
         &mut || {
