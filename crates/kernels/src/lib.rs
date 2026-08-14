@@ -2781,9 +2781,24 @@ impl Kernels {
         if std::env::var_os("TUILI_MMQ_VARIANT").is_some() {
             return Some(v);
         }
-        if n >= 20_000 && v == "mmqy1w8s2" {
-            return Some("mmqy2w8s2");
-        }
+        // One shape for every width. `gate_up` used to get `mmqy2w8s2` — twice
+        // the rows a block, half the activation re-reads — on the strength of a
+        // step's matmuls taking 96.1 ms against `mmqy1w8s2`'s 98.7. That
+        // reversed, the way the NBLK sweep in `mmq.cu` reversed the f16 path's
+        // first conclusion, and for the same reason: it was measured before the
+        // weight prefetch and the grid constant that followed it.
+        //
+        // Re-measured on the Blackwell at 32 tokens, isolated (GB/s of
+        // weights): 1164 for `mmqy1w8s2` against 1082 for `mmqy2w8s2`, 53.6 us
+        // against 57.7. In the served engine, one binary, `TUILI_MMQ_VARIANT`
+        // pinning the narrow shape for every matrix: **layers 5.898 ms against
+        // 5.988 and 4828 tok/s against 4772**.
+        //
+        // Halving the activation traffic is not the trade it looks like. Those
+        // re-reads are L2 hits — `each_projection_at_its_own_shape` puts every
+        // shape above this card's DRAM peak once they are counted — and what a
+        // wider row group actually costs is blocks. `mmqy4w8s2` halves them
+        // again and loses 27%.
         Some(v)
     }
 
