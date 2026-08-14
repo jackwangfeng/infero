@@ -1,7 +1,7 @@
 # Where the gap to vLLM is, and what has already been tried
 
-State at the end of the session that produced this file: **4890 tok/s against
-vLLM's 5403 at a batch of 32 — 1.105x behind**, both plateaus, measured back to
+State at the end of the session that produced this file: **5012 tok/s against
+vLLM's 5403 at a batch of 32 — 1.078x behind**, both plateaus, measured back to
 back on the distinct-prompt load, on a Blackwell RTX PRO 6000 with
 Llama-3.1-8B AWQ. The session before it read 4218.9 against 5454.2; the load
 generator is noisy to about ±5% and both engines were re-measured today, back to
@@ -24,7 +24,8 @@ served engine rather than on a kernel:
 | `o_proj`'s written by the attention combine — `f32_to_f16` gone | 4765 (+0.9%) |
 | the FFN residual added by the next layer's attention norm | 4772 (+0.15%) |
 | one row-group width for every projection, not two | 4849 (+1.6%) |
-| q/k/v read where the stacked projection wrote them | **4890 (+0.6%)** |
+| q/k/v read where the stacked projection wrote them | 4890 (+0.6%) |
+| the greedy vocabulary scan split across the device | **5012 (+2.5%)** |
 
 `layers_ms` at the end, as an interval average between two cumulative samples
 rather than the run's mean: **5.749 ms**, against 6.095 where this segment
@@ -95,7 +96,7 @@ Both engines, `~/bench.py` at 32 clients, 512 tokens a request, traced with
 | layer GEMMs | 3.617 ms | 3.290 ms |
 | attention | ~1.50 | 1.065 |
 | vocab projection | 0.699 -> 0.489 | 0.705 |
-| sampling | 0.176 | 0.097 |
+| sampling | 0.176 -> 0.020 | 0.097 |
 | everything else | ~0.60 | ~0.48 |
 | **GPU busy** | **6.95** | **5.63** |
 | GPU idle | 1.23 | 0.51 |
@@ -271,6 +272,32 @@ passing, which is the second lesson: `blockIdx.y` is the token-tile dimension, s
 a prefill launch has sixteen slices sharing one counter per row group, and the
 residency a spin-wait depends on is the whole grid rather than `gridDim.x`. Any
 test for a cross-block protocol has to run more than one token tile.
+
+## There is nothing left in scheduling: 98.5% of a step is a kernel running
+
+This file has carried a "GPU idle 1.23 ms" line and a note about graph launches
+costing "1.3 us for each of the step's 549 nodes" since the first session. Both
+are gone, and the measurement that settles it is over the trace's own kernel and
+memset timestamps rather than over `nsys`'s summary:
+
+| | |
+|---|---:|
+| merged busy intervals | 533111 |
+| gaps over 50 us (between bench runs, and the ramp) | 2008, 3891 ms |
+| gaps under 50 us (inside a step) | 531102, **median 96 ns** |
+| **utilisation inside a step** | **98.5%** |
+
+So the graph is doing its job and there is no scheduling win to find. The
+corollary matters more: the whole difference to vLLM is *kernel time*, which is
+also why the memset costs what it does — 0.12 ms a step of bytes, not of
+launches. `TUILI_MMQ_NO_ZERO=1` prices the pair: removing 130 nodes and their
+bytes is worth 0.109 ms, of which the bytes are 0.098, so a graph node costs
+about **0.08 us** here, not 1.3.
+
+Summing the top kernels of a trace is not the way to check this — that
+underestimates a step by about 0.9 ms, because the per-kernel averages `nsys
+stats` reports mix in the narrower launches of the batch's tail. Take the busy
+time and divide by the step count.
 
 ## Is the load generator fair? Yes, to within 3%
 
