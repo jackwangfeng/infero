@@ -349,6 +349,21 @@ that arithmetic is 15% slower on this card at both a 64-key tile and a 32-key
 one, because at decode only `group` of the sixteen M rows are live and the V
 transpose is on top of the padding.
 
+## The configuration lever is closed too: 4-bit KV is 2x slower
+
+Attention reads 1.15 ms a step of f16 KV, so a 4-bit cache would cut about
+0.85 ms — 13% of the step, which would put this engine past vLLM's f16 number.
+tuili has the option (`--kv-quant tq4`), and it measures **2540 tok/s against
+5012**. The output is fine; the kernel is not. Quantized KV takes a different
+decode path, and that path has had none of the work `attn_decode_gqa_f32` has
+had, so it gives back twice what the bytes save.
+
+Which is worth stating as a work item rather than a dead end: **the quantized-KV
+attention path is 2x off its own byte budget.** Fixing it would make 4-bit KV a
+real win — a quarter of attention's traffic — though it would still be a
+different configuration from the vLLM run it is being compared against, and the
+comparison would have to say so.
+
 ## Is the load generator fair? Yes, to within 3%
 
 `bench.py` sends all 32 clients the same prompt at temperature 0, so all 32
