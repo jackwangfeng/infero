@@ -2374,12 +2374,16 @@ impl Kernels {
             return self.mmq_variant(v, out, w, ty, x_q8_1, k, n, n_tokens);
         }
         let variant = if ty == WeightType::Q8_0S {
-            // Four warps, the same as the other integer types. Eight looked
-            // 23% faster in `the_vocab_projection_in_both_encodings` and is
-            // wrong: `mmqw8`/`mmqw8_2` disagree with the default shape for both
-            // Q8_0 and Q8_0S, which the zero-filled bandwidth harness could not
-            // see and `the_split_q8_0_layout_matches_the_packed_one` does. The
-            // 23% is real if that shape is ever fixed.
+            // The default `mmq` name, which resolves the shape and the launch
+            // from one place — `mmq_kernel_name` and `mmq_warps` — and so cannot
+            // disagree with itself. Naming a shape explicitly here can: two
+            // separate mismatches were found and fixed today (the warp count,
+            // then `per_block`), and until both were fixed every explicitly
+            // named plain shape was timed with the wrong grid. With them fixed,
+            // `mmq` and `mmqw8_2` measure the same thing on the vocab
+            // projection — 478 us against 468, 1167 GB/s against 1192 — because
+            // they *are* the same kernel, and no other instantiated shape comes
+            // close (`mmqw8` alone 809, `mmqw2` 852, `mmqw1` 1247).
             // Only the plain family's spellings: `mmq`, `mmq<tiles>` and
             // `mmqw<warps>[_<tiles>]`. An `mmqy`-style name pinned for the
             // layer matmuls has no instantiation here, and accepting it landed
@@ -2607,7 +2611,17 @@ impl Kernels {
             })?;
             return Ok(());
         }
-        let per_block = if variant == "mmq" || wide.is_some() {
+        // Token rows a block covers, which sizes `grid.y`. The plain family's
+        // explicitly named shapes carry their tile count in the name — parsed
+        // into `plain` above — and leaving them at `MMQ_M` launched twice the
+        // blocks for a two-tile kernel, half of them past `n_tokens` and doing
+        // nothing. The answer stayed right and the *timing* did not: it is why
+        // `mmqw8_2` measures 818 us on the vocab projection against the same
+        // kernel's 468 through the `mmq` path, and why any comparison in this
+        // file that named a plain shape explicitly was reading a grid twice the
+        // size it needed. Same class of mismatch as the warps one above, found
+        // the same way — a sweep whose numbers did not fit the shape.
+        let per_block = if variant == "mmq" || wide.is_some() || plain.is_some() {
             tiles * MMQ_M
         } else {
             MMQ_M

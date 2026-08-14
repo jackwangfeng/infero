@@ -191,7 +191,15 @@ two-warp shapes had been failing to launch at all for the same reason, which I
 first read as "unsupported at this shape".
 
 With the launch fixed the same kernel is 177 GB/s against 178 — the 23% *was*
-the bug. `the_split_q8_0_layout_matches_the_packed_one` now checks all sixteen
+the bug. A second mismatch of the same kind was still there and was found the
+same way, by a sweep whose numbers did not fit the shape: `per_block` also
+ignored the name's tile count, so a two-tile kernel launched twice the blocks it
+needed with half of them past `n_tokens`. Right answer, inflated time — 818 us
+against the same kernel's 468 on the vocab projection. **Every comparison in this
+file that named a plain shape explicitly was reading a grid up to twice the size
+it needed until both were fixed**; none of them changed a default, because the
+engine reaches these kernels through the `mmq` name, which derives the shape and
+the launch from one place. `the_split_q8_0_layout_matches_the_packed_one` now checks all sixteen
 (shape, encoding) pairs against the default shape's output and demands exact
 equality, which is the only assertion that would have caught it: peak-relative
 closeness survives a scale table off by one block.
