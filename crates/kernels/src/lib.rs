@@ -165,6 +165,7 @@ impl Kernels {
             "attn_scores_f32",
             "attn_softmax_f32",
             "attn_output_f32",
+            "silu_mul_split_f16_f32",
         ] {
             self.dev.kernels().get("tuili_ops", ops_src(), name)?;
         }
@@ -417,6 +418,38 @@ impl Kernels {
         b.arg(out).arg(xy).arg(&d_i).arg(&t_i);
         self.dev.profile().time("silu_mul", self.dev.stream(), || {
             unsafe { b.launch(elementwise(total as u32)) }.context("silu_mul_split")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// [`Self::silu_mul_split`] also writing the f16 copy `down_proj` reads.
+    ///
+    /// One launch instead of two: the separate `to_f16` over the same row was
+    /// 1.2 us a layer in the trace, against a 512 KB f16 write here that the
+    /// kernel is already positioned to do.
+    pub fn silu_mul_split_f16(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        hout: &mut CudaViewMut<'_, f16>,
+        xy: &CudaView<'_, f32>,
+        d_ff: usize,
+        total: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            hout.len() >= total,
+            "f16 scratch holds {} of {total} elements",
+            hout.len()
+        );
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_ops", ops_src(), "silu_mul_split_f16_f32")?;
+        let (d_i, t_i) = (d_ff as i32, total as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(hout).arg(xy).arg(&d_i).arg(&t_i);
+        self.dev.profile().time("silu_mul", self.dev.stream(), || {
+            unsafe { b.launch(elementwise(total as u32)) }.context("silu_mul_split_f16")?;
             Ok(())
         })?;
         Ok(())

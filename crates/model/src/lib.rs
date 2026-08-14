@@ -1762,6 +1762,20 @@ impl Model {
         // `gate_up`'s 1368. This is the FFN half of what vLLM gets from
         // `MergedColumnParallelLinear`.
         let stacked = l.w_gate_up.as_ref().filter(|_| n > 1 && want_h);
+        // Whether `down` will read its activation as f16, which is the only
+        // case where writing that copy early is worth anything. Mirrors what
+        // `matmul_pre` decides for itself; claiming it when the buffer was not
+        // written would hand the GEMM a stale one.
+        let ffn_f16 = stacked.is_some()
+            && self.use_mmq
+            && n > 1
+            && n <= tuili_kernels::MMQ_MAX_TOKENS
+            && matches!(
+                l.w_down.ty,
+                tuili_kernels::WeightType::Q4G128 | tuili_kernels::WeightType::Q4G128T
+            )
+            && Kernels::mmq_f16_variant_for_shape(l.w_down.ty, l.w_down.n).is_some()
+            && Self::mmq_shape_ok(&l.w_down);
         if let Some(gu) = stacked {
             Self::matmul_pre(
                 &self.kern,
@@ -1776,12 +1790,28 @@ impl Model {
                 shared,
                 shared_f16,
             )?;
-            self.kern.silu_mul_split(
-                &mut self.act.ffn.slice_mut(..n * d_ff),
-                &self.act.gate.slice(..n * 2 * d_ff),
-                d_ff,
-                n * d_ff,
-            )?;
+            // `down` is the only reader of this product, and above one token it
+            // takes f16 — so the f16 copy can be written here, out of the
+            // register the value is already in, rather than by a `to_f16`
+            // launch that reads the f32 back. Same numbers, one launch fewer,
+            // and one 512 KB round trip fewer. The trace put those conversions
+            // at 2.4 us a layer across the two that survived the fused norm.
+            if ffn_f16 {
+                self.kern.silu_mul_split_f16(
+                    &mut self.act.ffn.slice_mut(..n * d_ff),
+                    &mut self.scratch.x16.slice_mut(..n * d_ff),
+                    &self.act.gate.slice(..n * 2 * d_ff),
+                    d_ff,
+                    n * d_ff,
+                )?;
+            } else {
+                self.kern.silu_mul_split(
+                    &mut self.act.ffn.slice_mut(..n * d_ff),
+                    &self.act.gate.slice(..n * 2 * d_ff),
+                    d_ff,
+                    n * d_ff,
+                )?;
+            }
         } else if Self::fusable(&[&l.w_gate, &l.w_up], shared, n, self.use_mmvq) {
             let bytes = Kernels::q8_1_bytes(d);
             let (gate, up) = (&mut self.act.gate, &mut self.act.up);
@@ -1853,7 +1883,7 @@ impl Model {
             return Ok(());
         }
 
-        Self::matmul(
+        Self::matmul_pre(
             &self.kern,
             &mut self.scratch,
             &mut self.act.proj.slice_mut(..n * d),
@@ -1863,6 +1893,8 @@ impl Model {
             n,
             self.use_mmvq,
             self.use_mmq,
+            None,
+            ffn_f16,
         )?;
         self.kern.add_assign(
             &mut self.act.x.slice_mut(..n * d),

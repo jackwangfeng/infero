@@ -124,6 +124,32 @@ extern "C" __global__ void silu_mul_split_f32(float* __restrict__ out,
     out[i] = (g / (1.0f + __expf(-g))) * r[d_ff + col];
 }
 
+// The same, also writing the f16 copy `down_proj` is about to read.
+//
+// This product feeds exactly one matmul, and above `GEMM_THRESHOLD` tokens that
+// matmul takes f16 — so the f32 result was being written, read back and
+// converted by a separate `f32_to_f16` launch. The value is already in a
+// register here. Same numbers as the two-step form: one `__float2half` of the
+// same f32, just without the round trip. The f32 copy stays because the narrow
+// batches still take the mat-vec path.
+//
+// `add_rms_norm_f16_f32` does this for the norms, and the two `to_f16` launches
+// this removes are what the trace left after it: 2.4 us a layer.
+extern "C" __global__ void silu_mul_split_f16_f32(float* __restrict__ out,
+                                                  __half* __restrict__ hout,
+                                                  const float* __restrict__ xy,
+                                                  int d_ff, int total) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int row = i / d_ff;
+    const int col = i - row * d_ff;
+    const float* r = xy + (size_t)row * 2 * d_ff;
+    const float g = r[col];
+    const float v = (g / (1.0f + __expf(-g))) * r[d_ff + col];
+    out[i] = v;
+    hout[i] = __float2half(v);
+}
+
 // out[r, :] = in[rows[r], :]
 //
 // Picks the rows a batch actually needs logits for out of the residual stream,
