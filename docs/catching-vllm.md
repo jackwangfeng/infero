@@ -623,6 +623,32 @@ kernel cannot account for is where that would come from. Everything cheap has
 been measured; see the elimination table above. What is left is the architecture:
 TMA and warp specialization, which is a different kernel, not a tuned one.
 
+### The weight ring, and the resource that refuses it
+
+The mechanism the count leaves open is in-flight bytes, and there are exactly two
+places to buy them: registers, or shared memory. Depth-three register prefetch
+loses (below). `mmqc_*` is the other one — weights staged through shared by
+`cp.async`, the way Marlin does it — and it had never been measured on a real
+shape, because the model could not reach it until the `mmqc` prefix was accepted
+in `mmq_f16_variant_for`. Measured now, us a call at 32 tokens:
+
+| | A4000 qkv / gate_up | Blackwell qkv |
+|---|---:|---:|
+| `mmqy1w8s2` (registers) | **51.4 / 222.5** | **16.7** |
+| `mmqc1w8s2` (2-stage ring) | 59.7 / 269.8 | 18.9 |
+| `mmqc1w8s4` (4-stage ring) | refused | refused |
+
+Two stages cost more than the register pressure they relieve; four do not fit —
+the ring plus the activation ring asks for 110592 bytes against a 100 KB
+per-block limit.
+
+So both ways of buying in-flight bytes are closed, and they are closed by the
+same resource: registers and shared are both occupancy, and 940 KB an SM is not
+available at any useful block count. That is what TMA with warp specialization
+buys — bytes moved without holding registers, and one fat block using the SM's
+whole shared budget — and it is a different kernel, which is where this section
+started.
+
 ### The last mechanism, and it does not hold
 
 `mmqy1w8s2d3` is the depth-three weight prefetch — two k-tiles in flight instead

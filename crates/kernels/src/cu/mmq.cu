@@ -6539,6 +6539,35 @@ MMQ_K_SET(1w8s2_4, 8, 1, 4, 2)
         }                                                                      \
         flat += kt_hi - kt_lo;                                                 \
     }
+/* The weight ring, measured at last, and it loses on both cards.
+
+   The elimination table in `docs/catching-vllm.md` leaves one mechanism for the
+   GEMM's missing 20%: the kernel has about 276 KB in flight per SM where
+   1345 GB/s at ~700 ns of latency wants 940 KB, and the depth-three *register*
+   prefetch that would buy more costs 35 registers and loses. Staging the weights
+   through shared with `cp.async` buys in-flight bytes without registers, which is
+   what this family does and what Marlin does.
+
+   It was unreachable from the model until the `mmqc` prefix was accepted in
+   `mmq_f16_variant_for` — measuring it before that silently ran the integer
+   fallback — so these are its first numbers on real shapes (us a call, 32
+   tokens):
+
+                     A4000            Blackwell
+     mmqy1w8s2       51.4 / 222.5     16.7 / 53.6     qkv / gate_up
+     mmqc1w8s2       59.7 / 269.8     18.9 / --       16% and 21% slower
+     mmqc1w8s4       refused          refused         110592 B of shared
+
+   Two stages of weights cost more than the register pressure they relieve, and
+   four stages do not fit: the per-block shared limit is 100 KB and the ring plus
+   the activation ring wants 110.
+
+   Which is the whole answer to the missing 20%, from the third side. In-flight
+   bytes are bought with registers or with shared, both of them are occupancy, and
+   940 KB an SM is not available either way at any useful block count. TMA with
+   warp specialization is the way out because it moves bytes without holding
+   registers *and* lets one fat block use the SM's whole shared budget — which is
+   what CUTLASS and Marlin are built around, and is a different kernel. */
 #define MMQ_C_SET(SUFFIX, WARPS, NBLK, TILES, STAGES)                          \
     extern "C" __global__ __launch_bounds__((WARPS) * WARP_SIZE) void          \
     mmqc##SUFFIX##_q4_g128(float* __restrict__ out,                            \

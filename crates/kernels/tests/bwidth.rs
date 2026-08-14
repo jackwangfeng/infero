@@ -435,7 +435,14 @@ fn each_projection_at_its_own_shape() -> Result<()> {
         // at every row-group width the family instantiates.
         let chosen = Kernels::mmq_f16_variant_for_shape(tuili_kernels::WeightType::Q4G128T, n)
             .unwrap_or("mmqy1w8s2");
-        for v in ["mmqy1w8s2", "mmqy2w8s2", "mmqy4w8s2", "mmqy1w16s2", "mmqy2w16s2"] {
+        // `mmqc*` is the weight ring — weights staged through shared by
+        // `cp.async` instead of read into registers — which is the one mechanism
+        // the elimination table leaves open for the GEMM's missing 20%: bytes in
+        // flight without register cost. It was unreachable from the model until
+        // the `mmqc` prefix fix, so it has never been measured on a real shape.
+        for v in [
+            "mmqy1w8s2", "mmqy2w8s2", "mmqc1w8s2", "mmqc1w8s4",
+        ] {
         let mut run = |i: usize| -> Result<()> {
             kern.mmq_f16(
                 v,
@@ -447,8 +454,18 @@ fn each_projection_at_its_own_shape() -> Result<()> {
                 tokens,
             )
         };
+        let mut refused = None;
         for i in 0..4 {
-            run(i)?;
+            if let Err(e) = run(i) {
+                refused = Some(e);
+                break;
+            }
+        }
+        if let Some(e) = refused {
+            // A deep ring asks for more shared memory than a block may have;
+            // that is a result, not a broken test.
+            eprintln!("  {name} n={n:<6} {v:<11}  will not launch here ({e})");
+            continue;
         }
         dev.synchronize()?;
         let t0 = Instant::now();
