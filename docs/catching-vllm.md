@@ -1,7 +1,8 @@
 # Where the gap to vLLM is, and what has already been tried
 
-State at the end of the session that produced this file: **4697 tok/s against
-vLLM's 5418 at a batch of 32 — 1.15x behind**, on a Blackwell RTX PRO 6000 with
+State at the end of the session that produced this file: **4876 tok/s against
+vLLM's 5248 at a batch of 32 — 1.076x behind** on the distinct-prompt load
+(5398 and 1.107x on the shared-prompt one; see the fairness section), on a Blackwell RTX PRO 6000 with
 Llama-3.1-8B AWQ. The session before it read 4218.9 against 5454.2; the load
 generator is noisy to about ±5% and both engines were re-measured today, back to
 back, so those are the numbers to compare against.
@@ -18,7 +19,18 @@ served engine rather than on a kernel:
 | the residual add folded into the norm that follows it | inside the noise, 32 fewer launches a step |
 | a k-tile of weights prefetched into registers | 4449 (+0.7%) |
 | the grid constant re-swept after it: 2 blocks an SM, not 4 | 4599 (+3.4%) |
-| the vocab projection's scales split out of its quants (Q8_0S) | **4697 (+2.1%)** |
+| the vocab projection's scales split out of its quants (Q8_0S) | 4697 (+2.1%) |
+| `down_proj`'s f16 activation written by the SwiGLU kernel | 4724 (+0.6%) |
+| `o_proj`'s written by the attention combine — `f32_to_f16` gone | 4765 (+0.9%) |
+| the FFN residual added by the next layer's attention norm | 4772 (+0.15%) |
+| one row-group width for every projection, not two | 4849 (+1.6%) |
+| q/k/v read where the stacked projection wrote them | **4876 (+0.6%)** |
+
+`layers_ms` at the end, as an interval average between two cumulative samples
+rather than the run's mean: **5.749 ms**, against 6.095 where this segment
+started. GPU time a step is 6.417 ms of a 6.56 ms step, so there is no idle left
+to find — the 1.23 ms the trace below reports was node-level tracing overhead,
+and that entry stands corrected.
 
 Both engines were re-measured at the end, on the same box, minutes apart:
 tuili 4599 / 4603 / 4593 / 4604 / 4594, vLLM 5387 / 5477 / 5391. Take the
@@ -174,6 +186,43 @@ The two lessons are the same lesson. A timing harness cannot see correctness,
 and a name-selected shape carries a launch configuration that has to be read
 from the name. Any sweep in this file that selected a shape by name before this
 commit is suspect for the same reason.
+
+## The small-kernel tail, and what fusion is worth
+
+Half the remaining per-layer deficit was the tail of small kernels — nine of
+them, 19.6 us, against vLLM's four and ~12 — so this is where the last six
+percent came from. What landed, per layer:
+
+| | before | after |
+|---|---:|---:|
+| `f32_to_f16`, twice | 2.4 us | gone |
+| `split_qkv` | 1.1 | gone |
+| `add_assign` | 1.3 | 0.85 of it gone |
+| the kernels that absorbed them | | +0.03 |
+
+Three rules came out of it, and they are the useful part:
+
+**Write the f16 copy from the register that holds the f32.** The fused norm
+already did this for `qkv` and `gate_up`; the two activations no norm produces —
+attention's output and the SwiGLU product — were being written as f32, read back
+and converted. `silu_mul_split_f16_f32` averages 2397 ns against the f32-only
+form's 2367, and `attn_flash_reduce_f16_f32` 2286 against 2298. So 0.080 ms a
+step is *removed*, not moved, and `f32_to_f16` is absent from the trace.
+
+**Price the kernel that absorbs the work, not the launch that disappears.**
+Folding the FFN residual into the next layer's attention norm removes a 1.28 us
+`add_assign`, and is worth 0.45: the fused add-and-norm reads and writes the
+residual stream, so it runs 3.60 us against the plain norm's 2.77. Measured
+0.009 ms a step against a predicted 0.014. Taking the removed launch's cost as
+the saving would have overstated it threefold.
+
+**A copy that exists to simplify indexing is not a copy worth making.**
+`split_qkv` scattered the stacked projection's output row into three buffers so
+`rope_qk` and `store_kv2` could index without a stride. Both now read the packed
+row; `v` never moves at all.
+
+What is left of the tail is two norms (6.4), rope (2.3), the attention combine
+(2.3), `store_kv2` (1.5) and the residual adds at the two ends of the stack.
 
 ## Is the load generator fair? Yes, to within 3%
 
