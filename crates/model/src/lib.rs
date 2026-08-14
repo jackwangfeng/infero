@@ -1279,18 +1279,34 @@ impl Model {
                         | tuili_kernels::WeightType::Q4G128T
                 ) && w.k == d
             });
-        let (shared, shared_f16) = Self::norm_for_group(
-            &self.kern,
-            &mut self.scratch,
-            &mut self.act.xb,
-            &self.act.x.slice(..n * d),
-            &l.attn_norm.as_view(),
-            n,
-            d,
-            cfg.rms_eps,
-            want_q,
-            want_h,
-        )?;
+        let eps = cfg.rms_eps;
+        let (shared, shared_f16) = if self.attn_norm_takes_residual(layer, n) {
+            // The previous layer's FFN left its output in `proj` for this.
+            self.kern.add_rms_norm_f16(
+                &mut self.act.xb.slice_mut(..n * d),
+                &mut self.scratch.x16.slice_mut(..n * d),
+                &mut self.act.x.slice_mut(..n * d),
+                &self.act.proj.slice(..n * d),
+                &self.w.layers[layer].attn_norm.as_view(),
+                n,
+                d,
+                eps,
+            )?;
+            (None, true)
+        } else {
+            Self::norm_for_group(
+                &self.kern,
+                &mut self.scratch,
+                &mut self.act.xb,
+                &self.act.x.slice(..n * d),
+                &self.w.layers[layer].attn_norm.as_view(),
+                n,
+                d,
+                eps,
+                want_q,
+                want_h,
+            )?
+        };
 
         // All three read the same Q8_1 activation, so one launch covers them.
         // Two hundred and twenty-five mat-vecs back to back run at 328 GB/s
@@ -1708,6 +1724,47 @@ impl Model {
     /// have to agree: `attention` skips its `add_assign` exactly when
     /// `feed_forward` is going to do it, and a disagreement is a residual
     /// silently dropped or applied twice. So it is one predicate, asked twice.
+    /// Whether this layer's *attention* norm will add the previous layer's FFN
+    /// output itself, the way `ffn_norm_takes_residual` absorbs attention's.
+    ///
+    /// That leaves `add_assign` with nothing to do between two layers: the
+    /// residual stream is updated inside the norm that was going to read it
+    /// anyway. One launch and one 512 KB round trip a layer, 1.3 us in the
+    /// trace. The first layer has no pending residual and the last one has no
+    /// successor to absorb it, so both ends still add explicitly.
+    ///
+    /// Both sides read this: `feed_forward` skips its add exactly when the next
+    /// layer's `attention` will do it. `TUILI_FUSE_RESIDUAL=0` turns off this
+    /// one and the FFN one together.
+    fn attn_norm_takes_residual(&self, layer: usize, n: usize) -> bool {
+        if layer == 0 || layer >= self.cfg.n_layers {
+            return false;
+        }
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var("TUILI_FUSE_RESIDUAL").as_deref() == Ok("0")) {
+            return false;
+        }
+        let l = &self.w.layers[layer];
+        let prev = &self.w.layers[layer - 1];
+        let d = self.cfg.d_model;
+        // The consumer: this layer's q/k/v group has to be on the f16 path,
+        // because the fused add-and-norm is the kernel that writes f16.
+        let consumer = self.use_mmq
+            && n > 1
+            && n <= tuili_kernels::MMQ_MAX_TOKENS
+            && Kernels::mmq_f16_variant_for(l.wq.ty).is_some()
+            && [&l.wq, &l.wk, &l.wv].iter().all(|w| {
+                matches!(
+                    w.ty,
+                    tuili_kernels::WeightType::Q4G128 | tuili_kernels::WeightType::Q4G128T
+                ) && w.k == d
+            });
+        // The producer: the previous layer's `down` has to have left its output
+        // in `proj` rather than adding itself into the stream, which is what the
+        // single-token mat-vec path does.
+        consumer && !Self::residual_fusable(&prev.w_down, n, self.use_mmvq)
+    }
+
     fn ffn_norm_takes_residual(&self, layer: usize, n: usize) -> bool {
         let l = &self.w.layers[layer];
         let d = self.cfg.d_model;
@@ -1919,11 +1976,13 @@ impl Model {
             None,
             ffn_f16,
         )?;
-        self.kern.add_assign(
-            &mut self.act.x.slice_mut(..n * d),
-            &self.act.proj.slice(..n * d),
-            n * d,
-        )?;
+        if !self.attn_norm_takes_residual(layer + 1, n) {
+            self.kern.add_assign(
+                &mut self.act.x.slice_mut(..n * d),
+                &self.act.proj.slice(..n * d),
+                n * d,
+            )?;
+        }
         Ok(())
     }
 
