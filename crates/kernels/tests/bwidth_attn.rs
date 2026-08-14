@@ -162,6 +162,7 @@ fn decode_attention_at_the_vllm_shape() -> Result<()> {
     let fused = time(&mut |p| {
         kern.attn_decode(
             &mut dout.as_view_mut(),
+            None,
             &dq.as_view(),
             &dk[p].as_view(),
             &dv[p].as_view(),
@@ -171,6 +172,8 @@ fn decode_attention_at_the_vllm_shape() -> Result<()> {
             0.088_388_35,
             &mut dpart.as_view_mut(),
         )
+        // Whether the combine wrote an f16 copy is not what this measures.
+        .map(|_| ())
     })?;
 
     let mut sink = stream.alloc_zeros::<f32>(1)?;

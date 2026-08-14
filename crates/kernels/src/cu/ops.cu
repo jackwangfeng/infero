@@ -1137,6 +1137,49 @@ extern "C" __global__ void attn_flash_f32(
 }
 
 /// Combine the chunks: rescale each by its own max against the global one.
+// The combine, also writing the f16 copy the output projection reads.
+//
+// `hout` may be null, which is the batch-1 and mat-vec case: those paths take
+// the f32. When it is not, this is the last kernel to touch the attention
+// output before `o_proj`, so the conversion belongs here rather than in a
+// `f32_to_f16` launch that reads the f32 back — the same trade
+// `silu_mul_split_f16_f32` makes for the SwiGLU product, and the second of the
+// two conversions the fused norm left behind.
+extern "C" __global__ void attn_flash_reduce_f16_f32(
+    float* __restrict__ out, __half* __restrict__ hout,
+    const float* __restrict__ partial, int ms_off,
+    int n_heads, int d_head, int n_tokens, int n_chunks) {
+    const float* __restrict__ partial_acc = partial;
+    const float* __restrict__ partial_ms = partial + ms_off;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = n_tokens * n_heads * d_head;
+    if (i >= total) return;
+    const int head = (i / d_head) % n_heads;
+    const int token = i / (d_head * n_heads);
+
+    float m = -INFINITY;
+    for (int c = 0; c < n_chunks; ++c) {
+        m = fmaxf(m, partial_ms[(((size_t)c * n_tokens + token) * n_heads + head) * 2]);
+    }
+    if (m == -INFINITY) {
+        out[i] = 0.0f;
+        hout[i] = __float2half(0.0f);
+        return;
+    }
+    float acc = 0.0f, denom = 0.0f;
+    for (int c = 0; c < n_chunks; ++c) {
+        const float* ms =
+            partial_ms + (((size_t)c * n_tokens + token) * n_heads + head) * 2;
+        if (ms[0] == -INFINITY) continue;
+        const float w = __expf(ms[0] - m);
+        denom += ms[1] * w;
+        acc += partial_acc[(size_t)c * total + i] * w;
+    }
+    const float v = denom > 0.0f ? acc / denom : 0.0f;
+    out[i] = v;
+    hout[i] = __float2half(v);
+}
+
 extern "C" __global__ void attn_flash_reduce_f32(
     float* __restrict__ out, const float* __restrict__ partial, int ms_off,
     int n_heads, int d_head, int n_tokens, int n_chunks) {

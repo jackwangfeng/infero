@@ -793,6 +793,7 @@ fn attn_decode_matches_the_three_kernels() -> Result<()> {
         ))?;
         k.attn_decode(
             &mut got_d.as_view_mut(),
+            None,
             &dq.as_view(),
             &dk.as_view(),
             &dv.as_view(),

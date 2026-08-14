@@ -166,6 +166,7 @@ impl Kernels {
             "attn_softmax_f32",
             "attn_output_f32",
             "silu_mul_split_f16_f32",
+            "attn_flash_reduce_f16_f32",
         ] {
             self.dev.kernels().get("tuili_ops", ops_src(), name)?;
         }
@@ -1315,9 +1316,16 @@ impl Kernels {
     /// [`Self::attn_partial_floats`] long and the combine pass is the fused
     /// path's.
     #[allow(clippy::too_many_arguments)]
+    /// `hout`, when given, receives the f16 copy of the output that the output
+    /// projection is about to read — written by the combine rather than by a
+    /// separate `to_f16` over the f32. Returns whether it was written: the
+    /// single-chunk path stores straight from the attention kernel and has no
+    /// combine to fold it into, so the caller has to be told which happened
+    /// rather than assume.
     pub fn attn_decode(
         &self,
         out: &mut CudaViewMut<'_, f32>,
+        hout: Option<&mut CudaViewMut<'_, f16>>,
         q: &CudaView<'_, f32>,
         k_cache: &CudaView<'_, f16>,
         v_cache: &CudaView<'_, f16>,
@@ -1326,7 +1334,7 @@ impl Kernels {
         kv_len: usize,
         scale: f32,
         partial: &mut CudaViewMut<'_, f32>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         anyhow::ensure!(self.decode_attention(&dims), "attn_decode: unsupported shape");
         let group = dims.n_heads / dims.n_kv_heads;
         let (n_chunks, chunk) = self.decode_chunks(&dims, kv_len);
@@ -1400,19 +1408,35 @@ impl Kernels {
                 Ok(())
             })?;
         if single == 1 {
-            return Ok(());
+            return Ok(false);
         }
 
-        let r = self
-            .dev
-            .kernels()
-            .get("tuili_ops", ops_src(), "attn_flash_reduce_f32")?;
-        let part = partial.as_view();
         let total = (dims.n_tokens * dims.n_heads * dims.d_head) as u32;
         let (nt, nc) = (dims.n_tokens as i32, n_chunks as i32);
+        let part = partial.as_view();
+        let name = if hout.is_some() {
+            "attn_flash_reduce_f16_f32"
+        } else {
+            "attn_flash_reduce_f32"
+        };
+        let r = self.dev.kernels().get("tuili_ops", ops_src(), name)?;
         let mut rb = self.dev.stream().launch_builder(&r);
-        rb.arg(out)
-            .arg(&part)
+        let wrote = match hout {
+            Some(h16) => {
+                anyhow::ensure!(
+                    h16.len() >= total as usize,
+                    "attn_decode: f16 scratch holds {} of {total} elements",
+                    h16.len()
+                );
+                rb.arg(out).arg(h16);
+                true
+            }
+            None => {
+                rb.arg(out);
+                false
+            }
+        };
+        rb.arg(&part)
             .arg(&ms_off)
             .arg(&h)
             .arg(&dh)
@@ -1424,7 +1448,7 @@ impl Kernels {
                 unsafe { rb.launch(elementwise(total)) }.context("attn_decode_reduce")?;
                 Ok(())
             })?;
-        Ok(())
+        Ok(wrote)
     }
 
     /// Scores, softmax and the weighted sum in one pass over the KV range.

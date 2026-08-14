@@ -1255,6 +1255,9 @@ impl Model {
         let kv_dim = cfg.n_kv_heads * cfg.d_head;
         let l = &self.w.layers[layer];
         let table_stride = pool.table_stride();
+        // Set below, where the decode combine either writes the output
+        // projection's f16 activation or reports that it did not.
+        let mut attn_f16 = false;
 
         // One Q8_1 form for all three projections, produced by the norm that
         // writes their input. They read the same normalized residual, so
@@ -1441,6 +1444,22 @@ impl Model {
                     table_stride,
                 };
                 let (attn_out, partial) = (&mut self.act.attn, &mut self.act.attn_partial);
+                // Whether the output projection will read its activation as
+                // f16. When it will, the combine writes that copy instead of a
+                // `f32_to_f16` launch reading the f32 back — the other half of
+                // what `silu_mul_split_f16_f32` does for the SwiGLU product.
+                // The combine only exists on the split-chunk path, so
+                // `attn_decode` reports whether it actually wrote it.
+                let wo_f16 = self.use_mmq
+                    && n > 1
+                    && n <= tuili_kernels::MMQ_MAX_TOKENS
+                    && matches!(
+                        l.wo.ty,
+                        tuili_kernels::WeightType::Q4G128
+                            | tuili_kernels::WeightType::Q4G128T
+                    )
+                    && Kernels::mmq_f16_variant_for_shape(l.wo.ty, l.wo.n).is_some()
+                    && Self::mmq_shape_ok(&l.wo);
                 // The fused decode kernel measures *level* with the three it
                 // replaces on a microbenchmark, and wins by 4.7% in the served
                 // engine — 4150 tok/s to 4344 at 32 clients. The difference is
@@ -1456,8 +1475,10 @@ impl Model {
                 if !std::env::var("TUILI_DECODE_ATTN").is_ok_and(|v| v == "0")
                     && self.kern.decode_attention(&dims)
                 {
-                    self.kern.attn_decode(
+                    let mut h16 = self.scratch.x16.slice_mut(..n * d);
+                    attn_f16 = self.kern.attn_decode(
                         &mut attn_out.slice_mut(..n * d),
+                        wo_f16.then_some(&mut h16),
                         &self.act.q.slice(..n * d),
                         &pool.dense(layer).0.as_view(),
                         &pool.dense(layer).1.as_view(),
@@ -1653,7 +1674,7 @@ impl Model {
             return Ok(());
         }
 
-        Self::matmul(
+        Self::matmul_pre(
             &self.kern,
             &mut self.scratch,
             &mut self.act.proj.slice_mut(..n * d),
@@ -1663,6 +1684,8 @@ impl Model {
             n,
             self.use_mmvq,
             self.use_mmq,
+            None,
+            attn_f16,
         )?;
         if let Some(b) = &l.bo {
             self.kern
