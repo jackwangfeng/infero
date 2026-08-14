@@ -1,0 +1,25 @@
+[package]
+name = "tuili-kernels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tuili-safetensors.workspace = true
+tuili-cuda.workspace = true
+tuili-gguf.workspace = true
+anyhow.workspace = true
+half.workspace = true
+tracing.workspace = true
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "cublas", "f16", "dynamic-loading"] }
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+rand = "0.9"
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "cublas", "f16", "dynamic-loading"] }
+
+[features]
+default = ["cuda-13"]
+cuda-13 = ["tuili-cuda/cuda-13", "cudarc/cuda-13010"]
+cuda-12 = ["tuili-cuda/cuda-12", "cudarc/cuda-12080"]

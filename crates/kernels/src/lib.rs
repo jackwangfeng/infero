@@ -1,0 +1,3563 @@
+//! The GPU operator set: everything a decoder-only transformer needs, and
+//! nothing else.
+//!
+//! Kernels are plain CUDA C compiled by NVRTC at startup (see `tuili-cuda`).
+//! Weights stay in their GGUF block encoding on the device and are decoded
+//! inside the kernel that consumes them, which is the whole reason a 7B model
+//! fits in 5 GB.
+//!
+//! Shapes follow ggml's convention: a linear weight is `[n_out, k]` row-major,
+//! so `out[t, r] = dot(w[r, :], x[t, :])`.
+
+pub mod awq;
+pub mod turboquant;
+mod weight;
+
+use anyhow::{Context, Result};
+use cudarc::driver::{CudaView, CudaViewMut, LaunchConfig, PushKernelArg};
+use half::f16;
+use tuili_cuda::Device;
+
+pub use BatchLayout as Batch;
+pub use turboquant::{Codebook, DeviceTables as TqTables, KvQuant};
+pub use weight::WeightType;
+
+/// Widest MMQ block: four warps, eight weight rows each.
+const MMQ_MAX_ROWS: u32 = 32;
+/// Tokens per MMQ tile, fixed by the `m16n8k32` shape.
+const MMQ_M: u32 = 16;
+/// Padded byte stride of the f16 activation ring, and the one number the host
+/// has to keep in step with `mmq.cu`: it sizes the dynamic shared request.
+const MMQ_XF_STRIDE: u32 = 256 * 2 + 32;
+/// The same for the `ldmatrix` shapes, which need 16 mod 128 where the scalar
+/// gather needs 32. See `MMQ_XL_STRIDE` in `mmq.cu`.
+const MMQ_XL_STRIDE: u32 = 256 * 2 + 16;
+/// And for the Q8_1 ring: eight 36-byte blocks a row, padded. Matches
+/// `MMQ_XA_STRIDE` in `mmq.cu`.
+const MMQ_XA_STRIDE: u32 = 8 * 36 + 16;
+/// The swizzled f16 ring needs no padding at all; see `MMQ_XK_STRIDE`.
+const MMQ_XK_STRIDE: u32 = 256 * 2;
+
+const COMMON_CUH: &str = include_str!("cu/common.cuh");
+const OPS_CU: &str = include_str!("cu/ops.cu");
+const QUANT_CU: &str = include_str!("cu/quant.cu");
+const TURBOQUANT_CU: &str = include_str!("cu/turboquant.cu");
+const MMVQ_CU: &str = include_str!("cu/mmvq.cu");
+const MMA_CUH: &str = include_str!("cu/mma.cuh");
+const MMQ_CU: &str = include_str!("cu/mmq.cu");
+const SAMPLE_CU: &str = include_str!("cu/sample.cu");
+
+/// Threads per block for the reduction kernels. 256 keeps eight warps busy
+/// without pushing occupancy off a cliff on sm_86.
+const REDUCE_BLOCK: u32 = 256;
+
+/// Registers per thread in the fused norm; must match `RMS_REGS` in mmvq.cu.
+const RMS_REGS: u32 = 8;
+const ELEMENTWISE_BLOCK: u32 = 256;
+/// Warps per block in the attention score kernel; each warp does one score.
+const SCORE_WARPS: u32 = 4;
+/// Tokens one mat-vec block serves, matching `GEMV_TOKENS` in `quant.cu`.
+const GEMV_TOKENS_PER_BLOCK: u32 = 8;
+/// `sizeof(block_q8_1)`: a `half2` scale/sum pair plus 32 int8 quants.
+pub const Q8_1_BLOCK_BYTES: usize = 36;
+/// Above this many tokens, `dequant_to_f16` + cuBLAS beats the tensor-core
+/// GEMM: MMQ re-reads the weights once per 16- or 32-token tile while the
+/// dequant path pays for its f16 copy exactly once, so the two cross over.
+/// Measured at 96 on an A4000; see `mmq_tiles` for the companion threshold.
+pub const MMQ_MAX_TOKENS: usize = 96;
+
+fn ops_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    // The MMA helpers too: `attn_decode_mma_f32` uses the same `m16n8k16`
+    // fragments the GEMM does, and `mma.cuh` is where their layout is pinned.
+    SRC.get_or_init(|| format!("{COMMON_CUH}\n{MMA_CUH}\n{OPS_CU}"))
+}
+
+fn sample_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| format!("{COMMON_CUH}\n{SAMPLE_CU}"))
+}
+
+fn quant_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| format!("{COMMON_CUH}\n{QUANT_CU}"))
+}
+
+fn mmq_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| format!("{COMMON_CUH}\n{MMA_CUH}\n{MMQ_CU}"))
+}
+
+fn mmvq_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| format!("{COMMON_CUH}\n{MMVQ_CU}"))
+}
+
+fn tq_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| format!("{COMMON_CUH}\n{TURBOQUANT_CU}"))
+}
+
+/// Threads for a kernel that walks one vector of `d` per block.
+fn per_vector_block(d: usize) -> u32 {
+    (d as u32).next_multiple_of(32).clamp(32, 1024)
+}
+
+fn elementwise(n: u32) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (n.div_ceil(ELEMENTWISE_BLOCK).max(1), 1, 1),
+        block_dim: (ELEMENTWISE_BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+pub struct Kernels {
+    dev: Device,
+}
+
+fn b_args(
+    k: &Kernels,
+    f: &tuili_cuda::Kernel,
+    cfg: LaunchConfig,
+    out: &mut CudaViewMut<'_, f32>,
+    h_out: &mut CudaViewMut<'_, f16>,
+    x: &CudaView<'_, f32>,
+    weight: &CudaView<'_, f32>,
+    d: i32,
+    eps: f32,
+) -> Result<()> {
+    let mut b = k.device().stream().launch_builder(f);
+    b.arg(out).arg(h_out).arg(x).arg(weight).arg(&d).arg(&eps);
+    k.device()
+        .profile()
+        .time("rms_norm_f16", k.device().stream(), || {
+            unsafe { b.launch(cfg) }.context("rms_norm_f16")?;
+            Ok(())
+        })?;
+    Ok(())
+}
+
+impl Kernels {
+    pub fn new(dev: Device) -> Self {
+        Self { dev }
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.dev
+    }
+
+    /// Compile every kernel now instead of on first use, so the first token
+    /// isn't charged for NVRTC.
+    pub fn warm_up(&self) -> Result<()> {
+        let started = std::time::Instant::now();
+        for name in [
+            "rms_norm_f32",
+            "add_f32",
+            "add_assign_f32",
+            "add_bias_f32",
+            "silu_mul_f32",
+            "take_rows_f32",
+            "f32_to_f16",
+            "rope_neox_f32",
+            "rope_norm_f32",
+            "store_kv_f16",
+            "write_slot_table",
+            "attn_scores_f32",
+            "attn_softmax_f32",
+            "attn_output_f32",
+        ] {
+            self.dev.kernels().get("tuili_ops", ops_src(), name)?;
+        }
+        for ty in WeightType::ALL {
+            // The transposed AWQ layout is read by the tensor-core GEMM and by
+            // the prefill dequantization, and by nothing else yet — the
+            // mat-vec and the float path still expect packed blocks.
+            if ty == WeightType::Q4G128T {
+                // No `gemv` or `gather_rows` for this layout: the float path
+                // and the embedding gather never see it. The prefill
+                // dequantization and the mat-vec do.
+                self.dev.kernels().get(
+                    "tuili_quant",
+                    quant_src(),
+                    "dequant_q4_g128t_f16",
+                )?;
+                continue;
+            }
+            for prefix in ["gemv", "gather_rows", "dequant"] {
+                let name = match prefix {
+                    "dequant" => format!("dequant_{}_f16", ty.suffix()),
+                    _ => format!("{prefix}_{}", ty.suffix()),
+                };
+                self.dev.kernels().get("tuili_quant", quant_src(), &name)?;
+            }
+        }
+        self.dev
+            .kernels()
+            .get("tuili_mmvq", mmvq_src(), "quantize_q8_1_f32")?;
+        for ty in WeightType::ALL.iter().filter(|t| Self::has_mmvq(**t)) {
+            // Every width the dispatch can reach, not just the single-token
+            // one: a missing kernel is otherwise a 500 on whichever request
+            // happens to leave two sequences running.
+            for tag in ["", "t1", "t2", "t4", "t8", "t16"] {
+                let name = format!("mmvq{tag}_{}", ty.suffix());
+                self.dev.kernels().get("tuili_mmvq", mmvq_src(), &name)?;
+            }
+        }
+        // The tensor-core GEMM, both tile widths. Leaving these out made the
+        // first request after startup pay for NVRTC — 20 tok/s against 27 on
+        // every request after it.
+        if self.dev.arch() >= 80 {
+            for tag in ["", "2"] {
+                for ty in WeightType::ALL
+                    .iter()
+                    .filter(|t| Self::has_mmq(**t) && **t != WeightType::Q4G128T)
+                {
+                    let name = format!("mmq{tag}_{}", ty.suffix());
+                    self.dev.kernels().get("tuili_mmq", mmq_src(), &name)?;
+                }
+            }
+        }
+        for name in [
+            "tq_matvec",
+            "tq_store_v",
+            "tq_store_k",
+            "tq_attn_scores",
+            "tq_attn_output",
+        ] {
+            self.dev.kernels().get("tuili_turboquant", tq_src(), name)?;
+        }
+        tracing::debug!(ms = started.elapsed().as_millis(), "kernels compiled");
+        Ok(())
+    }
+
+    // ---- normalization and elementwise ----------------------------------
+
+    /// `out[t, :] = rms_norm(x[t, :]) * weight`
+    pub fn rms_norm(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        x: &CudaView<'_, f32>,
+        weight: &CudaView<'_, f32>,
+        n_tokens: usize,
+        d: usize,
+        eps: f32,
+    ) -> Result<()> {
+        debug_assert!(out.len() >= n_tokens * d && x.len() >= n_tokens * d);
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_ops", ops_src(), "rms_norm_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_tokens as u32, 1, 1),
+            block_dim: (REDUCE_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (d_i, eps_f) = (d as i32, eps);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(x).arg(weight).arg(&d_i).arg(&eps_f);
+        self.dev.profile().time("rms_norm", self.dev.stream(), || {
+            unsafe { b.launch(cfg) }.context("rms_norm")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// `out = a + b`, elementwise. Aliasing `out` with either input is fine.
+    pub fn add(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        a: &CudaView<'_, f32>,
+        b_in: &CudaView<'_, f32>,
+        n: usize,
+    ) -> Result<()> {
+        let f = self.dev.kernels().get("tuili_ops", ops_src(), "add_f32")?;
+        let n_i = n as i32;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(a).arg(b_in).arg(&n_i);
+        self.dev.profile().time("add", self.dev.stream(), || {
+            unsafe { b.launch(elementwise(n as u32)) }.context("add")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// `out += b`, in place.
+    pub fn add_assign(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        b_in: &CudaView<'_, f32>,
+        n: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_ops", ops_src(), "add_assign_f32")?;
+        let n_i = n as i32;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(b_in).arg(&n_i);
+        self.dev
+            .profile()
+            .time("add_assign", self.dev.stream(), || {
+                // Four elements a thread; see `add_assign_f32`.
+                unsafe { b.launch(elementwise((n as u32).div_ceil(4))) }.context("add_assign")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// `out[t, j] += bias[j]`
+    pub fn add_bias(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        bias: &CudaView<'_, f32>,
+        n_cols: usize,
+        n_rows: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_ops", ops_src(), "add_bias_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (n_cols as u32).div_ceil(ELEMENTWISE_BLOCK).max(1),
+                n_rows as u32,
+                1,
+            ),
+            block_dim: (ELEMENTWISE_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (c, r) = (n_cols as i32, n_rows as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(bias).arg(&c).arg(&r);
+        self.dev.profile().time("add_bias", self.dev.stream(), || {
+            unsafe { b.launch(cfg) }.context("add_bias")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// `out = silu(gate) * up`, the SwiGLU non-linearity.
+    pub fn silu_mul(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        gate: &CudaView<'_, f32>,
+        up: &CudaView<'_, f32>,
+        n: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_ops", ops_src(), "silu_mul_f32")?;
+        let n_i = n as i32;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(gate).arg(up).arg(&n_i);
+        self.dev.profile().time("silu_mul", self.dev.stream(), || {
+            unsafe { b.launch(elementwise(n as u32)) }.context("silu_mul")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Scatter a fused `q ++ k ++ v` result into three tensors.
+    ///
+    /// `fused` is `[tokens][d + 2 * kv_dim]`, which is what one matmul against
+    /// the stacked weight produces.
+    pub fn split_qkv(
+        &self,
+        q: &mut CudaViewMut<'_, f32>,
+        k: &mut CudaViewMut<'_, f32>,
+        v: &mut CudaViewMut<'_, f32>,
+        fused: &CudaView<'_, f32>,
+        d: usize,
+        kv_dim: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_ops", ops_src(), "split_qkv_f32")?;
+        let total = n_tokens * (d + 2 * kv_dim);
+        let (d_i, kv_i, t_i) = (d as i32, kv_dim as i32, total as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(q).arg(k).arg(v).arg(fused).arg(&d_i).arg(&kv_i).arg(&t_i);
+        self.dev
+            .profile()
+            .time("split_qkv", self.dev.stream(), || {
+                unsafe { b.launch(elementwise(total as u32)) }.context("split_qkv")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// [`Kernels::silu_mul`] over one fused `gate ++ up` row.
+    ///
+    /// `xy` is `[tokens][2 * d_ff]`, which is what a single matmul against the
+    /// concatenated weight produces.
+    pub fn silu_mul_split(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        xy: &CudaView<'_, f32>,
+        d_ff: usize,
+        total: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_ops", ops_src(), "silu_mul_split_f32")?;
+        let (d_i, t_i) = (d_ff as i32, total as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(xy).arg(&d_i).arg(&t_i);
+        self.dev.profile().time("silu_mul", self.dev.stream(), || {
+            unsafe { b.launch(elementwise(total as u32)) }.context("silu_mul_split")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// `out[r, :] = x[rows[r], :]`
+    /// Threads per sampling block; must match `SAMPLE_BLOCK` in `sample.cu`.
+    const SAMPLE_BLOCK: u32 = 256;
+
+    /// The largest `top_k` the device sampler will take.
+    ///
+    /// Survivors live in shared memory and are found by that many block-wide
+    /// passes, so the bound is what keeps both in hand. Past it the host path
+    /// runs instead, which is why it is a public predicate rather than an
+    /// assertion.
+    pub const SAMPLE_MAX_TOP_K: usize = 256;
+
+    /// Whether a batch can be sampled on the device at all.
+    ///
+    /// The vocabulary bitset is dynamic shared memory, so a large enough
+    /// vocabulary rules the kernel out on a card whose limit is 48 KiB without
+    /// an opt-in this does not take.
+    pub fn can_sample_on_device(vocab: usize, max_top_k: usize) -> bool {
+        max_top_k <= Self::SAMPLE_MAX_TOP_K && Self::sample_shared(vocab) <= 48 * 1024
+    }
+
+    fn sample_shared(vocab: usize) -> u32 {
+        let words = vocab.div_ceil(32) as u32;
+        // The bitset, then the reduction scratch, then the survivors.
+        words * 4 + Self::SAMPLE_BLOCK * 4 * 4
+    }
+
+    /// Sample one token per row without the logits ever leaving the device.
+    ///
+    /// `pen_tok` and `pen_cnt` are each row's repetition window as sorted
+    /// unique ids and their counts, padded to `pen_stride`; `rnd` is one
+    /// uniform draw per row, taken from that sequence's own generator on the
+    /// host so that seeding stays reproducible.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_rows(
+        &self,
+        out: &mut CudaViewMut<'_, u32>,
+        logits: &CudaView<'_, f32>,
+        params: &CudaView<'_, f32>,
+        pen_tok: &CudaView<'_, i32>,
+        pen_cnt: &CudaView<'_, i32>,
+        pen_len: &CudaView<'_, i32>,
+        rnd: &CudaView<'_, f64>,
+        n_rows: usize,
+        vocab: usize,
+        pen_stride: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_sample", sample_src(), "sample_rows_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_rows as u32, 1, 1),
+            block_dim: (Self::SAMPLE_BLOCK, 1, 1),
+            shared_mem_bytes: Self::sample_shared(vocab),
+        };
+        let v = vocab as i32;
+        let ps = pen_stride as i32;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out)
+            .arg(logits)
+            .arg(params)
+            .arg(pen_tok)
+            .arg(pen_cnt)
+            .arg(pen_len)
+            .arg(rnd)
+            .arg(&v)
+            .arg(&ps);
+        self.dev
+            .profile()
+            .time("sample_rows", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("sample_rows")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    pub fn take_rows(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        x: &CudaView<'_, f32>,
+        rows: &CudaView<'_, i32>,
+        n_rows: usize,
+        d: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_ops", ops_src(), "take_rows_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (d as u32).div_ceil(ELEMENTWISE_BLOCK).max(1),
+                n_rows as u32,
+                1,
+            ),
+            block_dim: (ELEMENTWISE_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let d_i = d as i32;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(x).arg(rows).arg(&d_i);
+        self.dev
+            .profile()
+            .time("take_rows", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("take_rows")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    pub fn to_f16(
+        &self,
+        out: &mut CudaViewMut<'_, f16>,
+        x: &CudaView<'_, f32>,
+        n: usize,
+    ) -> Result<()> {
+        self.to_f16_inner(out, x, n, false)
+    }
+
+    /// [`Self::to_f16`] writing k in the order an `ldmatrix`-loaded A fragment
+    /// pairs with a weight word read straight out of an AWQ pack.
+    ///
+    /// See `f32_to_f16_kperm` in `ops.cu`: the alternative is repacking the
+    /// weights, and the activations are a thousandth of the bytes.
+    pub fn to_f16_kperm(
+        &self,
+        out: &mut CudaViewMut<'_, f16>,
+        x: &CudaView<'_, f32>,
+        n: usize,
+    ) -> Result<()> {
+        self.to_f16_inner(out, x, n, true)
+    }
+
+    fn to_f16_inner(
+        &self,
+        out: &mut CudaViewMut<'_, f16>,
+        x: &CudaView<'_, f32>,
+        n: usize,
+        kperm: bool,
+    ) -> Result<()> {
+        let name = if kperm { "f32_to_f16_kperm" } else { "f32_to_f16" };
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_ops", ops_src(), name)?;
+        let n_i = n as i32;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(x).arg(&n_i);
+        // `f32_to_f16` takes four elements a thread — see the note on it — while
+        // the k-permuted variant still takes one. One wrapper, two grids.
+        let threads = if kperm { n as u32 } else { (n as u32).div_ceil(4) };
+        self.dev.profile().time("to_f16", self.dev.stream(), || {
+            unsafe { b.launch(elementwise(threads)) }.context("to_f16")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    // ---- positional -----------------------------------------------------
+
+    /// Rotary embeddings applied in place to `x[n_tokens, n_heads, d_head]`.
+    ///
+    /// `interleaved` selects the pairing: false pairs `i` with `i + d/2`
+    /// (NeoX, what Qwen2 wants), true pairs `2i` with `2i+1` (what llama-family
+    /// GGUFs want, their Q and K having been permuted to suit).
+    #[allow(clippy::too_many_arguments)]
+    /// Rotary embeddings for Q and K in one launch.
+    ///
+    /// See [`Kernels::rope`] for the conventions; this differs only in doing
+    /// both tensors at once, which at a batch of one turns two grids of eight
+    /// and thirty-two blocks into one of forty.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_qk(
+        &self,
+        q: &mut CudaViewMut<'_, f32>,
+        k: &mut CudaViewMut<'_, f32>,
+        positions: &CudaView<'_, i32>,
+        freq_factors: &CudaView<'_, f32>,
+        n_tokens: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        d_head: usize,
+        theta_base: f32,
+        freq_scale: f32,
+        interleaved: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            d_head.is_multiple_of(2),
+            "d_head {d_head} must be even for rope"
+        );
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_ops", ops_src(), "rope_qk_f32")?;
+        let half = (d_head / 2) as u32;
+        let block = half.clamp(1, 128);
+        let cfg = LaunchConfig {
+            grid_dim: (
+                half.div_ceil(block),
+                (n_heads + n_kv_heads) as u32,
+                n_tokens as u32,
+            ),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (h, kh, dh, il) = (
+            n_heads as i32,
+            n_kv_heads as i32,
+            d_head as i32,
+            i32::from(interleaved),
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(q)
+            .arg(k)
+            .arg(positions)
+            .arg(freq_factors)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&theta_base)
+            .arg(&freq_scale)
+            .arg(&il);
+        self.dev.profile().time("rope_qk", self.dev.stream(), || {
+            unsafe { b.launch(cfg) }.context("rope_qk")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope(
+        &self,
+        x: &mut CudaViewMut<'_, f32>,
+        positions: &CudaView<'_, i32>,
+        freq_factors: &CudaView<'_, f32>,
+        n_tokens: usize,
+        n_heads: usize,
+        d_head: usize,
+        theta_base: f32,
+        freq_scale: f32,
+        interleaved: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            d_head.is_multiple_of(2),
+            "d_head {d_head} must be even for rope"
+        );
+        let name = if interleaved {
+            "rope_norm_f32"
+        } else {
+            "rope_neox_f32"
+        };
+        let f = self.dev.kernels().get("tuili_ops", ops_src(), name)?;
+        let half = (d_head / 2) as u32;
+        let block = half.clamp(1, 128);
+        let cfg = LaunchConfig {
+            grid_dim: (half.div_ceil(block), n_heads as u32, n_tokens as u32),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (h, dh) = (n_heads as i32, d_head as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(x)
+            .arg(positions)
+            .arg(freq_factors)
+            .arg(&h)
+            .arg(&dh)
+            .arg(&theta_base)
+            .arg(&freq_scale);
+        self.dev
+            .profile()
+            .time("rope_neox", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("rope_neox")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    // ---- attention ------------------------------------------------------
+
+    /// Scatter `src[n_tokens, n_kv_heads, d_head]` into a
+    /// `[n_kv_heads, n_slots, d_head]` f16 pool at the given physical slots.
+    #[allow(clippy::too_many_arguments)]
+    /// Append this step's keys *and* values to the pool in one launch.
+    ///
+    /// See [`Kernels::store_kv`]; `blockIdx.y` covers both halves, which halves
+    /// the launches a decode step spends here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_kv2(
+        &self,
+        k_cache: &mut CudaViewMut<'_, f16>,
+        v_cache: &mut CudaViewMut<'_, f16>,
+        k_src: &CudaView<'_, f32>,
+        v_src: &CudaView<'_, f32>,
+        slots: &CudaView<'_, i32>,
+        n_kv_heads: usize,
+        d_head: usize,
+        n_slots: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_ops", ops_src(), "store_kv2_f16")?;
+        let block = (d_head as u32).clamp(1, 256);
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (d_head as u32).div_ceil(block),
+                2 * n_kv_heads as u32,
+                n_tokens as u32,
+            ),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (kh, dh, ms, nt) = (
+            n_kv_heads as i32,
+            d_head as i32,
+            n_slots as i32,
+            n_tokens as i32,
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(k_cache)
+            .arg(v_cache)
+            .arg(k_src)
+            .arg(v_src)
+            .arg(slots)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ms)
+            .arg(&nt);
+        self.dev.profile().time("store_kv", self.dev.stream(), || {
+            unsafe { b.launch(cfg) }.context("store_kv2")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_kv(
+        &self,
+        cache: &mut CudaViewMut<'_, f16>,
+        src: &CudaView<'_, f32>,
+        slots: &CudaView<'_, i32>,
+        n_kv_heads: usize,
+        d_head: usize,
+        n_slots: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_ops", ops_src(), "store_kv_f16")?;
+        let block = (d_head as u32).clamp(1, 256);
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (d_head as u32).div_ceil(block),
+                n_kv_heads as u32,
+                n_tokens as u32,
+            ),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (kh, dh, ms, nt) = (
+            n_kv_heads as i32,
+            d_head as i32,
+            n_slots as i32,
+            n_tokens as i32,
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(cache)
+            .arg(src)
+            .arg(slots)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ms)
+            .arg(&nt);
+        self.dev.profile().time("store_kv", self.dev.stream(), || {
+            unsafe { b.launch(cfg) }.context("store_kv")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Record where each of the batch's tokens landed in the pool.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_slot_table(
+        &self,
+        table: &mut CudaViewMut<'_, i32>,
+        seq_of: &CudaView<'_, i32>,
+        positions: &CudaView<'_, i32>,
+        slots: &CudaView<'_, i32>,
+        table_stride: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_ops", ops_src(), "write_slot_table")?;
+        let (stride, n) = (table_stride as i32, n_tokens as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(table)
+            .arg(seq_of)
+            .arg(positions)
+            .arg(slots)
+            .arg(&stride)
+            .arg(&n);
+        self.dev
+            .profile()
+            .time("write_slot_table", self.dev.stream(), || {
+                unsafe { b.launch(elementwise(n_tokens as u32)) }.context("write_slot_table")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// `scores[h, t, j] = q[t, h] · k_cache[h/gqa, j] * scale`, causally masked
+    /// against `positions[t]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_scores(
+        &self,
+        scores: &mut CudaViewMut<'_, f32>,
+        q: &CudaView<'_, f32>,
+        k_cache: &CudaView<'_, f16>,
+        batch: BatchLayout<'_>,
+        dims: AttnDims,
+        kv_len: usize,
+        scale: f32,
+    ) -> Result<()> {
+        // One K fetch for every query head that shares it, when there is more
+        // than one. `d_head` above 128 would not fit the four registers the
+        // grouped kernel holds it in.
+        let group = dims.n_heads / dims.n_kv_heads.max(1);
+        let gqa = group > 1 && dims.d_head <= 4 * 32 && dims.d_head.is_multiple_of(32);
+        let f = self.dev.kernels().get(
+            "tuili_ops",
+            ops_src(),
+            // Strided, and measured against the contiguous alternative rather
+            // than assumed. `attn_scores_gqa_v4_f32` gives each lane a
+            // contiguous run — the change that took `attn_output` from 86.2 us
+            // to 36.0 — and here it *loses*: 45.1 us against 43.6 at a batch of
+            // 32, and 46.9 before the query load was hoisted out of the guard.
+            //
+            // The two kernels are not in the same situation. `attn_output`
+            // spends each V element once, so its load width sets its
+            // instruction count. This one reads a K row once into registers and
+            // spends it on all four query heads in the group, so K's width
+            // barely registers, and the query access it would replace is
+            // already perfectly coalesced — a warp's strided read is 128
+            // consecutive floats. There is nothing to win and a branch to lose.
+            //
+            // `TUILI_ATTN_V1` still selects the older `attn_output`, which is
+            // the one where the width mattered.
+            // Two keys a warp, which doubles what the score loop has in
+            // flight: 43.4 us a layer down to 33.9 at a batch of 32, or 762
+            // GB/s of K up to 990. `TUILI_ATTN_X2=0` restores one key a warp.
+            match (gqa, !std::env::var("TUILI_ATTN_X2").is_ok_and(|v| v == "0")) {
+                (true, true) => "attn_scores_gqa_v4_f32",
+                (true, false) => "attn_scores_gqa_f32",
+                (false, _) => "attn_scores_f32",
+            },
+        )?;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                {
+                    // The `x2` variant gives a warp two keys, so it needs half
+                    // the blocks to cover the range.
+                    let per = if gqa
+                        && !std::env::var("TUILI_ATTN_X2").is_ok_and(|v| v == "0")
+                    {
+                        SCORE_WARPS * 2
+                    } else {
+                        SCORE_WARPS
+                    };
+                    (kv_len as u32).div_ceil(per).max(1)
+                },
+                if gqa { dims.n_kv_heads as u32 } else { dims.n_heads as u32 },
+                dims.n_tokens as u32,
+            ),
+            block_dim: (SCORE_WARPS * 32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let group_i = group as i32;
+        let (stride, h, kh, dh, ms, kl) = (
+            batch.table_stride as i32,
+            dims.n_heads as i32,
+            dims.n_kv_heads as i32,
+            dims.d_head as i32,
+            dims.n_slots as i32,
+            kv_len as i32,
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(scores)
+            .arg(q)
+            .arg(k_cache)
+            .arg(batch.seq_of)
+            .arg(batch.positions)
+            .arg(batch.slot_table)
+            .arg(&stride)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ms)
+            .arg(&kl)
+            .arg(&scale);
+        if gqa {
+            b.arg(&group_i);
+        }
+        self.dev
+            .profile()
+            .time("attn_scores", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("attn_scores")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// In-place softmax over the kv axis of `scores[n_heads, n_tokens, kv_len]`.
+    pub fn attn_softmax(
+        &self,
+        scores: &mut CudaViewMut<'_, f32>,
+        n_heads: usize,
+        n_tokens: usize,
+        kv_len: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_ops", ops_src(), "attn_softmax_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_heads as u32, n_tokens as u32, 1),
+            block_dim: (REDUCE_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let kl = kv_len as i32;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(scores).arg(&kl);
+        self.dev
+            .profile()
+            .time("attn_softmax", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("attn_softmax")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// `out[t, h, :] = sum_j scores[h, t, j] * v_cache[h/gqa, j, :]`
+    /// How many KV chunks the split-K attention output should use, and 0 when
+    /// the plain kernel is the better choice.
+    ///
+    /// The plain kernel makes `n_heads * n_tokens` blocks. That is plenty once
+    /// a batch is wide, and far too few for a single sequence — 32 blocks on a
+    /// 48-SM device leaves two thirds of it idle. Chunking the KV range buys
+    /// blocks; it also costs a second pass over the partials, so it is only
+    /// worth it when the grid is actually short.
+    fn attn_chunks(&self, dims: &AttnDims, kv_len: usize) -> (u32, u32) {
+        // Counted ungrouped on purpose. The grouped value kernel gives a block
+        // to each (KV head, token) and reads each V row once for the whole
+        // query group — a quarter of the traffic at Llama-3.1's 32-over-8 —
+        // and pairing it with the split to buy the grid back was measured:
+        // 387 tok/s against 406 at a batch of eight.
+        //
+        // The reason it loses is that the traffic it saves is not DRAM. A
+        // layer's V cache at 256 tokens of context is 590 KB and sits in L2,
+        // so the four reads are L2 reads, while the partial sums the split
+        // writes and the reduce pass that consumes them are new traffic and a
+        // third launch. `attn_output_gqa_split_f32` stays for the shapes where
+        // the context is long enough for V to leave L2; this counter decides
+        // when it runs, and at these sizes it should not.
+        let blocks = (dims.n_heads * dims.n_tokens) as u32;
+        let want = self.dev.sm_count() * 4;
+        // The gate counts blocks and nothing else, and a block is not the only
+        // thing that can be short of work: `attn_output_f32` walks the whole
+        // key range in one loop, so its latency is `kv_len` dependent loads
+        // however many blocks there are. `TUILI_ATTN_SPLIT=1` chunks anyway.
+        static ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let always = *ALWAYS.get_or_init(|| std::env::var_os("TUILI_ATTN_SPLIT").is_some());
+        if (blocks >= want && !always) || kv_len <= 128 {
+            return (0, 0);
+        }
+        let chunks = if always && blocks >= want {
+            // Enough blocks already; the split is for the chain, not the grid.
+            4
+        } else {
+            want.div_ceil(blocks).clamp(2, 32)
+        };
+        let chunk = (kv_len as u32).div_ceil(chunks).next_multiple_of(32);
+        let chunks = (kv_len as u32).div_ceil(chunk.max(1));
+        if chunks < 2 { (0, 0) } else { (chunks, chunk) }
+    }
+
+    /// Floats of scratch the split attention paths need for their partials.
+    ///
+    /// The first `32 * n_heads * d_head * n_tokens` hold the per-chunk weighted
+    /// sums, which is all `attn_output` uses; the tail is the flash path's
+    /// per-chunk `{max, denominator}` pair.
+    pub fn attn_partial_floats(n_heads: usize, d_head: usize, n_tokens: usize) -> usize {
+        32 * n_heads * n_tokens * (d_head + 2)
+    }
+
+    /// How the fused attention kernel would split this shape, and `None` when
+    /// it declines the work.
+    ///
+    /// It keeps the score row in shared memory, so a chunk has to fit there;
+    /// 2048 keys is 8 KB, comfortably inside the 48 KB every block gets. It is
+    /// also worth using only while the grid is short — once a batch is wide
+    /// enough to fill the device on its own, the separate score kernel's
+    /// grouped-query reuse reads each key once for four heads instead of once
+    /// per head, and that is the bigger effect.
+    /// Heads the fused attention grid will span: `n_kv_heads` when the grouped
+    /// kernel is the one that will run, `n_heads` otherwise.
+    ///
+    /// This repeats the `gqa` predicate in [`Self::attn_flash`] rather than
+    /// sharing it because the split has to be chosen before the launch is
+    /// built. The two must agree; a mismatch shows up as a kernel starved of
+    /// blocks, which is what it was.
+    fn flash_grid_heads(dims: &AttnDims) -> usize {
+        let group = dims.n_heads / dims.n_kv_heads.max(1);
+        let lanes = (dims.d_head as u32).next_multiple_of(32).clamp(32, 1024);
+        let subs = std::env::var("TUILI_ATTN_SUBS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(4)
+            .clamp(1, 1024 / lanes.max(1));
+        let grouped = std::env::var("TUILI_ATTN_GQA").is_ok_and(|v| v != "0")
+            && group > 1
+            && group <= 8
+            && lanes * subs >= group as u32 * 32
+            && dims.d_head.is_multiple_of(8)
+            && (lanes * subs).is_multiple_of((dims.d_head / 8) as u32);
+        if grouped { dims.n_kv_heads } else { dims.n_heads }
+    }
+
+    fn attn_flash_split(&self, dims: &AttnDims, kv_len: usize) -> Option<(u32, u32)> {
+        const MAX_CHUNK: u32 = 2048;
+        if dims.d_head > 1024 || kv_len == 0 {
+            return None;
+        }
+        // Blocks the launch will actually make, which is not `n_heads *
+        // n_tokens` when the grouped kernel runs: that one gives a block to
+        // each (KV head, token). Deciding the split from the ungrouped count
+        // told it there were 1024 blocks where there were 256, so it split not
+        // at all and the grouped kernel ran at 1.4 blocks per SM.
+        let blocks = (Self::flash_grid_heads(dims) * dims.n_tokens) as u32;
+        let want = self.dev.sm_count() * 4;
+        if blocks >= want {
+            // Enough blocks already, so the *split* buys nothing. The fused
+            // kernel does two other things — keeps the score matrix out of HBM
+            // and costs two launches a layer instead of three — and the guess
+            // was that those would pay at any batch. `TUILI_FLASH_WIDE=1`
+            // measures it and they do not: on an A4000, 379 tok/s against 405
+            // at a batch of eight and 730 against 852 at thirty-two; on a
+            // Blackwell RTX PRO 6000, 1057.8 against 1091.9 and 1990.5 against
+            // 3500.0. One block per (head, token) with the scores in global
+            // beats one fused block per (head, token) with them in shared,
+            // because the fused block holds a chunk of scores in shared memory
+            // and that is what caps its occupancy.
+            //
+            // Re-run on Blackwell after `attn_output_v4_f32` cut the unfused
+            // path's weighted sum from 85.6 us to 35.5, on the theory that the
+            // old comparison was against a crippled baseline. It was not the
+            // baseline: the gap widened.
+            //
+            // That is a verdict on *this* fused kernel, not on fusing. vLLM's
+            // `flash_attn_varlen_func` was timed at the same shape — batch 32,
+            // 512 of history, 32 query heads over 8 KV heads of 128 — and takes
+            // 58.1 us against these three kernels' 85.8, which is 1156 GB/s of
+            // KV against 782. So a fused decode attention is worth 0.89 ms a
+            // step here; it is the largest single piece of the remaining gap.
+            // See `scripts/flash_attn_bandwidth.py`.
+            //
+            // Two things are wrong with `attn_flash_f32`, and only one of them
+            // has been fixed. Its K and V loads were two bytes a thread, the
+            // same defect `attn_output_f32` had; widening them took the fused
+            // path from 1990 tok/s to 3180, a 60% gain that confirms the
+            // diagnosis. What remains is that it is not grouped-query aware:
+            // one block per *query* head means 32 blocks read the 8 KV heads,
+            // so K and V each cross the bus four times. The unfused path only
+            // pays that on V, because `attn_scores_gqa_f32` holds a K row for
+            // the whole group — which is exactly why it still wins, 85.8 us
+            // against the fused 108.2 + 9.2. vLLM pays it on neither, and that
+            // is the whole of the 620 GB/s against 1156.
+            //
+            // The grouped kernel was then given the same treatment — eight
+            // halves a thread on both K and V, and the key range split across
+            // the block — and it is *worse*: 184.4 us a layer, against the
+            // ungrouped 108.2 and the unfused 85.8. Grouping divides the grid
+            // by the group as well as the traffic, and one block per (KV head,
+            // token) is 256 blocks on 188 SMs. Four times less KV read does not
+            // pay for one and a half blocks an SM.
+            //
+            // `attn_flash_split` was then taught which kernel it is splitting
+            // for — see `flash_grid_heads` — since it had been reading 1024
+            // blocks where the grouped launch makes 256, and so returning a
+            // single chunk. That is worth 10% (2511 tok/s to 2756) and still
+            // leaves the fused path 21% behind the three kernels.
+            //
+            // Five measured shapes of this kernel, at a batch of 32:
+            //
+            // | fused, ungrouped, 2-byte loads      | 1990 tok/s |
+            // | fused, ungrouped, wide loads        | 3180 |
+            // | fused, grouped, split blind         | 2511 |
+            // | fused, grouped, split aware         | 2756 |
+            // | fused, grouped, K held across group | 2777 |
+            // | fused, grouped, 256-thread block    | 2676 |
+            // | fused, grouped, 512-thread block    | 2380 |
+            // | unfused three kernels               | 3489 |
+            //
+            // The last three are the sharpest. Giving a warp to each *key* and
+            // holding that row across the group — exactly what
+            // `attn_scores_gqa_f32` does, and why the unfused path wins on K —
+            // bought 21 tok/s. Then, on the theory that the score phase was
+            // starved because the block was pinned to `group * 32` threads
+            // while the unfused kernel spreads that phase over the whole grid,
+            // the block was unpinned: wider is *worse*, monotonically. More
+            // warps per block cost more resident blocks per SM than the extra
+            // parallelism is worth, and the softmax phase leaves all but
+            // `group` of them idle anyway.
+            //
+            // Every one of those changes moved the number the way its diagnosis
+            // said it would, and none came close, so what is left is not
+            // another defect in this kernel. The decomposition itself is the
+            // problem: a block pinned to a (head, token, chunk) with its scores
+            // in shared memory. FlashAttention's decode path schedules query
+            // heads, KV heads and key chunks against the machine as one
+            // problem, and matching it means writing that rather than repairing
+            // this. Anyone starting should read `vllm_flash_attn` rather than
+            // this file.
+            //
+            // The gate stays; the switch stays so the result is re-runnable.
+            static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let on = *WIDE
+                .get_or_init(|| std::env::var_os("TUILI_FLASH_WIDE").is_some());
+            return if on {
+                Some((1, (kv_len as u32).next_multiple_of(32).min(MAX_CHUNK)))
+            } else {
+                None
+            };
+        }
+        let want = std::env::var("TUILI_ATTN_WANT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(want);
+        let chunks = want.div_ceil(blocks).clamp(1, 32);
+        // Round the chunk *down* to a warp: rounding up is what collapsed a
+        // six-way split into a four-way one, and the split is the only source
+        // of parallelism this kernel has at a batch of one.
+        let chunk = ((kv_len as u32) / chunks / 32 * 32).clamp(32, MAX_CHUNK);
+        let chunks = (kv_len as u32).div_ceil(chunk).min(32);
+        // A chunk has to cover the range once the count is capped.
+        let chunk = (kv_len as u32).div_ceil(chunks).next_multiple_of(32);
+        Some((chunks, chunk))
+    }
+
+    /// Whether [`Self::attn_flash`] would take this shape.
+    pub fn flash_attention(&self, dims: &AttnDims, kv_len: usize) -> bool {
+        // Read once: this is asked per layer per step, and `std::env::var`
+        // takes the environment lock and allocates every time.
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| !std::env::var("TUILI_NO_FLASH_ATTN").is_ok_and(|v| v != "0"))
+            && self.attn_flash_split(dims, kv_len).is_some()
+    }
+
+    /// The KV cache read at attention's grid and access pattern, and nothing
+    /// else. See the kernel's comment: this is the ceiling both attention
+    /// paths are measured against.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_kv_probe(
+        &self,
+        sink: &mut CudaViewMut<'_, f32>,
+        k_cache: &CudaView<'_, f16>,
+        v_cache: &CudaView<'_, f16>,
+        batch: BatchLayout<'_>,
+        dims: AttnDims,
+        kv_len: usize,
+    ) -> Result<()> {
+        let (n_chunks, chunk) = self.decode_chunks(&dims, kv_len);
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_ops", ops_src(), "attn_kv_probe_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (dims.n_kv_heads as u32, dims.n_tokens as u32, n_chunks),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (stride, kh, dh, ms, kl, ck) = (
+            batch.table_stride as i32,
+            dims.n_kv_heads as i32,
+            dims.d_head as i32,
+            dims.n_slots as i32,
+            kv_len as i32,
+            chunk as i32,
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(sink)
+            .arg(k_cache)
+            .arg(v_cache)
+            .arg(batch.seq_of)
+            .arg(batch.positions)
+            .arg(batch.slot_table)
+            .arg(&stride)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ms)
+            .arg(&kl)
+            .arg(&ck);
+        self.dev
+            .profile()
+            .time("attn_kv_probe", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("attn_kv_probe")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// Whether [`Self::attn_decode`] takes this shape.
+    ///
+    /// It wants a real query group, a `d_head` its lanes divide evenly, and a
+    /// group narrow enough that `group * 32` is a legal block.
+    pub fn decode_attention(&self, dims: &AttnDims) -> bool {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var("TUILI_NO_DECODE_ATTN").is_ok_and(|v| v != "0")) {
+            return false;
+        }
+        let group = dims.n_heads / dims.n_kv_heads.max(1);
+        group > 1
+            && group <= 16
+            && dims.n_heads == group * dims.n_kv_heads
+            && dims.d_head.is_multiple_of(32)
+            && dims.d_head / 32 <= 8
+            && dims.d_head.is_multiple_of(8)
+    }
+
+    /// How the key range is cut up for [`Self::attn_decode`].
+    ///
+    /// The kernel's grid is one block per (KV head, token, chunk), and the
+    /// first two are 256 blocks at Llama-3.1's shape and a batch of 32 — 1.4
+    /// per SM on a 188-SM card. The chunk count is what buys the grid back;
+    /// it costs a partial buffer and a combine pass, which is why it is the
+    /// smallest count that fills the device rather than the largest.
+    fn decode_chunks(&self, dims: &AttnDims, kv_len: usize) -> (u32, u32) {
+        let blocks = (dims.n_kv_heads * dims.n_tokens).max(1) as u32;
+        let want = std::env::var("TUILI_DECODE_WANT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(self.dev.sm_count() * 4);
+        let chunks = want.div_ceil(blocks).clamp(1, 16);
+        // Whole tiles: a chunk shorter than a tile wastes the block it runs in.
+        let chunk = ((kv_len as u32).div_ceil(chunks)).next_multiple_of(32);
+        let chunks = (kv_len as u32).div_ceil(chunk.max(32)).max(1);
+        (chunks, chunk.max(32))
+    }
+
+    /// Scores, softmax and the weighted sum in one pass, with the key range
+    /// tiled through shared memory and the score row kept inside a warp.
+    ///
+    /// See the comment on `attn_decode_gqa_f32`. Replaces `attn_scores` +
+    /// `attn_softmax` + `attn_output` for grouped-query shapes; `partial` is
+    /// [`Self::attn_partial_floats`] long and the combine pass is the fused
+    /// path's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_decode(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        q: &CudaView<'_, f32>,
+        k_cache: &CudaView<'_, f16>,
+        v_cache: &CudaView<'_, f16>,
+        batch: BatchLayout<'_>,
+        dims: AttnDims,
+        kv_len: usize,
+        scale: f32,
+        partial: &mut CudaViewMut<'_, f32>,
+    ) -> Result<()> {
+        anyhow::ensure!(self.decode_attention(&dims), "attn_decode: unsupported shape");
+        let group = dims.n_heads / dims.n_kv_heads;
+        let (n_chunks, chunk) = self.decode_chunks(&dims, kv_len);
+        let ms_off = (32 * dims.n_heads * dims.n_tokens * dims.d_head) as i32;
+        anyhow::ensure!(
+            n_chunks <= 32,
+            "attn_decode: {n_chunks} chunks past the partial buffer's 32"
+        );
+
+        // `TUILI_ATTN_MMA=1` runs the tensor-core decomposition instead; see
+        // `attn_decode_mma_f32`. It wants four warps whatever the group is, a
+        // 64-key tile, and V transposed on the way into shared.
+        static MMA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let mma = *MMA.get_or_init(|| std::env::var("TUILI_ATTN_MMA").as_deref() == Ok("1"))
+            && dims.d_head.is_multiple_of(16)
+            && dims.d_head <= 128
+            && group <= 8;
+        let f = self.dev.kernels().get(
+            "tuili_ops",
+            ops_src(),
+            if mma { "attn_decode_mma_f32" } else { "attn_decode_gqa_f32" },
+        )?;
+        // Query rows, and one 16-key tile each of K and V — or, for the MMA
+        // shape, sixteen f16 query rows, a 64-key tile, and the transposed V.
+        let shared = if mma {
+            (16 * (dims.d_head + 8) * 2 + 64 * (dims.d_head + 8) * 2 + dims.d_head * 66 * 2)
+                as u32
+        } else {
+            (group * dims.d_head * 4 + 2 * 16 * (dims.d_head + 8) * 2) as u32
+        };
+        let single = i32::from(n_chunks == 1);
+        let cfg = LaunchConfig {
+            grid_dim: (dims.n_kv_heads as u32, dims.n_tokens as u32, n_chunks),
+            block_dim: (if mma { 128 } else { group as u32 * 32 }, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let (stride, h, kh, dh, ms, ck, kl, gi) = (
+            batch.table_stride as i32,
+            dims.n_heads as i32,
+            dims.n_kv_heads as i32,
+            dims.d_head as i32,
+            dims.n_slots as i32,
+            chunk as i32,
+            kv_len as i32,
+            group as i32,
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(&mut *partial)
+            .arg(&ms_off)
+            .arg(&mut *out)
+            .arg(&single)
+            .arg(q)
+            .arg(k_cache)
+            .arg(v_cache)
+            .arg(batch.seq_of)
+            .arg(batch.positions)
+            .arg(batch.slot_table)
+            .arg(&stride)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ms)
+            .arg(&scale)
+            .arg(&ck)
+            .arg(&kl)
+            .arg(&gi);
+        self.dev
+            .profile()
+            .time("attn_decode", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("attn_decode")?;
+                Ok(())
+            })?;
+        if single == 1 {
+            return Ok(());
+        }
+
+        let r = self
+            .dev
+            .kernels()
+            .get("tuili_ops", ops_src(), "attn_flash_reduce_f32")?;
+        let part = partial.as_view();
+        let total = (dims.n_tokens * dims.n_heads * dims.d_head) as u32;
+        let (nt, nc) = (dims.n_tokens as i32, n_chunks as i32);
+        let mut rb = self.dev.stream().launch_builder(&r);
+        rb.arg(out)
+            .arg(&part)
+            .arg(&ms_off)
+            .arg(&h)
+            .arg(&dh)
+            .arg(&nt)
+            .arg(&nc);
+        self.dev
+            .profile()
+            .time("attn_decode_reduce", self.dev.stream(), || {
+                unsafe { rb.launch(elementwise(total)) }.context("attn_decode_reduce")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// Scores, softmax and the weighted sum in one pass over the KV range.
+    ///
+    /// Replaces `attn_scores` + `attn_softmax` + `attn_output` for the shapes
+    /// [`Self::flash_attention`] accepts. The score matrix never reaches HBM,
+    /// and a layer's attention costs two launches instead of three — at a batch
+    /// of one, where each of those kernels is latency rather than bandwidth,
+    /// that is most of the cost.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_flash(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        q: &CudaView<'_, f32>,
+        k_cache: &CudaView<'_, f16>,
+        v_cache: &CudaView<'_, f16>,
+        batch: BatchLayout<'_>,
+        dims: AttnDims,
+        kv_len: usize,
+        scale: f32,
+        partial: &mut CudaViewMut<'_, f32>,
+    ) -> Result<()> {
+        let (n_chunks, chunk) = self
+            .attn_flash_split(&dims, kv_len)
+            .context("attn_flash called for a shape it does not take")?;
+        let ms_off = (32 * dims.n_heads * dims.n_tokens * dims.d_head) as i32;
+        // Stack four groups of `d_head` threads when they fit: the value loop
+        // is the kernel's cost, and one group per block leaves the memory
+        // pipeline with too few independent addresses to work on.
+        let lanes = (dims.d_head as u32).next_multiple_of(32).clamp(32, 1024);
+        let subs = std::env::var("TUILI_ATTN_SUBS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(4)
+            .clamp(1, 1024 / lanes.max(1));
+        let block = lanes * subs;
+        let (stride, h, kh, dh, ms, nc, ck) = (
+            batch.table_stride as i32,
+            dims.n_heads as i32,
+            dims.n_kv_heads as i32,
+            dims.d_head as i32,
+            dims.n_slots as i32,
+            n_chunks as i32,
+            chunk as i32,
+        );
+
+        // The grouped variant needs one warp per query head in the group and
+        // one thread per head dimension, and holds the group's accumulators in
+        // a fixed eight registers.
+        let group = dims.n_heads / dims.n_kv_heads.max(1);
+        // The block only has to be wide enough to hold the group's rows and to
+        // divide `d_head / 8` for the value loop; it does *not* have to be
+        // exactly `group * 32`. Pinning it there left four warps to score a
+        // whole chunk of keys — the phase that the unfused `attn_scores_gqa_f32`
+        // spreads over the entire grid — which is what made the fused kernel
+        // slower than the three it replaces.
+        let gqa = std::env::var("TUILI_ATTN_GQA").is_ok_and(|v| v != "0")
+            && group > 1
+            && group <= 8
+            && block >= group as u32 * 32
+            && dims.d_head.is_multiple_of(8)
+            && block.is_multiple_of((dims.d_head / 8) as u32);
+        let f = self.dev.kernels().get(
+            "tuili_ops",
+            ops_src(),
+            if gqa { "attn_flash_gqa_f32" } else { "attn_flash_f32" },
+        )?;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                if gqa { dims.n_kv_heads as u32 } else { dims.n_heads as u32 },
+                dims.n_tokens as u32,
+                n_chunks,
+            ),
+            block_dim: (block, 1, 1),
+            // The scores — one row per query head when grouped — the chunk's
+            // slot indices, and the per-group partial sums.
+            shared_mem_bytes: if gqa {
+                // A weight row per query head, the chunk's slots, and the
+                // value reduction — `block * 8` floats, as below.
+                chunk * 4 * (group as u32 + 1) + block * 8 * 4
+            } else {
+                // The value loop gives each thread eight halves, so the block
+                // covers `blockDim.x / (d_head / 8)` slices of the key range
+                // and the reduction holds that many rows of `d_head` — which
+                // is `block * 8` floats however `d_head` divides up.
+                chunk * 8 + block * 8 * 4
+            },
+        };
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(&mut *partial)
+            .arg(&ms_off)
+            .arg(q)
+            .arg(k_cache)
+            .arg(v_cache)
+            .arg(batch.seq_of)
+            .arg(batch.positions)
+            .arg(batch.slot_table)
+            .arg(&stride)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ms)
+            .arg(&scale)
+            .arg(&ck);
+        self.dev
+            .profile()
+            .time("attn_flash", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("attn_flash")?;
+                Ok(())
+            })?;
+
+        let r = self
+            .dev
+            .kernels()
+            .get("tuili_ops", ops_src(), "attn_flash_reduce_f32")?;
+        let part = partial.as_view();
+        let total = (dims.n_tokens * dims.n_heads * dims.d_head) as u32;
+        let nt = dims.n_tokens as i32;
+        let mut rb = self.dev.stream().launch_builder(&r);
+        rb.arg(out)
+            .arg(&part)
+            .arg(&ms_off)
+            .arg(&h)
+            .arg(&dh)
+            .arg(&nt)
+            .arg(&nc);
+        self.dev
+            .profile()
+            .time("attn_flash_reduce", self.dev.stream(), || {
+                unsafe { rb.launch(elementwise(total)) }.context("attn_flash_reduce")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_output(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        scores: &CudaView<'_, f32>,
+        v_cache: &CudaView<'_, f16>,
+        batch: BatchLayout<'_>,
+        dims: AttnDims,
+        kv_len: usize,
+        partial: Option<&mut CudaViewMut<'_, f32>>,
+    ) -> Result<()> {
+        let (stride, h, kh, dh, ms, kl) = (
+            batch.table_stride as i32,
+            dims.n_heads as i32,
+            dims.n_kv_heads as i32,
+            dims.d_head as i32,
+            dims.n_slots as i32,
+            kv_len as i32,
+        );
+        let block = (dims.d_head as u32).next_multiple_of(32).min(1024);
+        let (n_chunks, chunk) = match partial {
+            Some(_) => self.attn_chunks(&dims, kv_len),
+            None => (0, 0),
+        };
+
+        if n_chunks >= 2 {
+            let part = partial.unwrap();
+            // Read each V row once for the whole query group when the group is
+            // real and small enough to hold running sums for. The split is
+            // what makes this affordable: on its own the grouped kernel is a
+            // quarter of the grid, which is why the unsplit one below is off.
+            let group = dims.n_heads / dims.n_kv_heads.max(1);
+            let gqa = group > 1 && group <= 8;
+            let f = self.dev.kernels().get(
+                "tuili_ops",
+                ops_src(),
+                if gqa {
+                    "attn_output_gqa_split_f32"
+                } else {
+                    "attn_output_split_f32"
+                },
+            )?;
+            let cfg = LaunchConfig {
+                grid_dim: (
+                    if gqa {
+                        dims.n_kv_heads as u32
+                    } else {
+                        dims.n_heads as u32
+                    },
+                    dims.n_tokens as u32,
+                    n_chunks,
+                ),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let (nc, ck, gi) = (n_chunks as i32, chunk as i32, group as i32);
+            let mut b = self.dev.stream().launch_builder(&f);
+            b.arg(&mut *part)
+                .arg(scores)
+                .arg(v_cache)
+                .arg(batch.seq_of)
+                .arg(batch.positions)
+                .arg(batch.slot_table)
+                .arg(&stride)
+                .arg(&h)
+                .arg(&kh)
+                .arg(&dh)
+                .arg(&ms)
+                .arg(&kl)
+                .arg(&nc)
+                .arg(&ck);
+            if gqa {
+                b.arg(&gi);
+            }
+            self.dev
+                .profile()
+                .time("attn_output", self.dev.stream(), || {
+                    unsafe { b.launch(cfg) }.context("attn_output_split")?;
+                    Ok(())
+                })?;
+
+            let part_view = part.as_view();
+            let r = self
+                .dev
+                .kernels()
+                .get("tuili_ops", ops_src(), "attn_output_reduce_f32")?;
+            let total = (dims.n_tokens * dims.n_heads * dims.d_head) as u32;
+            let (nt, ncr) = (dims.n_tokens as i32, n_chunks as i32);
+            let mut rb = self.dev.stream().launch_builder(&r);
+            rb.arg(out)
+                .arg(&part_view)
+                .arg(&h)
+                .arg(&dh)
+                .arg(&nt)
+                .arg(&ncr);
+            self.dev
+                .profile()
+                .time("attn_reduce", self.dev.stream(), || {
+                    unsafe { rb.launch(elementwise(total)) }.context("attn_reduce")?;
+                    Ok(())
+                })?;
+            return Ok(());
+        }
+
+        // Grouping the query heads that share a V row is a loss here, unlike on
+        // the score side. It cuts V traffic fourfold and the grid with it — from
+        // 1024 blocks to 256 at a batch of 32 — and the parallelism is worth
+        // more: 68.0 ms per step against 64.7. The score kernel keeps its `j`
+        // dimension when it groups, so it does not pay that.
+        let gqa = false;
+        let group_i = 0i32;
+        // Eight halves per thread and sixteen key slices per block, which is a
+        // load width and a count of loads in flight rather than a different
+        // sum. `TUILI_ATTN_V1` puts the two-byte version back for A/B.
+        let wide = dims.d_head.is_multiple_of(8)
+            && dims.d_head >= 8
+            && std::env::var_os("TUILI_ATTN_V1").is_none();
+        let (lanes, slices) = if wide {
+            let l = dims.d_head / 8;
+            // A power of two, so the reduction across slices is a clean tree.
+            (l as u32, (256 / l.max(1)).max(1).next_power_of_two() as u32)
+        } else {
+            (0, 0)
+        };
+        let f = self.dev.kernels().get(
+            "tuili_ops",
+            ops_src(),
+            match (wide, gqa) {
+                (true, _) => "attn_output_v4_f32",
+                (false, true) => "attn_output_gqa_f32",
+                (false, false) => "attn_output_f32",
+            },
+        )?;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                if gqa { dims.n_kv_heads as u32 } else { dims.n_heads as u32 },
+                dims.n_tokens as u32,
+                1,
+            ),
+            block_dim: (if wide { lanes * slices } else { block }, 1, 1),
+            shared_mem_bytes: if wide {
+                slices * dims.d_head as u32 * 4
+            } else {
+                0
+            },
+        };
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out)
+            .arg(scores)
+            .arg(v_cache)
+            .arg(batch.seq_of)
+            .arg(batch.positions)
+            .arg(batch.slot_table)
+            .arg(&stride)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ms)
+            .arg(&kl);
+        if gqa {
+            b.arg(&group_i);
+        }
+        self.dev
+            .profile()
+            .time("attn_output", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("attn_output")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    // ---- weights --------------------------------------------------------
+
+    /// `out[t, :] = dequant(w[rows[t], :])`, the embedding lookup.
+    pub fn gather_rows(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        w: &CudaView<'_, u8>,
+        ty: WeightType,
+        rows: &CudaView<'_, i32>,
+        n_tokens: usize,
+        k: usize,
+    ) -> Result<()> {
+        let name = format!("gather_rows_{}", ty.suffix());
+        let f = self.dev.kernels().get("tuili_quant", quant_src(), &name)?;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (k as u32).div_ceil(ELEMENTWISE_BLOCK).max(1),
+                n_tokens as u32,
+                1,
+            ),
+            block_dim: (ELEMENTWISE_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let k_i = k as i32;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(w).arg(rows).arg(&k_i);
+        self.dev
+            .profile()
+            .time("gather_rows", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("gather_rows")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// Decode a whole weight matrix into f16, for the cuBLAS prefill path.
+    pub fn dequant_to_f16(
+        &self,
+        out: &mut CudaViewMut<'_, f16>,
+        w: &CudaView<'_, u8>,
+        ty: WeightType,
+        n_elements: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            out.len() >= n_elements,
+            "dequant scratch holds {} elements, need {n_elements}",
+            out.len()
+        );
+        let name = format!("dequant_{}_f16", ty.suffix());
+        let f = self.dev.kernels().get("tuili_quant", quant_src(), &name)?;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (n_elements as u64).div_ceil(ELEMENTWISE_BLOCK as u64) as u32,
+                1,
+                1,
+            ),
+            block_dim: (ELEMENTWISE_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n = n_elements as u64;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(w).arg(&n);
+        self.dev
+            .profile()
+            .time("dequant_to_f16", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("dequant_to_f16")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// Bytes a `k`-element row occupies once quantized to Q8_1.
+    pub fn q8_1_bytes(k: usize) -> usize {
+        k.div_ceil(32) * Q8_1_BLOCK_BYTES
+    }
+
+    /// Whether the integer mat-vec has a dot product for this encoding.
+    ///
+    /// The rest still go through the float path; adding one is a matter of
+    /// porting its `vec_dot_*_q8_1` from llama.cpp.
+    pub fn has_mmvq(ty: WeightType) -> bool {
+        matches!(
+            ty,
+            WeightType::Q8_0
+                | WeightType::Q4K
+                | WeightType::Q6K
+                | WeightType::Q4G128
+                | WeightType::Q4G128T
+        )
+    }
+
+    /// Quantize one activation row to Q8_1, the form the integer mat-vec wants.
+    pub fn quantize_q8_1(
+        &self,
+        out: &mut CudaViewMut<'_, u8>,
+        x: &CudaView<'_, f32>,
+        k: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            k.is_multiple_of(32),
+            "Q8_1 needs a multiple of 32 elements, got {k}"
+        );
+        anyhow::ensure!(
+            out.len() >= Self::q8_1_bytes(k),
+            "q8_1 buffer holds {} bytes, need {}",
+            out.len(),
+            Self::q8_1_bytes(k)
+        );
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_mmvq", mmvq_src(), "quantize_q8_1_f32")?;
+        let k_i = k as i32;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(x).arg(&k_i);
+        self.dev
+            .profile()
+            .time("quantize_q8_1", self.dev.stream(), || {
+                unsafe { b.launch(elementwise(k as u32)) }.context("quantize_q8_1")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// Tokens one multi-token mat-vec block serves. Chosen per call.
+    fn mmvq_t(n_tokens: usize) -> u32 {
+        match n_tokens {
+            0..=1 => 1,
+            2..=3 => 2,
+            4..=7 => 4,
+            8..=15 => 8,
+            _ => 16,
+        }
+    }
+
+    /// `out[t, r] = dot(w[r, :], x[t, :])`, streaming each weight once and
+    /// spending it on `T` tokens.
+    ///
+    /// The single-token mat-vec reaches 93% of this card's streaming-read
+    /// ceiling because it never stages weights through shared memory. This
+    /// keeps that property and amortizes the read across a batch, which is the
+    /// thing the tensor-core GEMM was supposed to do and does at a quarter of
+    /// the rate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mmvq_batch(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        w: &CudaView<'_, u8>,
+        ty: WeightType,
+        x_q8_1: &CudaView<'_, u8>,
+        k: usize,
+        n: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(Self::has_mmvq(ty), "no integer mat-vec for {ty}");
+        let t = Self::mmvq_t(n_tokens);
+        let name = format!("mmvqt{t}_{}", ty.suffix());
+        let f = self.dev.kernels().get("tuili_mmvq", mmvq_src(), &name)?;
+        let slices = match ty {
+            WeightType::Q8_0 => k / 8,
+            WeightType::Q4K => k / 16,
+            WeightType::Q6K => k / 8,
+            // One 32-weight quarter of a group per thread.
+            WeightType::Q4G128 | WeightType::Q4G128T => k / 32,
+            _ => unreachable!("guarded above"),
+        };
+        let block = (slices as u32).next_multiple_of(32).clamp(32, REDUCE_BLOCK);
+        let cfg = LaunchConfig {
+            grid_dim: (n as u32, (n_tokens as u32).div_ceil(t), 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (k_i, n_i, t_i) = (k as i32, n as i32, n_tokens as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(w).arg(x_q8_1).arg(&k_i).arg(&n_i).arg(&t_i);
+        self.dev.profile().time("mmvq_batch", self.dev.stream(), || {
+            unsafe { b.launch(cfg) }.context("mmvq_batch")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// RMS norm that also writes its output as f16.
+    ///
+    /// The counterpart of [`Self::rms_norm_q8_1`] for the f16-operand GEMM,
+    /// which is the Q4_G128 default. Saves the separate `to_f16` launch and
+    /// its re-read, and stops producing a Q8_1 buffer nothing reads.
+    #[allow(clippy::too_many_arguments)]
+    /// [`Self::rms_norm_f16`] with the residual add that always precedes it.
+    ///
+    /// `x` is updated in place: it is the residual stream, and the next
+    /// sublayer adds to it. See the kernel's comment for what the fusion saves.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_rms_norm_f16(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        h_out: &mut CudaViewMut<'_, f16>,
+        x: &mut CudaViewMut<'_, f32>,
+        b: &CudaView<'_, f32>,
+        weight: &CudaView<'_, f32>,
+        n_tokens: usize,
+        d: usize,
+        eps: f32,
+    ) -> Result<()> {
+        let block = (d as u32).div_ceil(RMS_REGS).next_multiple_of(32).clamp(32, 1024);
+        anyhow::ensure!(
+            (block as usize) * (RMS_REGS as usize) >= d,
+            "fused norm needs d <= 1024 * {RMS_REGS}, got {d}"
+        );
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_mmvq", mmvq_src(), "add_rms_norm_f16_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_tokens as u32, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (d_i, eps_f) = (d as i32, eps);
+        let mut bl = self.dev.stream().launch_builder(&f);
+        bl.arg(out)
+            .arg(h_out)
+            .arg(&mut *x)
+            .arg(b)
+            .arg(weight)
+            .arg(&d_i)
+            .arg(&eps_f);
+        self.dev
+            .profile()
+            .time("add_rms_norm_f16", self.dev.stream(), || {
+                unsafe { bl.launch(cfg) }.context("add_rms_norm_f16")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    pub fn rms_norm_f16(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        h_out: &mut CudaViewMut<'_, f16>,
+        x: &CudaView<'_, f32>,
+        weight: &CudaView<'_, f32>,
+        n_tokens: usize,
+        d: usize,
+        eps: f32,
+    ) -> Result<()> {
+        let block = (d as u32).div_ceil(RMS_REGS).next_multiple_of(32).clamp(32, 1024);
+        anyhow::ensure!(
+            (block as usize) * (RMS_REGS as usize) >= d,
+            "fused norm needs d <= 1024 * {RMS_REGS}, got {d}"
+        );
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_mmvq", mmvq_src(), "rms_norm_f16_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_tokens as u32, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (d_i, eps_f) = (d as i32, eps);
+        b_args(self, &f, cfg, out, h_out, x, weight, d_i, eps_f)
+    }
+
+    /// RMS norm that also writes its output's Q8_1 form.
+    ///
+    /// Saves the separate `quantize_q8_1` launch and its re-read of the
+    /// normalized vector. `d` must be a multiple of 32, which every model
+    /// dimension is.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rms_norm_q8_1(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        q_out: &mut CudaViewMut<'_, u8>,
+        x: &CudaView<'_, f32>,
+        weight: &CudaView<'_, f32>,
+        n_tokens: usize,
+        d: usize,
+        eps: f32,
+    ) -> Result<()> {
+        anyhow::ensure!(d.is_multiple_of(32), "fused norm needs d % 32 == 0");
+        // The kernel holds its row in `RMS_REGS` registers per thread, so the
+        // block has to be wide enough to cover `d` — and no wider, or the tail
+        // threads sit idle through the reduction.
+        let block = (d as u32).div_ceil(RMS_REGS).next_multiple_of(32).clamp(32, 1024);
+        anyhow::ensure!(
+            (block as usize) * (RMS_REGS as usize) >= d,
+            "fused norm needs d <= 1024 * {RMS_REGS}, got {d}"
+        );
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_mmvq", mmvq_src(), "rms_norm_q8_1_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_tokens as u32, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (d_i, eps_f) = (d as i32, eps);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(q_out).arg(x).arg(weight).arg(&d_i).arg(&eps_f);
+        self.dev
+            .profile()
+            .time("rms_norm_q8_1", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("rms_norm_q8_1")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// `out[r] = dot(w[r, :], x)` with both sides held as integers.
+    ///
+    /// `x_q8_1` must be the activation row already through
+    /// [`Kernels::quantize_q8_1`]. Single row only — above that the answer is a
+    /// tensor-core GEMM rather than a wider mat-vec.
+    /// Which weight types have a tensor-core GEMM.
+    ///
+    /// The K-quants plus Q8_0. The legacy block-32 types are absent because a
+    /// Q4_K_M build only falls back to them for awkward row lengths, which the
+    /// shape check rejects anyway.
+    pub fn has_mmq(ty: WeightType) -> bool {
+        matches!(
+            ty,
+            WeightType::Q8_0
+                | WeightType::Q4K
+                | WeightType::Q6K
+                | WeightType::Q4G128
+                | WeightType::Q4G128T
+        )
+    }
+
+    /// `out[t, r] = dot(w[r, :], x[t, :])` on the integer tensor cores.
+    ///
+    /// Needs `x` pre-quantized by [`Self::quantize_q8_1`] and an Ampere or
+    /// newer device. Reads each weight once for a whole 16-token tile, which is
+    /// what separates it from [`Self::mmvq`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn mmq(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        w: &CudaView<'_, u8>,
+        ty: WeightType,
+        x_q8_1: &CudaView<'_, u8>,
+        k: usize,
+        n: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(Self::has_mmq(ty), "no tensor-core gemm for {ty}");
+        anyhow::ensure!(
+            self.dev.arch() >= 80,
+            "mmq needs sm_80 or newer, device is sm_{}",
+            self.dev.arch()
+        );
+        anyhow::ensure!(k.is_multiple_of(32), "mmq needs k divisible by 32, got {k}");
+        if matches!(ty, WeightType::Q4K | WeightType::Q6K) {
+            anyhow::ensure!(
+                k.is_multiple_of(256),
+                "mmq {ty} needs k divisible by 256, got {k}"
+            );
+        }
+        // The direct-B pipeline reads its weight fragments straight from
+        // global instead of expanding every nibble into a shared int8 tile;
+        // see `mmq.cu`. Only Q4_G128 has one, whose layout puts a fragment in
+        // a single contiguous sector.
+        if ty == WeightType::Q4G128T {
+            // One kernel reads this layout, and it is the one the layout was
+            // made for. `TUILI_MMQ_VARIANT` still selects a shape.
+            let v = match std::env::var("TUILI_MMQ_VARIANT") {
+                Ok(s)
+                    if s.starts_with("mmqz")
+                        || s.starts_with("mmqy")
+                        || s.starts_with("mmqc") =>
+                {
+                    Box::leak(s.into_boxed_str())
+                }
+                _ => "mmqy1w8s2",
+            };
+            return self.mmq_variant(v, out, w, ty, x_q8_1, k, n, n_tokens);
+        }
+        let variant = if ty != WeightType::Q4G128 {
+            "mmq"
+        } else {
+            // `mmqp` is the epilogue probe: right pipeline, wrong answer. It
+            // prices the per-group scale application and nothing else.
+            match std::env::var("TUILI_MMQ_VARIANT").as_deref() {
+                Ok("staged") => "mmq",
+                Ok("probe") => "mmqp",
+                Ok("direct") => "mmqd",
+                Ok("striped") => "mmqs",
+                // `mmqx<nblk>w<warps>` picks a wide-tile shape by name, and
+                // `mmqa<nblk>w<warps>s<stages>` the same tile behind a
+                // `cp.async` ring buffer.
+                Ok(v)
+                    if v.starts_with("mmqx")
+                        || v.starts_with("mmqa")
+                        || v.starts_with("mmqr")
+                        || v.starts_with("mmqsr")
+                        || v.starts_with("mmqb")
+                        || v.starts_with("mmql") =>
+                {
+                    Box::leak(v.to_string().into_boxed_str())
+                }
+                _ => "mmqd",
+            }
+        };
+        self.mmq_variant(variant, out, w, ty, x_q8_1, k, n, n_tokens)
+    }
+
+    /// [`Self::mmq`] with the kernel name spelled out, for the attribution
+    /// probes in `mmq.cu`. `variant` is `"mmq"`, `"mmq_stage_only"` or
+    /// `"mmq_mma_only"`; the last two compute nothing usable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mmq_variant(
+        &self,
+        variant: &str,
+        out: &mut CudaViewMut<'_, f32>,
+        w: &CudaView<'_, u8>,
+        ty: WeightType,
+        x_q8_1: &CudaView<'_, u8>,
+        k: usize,
+        n: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        // Four token tiles exist only for the f16 shapes; every other family is
+        // instantiated at one and two, and the Q8_0 vocab projection goes
+        // through one of them.
+        let tiles = if (variant.starts_with("mmqf") && !variant.starts_with("mmqfp"))
+            || variant.starts_with("mmqg")
+            || variant.starts_with("mmqz")
+            || variant.starts_with("mmqy")
+            || variant.starts_with("mmqk")
+            || variant.starts_with("mmqc")
+            || variant.starts_with("mmqe")
+        {
+            Self::mmq_tiles(n_tokens)
+        } else {
+            Self::mmq_tiles(n_tokens).min(2)
+        };
+        // A wide-tile name carries its own shape: `<nblk>w<warps>`, and the
+        // `cp.async` variant appends `s<stages>`, which only the kernel needs.
+        // `mmqsr` before `mmqs`, which is an exact name rather than a prefix.
+        let wide_named = ["mmqsr", "mmqx", "mmqa", "mmqr", "mmqfp", "mmqf", "mmqg", "mmqzg", "mmqz", "mmqy", "mmqk", "mmqc", "mmqm", "mmqnm", "mmqnx", "mmqnh", "mmqnr", "mmqe", "mmqb", "mmql", "mmqna", "mmqne"]
+            .iter()
+            .find_map(|p| variant.strip_prefix(p).map(|shape| (*p, shape)));
+        let wide_shape = wide_named.map(|(_, shape)| shape);
+        let wide = wide_shape.map(|shape| {
+            let (nblk, rest) = shape
+                .split_once('w')
+                .expect("wide-tile name needs <nblk>w<warps>");
+            let warps = rest.split_once('s').map_or(rest, |(w, _)| w);
+            (
+                nblk.parse::<u32>().expect("nblk"),
+                warps.parse::<u32>().expect("warps"),
+            )
+        });
+        if variant.starts_with("mmqe")
+            || variant.starts_with("mmqa")
+            || variant.starts_with("mmqr")
+            || variant.starts_with("mmqsr")
+            || variant.starts_with("mmqb")
+            || variant.starts_with("mmql")
+            || variant.starts_with("mmqn")
+        {
+            // A tile row is 288 bytes of `block_q8_1` and `cp.async.cg` copies
+            // 16 at a time, so the row stride `(k / 32) * 36` has to be a
+            // multiple of 16 for the source addresses to be aligned at all.
+            anyhow::ensure!(
+                k.is_multiple_of(128),
+                "{variant} needs k divisible by 128, got {k}"
+            );
+        }
+        let warps = match (variant, wide) {
+            (_, Some((_, w))) => w,
+            ("mmq", _) => self.mmq_warps(n, n_tokens),
+            _ => MMQ_MAX_ROWS / 8,
+        };
+        let rows_per_block = wide.map_or(warps * 8, |(nblk, w)| nblk * w * 8);
+        let name = if variant == "mmq" {
+            self.mmq_kernel_name(ty, n, n_tokens)
+        } else if let Some((prefix, shape)) = wide_named {
+            // The wide-tile kernels are named by their own shape rather than
+            // derived from `mmq_kernel_name`: the rows a block covers is
+            // warps * nblk * 8, and the token tiles are part of the name too,
+            // so the launch grid and the kernel agree on both.
+            let t = match tiles {
+                4 => "_4",
+                2 => "_2",
+                _ => "",
+            };
+            // The f16 families are instantiated once, under the packed type's
+            // suffix; which layout they read is the kernel's business, not the
+            // name's.
+            let suffix = if ty == WeightType::Q4G128T {
+                "q4_g128"
+            } else {
+                ty.suffix()
+            };
+            format!("{prefix}{shape}{t}_{suffix}")
+        } else if variant == "mmqs" {
+            format!("mmqs{}", self.mmq_kernel_name(ty, n, n_tokens).trim_start_matches("mmq"))
+        } else if variant == "mmqp" {
+            format!("mmqp{}", self.mmq_kernel_name(ty, n, n_tokens).trim_start_matches("mmq"))
+        } else if variant == "mmqd" {
+            format!("mmqd{}", self.mmq_kernel_name(ty, n, n_tokens).trim_start_matches("mmq"))
+        } else {
+            format!("{variant}_{}", ty.suffix())
+        };
+        if variant == "mmq2r" {
+            let f = self
+                .dev
+                .kernels()
+                .get("tuili_mmq", mmq_src(), "mmq2r_q4_K")?;
+            let cfg = LaunchConfig {
+                grid_dim: ((n as u32).div_ceil(128), (n_tokens as u32).div_ceil(16), 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let (k_i, n_i, t_i) = (k as i32, n as i32, n_tokens as i32);
+            let mut b = self.dev.stream().launch_builder(&f);
+            b.arg(out).arg(w).arg(x_q8_1).arg(&k_i).arg(&n_i).arg(&t_i);
+            self.dev.profile().time("mmq2r", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("mmq2r")?;
+                Ok(())
+            })?;
+            return Ok(());
+        }
+
+        if variant == "mmq_readonly" {
+            let f = self
+                .dev
+                .kernels()
+                .get("tuili_mmq", mmq_src(), "mmq_readonly_q4_K")?;
+            let cfg = LaunchConfig {
+                grid_dim: ((n as u32).div_ceil(64), 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let (k_i, n_i, t_i) = (k as i32, n as i32, n_tokens as i32);
+            let mut b = self.dev.stream().launch_builder(&f);
+            b.arg(out).arg(w).arg(x_q8_1).arg(&k_i).arg(&n_i).arg(&t_i);
+            unsafe { b.launch(cfg) }.context("mmq_readonly")?;
+            return Ok(());
+        }
+
+        // The weights-in-A variant has a fixed 64-row, 32-token tile.
+        if variant == "mmqw" {
+            let f = self
+                .dev
+                .kernels()
+                .get("tuili_mmq", mmq_src(), &format!("mmqw_{}", ty.suffix()))?;
+            let cfg = LaunchConfig {
+                grid_dim: (
+                    (n as u32).div_ceil(64),
+                    (n_tokens as u32).div_ceil(32),
+                    1,
+                ),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let (k_i, n_i, t_i) = (k as i32, n as i32, n_tokens as i32);
+            let mut b = self.dev.stream().launch_builder(&f);
+            b.arg(out).arg(w).arg(x_q8_1).arg(&k_i).arg(&n_i).arg(&t_i);
+            self.dev.profile().time("mmqw", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("mmqw")?;
+                Ok(())
+            })?;
+            return Ok(());
+        }
+        let per_block = if variant == "mmq" || wide.is_some() {
+            tiles * MMQ_M
+        } else {
+            MMQ_M
+        };
+        // Split k when the row grid alone leaves the device idle. Only the
+        // direct Q4_G128 kernel reads `gridDim.z`; everything else launches
+        // with one slice and stores rather than accumulates.
+        let blocks = (n as u32).div_ceil(rows_per_block) * (n_tokens as u32).div_ceil(per_block);
+        let splits = if variant == "mmqd" {
+            // Aim well past one block per SM. The row grid alone gives 64
+            // blocks for a 4096-row projection — 1.3 per SM — and measured
+            // against that, splitting k sixteen ways is worth 18% at eight
+            // tokens and 17% at sixteen. Three ways, which is what targeting
+            // `sm_count * 4` produced, was worth nothing: the device wants
+            // enough concurrent blocks to hide the weight loads, not merely
+            // enough to be busy.
+            let want = self.dev.sm_count() * 16;
+            let tiles_k = (k as u32).div_ceil(256).max(1);
+            Self::mmq_splits()
+                .unwrap_or_else(|| want.div_ceil(blocks.max(1)).clamp(1, 16))
+                .min(tiles_k)
+        } else {
+            1
+        };
+        // The striped schedule sizes its grid from the device rather than the
+        // matrix and partitions the flattened (row group, k chunk) list across
+        // it. Runs that straddle a row-group boundary accumulate, so `out` has
+        // to start at zero — but only the boundaries do, which is the whole
+        // difference from splitting every slice.
+        // The f16 kernels carry the striped partition inside them, and their
+        // activation ring is `extern __shared__` — 8.5 KB a stage a token tile,
+        // which is past the static cap at four stages and two tiles.
+        let f16 = (variant.starts_with("mmqf") && !variant.starts_with("mmqfp"))
+            || variant.starts_with("mmqg")
+            || variant.starts_with("mmqz")
+            || variant.starts_with("mmqy")
+            || variant.starts_with("mmqk")
+            || variant.starts_with("mmqc")
+            || variant.starts_with("mmqm")
+            || variant.starts_with("mmqnm")
+            || variant.starts_with("mmqnx")
+            || variant.starts_with("mmqnh")
+            || variant.starts_with("mmqnr");
+        // `mmqe_*` takes Q8_1 activations but stages them in the same
+        // `extern __shared__` ring, so it needs the request too — at the
+        // narrower stride, which is the point of it.
+        let e8 = variant.starts_with("mmqe");
+        let dyn_shared = if f16 || e8 {
+            // The digits after the first `s`, and only those: a name may carry
+            // further suffixes (`...s2x2`) that are not the stage count.
+            let stages: u32 = wide_shape
+                .and_then(|s| s.split_once('s'))
+                .and_then(|(_, st)| {
+                    let digits: String = st.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    digits.parse().ok()
+                })
+                .expect("mmqf name needs s<stages>");
+            let stride = if variant.starts_with("mmqk") {
+                MMQ_XK_STRIDE
+            } else if e8 {
+                MMQ_XA_STRIDE
+            } else if variant.starts_with("mmqm") {
+                MMQ_XL_STRIDE
+            } else {
+                MMQ_XF_STRIDE
+            };
+            let rows = if variant.starts_with("mmqnr") { tiles * 8 } else { tiles * 16 };
+            let rows = if variant.starts_with("mmqg") { 16 } else { rows };
+            let act = stages * rows * stride;
+            if variant.starts_with("mmqc") {
+                // Plus the weight ring: two 128-blocks a k-tile, `mrows` rows
+                // of an 80-byte padded stride. See `MMQ_BSH_STRIDE`.
+                act + stages * 2 * rows_per_block * 80
+            } else {
+                act
+            }
+        } else {
+            0
+        };
+        let striped =
+            variant == "mmqs" || variant.starts_with("mmqsr")
+                || variant.starts_with("mmqb")
+                || variant.starts_with("mmql")
+                || variant.starts_with("mmqn")
+                || f16;
+        let stripe_blocks = if striped {
+            // `mmqs`'s 4 was measured on its own shape. `mmqsr` is the same
+            // partition around the register-pipelined loop, and 4 happens to be
+            // the *worst* point in its sweep — see the table in `mmq.cu`. The
+            // two ends of that sweep want opposite numbers, and the split is
+            // the token-tile count: at one tile a block holds half the
+            // arithmetic and wants twice the blocks.
+            let default_bps = if f16 || e8 {
+                // Swept for this kernel rather than inherited: it holds eight
+                // warps to `mmql_*`'s four and twice the shared memory a
+                // stage, so it wants a shorter grid at both tile counts.
+                // Interleaved three ways against the numbers below, the
+                // ordering held every round — 334 GB/s against 305 at one
+                // token tile, 220 against 211 at two.
+                //
+                // Two, not four, since the weight prefetch landed. The prefetch
+                // gives a block a k-tile of weights in flight while it computes
+                // the tile before it, so a block covering more of the flattened
+                // partition now amortizes what it used to only lengthen — and
+                // the optimum moved with it. A step's matmuls, twenty steps,
+                // the same binary, two runs each: **91.15 ms at two against
+                // 96.39 at four**, and 94.27 at one. It wins at every batch
+                // width — 80.8 against 82.0 at eight tokens, 82.0 against 83.8
+                // at sixteen — and the runs are reproducible to 0.01 ms, which
+                // is what makes a 5.4% difference readable at all here.
+                //
+                // The curve is still not monotonic at the low end (three
+                // measures 100.1, worse than either side of it) and nothing
+                // here explains that; it stays a measurement.
+                if tiles == 2 { 2 } else { 24 }
+            } else if variant.starts_with("mmqsr")
+                || variant.starts_with("mmqb")
+                || variant.starts_with("mmql")
+                || variant.starts_with("mmqn")
+            {
+                if tiles == 2 { 8 } else { 48 }
+            } else {
+                4
+            };
+            let bps = std::env::var("TUILI_MMQ_BPS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(default_bps);
+            let want = self.dev.sm_count() * bps;
+            let n_tiles = (n as u32).div_ceil(rows_per_block);
+            let k_tiles = (k as u32).div_ceil(256).max(1);
+            let total = n_tiles * k_tiles;
+            // One whole row group a block, when there are enough row groups to
+            // fill the device with them.
+            //
+            // The partition's runs straddle row-group boundaries, and a
+            // straddling run cannot store — it has to `atomicAdd`, which is a
+            // read-modify-write of the output and needs that output zeroed
+            // first. Both costs are invisible in a kernel profile: the memsets
+            // are 128 a step and 170 MB, and every one of `gate_up`'s 917k
+            // outputs is accumulated rather than stored, because `iters` is 10
+            // against a `k_tiles` of 16 and so *no* row group comes out whole.
+            //
+            // Sizing the grid to the row groups instead makes `iters` exactly
+            // `k_tiles`, every run whole, every output a store — no atomics and
+            // no memset.
+            //
+            // **And it loses**, by 15%: a step's matmuls take 111.9 ms against
+            // 97.3 with `gate_up` down from 752 blocks to 224. The atomics and
+            // the memset together are worth less than the block count they buy,
+            // which is the same trade every other row-tile experiment on this
+            // kernel has made and lost. Off by default; `TUILI_MMQ_ALIGNED=1`
+            // re-runs it.
+            let aligned = std::env::var("TUILI_MMQ_ALIGNED").is_ok_and(|v| v == "1")
+                && n_tiles >= self.dev.sm_count()
+                && n_tokens <= per_block as usize;
+            // Never hand a block fewer than two of the flattened units. At the
+            // old ceiling of `total` every row group is split into `k_tiles`
+            // pieces and every output goes through `atomicAdd`, which is what
+            // the partition exists to avoid — and on the narrow matrices that
+            // is exactly what a device-sized grid asks for. `attn_k` is 16 row
+            // groups by 16 k chunks, so `sm_count * 24` clamps to 256 and
+            // `iters` lands at 1.
+            //
+            // Measured in GB/s of weights at eight tokens, this rule against
+            // the ceiling it replaces: `attn_k` 161 -> 186, `attn_q` 238 ->
+            // 259, `ffn_gate` unchanged at 334 because its grid was never the
+            // binding term. Fitting a constant per shape does better still —
+            // 187 and 285 — and is overfitting to three matrices.
+            // `TUILI_MMQ_BLOCKS` pins the count, for testing whether the
+            // partition's *balance* matters rather than its size. At 376 blocks
+            // `gate_up`'s 3584 units come out 9.53 to a block — so some get ten
+            // and some nine — and 376 blocks over 188 SMs holding 2.9 each is
+            // 0.69 of a wave, which exposes that 10% in full instead of
+            // averaging it away. A count that divides the units evenly would
+            // not. It is also what the non-monotonic bps sweep looks like.
+            if let Some(b) = std::env::var("TUILI_MMQ_BLOCKS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+            {
+                b.clamp(1, total.max(1))
+            } else if aligned {
+                n_tiles
+            } else {
+                want.clamp(1, (total / 2).max(1))
+            }
+        } else {
+            0
+        };
+        // A run that covers a whole row group stores; only a straddling one
+        // accumulates, and only that needs the output zeroed first.
+        let accumulates = splits > 1
+            || (striped && stripe_blocks * (k as u32).div_ceil(256).max(1) != {
+                let n_tiles = (n as u32).div_ceil(rows_per_block);
+                n_tiles * (k as u32).div_ceil(256).max(1)
+            });
+        if accumulates {
+            // The slices accumulate into `out`, so it has to start at zero.
+            self.dev.stream().memset_zeros(out)?;
+        }
+        let f = self.dev.kernels().get("tuili_mmq", mmq_src(), &name)?;
+        if dyn_shared > 0 {
+            tuili_cuda::set_max_dynamic_shared(&f, dyn_shared)?;
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (
+                if striped {
+                    stripe_blocks
+                } else {
+                    (n as u32).div_ceil(rows_per_block)
+                },
+                (n_tokens as u32).div_ceil(per_block),
+                splits,
+            ),
+            block_dim: (warps * 32, 1, 1),
+            shared_mem_bytes: dyn_shared,
+        };
+        let (k_i, n_i, t_i) = (k as i32, n as i32, n_tokens as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(w).arg(x_q8_1).arg(&k_i).arg(&n_i).arg(&t_i);
+        self.dev.profile().time("mmq", self.dev.stream(), || {
+            unsafe { b.launch(cfg) }.context("mmq")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Registers per thread and static shared bytes per block.
+    ///
+    /// `kernel_limits` answers whether registers cap the *block size*, which is
+    /// a weaker question than it looks: a kernel can use far more registers and
+    /// still allow 128 threads while fitting fewer blocks on the SM. This is
+    /// the number that settles it — 65536 registers per SM on sm_86 divided by
+    /// `regs * block_threads` is the resident block count.
+    pub fn kernel_registers(&self, module: &'static str, name: &str) -> Result<(i32, i32)> {
+        let src = match module {
+            "tuili_mmq" => mmq_src(),
+            "tuili_mmvq" => mmvq_src(),
+            "tuili_ops" => ops_src(),
+            _ => quant_src(),
+        };
+        let f = self.dev.kernels().get(module, src, name)?;
+        Ok((f.num_regs()?, f.shared_size_bytes()?))
+    }
+
+    /// Walk a weight matrix with the GEMM's own access pattern, at four bytes
+    /// a load or at sixteen, and read nothing else.
+    ///
+    /// `wide` picks the sixteen-byte pattern. See `mmq_bw_probe_w4` in
+    /// `mmq.cu`: this exists to price the weight repack before doing it.
+    pub fn mmq_bw_probe(
+        &self,
+        wide: bool,
+        sink: &mut CudaViewMut<'_, f32>,
+        w: &CudaView<'_, u8>,
+        nb: usize,
+        n: usize,
+        blocks: u32,
+    ) -> Result<()> {
+        let name = match wide {
+            // `TUILI_MMQ_PROBE=coalesced` reads the same bytes as one 512-byte
+            // run a warp instead of eight 64-byte ones; see the kernel.
+            true if std::env::var("TUILI_MMQ_PROBE").as_deref() == Ok("coalesced") => {
+                "mmq_bw_probe_c16"
+            }
+            // With the scale read the kernel also pays for, row-major or
+            // block-major; see the kernels.
+            true if std::env::var("TUILI_MMQ_PROBE").as_deref() == Ok("scales") => {
+                "mmq_bw_probe_s16"
+            }
+            true if std::env::var("TUILI_MMQ_PROBE").as_deref() == Ok("scales_bm") => {
+                "mmq_bw_probe_sc16"
+            }
+            // A write stream beside the read one; see the kernel.
+            true if std::env::var("TUILI_MMQ_PROBE").as_deref() == Ok("rw") => {
+                "mmq_bw_probe_rw16"
+            }
+            true => "mmq_bw_probe_w16",
+            false => "mmq_bw_probe_w4",
+        };
+        let f = self.dev.kernels().get("tuili_mmq", mmq_src(), name)?;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (nb_i, n_i) = (nb as i32, n as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(sink).arg(w).arg(&nb_i).arg(&n_i);
+        unsafe { b.launch(cfg) }.context(name)?;
+        Ok(())
+    }
+
+    /// Read `bytes` of device memory and discard it.
+    ///
+    /// The reference point for every bandwidth claim about the quantized
+    /// kernels: it is what this card gives a kernel that does nothing but read.
+    pub fn stream_read_probe(
+        &self,
+        sink: &mut CudaViewMut<'_, f32>,
+        src: &CudaView<'_, u8>,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_mmq", mmq_src(), "stream_read_probe")?;
+        let n_vec = (src.len() / 16) as i32;
+        let cfg = LaunchConfig {
+            grid_dim: (2048, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(sink).arg(src).arg(&n_vec);
+        unsafe { b.launch(cfg) }.context("stream_read_probe")?;
+        Ok(())
+    }
+
+    /// Blocks the tensor-core GEMM launches for this shape, and how many the
+    /// device can hold at once. A ratio well under 1 means the grid, not the
+    /// kernel, is the limit.
+    pub fn mmq_grid(&self, n: usize, n_tokens: usize) -> (u32, u32, u32) {
+        let tiles = Self::mmq_tiles(n_tokens);
+        let warps = self.mmq_warps(n, n_tokens);
+        let blocks = (n as u32).div_ceil(warps * 8)
+            * (n_tokens as u32).div_ceil(tiles * MMQ_M);
+        // Shared memory is what caps blocks per SM: about 16 KB at four warps
+        // and one tile, halving the count each time either doubles.
+        let per_sm = (6 * 4 / warps.max(1)).min(16) / if tiles == 1 { 1 } else { 2 };
+        (blocks, self.dev.sm_count() * per_sm.max(1), warps)
+    }
+
+    /// How many 16-token tiles share one staging of the weight tile.
+    /// How many 16-token tiles share one staging of the weight tile.
+    ///
+    /// More tiles means fewer passes over the weights but more shared memory,
+    /// and shared memory is what caps blocks per SM. Since the staging is
+    /// latency-bound rather than bandwidth-bound, losing resident warps can
+    /// cost more than the saved pass — so the thresholds are measured, not
+    /// derived. `TUILI_MMQ_TILES` overrides them for re-measuring.
+    fn mmq_tiles(n_tokens: usize) -> u32 {
+        if let Some(t) = Self::tiles_override() {
+            return t;
+        }
+        // Measured on an A4000 against `blk.0.ffn_gate.weight` of
+        // Llama-3.1-8B Q4_K_M: at 16 tokens one tile beats two by 18% because
+        // it keeps six blocks per SM instead of four, and by 64 tokens two
+        // tiles win by 15% because the saved weight pass finally outweighs
+        // that. Four tiles never won at any width.
+        // Four tiles was tried on the theory that 64 tokens to one pass over
+        // the weights would finally pay, and it does not: on Blackwell at 64
+        // tokens it measured 478 GB/s against two tiles' 1149. The ring is
+        // four deep in tokens as well as stages, so the shared request grows
+        // with it and the block count per SM falls faster than the saved
+        // weight pass earns.
+        if n_tokens <= 16 { 1 } else { 2 }
+    }
+
+    /// The f16-operand kernel `TUILI_MMQ_VARIANT` selects, if it selects one.
+    ///
+    /// The model has to ask, because this path wants a different activation
+    /// buffer: f16 rather than Q8_1. Only Q4_G128 has such a kernel.
+    /// The f16-operand kernel is the Q4_G128 default, unless
+    /// `TUILI_MMQ_VARIANT` names something else.
+    ///
+    /// Measured on every Q4_G128 shape a Llama-3.1-8B step touches, in GB/s of
+    /// weights against `mmqd`, which held this slot before:
+    ///
+    /// | | 8 tokens | 32 tokens |
+    /// | --- | --- | --- |
+    /// | `ffn_gate`, 4096x14336 | 237 -> 331 | 93 -> 214 |
+    /// | `ffn_down`, 14336x4096 | 159 -> 341 | 75 -> 227 |
+    /// | `attn_q`, 4096x4096 | 180 -> 236 | 87 -> 171 |
+    /// | `attn_k`, 4096x1024 | 167 -> 158 | 72 -> 115 |
+    ///
+    /// Ahead everywhere except `attn_k` at eight tokens, where it gives up 5%
+    /// on a matrix that is 3.8% of a layer's weights — 0.2% of the step, against
+    /// 2.3x on `ffn_down`.
+    pub fn mmq_f16_variant() -> Option<&'static str> {
+        Self::mmq_f16_variant_for(WeightType::Q4G128)
+    }
+
+    /// The f16-operand kernel for a weight layout.
+    ///
+    /// The two Q4_G128 layouts need different kernels and the name does not say
+    /// so — `mmqz_*` reads the transposed one, `mmqf_*` the packed one — which
+    /// is a mistake waiting to happen, and did: routing transposed weights
+    /// through `mmqf1w8s2` produces fluent-looking garbage rather than an
+    /// error, and `batch_bench` times it happily because it never looks at what
+    /// comes out.
+    /// [`Self::mmq_f16_variant_for`], widened for matrices that reward it.
+    ///
+    /// A block covering more rows re-reads the activations fewer times, which
+    /// is what this kernel spends its batch-32 time on: for `ffn_gate` the
+    /// activations are 58.7 MiB against 31 of weights at 32 tokens. Two
+    /// row-blocks pays for that only once the matrix is wide enough to keep the
+    /// grid full — measured at 32 tokens, in microseconds, one against two:
+    /// `attn_k` 8.2/8.7, `qkv` 16.8/18.3, `ffn_gate` 27.0/27.8, `ffn_down`
+    /// 26.9/28.3, all losses; `gate_up` at 28672 wide, 45.5 against 41.6, a
+    /// repeatable 8.6%. The threshold sits between the two widest shapes a
+    /// Llama-family layer has, which is as much as one model can say.
+    pub fn mmq_f16_variant_for_shape(ty: WeightType, n: usize) -> Option<&'static str> {
+        let v = Self::mmq_f16_variant_for(ty)?;
+        if n >= 20_000 && v == "mmqy1w8s2" {
+            return Some("mmqy2w8s2");
+        }
+        Some(v)
+    }
+
+    pub fn mmq_f16_variant_for(ty: WeightType) -> Option<&'static str> {
+        static V: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+        static VT: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+        match ty {
+            WeightType::Q4G128T => *VT.get_or_init(|| {
+                match std::env::var("TUILI_MMQ_VARIANT") {
+                    // `mmqc` is the weight-ring family, which reads the same
+                    // f16 activations and so belongs on this path too — it was
+                    // unreachable from the model before, and measuring it
+                    // silently ran the integer fallback instead.
+                    Ok(v)
+                        if v.starts_with("mmqz")
+                            || v.starts_with("mmqy")
+                            || v.starts_with("mmqc") =>
+                    {
+                        Some(&*Box::leak(v.into_boxed_str()))
+                    }
+                    Ok(_) => None,
+                    Err(_) => Some("mmqy1w8s2"),
+                }
+            }),
+            _ => *V.get_or_init(|| match std::env::var("TUILI_MMQ_VARIANT") {
+                Ok(v) if v.starts_with("mmqf") => Some(&*Box::leak(v.into_boxed_str())),
+                // Any other explicit name means the caller wants an integer
+                // kernel, and those take Q8_1 activations.
+                Ok(_) => None,
+                Err(_) => Some("mmqf1w8s2"),
+            }),
+        }
+    }
+
+    /// `TUILI_MMQ_SPLITS` pins the k-split factor.
+    fn mmq_splits() -> Option<u32> {
+        static V: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("TUILI_MMQ_SPLITS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        })
+    }
+
+    fn tiles_override() -> Option<u32> {
+        static O: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        *O.get_or_init(|| {
+            std::env::var("TUILI_MMQ_TILES").ok().and_then(|v| v.parse().ok())
+        })
+    }
+
+    fn warps_override() -> Option<u32> {
+        static O: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        *O.get_or_init(|| {
+            std::env::var("TUILI_MMQ_WARPS").ok().and_then(|v| v.parse().ok())
+        })
+    }
+
+    /// Warps per block, hence weight rows per block.
+    ///
+    /// Eight, which is a borrowed number rather than a derived one: llama.cpp's
+    /// tuned Ampere table asks for 256 threads and 128 output rows per block for
+    /// Q4_K at every batch width, against the 128 threads and 32 rows this
+    /// kernel started with. Wide blocks reuse each staged activation fragment
+    /// across four times as many weight rows, which is the traffic that grows
+    /// with batch. Measured here at 64 rows — 128 does not fit the 48 KB static
+    /// shared-memory limit with this tile layout — it is worth 10% at one token
+    /// and 2% at 32.
+    ///
+    /// Note what the same table says about occupancy: 1. They deliberately run
+    /// one block per SM and make it wide, which is the opposite of the instinct
+    /// that narrower blocks would help here — an instinct this kernel already
+    /// tested and measured at exactly zero.
+    ///
+    /// Chosen per matrix, because the trade runs both ways: a wide block is
+    /// free reuse on a 14336-row projection (224 blocks, plenty) and is pure
+    /// loss on a 1024-row one, where it halves an already-short grid from 32
+    /// blocks to 16. Measured end to end, a flat 8 gained 2% at batch 32 and
+    /// lost 5% at batch 8 for exactly that reason.
+    ///
+    /// `TUILI_MMQ_WARPS` overrides, for re-measuring on another device.
+    fn mmq_warps(&self, n: usize, _n_tokens: usize) -> u32 {
+        if let Some(w) = Self::warps_override() {
+            return w;
+        }
+        let wide = (n as u32).div_ceil(64);
+        if wide >= self.dev.sm_count() * 2 { 8 } else { 4 }
+    }
+
+    fn mmq_kernel_name(&self, ty: WeightType, n: usize, n_tokens: usize) -> String {
+        let warps = self.mmq_warps(n, n_tokens);
+        // This family is instantiated at one and two token tiles only.
+        let tiles = Self::mmq_tiles(n_tokens).min(2);
+        let w = if warps == 4 {
+            String::new()
+        } else {
+            format!("w{warps}")
+        };
+        let t = if tiles == 1 { String::new() } else { tiles.to_string() };
+        let sep = if !w.is_empty() && !t.is_empty() { "_" } else { "" };
+        format!("mmq{w}{sep}{t}_{}", ty.suffix())
+    }
+
+    /// What the driver says a kernel's occupancy is limited to.
+    ///
+    /// `max_threads_per_block` is derived from the register count, so a value
+    /// below the launch's block size means registers are the constraint and a
+    /// value at or above it means shared memory or the launch shape is. Worth
+    /// asking before cutting either: the batch-32 GEMM spends 54% of its time
+    /// in the MMA pipeline against an instruction count that should be
+    /// negligible, which is what unhidden shared-memory latency looks like.
+    pub fn kernel_limits(&self, module: &'static str, name: &str) -> Result<(i32, i32)> {
+        let src = match module {
+            "tuili_mmq" => mmq_src(),
+            "tuili_mmvq" => mmvq_src(),
+            "tuili_ops" => ops_src(),
+            _ => quant_src(),
+        };
+        let f = self.dev.kernels().get(module, src, name)?;
+        Ok((f.max_threads_per_block()?, f.binary_version()?))
+    }
+
+    /// Load an A fragment two ways — cooperatively with `ldmatrix` and with the
+    /// scalar gather it would replace — and hand both back for comparison.
+    pub fn ldmatrix_probe(
+        &self,
+        out: &mut CudaViewMut<'_, i32>,
+        a: &CudaView<'_, i8>,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_mmq", mmq_src(), "ldmatrix_a_probe")?;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(a).arg(out);
+        unsafe { b.launch(cfg) }.context("ldmatrix_a_probe")?;
+        Ok(())
+    }
+
+    /// [`Self::ldmatrix_probe`] for the B operand.
+    pub fn ldmatrix_b_probe(
+        &self,
+        out: &mut CudaViewMut<'_, i32>,
+        b_in: &CudaView<'_, i8>,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_mmq", mmq_src(), "ldmatrix_b_probe")?;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(b_in).arg(out);
+        unsafe { b.launch(cfg) }.context("ldmatrix_b_probe")?;
+        Ok(())
+    }
+
+    /// One `mma.m16n8k32.s8` on a 16x32 by 32x8 pair of int8 tiles.
+    /// One `mma.m16n8k32.s8` on a 16x32 by 32x8 pair of int8 tiles.
+    ///
+    /// Only [`crate`]'s tests call this. It exists so the fragment layouts the
+    /// real kernel depends on are proven against a CPU reference instead of
+    /// trusted.
+    pub fn mma_s8_probe(
+        &self,
+        d: &mut CudaViewMut<'_, i32>,
+        a: &CudaView<'_, i8>,
+        b_in: &CudaView<'_, i8>,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_mmq", mmq_src(), "mma_s8_probe")?;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut bb = self.dev.stream().launch_builder(&f);
+        bb.arg(a).arg(b_in).arg(d);
+        unsafe { bb.launch(cfg) }.context("mma_s8_probe")?;
+        Ok(())
+    }
+
+    /// [`Self::mmq_variant`] for the f16-operand kernels, whose activations are
+    /// plain f16 rather than Q8_1.
+    ///
+    /// Separate entry point on purpose: the whole point of the f16 path is that
+    /// there is no activation quantization, so routing it through a parameter
+    /// named `x_q8_1` would be a lie about what the buffer holds. The model
+    /// still dispatches the Q8_1 path; this is what the A/B measures against
+    /// it before that changes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mmq_f16(
+        &self,
+        variant: &str,
+        out: &mut CudaViewMut<'_, f32>,
+        w: &CudaView<'_, u8>,
+        x_f16: &CudaView<'_, half::f16>,
+        k: usize,
+        n: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            variant.starts_with("mmqf") || variant.starts_with("mmqg")
+                || variant.starts_with("mmqz") || variant.starts_with("mmqy")
+                || variant.starts_with("mmqk") || variant.starts_with("mmqc")
+                || variant.starts_with("mmqm")
+                || variant.starts_with("mmqnm") || variant.starts_with("mmqnx")
+                || variant.starts_with("mmqnh") || variant.starts_with("mmqnr"),
+            "mmq_f16 is for the f16-operand kernels, got {variant}"
+        );
+        anyhow::ensure!(
+            k.is_multiple_of(128),
+            "{variant} needs k divisible by 128, got {k}"
+        );
+        // The launcher takes activations as bytes and the kernel casts; only
+        // the element type differs from the Q8_1 path.
+        // Safe in the only sense that matters here: the kernel reads this
+        // buffer through `cp.async` as raw bytes and never as `u8` values, and
+        // an f16 slice is exactly twice as many bytes with no padding.
+        let bytes = unsafe { x_f16.transmute::<u8>(x_f16.len() * 2) }
+            .context("f16 activations do not reinterpret as bytes")?;
+        self.mmq_variant(
+            variant,
+            out,
+            w,
+            WeightType::Q4G128,
+            &bytes,
+            k,
+            n,
+            n_tokens,
+        )
+    }
+
+    /// One `mma.m16n8k16.f16` on a 16x16 by 16x8 pair of f16 tiles.
+    ///
+    /// The f16 counterpart of [`Self::mma_s8_probe`], and there for the same
+    /// reason: the f16-operand GEMM builds its fragments by hand.
+    pub fn mma_f16_probe(
+        &self,
+        d: &mut CudaViewMut<'_, f32>,
+        a: &CudaView<'_, half::f16>,
+        b_in: &CudaView<'_, half::f16>,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_mmq", mmq_src(), "mma_f16_probe")?;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut bb = self.dev.stream().launch_builder(&f);
+        bb.arg(a).arg(b_in).arg(d);
+        unsafe { bb.launch(cfg) }.context("mma_f16_probe")?;
+        Ok(())
+    }
+
+    /// One 128-weight Q4_G128 block through the `lop3` dequantization, laid
+    /// out by logical k. Tests only; see `mmq_deq4_f16_probe` in `mmq.cu`.
+    pub fn deq4_f16_probe(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        w: &CudaView<'_, u8>,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_mmq", mmq_src(), "mmq_deq4_f16_probe")?;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(w).arg(out);
+        unsafe { b.launch(cfg) }.context("mmq_deq4_f16_probe")?;
+        Ok(())
+    }
+
+    /// Two mat-vecs that share one activation, in one launch.
+    ///
+    /// Back to back these kernels reach 328 GB/s where one alone reaches 392,
+    /// and a CUDA graph does not close the gap: what costs is each kernel
+    /// draining before the next can start. Merging the FFN's gate and up
+    /// projections, and Q/K/V through [`Kernels::mmvq_fused3`], removes
+    /// ninety-six of those drains from a decode step.
+    ///
+    /// Both matrices must share `k` and the weight type.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mmvq_fused2(
+        &self,
+        out0: &mut CudaViewMut<'_, f32>,
+        out1: &mut CudaViewMut<'_, f32>,
+        w0: &CudaView<'_, u8>,
+        w1: &CudaView<'_, u8>,
+        ty: WeightType,
+        x_q8_1: &CudaView<'_, u8>,
+        k: usize,
+        n0: usize,
+        n1: usize,
+    ) -> Result<()> {
+        let f = self.fused_kernel(ty, "mmvqf2_")?;
+        let cfg = self.fused_cfg(ty, k, n0 + n1);
+        let (k_i, a, b_n) = (k as i32, n0 as i32, n1 as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out0)
+            .arg(out1)
+            .arg(w0)
+            .arg(w1)
+            .arg(x_q8_1)
+            .arg(&k_i)
+            .arg(&a)
+            .arg(&b_n);
+        self.dev.profile().time("mmvq_fused", self.dev.stream(), || {
+            unsafe { b.launch(cfg) }.context("mmvq_fused2")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Three mat-vecs that share one activation. See [`Kernels::mmvq_fused2`].
+    ///
+    /// All three must share `k` and the weight type — a Q4_K_M file gives its
+    /// first layer a Q6_K V projection between two Q4_K siblings, so the caller
+    /// checks rather than assuming.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mmvq_fused3(
+        &self,
+        out0: &mut CudaViewMut<'_, f32>,
+        out1: &mut CudaViewMut<'_, f32>,
+        out2: &mut CudaViewMut<'_, f32>,
+        w0: &CudaView<'_, u8>,
+        w1: &CudaView<'_, u8>,
+        w2: &CudaView<'_, u8>,
+        ty: WeightType,
+        x_q8_1: &CudaView<'_, u8>,
+        k: usize,
+        ns: [usize; 3],
+    ) -> Result<()> {
+        let f = self.fused_kernel(ty, "mmvqf3_")?;
+        let cfg = self.fused_cfg(ty, k, ns.iter().sum());
+        let k_i = k as i32;
+        let n: Vec<i32> = ns.iter().map(|v| *v as i32).collect();
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out0)
+            .arg(out1)
+            .arg(out2)
+            .arg(w0)
+            .arg(w1)
+            .arg(w2)
+            .arg(x_q8_1)
+            .arg(&k_i)
+            .arg(&n[0])
+            .arg(&n[1])
+            .arg(&n[2]);
+        self.dev.profile().time("mmvq_fused", self.dev.stream(), || {
+            unsafe { b.launch(cfg) }.context("mmvq_fused3")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    fn fused_kernel(
+        &self,
+        ty: WeightType,
+        prefix: &str,
+    ) -> Result<cudarc::driver::CudaFunction> {
+        anyhow::ensure!(Self::has_mmvq(ty), "no integer mat-vec for {ty}");
+        let name = format!("{prefix}{}", ty.suffix());
+        self.dev.kernels().get("tuili_mmvq", mmvq_src(), &name)
+    }
+
+    /// Same block shape as [`Kernels::mmvq`], over the concatenated rows.
+    fn fused_cfg(&self, ty: WeightType, k: usize, rows: usize) -> LaunchConfig {
+        let slices = match ty {
+            WeightType::Q8_0 | WeightType::Q6K => k / 8,
+            WeightType::Q4G128 | WeightType::Q4G128T => k / 32,
+            _ => k / 16,
+        };
+        LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (
+                (slices as u32).next_multiple_of(32).clamp(32, REDUCE_BLOCK),
+                1,
+                1,
+            ),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    pub fn mmvq(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        w: &CudaView<'_, u8>,
+        ty: WeightType,
+        x_q8_1: &CudaView<'_, u8>,
+        k: usize,
+        n: usize,
+    ) -> Result<()> {
+        self.mmvq_inner(out, w, ty, x_q8_1, k, n, false)
+    }
+
+    /// [`Kernels::mmvq`] adding into `out` instead of overwriting it.
+    ///
+    /// The output and down projections both feed straight back into the
+    /// residual stream, and folding that add into the projection saves a
+    /// kernel and three passes over the vector per layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mmvq_add(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        w: &CudaView<'_, u8>,
+        ty: WeightType,
+        x_q8_1: &CudaView<'_, u8>,
+        k: usize,
+        n: usize,
+    ) -> Result<()> {
+        self.mmvq_inner(out, w, ty, x_q8_1, k, n, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mmvq_inner(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        w: &CudaView<'_, u8>,
+        ty: WeightType,
+        x_q8_1: &CudaView<'_, u8>,
+        k: usize,
+        n: usize,
+        accum: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(Self::has_mmvq(ty), "no integer mat-vec for {ty}");
+        // Rows per block for the warp-per-row shape; 0 is the block-per-row
+        // one, which measured level with every setting of it and is the
+        // default. Read once — this is asked 225 times a step.
+        static ROWS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let rows = *ROWS.get_or_init(|| {
+            std::env::var("TUILI_MMVQ_ROWS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        });
+        let warped = rows > 0 && (n as u32).is_multiple_of(rows);
+        let name = format!("{}{}", if warped { "mmvqw_" } else { "mmvq_" }, ty.suffix());
+        let f = self.dev.kernels().get("tuili_mmvq", mmvq_src(), &name)?;
+        // One slice per thread, same shape as the float path.
+        let slices = match ty {
+            WeightType::Q8_0 => k / 8,
+            WeightType::Q4K => k / 16,
+            WeightType::Q6K => k / 8,
+            // One 32-weight quarter of a group per thread.
+            WeightType::Q4G128 | WeightType::Q4G128T => k / 32,
+            _ => unreachable!("guarded above"),
+        };
+        let block = (slices as u32).next_multiple_of(32).clamp(32, REDUCE_BLOCK);
+        let cfg = if warped {
+            LaunchConfig {
+                grid_dim: ((n as u32) / rows, 1, 1),
+                block_dim: (32, rows, 1),
+                shared_mem_bytes: 0,
+            }
+        } else {
+            LaunchConfig {
+                grid_dim: (n as u32, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            }
+        };
+        let (k_i, n_i, acc) = (k as i32, n as i32, i32::from(accum));
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(w).arg(x_q8_1).arg(&k_i).arg(&n_i).arg(&acc);
+        self.dev.profile().time("mmvq", self.dev.stream(), || {
+            unsafe { b.launch(cfg) }.context("mmvq")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// `out[t, r] = dot(w[r, :], x[t, :])` decoding `w` on the fly.
+    ///
+    /// Reads the weights once per token, so it is the right kernel for one or
+    /// a few tokens and the wrong one for a long prefill — see
+    /// [`Kernels::gemm_f16`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        w: &CudaView<'_, u8>,
+        ty: WeightType,
+        x: &CudaView<'_, f32>,
+        k: usize,
+        n: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            k.is_multiple_of(ty.block_size()),
+            "{ty:?} needs k ({k}) to be a multiple of {}",
+            ty.block_size()
+        );
+        let name = format!("gemv_{}", ty.suffix());
+        let f = self.dev.kernels().get("tuili_quant", quant_src(), &name)?;
+        // Size the block to the work rather than to a constant: an oversized
+        // block idles most of its threads and still pays for the block-wide
+        // reduction, which for the vocab projection is the difference between
+        // one warp and eight.
+        let block = (ty.gemv_work_items(k) as u32)
+            .next_multiple_of(32)
+            .clamp(32, REDUCE_BLOCK);
+        let cfg = LaunchConfig {
+            grid_dim: (
+                n as u32,
+                (n_tokens as u32).div_ceil(GEMV_TOKENS_PER_BLOCK).max(1),
+                1,
+            ),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (k_i, n_i, nt_i) = (k as i32, n as i32, n_tokens as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(w).arg(x).arg(&k_i).arg(&n_i).arg(&nt_i);
+        self.dev.profile().time("gemv", self.dev.stream(), || {
+            unsafe { b.launch(cfg) }.context("gemv")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    // ---- TurboQuant KV cache ------------------------------------------
+    //
+    // The paper's estimator is evaluated entirely in the rotated basis, so a
+    // cached key is never rotated back: the query is rotated once and the
+    // QJL projection is folded into the same basis. See `cu/turboquant.cu`.
+
+    /// `out[v] = M · x[v]`. Safe to call with `out` aliasing `x`.
+    pub fn tq_matvec(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        x: &CudaView<'_, f32>,
+        mat: &CudaView<'_, f32>,
+        d: usize,
+        n_vec: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_turboquant", tq_src(), "tq_matvec")?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_vec as u32, 1, 1),
+            block_dim: (per_vector_block(d), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (d_i, n_i) = (d as i32, n_vec as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(x).arg(mat).arg(&d_i).arg(&n_i);
+        self.dev
+            .profile()
+            .time("tq_matvec", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("tq_matvec")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// TurboQuant_mse over rotated value vectors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tq_store_v(
+        &self,
+        codes: &mut CudaViewMut<'_, u8>,
+        scale: &mut CudaViewMut<'_, f16>,
+        src: &CudaView<'_, f32>,
+        slots: &CudaView<'_, i32>,
+        levels: &CudaView<'_, f32>,
+        bits: u8,
+        n_kv_heads: usize,
+        d: usize,
+        n_slots: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_turboquant", tq_src(), "tq_store_v")?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_kv_heads as u32, n_tokens as u32, 1),
+            block_dim: (per_vector_block(d), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (bits_i, kh, d_i, ms, nt) = (
+            bits as i32,
+            n_kv_heads as i32,
+            d as i32,
+            n_slots as i32,
+            n_tokens as i32,
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(codes)
+            .arg(scale)
+            .arg(src)
+            .arg(slots)
+            .arg(levels)
+            .arg(&bits_i)
+            .arg(&kh)
+            .arg(&d_i)
+            .arg(&ms)
+            .arg(&nt);
+        self.dev
+            .profile()
+            .time("tq_store_v", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("tq_store_v")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// TurboQuant_prod over rotated key vectors: MSE codes, QJL signs of the
+    /// residual, and the two norms the estimator needs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tq_store_k(
+        &self,
+        codes: &mut CudaViewMut<'_, u8>,
+        signs: &mut CudaViewMut<'_, u8>,
+        scale: &mut CudaViewMut<'_, f16>,
+        gamma: &mut CudaViewMut<'_, f16>,
+        src: &CudaView<'_, f32>,
+        qjl: &CudaView<'_, f32>,
+        slots: &CudaView<'_, i32>,
+        levels: &CudaView<'_, f32>,
+        bits: u8,
+        n_kv_heads: usize,
+        d: usize,
+        n_slots: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_turboquant", tq_src(), "tq_store_k")?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_kv_heads as u32, n_tokens as u32, 1),
+            block_dim: (per_vector_block(d), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (bits_i, kh, d_i, ms, nt) = (
+            bits as i32,
+            n_kv_heads as i32,
+            d as i32,
+            n_slots as i32,
+            n_tokens as i32,
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(codes)
+            .arg(signs)
+            .arg(scale)
+            .arg(gamma)
+            .arg(src)
+            .arg(qjl)
+            .arg(slots)
+            .arg(levels)
+            .arg(&bits_i)
+            .arg(&kh)
+            .arg(&d_i)
+            .arg(&ms)
+            .arg(&nt);
+        self.dev
+            .profile()
+            .time("tq_store_k", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("tq_store_k")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// Attention logits from a quantized key cache, using the two-stage
+    /// unbiased inner product estimator.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tq_attn_scores(
+        &self,
+        scores: &mut CudaViewMut<'_, f32>,
+        q_rot: &CudaView<'_, f32>,
+        q_qjl: &CudaView<'_, f32>,
+        codes: &CudaView<'_, u8>,
+        signs: &CudaView<'_, u8>,
+        scale: &CudaView<'_, f16>,
+        gamma: &CudaView<'_, f16>,
+        batch: BatchLayout<'_>,
+        levels: &CudaView<'_, f32>,
+        bits: u8,
+        dims: AttnDims,
+        kv_len: usize,
+        attn_scale: f32,
+        qjl_scale: f32,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_turboquant", tq_src(), "tq_attn_scores")?;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (kv_len as u32).div_ceil(SCORE_WARPS).max(1),
+                dims.n_heads as u32,
+                dims.n_tokens as u32,
+            ),
+            block_dim: (SCORE_WARPS * 32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (bits_i, stride, h, kh, dh, ms, kl) = (
+            bits as i32,
+            batch.table_stride as i32,
+            dims.n_heads as i32,
+            dims.n_kv_heads as i32,
+            dims.d_head as i32,
+            dims.n_slots as i32,
+            kv_len as i32,
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(scores)
+            .arg(q_rot)
+            .arg(q_qjl)
+            .arg(codes)
+            .arg(signs)
+            .arg(scale)
+            .arg(gamma)
+            .arg(batch.seq_of)
+            .arg(batch.positions)
+            .arg(batch.slot_table)
+            .arg(&stride)
+            .arg(levels)
+            .arg(&bits_i)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ms)
+            .arg(&kl)
+            .arg(&attn_scale)
+            .arg(&qjl_scale);
+        self.dev
+            .profile()
+            .time("tq_attn_scores", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("tq_attn_scores")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// Weighted sum over a quantized value cache. The result is still in the
+    /// rotated basis; apply `Πᵀ` with [`Kernels::tq_matvec`] afterwards.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tq_attn_output(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        scores: &CudaView<'_, f32>,
+        codes: &CudaView<'_, u8>,
+        scale: &CudaView<'_, f16>,
+        batch: BatchLayout<'_>,
+        levels: &CudaView<'_, f32>,
+        bits: u8,
+        dims: AttnDims,
+        kv_len: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_turboquant", tq_src(), "tq_attn_output")?;
+        let cfg = LaunchConfig {
+            grid_dim: (dims.n_heads as u32, dims.n_tokens as u32, 1),
+            block_dim: (per_vector_block(dims.d_head), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (bits_i, stride, h, kh, dh, ms, kl) = (
+            bits as i32,
+            batch.table_stride as i32,
+            dims.n_heads as i32,
+            dims.n_kv_heads as i32,
+            dims.d_head as i32,
+            dims.n_slots as i32,
+            kv_len as i32,
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out)
+            .arg(scores)
+            .arg(codes)
+            .arg(scale)
+            .arg(batch.seq_of)
+            .arg(batch.positions)
+            .arg(batch.slot_table)
+            .arg(&stride)
+            .arg(levels)
+            .arg(&bits_i)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ms)
+            .arg(&kl);
+        self.dev
+            .profile()
+            .time("tq_attn_output", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("tq_attn_output")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// `c[n_tokens, n] = a[n_tokens, k] · bᵀ` with f16 inputs and f32 output,
+    /// accumulating in f32.
+    ///
+    /// `b` is the weight matrix in ggml layout, `[n, k]` row-major, already
+    /// dequantized. cuBLAS is column-major, so both operands are handed over
+    /// transposed-in-place and no data is moved.
+    pub fn gemm_f16(
+        &self,
+        c: &mut CudaViewMut<'_, f32>,
+        a: &CudaView<'_, f16>,
+        b: &CudaView<'_, f16>,
+        n_tokens: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<()> {
+        use cudarc::cublas::sys;
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+
+        let stream = self.dev.stream();
+        let (a_ptr, _ra) = a.device_ptr(stream);
+        let (b_ptr, _rb) = b.device_ptr(stream);
+        let (c_ptr, _rc) = c.device_ptr_mut(stream);
+
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+
+        self.dev.profile().time("gemm_f16", self.dev.stream(), || {
+            unsafe {
+                cudarc::cublas::result::gemm_ex(
+                    *self.dev.blas().handle(),
+                    sys::cublasOperation_t::CUBLAS_OP_T,
+                    sys::cublasOperation_t::CUBLAS_OP_N,
+                    n as i32,
+                    n_tokens as i32,
+                    k as i32,
+                    &alpha as *const f32 as *const _,
+                    b_ptr as *const _,
+                    sys::cudaDataType::CUDA_R_16F,
+                    k as i32,
+                    a_ptr as *const _,
+                    sys::cudaDataType::CUDA_R_16F,
+                    k as i32,
+                    &beta as *const f32 as *const _,
+                    c_ptr as *mut _,
+                    sys::cudaDataType::CUDA_R_32F,
+                    n as i32,
+                    sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                )
+            }
+            .context("cublasGemmEx")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+}
+
+/// The shape parameters every attention kernel needs.
+#[derive(Debug, Clone, Copy)]
+pub struct AttnDims {
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub d_head: usize,
+    /// Token slots in the shared KV pool, not a per-sequence limit.
+    pub n_slots: usize,
+    pub n_tokens: usize,
+}
+
+/// Where each token in the batch came from and where its history lives.
+///
+/// A batch mixes sequences freely: `seq_of` says which sequence a token
+/// belongs to, `positions` gives its absolute position within that sequence
+/// (which is also its causal mask), and `slot_table` maps a sequence's logical
+/// positions onto physical pool slots. Nothing here assumes the tokens are
+/// contiguous, ordered, or the same length.
+#[derive(Clone, Copy)]
+pub struct BatchLayout<'a> {
+    pub seq_of: &'a CudaView<'a, i32>,
+    pub positions: &'a CudaView<'a, i32>,
+    pub slot_table: &'a CudaView<'a, i32>,
+    /// Row length of `slot_table`, i.e. the longest sequence it can describe.
+    pub table_stride: usize,
+}

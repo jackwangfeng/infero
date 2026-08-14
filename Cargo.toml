@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/gguf",
+    "crates/safetensors",
+    "crates/cuda",
+    "crates/kernels",
+    "crates/tokenizer",
+    "crates/model",
+    "crates/server",
+    "crates/tui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+tuili-gguf = { path = "crates/gguf" }
+tuili-safetensors = { path = "crates/safetensors" }
+tuili-cuda = { path = "crates/cuda", default-features = false }
+tuili-kernels = { path = "crates/kernels", default-features = false }
+tuili-tokenizer = { path = "crates/tokenizer" }
+tuili-model = { path = "crates/model", default-features = false }
+
+anyhow = "1"
+thiserror = "2"
+half = "2"
+memmap2 = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1

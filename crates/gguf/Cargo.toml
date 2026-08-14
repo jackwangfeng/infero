@@ -1,0 +1,13 @@
+[package]
+name = "tuili-gguf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+half.workspace = true
+memmap2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

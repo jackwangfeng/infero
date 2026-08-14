@@ -1,0 +1,4 @@
+/target
+/models
+# A symlink into a conda install, not source.
+/vendor/cuda

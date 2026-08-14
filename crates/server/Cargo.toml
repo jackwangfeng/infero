@@ -1,0 +1,42 @@
+[package]
+name = "tuili-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "tuili_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tuili"
+path = "src/main.rs"
+
+[dependencies]
+tuili-model.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio-stream = "0.1.19"
+clap = { version = "4.6.6", features = ["derive"] }
+futures = "0.3.34"
+tower-http = { version = "0.7.0", features = ["cors", "trace"] }
+tuili-gguf.workspace = true
+tuili-cuda.workspace = true
+tuili-tokenizer.workspace = true
+tokio = { version = "1.53.1", features = ["full"] }
+axum = { version = "0.8.9", features = ["macros"] }
+
+[dev-dependencies]
+http-body-util = "0.1.4"
+hyper = { version = "1.11.0", features = ["client", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+tuili-model.workspace = true
+
+[features]
+default = ["cuda-13"]
+cuda-13 = ["tuili-model/cuda-13", "tuili-cuda/cuda-13"]
+cuda-12 = ["tuili-model/cuda-12", "tuili-cuda/cuda-12"]

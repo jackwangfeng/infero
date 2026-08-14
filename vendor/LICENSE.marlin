@@ -1,0 +1,27 @@
+The tensor-core GEMM design notes in crates/kernels/src/cu/mmq.cu reference
+Marlin, as carried by vLLM:
+
+  https://github.com/vllm-project/vllm  csrc/quantization/gptq_marlin/
+  https://github.com/IST-DASLab/marlin
+  "MARLIN: Mixed-Precision Auto-Regressive Parallel Inference on Large
+   Language Models", Frantar, Castro, Chen, Hoefler, Alistarh, arXiv:2408.11743
+
+Both are Apache License 2.0. The sources are vendored under vendor/marlin/ for
+reference and are not compiled; see vendor/marlin/README.md for what reading
+them established. Any code ported from them carries this notice.
+
+                                 Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.

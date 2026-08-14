@@ -1,0 +1,13 @@
+[package]
+name = "tuili-safetensors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+half.workspace = true
+memmap2.workspace = true
+serde_json = "1"
+tracing.workspace = true

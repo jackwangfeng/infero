@@ -1,0 +1,35 @@
+[package]
+name = "tuili-cuda"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+half.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+cudarc = { version = "0.19", default-features = false, features = [
+    "std",
+    "driver",
+    "nvrtc",
+    "cublas",
+    "f16",
+    "dynamic-loading",
+] }
+libloading = "0.8"
+
+# Which CUDA userspace to generate bindings against. The libraries are dlopened
+# at run time, but the struct layouts and entry points are compiled in, so
+# exactly one of these has to be picked. Blackwell (sm_120) needs 12.8 or newer;
+# a box with `/usr/local/cuda-12.8` and no CUDA 13 wheels builds with
+# `--no-default-features --features cuda-12`.
+[features]
+default = ["cuda-13"]
+cuda-13 = ["cudarc/cuda-13010"]
+cuda-12 = ["cudarc/cuda-12080"]
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

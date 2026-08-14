@@ -1,0 +1,17 @@
+[package]
+name = "tuili-tokenizer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tuili-gguf.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+fancy-regex = "0.14"
+minijinja = { version = "2", features = ["loop_controls", "builtins"] }
+serde_json = "1"
+rustc-hash = "2"
+minijinja-contrib = { version = "2.23.0", features = ["pycompat"] }
+serde = { version = "1.0.229", features = ["derive"] }
