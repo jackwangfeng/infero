@@ -551,3 +551,137 @@ fn tma_streams_weights_against_the_cp_async_probe() -> Result<()> {
     }
     Ok(())
 }
+
+/// Does `chunk ^ (row & 7)` undo TMA's 128-byte swizzle?
+///
+/// A GEMM tile that arrives dense is unreadable at speed: the weight fragment
+/// mapping has eight lanes take the same 16-byte column of eight consecutive
+/// rows, and at a 128-byte row stride those eight land in one bank group. The
+/// 80-byte padding in `MMQ_CB_FETCH` exists for exactly that reason and TMA
+/// cannot produce it — it writes dense, or dense-and-swizzled.
+///
+/// `CU_TENSOR_MAP_SWIZZLE_128B` is the way out if the read side can undo it,
+/// and the formula is supposed to be that row `r`'s 16-byte chunk `c` lands at
+/// chunk `c ^ (r & 7)`. This checks that against real bytes before anything is
+/// built on it: fill the source so every 16-byte chunk is stamped with its own
+/// (row, chunk), copy one tile in, and have the kernel assert it can find each
+/// stamp where the formula says.
+const SWIZZLE_SRC: &str = r#"
+struct __align__(64) TmaDesc { unsigned char bytes[128]; };
+
+extern "C" __global__ void tma_swizzle_check(int* __restrict__ bad,
+                                             const __grid_constant__ TmaDesc desc,
+                                             int rows, int chunks) {
+    extern __shared__ __align__(128) unsigned char smem[];
+    unsigned char* tile = smem;
+    unsigned long long* mbar = (unsigned long long*)(void*)(smem + 8192);
+    const unsigned int t = (unsigned int)__cvta_generic_to_shared(tile);
+    const unsigned int m = (unsigned int)__cvta_generic_to_shared(mbar);
+    const int bytes = rows * chunks * 16;
+
+    if (threadIdx.x == 0) {
+        asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" ::"r"(m));
+        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(m),
+                     "r"(bytes));
+        asm volatile(
+            "cp.async.bulk.tensor.2d.shared::cluster.global"
+            ".mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];\n" ::"r"(t),
+            "l"(&desc), "r"(0), "r"(0), "r"(m)
+            : "memory");
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        asm volatile(
+            "{\n.reg .pred p;\nWS:\n"
+            "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], 0;\n"
+            "@p bra.uni DS;\nbra.uni WS;\nDS:\n}\n" ::"r"(m)
+            : "memory");
+    }
+    __syncthreads();
+
+    /* Every (row, chunk) stamp, read where the formula says it landed. */
+    for (int i = threadIdx.x; i < rows * chunks; i += blockDim.x) {
+        const int r = i / chunks;
+        const int c = i % chunks;
+        const int at = r * chunks * 16 + ((c ^ (r & 7)) * 16);
+        const unsigned short* p = (const unsigned short*)(const void*)(tile + at);
+        if (p[0] != (unsigned short)(r * 256 + c)) atomicAdd(bad, 1);
+    }
+}
+"#;
+
+#[test]
+fn the_128b_swizzle_is_undone_by_xor_with_the_row() -> Result<()> {
+    let dev = match Device::new(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skipping: no cuda device ({e})");
+            return Ok(());
+        }
+    };
+    if dev.arch() < 90 {
+        eprintln!("skipping: TMA needs sm_90 or newer, this is sm_{}", dev.arch());
+        return Ok(());
+    }
+    let stream = dev.stream();
+    // A 128-byte row is eight 16-byte chunks, which is what the swizzle covers.
+    let (rows, chunks) = (64usize, 8usize);
+    let row_bytes = chunks * 16;
+    let mut host = vec![0u8; rows * row_bytes];
+    for r in 0..rows {
+        for c in 0..chunks {
+            let stamp = (r * 256 + c) as u16;
+            let at = r * row_bytes + c * 16;
+            host[at..at + 2].copy_from_slice(&stamp.to_le_bytes());
+        }
+    }
+    let src = stream.clone_htod(&host)?;
+
+    let mut desc = TmaDesc([0u8; 128]);
+    let global_dim = [(row_bytes / 4) as u64, rows as u64];
+    let global_strides = [row_bytes as u64];
+    let box_dim = [(row_bytes / 4) as u32, rows as u32];
+    let elem_strides = [1u32, 1];
+    let (dptr, _sync) = src.device_ptr(stream);
+    let r = unsafe {
+        sys::cuTensorMapEncodeTiled(
+            (&mut desc as *mut TmaDesc).cast(),
+            sys::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32,
+            2,
+            dptr as *mut std::ffi::c_void,
+            global_dim.as_ptr(),
+            global_strides.as_ptr(),
+            box_dim.as_ptr(),
+            elem_strides.as_ptr(),
+            sys::CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+            sys::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+            sys::CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            sys::CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+        )
+    };
+    anyhow::ensure!(
+        r == sys::CUresult::CUDA_SUCCESS,
+        "cuTensorMapEncodeTiled: {r:?}"
+    );
+
+    let f = dev
+        .kernels()
+        .get("tuili_tma_swz", SWIZZLE_SRC, "tma_swizzle_check")
+        .context("compiling the swizzle check")?;
+    let mut bad = stream.alloc_zeros::<i32>(1)?;
+    let (rr, cc) = (rows as i32, chunks as i32);
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 8192 + 8,
+    };
+    let mut b = stream.launch_builder(&f);
+    b.arg(&mut bad).arg(&desc).arg(&rr).arg(&cc);
+    unsafe { b.launch(cfg) }.context("tma_swizzle_check")?;
+    let got = stream.clone_dtoh(&bad)?;
+    dev.synchronize()?;
+    eprintln!("  {} of {} stamps in the wrong place", got[0], rows * chunks);
+    assert_eq!(got[0], 0, "the xor formula does not undo the 128B swizzle");
+    Ok(())
+}
