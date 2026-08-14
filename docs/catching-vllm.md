@@ -592,6 +592,32 @@ one lever big enough to matter on its own: an fp8 KV cache would take attention
 from 1.5 ms to 0.75 and is worth 10% — but vLLM has `--kv-cache-dtype fp8` too
 and would take the same 10%, so it moves both engines and closes nothing.
 
+### Marlin's tile shape, and the register file that refuses it
+
+The narrow projections are level with Marlin — 17.3 us each against 17.26 — and
+the whole GEMM deficit is `gate_up`: 53.7 us against 50.1, 7%. Marlin runs the
+wide matrices at 256 rows a block with **four** warps (`thread_n_blocks` 16 at
+256 threads), so that shape was instantiated in this body and measured:
+
+| shape | rows a block | warps | registers | us (A4000, 32 tokens) |
+|---|---:|---:|---:|---:|
+| `1w8s2` | 64 | 8 | **100** | **222** |
+| `2w8s2` | 128 | 8 | 128 | 230 |
+| `4w4s2` | 128 | 4 | 215 | 226 |
+| `4w8s2` | 256 | 8 | 215 | 258 |
+| `8w4s2` | 256 | 4 | **255** | **778** |
+
+255 is the hard cap: the compiler spilled, and the kernel reads weights at
+80 GB/s against `1w8s2`'s 281. At 215 registers a 256-thread block leaves one
+resident block an SM, which is the shape of the two middle rows.
+
+So the 7% is not a parameter. `1w8s2` is 100 registers and 19.5 KB of shared
+because this body is built around many thin blocks, each holding one row group's
+accumulators; Marlin is built around one fat block an SM, kept busy by a
+four-stage `cp.async` pipeline and warp-level scheduling. Reaching its number
+means adopting that structure, which is the same answer the elimination table
+above gives from the other end.
+
 **Beating vLLM at this batch needs a GEMM that beats Marlin**, and the 14% this
 kernel cannot account for is where that would come from. Everything cheap has
 been measured; see the elimination table above. What is left is the architecture:

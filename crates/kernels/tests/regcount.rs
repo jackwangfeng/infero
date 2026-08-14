@@ -80,3 +80,24 @@ fn the_gemm_shapes_still_fit_more_than_one_block_per_sm() -> Result<()> {
     }
     Ok(())
 }
+
+/// What a wider row group costs in registers, which is why Marlin's tile shape
+/// does not port: at 256 rows and four warps this body needs 255 of them and
+/// spills. See the note above `MMQ_Y_SET` in `mmq.cu`.
+#[test]
+fn the_wide_row_group_shapes_and_their_registers() -> anyhow::Result<()> {
+    let dev = match tuili_cuda::Device::new(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skipping: no cuda device ({e})");
+            return Ok(());
+        }
+    };
+    let kern = Kernels::new(dev);
+    for v in ["mmqy1w8s2_2", "mmqy2w8s2_2", "mmqy4w8s2_2"] {
+        let name = format!("{v}_q4_g128");
+        let (regs, smem) = kern.kernel_registers("tuili_mmq", &name)?;
+        eprintln!("  {v:<14} {regs:>4} regs  {smem:>6} B static smem");
+    }
+    Ok(())
+}

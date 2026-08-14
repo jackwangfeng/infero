@@ -5992,6 +5992,21 @@ MMQ_Y_SET(2w8s4_4, 8, 2, 4, 4)
 MMQ_Y_SET(1w16s2, 16, 1, 1, 2)
 MMQ_Y_SET(1w16s2_2, 16, 1, 2, 2)
 MMQ_Y_SET(1w16s2_4, 16, 1, 4, 2)
+/* Marlin's tile shape does not port to this body, and the register file says why.
+   Its wide matrices run 256 rows a block with *four* warps
+   (`thread_n_blocks` 16 at 256 threads); instantiated here as `8w4s2` that is
+   **255 registers** — the hard cap, so the compiler spilled — and 777 us against
+   `1w8s2`'s 222 on an A4000, 80 GB/s of weights against 281. `4w4s2` (128 rows,
+   four warps) and `4w8s2` (256 rows, eight) both land on 215 registers, which is
+   one resident block an SM, and measure 226 and 258 against 222.
+ 
+   `1w8s2` is 100 registers and 19.5 KB of shared, which is what lets several
+   blocks share an SM, and that is the shape this body is built around: many thin
+   blocks, each holding one row group's accumulators. Marlin is built around the
+   opposite — one fat block an SM, kept busy by a four-stage `cp.async` pipeline
+   and warp-level scheduling. Its remaining 7% on `gate_up` lives in that choice,
+   not in a parameter, which is the same conclusion the elimination table in
+   `docs/catching-vllm.md` reaches from the other end. */
 MMQ_Y_SET(4w8s2, 8, 4, 1, 2)
 MMQ_Y_SET(4w8s2_2, 8, 4, 2, 2)
 MMQ_Y_SET(4w8s2_4, 8, 4, 4, 2)
