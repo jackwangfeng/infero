@@ -414,6 +414,36 @@ the card, vLLM's 1264 at the same history is *below* it rather than through it,
 and attention is worth 2.2% against vLLM rather than the 8% a broken ceiling
 would have implied.
 
+## The constraint the kernel already names, and the one thing aimed at it
+
+`mmq.cu`'s own elimination summary at 32 tokens, from variants that exist and
+were measured: this GEMM is **not** bound by the tensor cores (`mmqnm_*`, 0%),
+**not** by weight load width (`mmqfp_*`, 0%), **not** by A-fragment order
+(`mmqm_*` with `ldmatrix`, negative), and only 7% by the activation stream. What
+is left, in its own words, is *the shared-memory footprint itself*: two token
+tiles at two stages is 34.8 KB, which is **two resident blocks an SM against
+five at one tile**.
+
+Every experiment since has moved bytes between registers and shared and found
+the same wall, because both are that same footprint. The one move that does not
+trade one for the other is to **stop staging the activations at all** — read the
+A fragments straight from global, where L2 already holds them.
+
+The evidence that this is not absurd is in this file: the activation re-reads
+across blocks are 1.9x the weight bytes and cost nothing, because they are L2
+hits. Every projection measures above this card's DRAM peak once activations are
+counted. So L2 is already serving that traffic; the ring buys locality that L2
+was providing anyway, and pays 34.8 KB for it.
+
+If the ring goes, the footprint at 32 tokens falls to almost nothing and the
+block count goes from two an SM toward five. That is the only untried change
+pointed at the constraint the kernel names, rather than at one of the four
+things it has already ruled out.
+
+The risk is coalescing: a warp's lanes read 8 bytes each from different rows, so
+the global path is scattered where the shared path was not. Whether L1 absorbs
+that is the measurement.
+
 ## Is the load generator fair? Yes, to within 3%
 
 `bench.py` sends all 32 clients the same prompt at temperature 0, so all 32
