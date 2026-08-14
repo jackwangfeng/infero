@@ -680,9 +680,23 @@ computing on what TMA copies:
 | 256x64 B, 6 x 16 KiB | 1355 | 1354 |
 
 **96% of the copy-only ceiling survives the arithmetic**, against the 87% this
-kernel keeps of its own `cp.async` probe. So warp specialization's benefit is
-real and measured, not assumed — the consumer warps never issue a load, so they
-never stall on one.
+kernel keeps of its own `cp.async` probe.
+
+Then the kernel was written — `mmqt*`, the weight ring fed by
+`cp.async.bulk.tensor`, correct at three shapes and four token counts — and it
+is **5-17% slower** (`gate_up` 51.1 us against 48.9, `qkv` 14.7 against 12.6),
+with three stages far worse still (88.7). Which corrects the paragraph this one
+replaced: the issue cost in this kernel is one thread issuing one instruction a
+k-tile, so a producer warp would save nothing. What the block waits for is the
+copy, and at this tile size there is not enough arithmetic to hide it — a k-tile
+is 8 KB against sixteen MMAs a thread, where the probe's tile is 32 KB and its
+consumer reads no shared memory of its own.
+
+**So the tile is too small to hide any pipeline, whichever engine fills it.**
+Using TMA here means a bigger tile — more rows and more token tiles a block — and
+that moves the register budget, the row partition and the striped schedule
+together. The projection below stands, but its subject is that kernel, not this
+one with its copies swapped.
 
 It is also not enough. 1356 GB/s against this kernel's 1164 is +16.5%, which
 takes the GEMM from 3.32 ms to 2.85 and the engine from 5012 to about **5395** —

@@ -6884,7 +6884,31 @@ struct __align__(64) MmqTmaDesc { unsigned char bytes[128]; };
     }
 
 /* Named like the rest: mmqt<nblk>w<warps>s<stages>[_<tiles>]. The descriptor is
-   a by-value kernel parameter, which is how a `CUtensorMap` reaches a kernel. */
+   a by-value kernel parameter, which is how a `CUtensorMap` reaches a kernel.
+
+   Measured on a Blackwell at 16 tokens, us a call:
+
+                  mmqy1w8s2   mmqt1w8s2   mmqt1w8s3
+     qkv            12.6        14.7        18.7
+     gate_up        49.2        51.1        88.7
+
+   Slower, and deeper is much worse — the same curve the `cp.async` ring has, for
+   the same reason: stages are shared memory and shared memory is blocks an SM.
+
+   What that rules out is worth stating, because it is not what "TMA plus warp
+   specialization" suggests. The issue cost here is *one thread issuing one
+   instruction per k-tile*, so dedicating a producer warp would save essentially
+   nothing. What the block waits for is the copy itself, and at this tile size
+   there is not enough arithmetic to hide it: a k-tile is 8 KB and a block's work
+   on it is sixteen MMAs a thread. The streaming probe in `tests/tma.rs` holds
+   96% of its copy rate with arithmetic in place because its tile is 32 KB and
+   its consumer touches no shared memory of its own.
+
+   So the way to use TMA here is a bigger tile — more rows and more token tiles a
+   block, so the compute per copy grows — and that changes the register budget,
+   the row partition and the striped schedule together. Which is the "different
+   kernel" the elimination table keeps arriving at, now with a measured reason:
+   **this tile is too small to hide any pipeline, whichever engine fills it.** */
 #define MMQ_T_SET(SUFFIX, WARPS, NBLK, TILES, STAGES)                          \
     extern "C" __global__ __launch_bounds__((WARPS) * WARP_SIZE) void          \
     mmqt##SUFFIX##_q4_g128(float* __restrict__ out,                            \
