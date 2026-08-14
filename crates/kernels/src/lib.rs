@@ -485,6 +485,94 @@ impl Kernels {
         words * 4 + Self::SAMPLE_BLOCK * 4 * 4
     }
 
+    /// Slices a row's vocabulary takes on the greedy path.
+    ///
+    /// 32 rows a step at one block each is 2% of a 188-SM card, so the scan runs
+    /// at 94 GB/s. Thirty-two slices make it 1024 blocks, which fills the device
+    /// at every batch width this engine serves.
+    pub const ARGMAX_SPLITS: usize = 32;
+
+    /// [`Self::sample_rows`] when every row is greedy: the vocabulary scan split
+    /// across the device and the winners reduced by a second kernel.
+    ///
+    /// `pv`/`pi` hold `n_rows * ARGMAX_SPLITS` slice winners. The answer is the
+    /// single-block kernel's, token for token — both passes order candidates
+    /// with `samp_better`, so the lowest index still wins a tie.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_rows_greedy(
+        &self,
+        out: &mut CudaViewMut<'_, u32>,
+        pv: &mut CudaViewMut<'_, f32>,
+        pi: &mut CudaViewMut<'_, i32>,
+        logits: &CudaView<'_, f32>,
+        params: &CudaView<'_, f32>,
+        pen_tok: &CudaView<'_, i32>,
+        pen_cnt: &CudaView<'_, i32>,
+        pen_len: &CudaView<'_, i32>,
+        n_rows: usize,
+        vocab: usize,
+        pen_stride: usize,
+    ) -> Result<()> {
+        let splits = Self::ARGMAX_SPLITS;
+        anyhow::ensure!(
+            pv.len() >= n_rows * splits && pi.len() >= n_rows * splits,
+            "argmax scratch holds {} of {} slots",
+            pv.len().min(pi.len()),
+            n_rows * splits
+        );
+        let chunk = vocab.div_ceil(splits);
+        let part_shared = ((chunk.div_ceil(32) + 1) * 4) as u32 + Self::SAMPLE_BLOCK * 2 * 4;
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_sample", sample_src(), "argmax_partial_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (splits as u32, n_rows as u32, 1),
+            block_dim: (Self::SAMPLE_BLOCK, 1, 1),
+            shared_mem_bytes: part_shared,
+        };
+        let (v, ps, sp) = (vocab as i32, pen_stride as i32, splits as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        // Reborrowed, so the second pass can still read what this one writes.
+        b.arg(&mut *pv)
+            .arg(&mut *pi)
+            .arg(logits)
+            .arg(params)
+            .arg(pen_tok)
+            .arg(pen_cnt)
+            .arg(pen_len)
+            .arg(&v)
+            .arg(&ps)
+            .arg(&sp);
+        self.dev
+            .profile()
+            .time("argmax_partial", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("argmax_partial")?;
+                Ok(())
+            })?;
+
+        let g = self
+            .dev
+            .kernels()
+            .get("tuili_sample", sample_src(), "argmax_combine_f32")?;
+        let cfg2 = LaunchConfig {
+            grid_dim: (n_rows as u32, 1, 1),
+            block_dim: (Self::SAMPLE_BLOCK, 1, 1),
+            shared_mem_bytes: Self::SAMPLE_BLOCK * 2 * 4,
+        };
+        let pvv = pv.as_view();
+        let piv = pi.as_view();
+        let mut b2 = self.dev.stream().launch_builder(&g);
+        b2.arg(out).arg(&pvv).arg(&piv).arg(&sp);
+        self.dev
+            .profile()
+            .time("argmax_combine", self.dev.stream(), || {
+                unsafe { b2.launch(cfg2) }.context("argmax_combine")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     /// Sample one token per row without the logits ever leaving the device.
     ///
     /// `pen_tok` and `pen_cnt` are each row's repetition window as sorted
@@ -2705,7 +2793,15 @@ impl Kernels {
             });
         if accumulates {
             // The slices accumulate into `out`, so it has to start at zero.
-            self.dev.stream().memset_zeros(out)?;
+            //
+            // `TUILI_MMQ_NO_ZERO=1` skips it and computes the wrong answer on
+            // purpose: 130 of a step's ~420 graph nodes are these memsets, and
+            // their cost is their bytes *plus* a node transition each. Their
+            // execution time is 0.12 ms a step in a trace; this prices what
+            // removing them would actually be worth. Same idea as `mmqp`.
+            if !std::env::var("TUILI_MMQ_NO_ZERO").is_ok_and(|v| v == "1") {
+                self.dev.stream().memset_zeros(out)?;
+            }
         }
         let f = self.dev.kernels().get("tuili_mmq", mmq_src(), &name)?;
         if dyn_shared > 0 {

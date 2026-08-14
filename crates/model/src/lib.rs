@@ -356,6 +356,10 @@ pub struct Model {
 /// the model was built for.
 struct SampleBufs {
     params: cudarc::driver::CudaSlice<f32>,
+    /// Slice winners for the split greedy argmax; see
+    /// `Kernels::sample_rows_greedy`.
+    arg_v: cudarc::driver::CudaSlice<f32>,
+    arg_i: cudarc::driver::CudaSlice<i32>,
     pen_tok: cudarc::driver::CudaSlice<i32>,
     pen_cnt: cudarc::driver::CudaSlice<i32>,
     pen_len: cudarc::driver::CudaSlice<i32>,
@@ -1127,11 +1131,23 @@ impl Model {
             rnd[i] = r.rnd;
         }
 
+        // Every row greedy means the whole batch can take the split argmax,
+        // which fills the device instead of giving each row one block. The test
+        // is the kernel's own `is_greedy()`: zero temperature, or a top-k of one.
+        let all_greedy = rows
+            .iter()
+            .all(|r| r.temperature <= 0.0 || r.top_k == 1);
         let stream = self.dev.stream().clone();
         let fits = matches!(&self.samp, Some(b) if b.stride >= stride && b.pen_len.len() >= n);
         if !fits {
             self.samp = Some(SampleBufs {
                 params: stream.alloc_zeros::<f32>(self.max_logit_rows * 4)?,
+                arg_v: stream.alloc_zeros::<f32>(
+                    self.max_logit_rows * Kernels::ARGMAX_SPLITS,
+                )?,
+                arg_i: stream.alloc_zeros::<i32>(
+                    self.max_logit_rows * Kernels::ARGMAX_SPLITS,
+                )?,
                 pen_tok: stream.alloc_zeros::<i32>(self.max_logit_rows * stride)?,
                 pen_cnt: stream.alloc_zeros::<i32>(self.max_logit_rows * stride)?,
                 pen_len: stream.alloc_zeros::<i32>(self.max_logit_rows)?,
@@ -1170,18 +1186,38 @@ impl Model {
             b.rnd.slice(..n),
         );
         let mut out_v = b.out.slice_mut(..n);
-        self.kern.sample_rows(
-            &mut out_v,
-            &self.act.logits.slice(..n * vocab),
-            &params_v,
-            &tok_v,
-            &cnt_v,
-            &len_v,
-            &rnd_v,
-            n,
-            vocab,
-            stride,
-        )?;
+        if all_greedy {
+            let (mut av, mut ai) = (
+                b.arg_v.slice_mut(..n * Kernels::ARGMAX_SPLITS),
+                b.arg_i.slice_mut(..n * Kernels::ARGMAX_SPLITS),
+            );
+            self.kern.sample_rows_greedy(
+                &mut out_v,
+                &mut av,
+                &mut ai,
+                &self.act.logits.slice(..n * vocab),
+                &params_v,
+                &tok_v,
+                &cnt_v,
+                &len_v,
+                n,
+                vocab,
+                stride,
+            )?;
+        } else {
+            self.kern.sample_rows(
+                &mut out_v,
+                &self.act.logits.slice(..n * vocab),
+                &params_v,
+                &tok_v,
+                &cnt_v,
+                &len_v,
+                &rnd_v,
+                n,
+                vocab,
+                stride,
+            )?;
+        }
         if let Some(pe) = &self.phase_ev {
             pe.ev[3].record(&stream)?;
         }

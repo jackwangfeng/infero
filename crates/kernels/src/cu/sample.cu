@@ -83,6 +83,109 @@ __device__ __forceinline__ float samp_penalize(float l, int count, float p,
     return l;
 }
 
+/// The greedy path, split across the device instead of one block a row.
+///
+/// `sample_rows_f32` gives a row to a block, which at a batch of 32 is 32 blocks
+/// of 256 threads — 2% of a 188-SM card — and 128256 logits a row then take
+/// 175 us a step at 94 GB/s where the bytes alone are 16.4 MB. The scan is a
+/// reduction, so it splits: every block takes a slice of the vocabulary, and a
+/// second kernel picks the winner among the slices. Nothing about the answer
+/// changes — `samp_better` breaks ties by lowest index in both passes, so the
+/// token is the same one the single-block kernel would have chosen.
+///
+/// Only greedy rows. Above one candidate the survivors have to be selected
+/// across the *whole* row in descending order, which is what the top-k loop in
+/// `sample_rows_f32` does and is not a per-slice reduction.
+///
+/// The penalty bitmap covers this slice only — `chunk/32` words rather than the
+/// vocabulary's 4008 — which is what keeps the shared memory small enough for
+/// many blocks an SM.
+extern "C" __global__ void argmax_partial_f32(
+    float* __restrict__ pv, int* __restrict__ pi,
+    const float* __restrict__ logits, const SampleParams* __restrict__ params,
+    const int* __restrict__ pen_tok, const int* __restrict__ pen_cnt,
+    const int* __restrict__ pen_len, int vocab, int pen_stride, int splits) {
+    extern __shared__ __align__(16) unsigned int smem[];
+
+    const int s = blockIdx.x;
+    const int row = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int chunk = (vocab + splits - 1) / splits;
+    const int lo = s * chunk;
+    const int hi = min(vocab, lo + chunk);
+    const int words = (chunk + 31) / 32 + 1;
+
+    unsigned int* bits = smem;
+    float* rv = (float*)(void*)(smem + words);
+    int* ri = (int*)(void*)(rv + SAMPLE_BLOCK);
+
+    const SampleParams p = params[row];
+    const float* row_logits = logits + (size_t)row * vocab;
+    const int plen = pen_len[row];
+    const int* ptok = pen_tok + (size_t)row * pen_stride;
+    const int* pcnt = pen_cnt + (size_t)row * pen_stride;
+
+    for (int i = tid; i < words; i += SAMPLE_BLOCK) bits[i] = 0u;
+    __syncthreads();
+    for (int i = tid; i < plen; i += SAMPLE_BLOCK) {
+        const int t = ptok[i];
+        if (t >= lo && t < hi) {
+            const int b = t - lo;
+            atomicOr(&bits[b >> 5], 1u << (b & 31));
+        }
+    }
+    __syncthreads();
+
+    float best = -INFINITY;
+    int besti = 0x7fffffff;
+    for (int i = lo + tid; i < hi; i += SAMPLE_BLOCK) {
+        float v = row_logits[i];
+        const int b = i - lo;
+        if (bits[b >> 5] & (1u << (b & 31))) {
+            v = samp_penalize(v, samp_count(ptok, pcnt, plen, i), p.rep_penalty,
+                              true);
+        }
+        if (samp_better(v, i, best, besti)) {
+            best = v;
+            besti = i;
+        }
+    }
+    rv[tid] = best;
+    ri[tid] = besti;
+    samp_reduce(rv, ri, tid);
+    if (tid == 0) {
+        pv[(size_t)row * splits + s] = rv[0];
+        pi[(size_t)row * splits + s] = ri[0];
+    }
+}
+
+/// One block a row over the slice winners, which is a few hundred values.
+extern "C" __global__ void argmax_combine_f32(unsigned int* __restrict__ out,
+                                             const float* __restrict__ pv,
+                                             const int* __restrict__ pi,
+                                             int splits) {
+    extern __shared__ __align__(16) unsigned int smem[];
+    float* rv = (float*)(void*)smem;
+    int* ri = (int*)(void*)(rv + SAMPLE_BLOCK);
+
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    float best = -INFINITY;
+    int besti = 0x7fffffff;
+    for (int i = tid; i < splits; i += SAMPLE_BLOCK) {
+        const float v = pv[(size_t)row * splits + i];
+        const int idx = pi[(size_t)row * splits + i];
+        if (samp_better(v, idx, best, besti)) {
+            best = v;
+            besti = idx;
+        }
+    }
+    rv[tid] = best;
+    ri[tid] = besti;
+    samp_reduce(rv, ri, tid);
+    if (tid == 0) out[row] = (unsigned int)ri[0];
+}
+
 /// One block per row.
 ///
 /// `pen_tok` / `pen_cnt` hold each row's window as sorted unique ids with

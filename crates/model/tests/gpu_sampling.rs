@@ -200,3 +200,99 @@ fn the_device_sampler_picks_what_the_host_sampler_picks() -> Result<()> {
     }
     Ok(())
 }
+
+/// The split greedy argmax against the single-block kernel it replaces.
+///
+/// One block a row is 2% of a big card, so the greedy path now gives each row
+/// thirty-two blocks and reduces the slice winners. It has to pick the same
+/// token, and "the same" includes the tie-break: both passes order candidates
+/// with `samp_better`, so the lowest index wins, and this test feeds duplicate
+/// logits on purpose to say so.
+#[test]
+fn the_split_argmax_picks_what_one_block_picks() -> Result<()> {
+    let dev = match Device::new(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skipping: no cuda device ({e})");
+            return Ok(());
+        }
+    };
+    let kern = Kernels::new(dev.clone());
+    let stream = dev.stream();
+    let rows = 5usize;
+    let stride = 8usize;
+
+    for (case, penalty) in [(0usize, 1.0f32), (1, 1.3)] {
+        let mut all = Vec::with_capacity(rows * VOCAB);
+        for r in 0..rows {
+            let mut row = logits_for(r, VOCAB);
+            // A plateau of equal maxima, so the tie-break is exercised: the
+            // lowest index has to win whichever slice each copy lands in.
+            let top = row.iter().cloned().fold(f32::MIN, f32::max);
+            for j in [3usize, VOCAB / 3, VOCAB / 2, VOCAB - 7] {
+                row[(j + r) % VOCAB] = top;
+            }
+            all.extend_from_slice(&row);
+        }
+        // A window whose tokens include some of the plateau, so the penalty
+        // moves the answer between the two cases.
+        let windows: Vec<Vec<u32>> = (0..rows)
+            .map(|r| vec![3u32 + r as u32, (VOCAB / 2 + r) as u32, 17])
+            .collect();
+        let (tok, cnt, len) = window_tables(&windows, stride);
+
+        let mut pv = vec![0f32; rows * 4];
+        for p in 0..rows {
+            pv[p * 4] = 0.0; // greedy
+            pv[p * 4 + 1] = 1.0;
+            pv[p * 4 + 2] = f32::from_bits(1);
+            pv[p * 4 + 3] = penalty;
+        }
+
+        let d_logits = stream.clone_htod(&all)?;
+        let d_params = stream.clone_htod(&pv)?;
+        let d_tok = stream.clone_htod(&tok)?;
+        let d_cnt = stream.clone_htod(&cnt)?;
+        let d_len = stream.clone_htod(&len)?;
+        let d_rnd = stream.clone_htod(&vec![0.5f64; rows])?;
+
+        let mut one = stream.alloc_zeros::<u32>(rows)?;
+        kern.sample_rows(
+            &mut one.as_view_mut(),
+            &d_logits.as_view(),
+            &d_params.as_view(),
+            &d_tok.as_view(),
+            &d_cnt.as_view(),
+            &d_len.as_view(),
+            &d_rnd.as_view(),
+            rows,
+            VOCAB,
+            stride,
+        )?;
+
+        let mut split = stream.alloc_zeros::<u32>(rows)?;
+        let mut av = stream.alloc_zeros::<f32>(rows * Kernels::ARGMAX_SPLITS)?;
+        let mut ai = stream.alloc_zeros::<i32>(rows * Kernels::ARGMAX_SPLITS)?;
+        kern.sample_rows_greedy(
+            &mut split.as_view_mut(),
+            &mut av.as_view_mut(),
+            &mut ai.as_view_mut(),
+            &d_logits.as_view(),
+            &d_params.as_view(),
+            &d_tok.as_view(),
+            &d_cnt.as_view(),
+            &d_len.as_view(),
+            rows,
+            VOCAB,
+            stride,
+        )?;
+        let (a, b) = (stream.clone_dtoh(&one)?, stream.clone_dtoh(&split)?);
+        dev.synchronize()?;
+        assert_eq!(
+            b, a,
+            "case {case} (penalty {penalty}): split argmax and one-block \
+             disagree"
+        );
+    }
+    Ok(())
+}
