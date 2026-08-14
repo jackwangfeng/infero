@@ -6559,8 +6559,23 @@ MMQ_K_SET(1w8s2_4, 8, 1, 4, 2)
      mmqc1w8s4       refused          refused         110592 B of shared
 
    Two stages of weights cost more than the register pressure they relieve, and
-   four stages do not fit: the per-block shared limit is 100 KB and the ring plus
-   the activation ring wants 110.
+   four stages do not fit at two token tiles: the per-block shared limit is 100 KB
+   and the ring plus the activation ring wants 110.
+
+   At *one* token tile the activation ring halves and every depth fits, which is
+   the sweep that settles the mechanism rather than one point of it (us a call,
+   16 tokens, `gate_up` / `qkv`):
+
+                    A4000            Blackwell gate_up
+     mmqy1w8s2      186.8 / 49.4     48.5    (the register path)
+     mmqc1w8s2      185.4 / 57.7     50.7
+     mmqc1w8s3      242.7 / 88.1     77.9
+     mmqc1w8s4      254.9 / 96.3     84.4
+
+   Depth is monotonically worse on both cards. So it is not that the ring is
+   *shallow* — a deeper one does not buy the in-flight bytes the latency count
+   says are missing, it buys occupancy loss. Both places one can hold bytes,
+   registers and shared, are the same resource seen twice.
 
    Which is the whole answer to the missing 20%, from the third side. In-flight
    bytes are bought with registers or with shared, both of them are occupancy, and

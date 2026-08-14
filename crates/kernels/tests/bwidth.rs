@@ -407,6 +407,8 @@ fn each_projection_at_its_own_shape() -> Result<()> {
     };
     let kern = Kernels::new(dev.clone());
     let stream = dev.stream();
+    // `TUILI_MMQ_TOKENS=16` puts the f16 family on one token tile, which halves
+    // the activation ring and is the only way the deep weight rings fit at all.
     let tokens: usize = std::env::var("TUILI_MMQ_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -441,7 +443,7 @@ fn each_projection_at_its_own_shape() -> Result<()> {
         // flight without register cost. It was unreachable from the model until
         // the `mmqc` prefix fix, so it has never been measured on a real shape.
         for v in [
-            "mmqy1w8s2", "mmqy2w8s2", "mmqc1w8s2", "mmqc1w8s4",
+            "mmqy1w8s2", "mmqc1w8s2", "mmqc1w8s3", "mmqc1w8s4",
         ] {
         let mut run = |i: usize| -> Result<()> {
             kern.mmq_f16(

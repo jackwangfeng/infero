@@ -653,9 +653,16 @@ in `mmq_f16_variant_for`. Measured now, us a call at 32 tokens:
 | `mmqc1w8s2` (2-stage ring) | 59.7 / 269.8 | 18.9 |
 | `mmqc1w8s4` (4-stage ring) | refused | refused |
 
-Two stages cost more than the register pressure they relieve; four do not fit —
-the ring plus the activation ring asks for 110592 bytes against a 100 KB
-per-block limit.
+Two stages cost more than the register pressure they relieve; four do not fit at
+two token tiles — the ring plus the activation ring asks for 110592 bytes against
+a 100 KB per-block limit. At *one* token tile the activation ring halves, every
+depth fits, and the sweep is monotonic on both cards (`gate_up`, us a call, 16
+tokens): registers 48.5, ring-2 50.7, ring-3 77.9, ring-4 84.4 on the Blackwell;
+186.8 / 185.4 / 242.7 / 254.9 on the A4000.
+
+So the ring is not too *shallow*. Depth does not buy the in-flight bytes the
+latency count says are missing — it buys occupancy loss, which is the same thing
+the register path pays. Registers and shared are one resource seen twice.
 
 So both ways of buying in-flight bytes are closed, and they are closed by the
 same resource: registers and shared are both occupancy, and 940 KB an SM is not
