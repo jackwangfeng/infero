@@ -443,7 +443,7 @@ fn each_projection_at_its_own_shape() -> Result<()> {
         // flight without register cost. It was unreachable from the model until
         // the `mmqc` prefix fix, so it has never been measured on a real shape.
         for v in [
-            "mmqy1w8s2", "mmqc1w8s2", "mmqc1w8s3", "mmqc1w8s4",
+            "mmqy1w8s2", "mmqt1w8s2",
         ] {
         let mut run = |i: usize| -> Result<()> {
             kern.mmq_f16(

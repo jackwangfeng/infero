@@ -113,7 +113,17 @@ fn elementwise(n: u32) -> LaunchConfig {
 
 pub struct Kernels {
     dev: Device,
+    /// One `CUtensorMap` per weight plane, keyed by its device pointer and
+    /// shape. Building one is a host call of a few microseconds; a decode step
+    /// wants 128 of them, so they are built once and kept.
+    tma: std::sync::Mutex<std::collections::HashMap<(u64, usize, usize), TmaDesc>>,
 }
+
+/// A `CUtensorMap` is 128 opaque bytes that reach the kernel by value.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+pub struct TmaDesc([u8; 128]);
+unsafe impl cudarc::driver::DeviceRepr for TmaDesc {}
 
 fn b_args(
     k: &Kernels,
@@ -139,7 +149,10 @@ fn b_args(
 
 impl Kernels {
     pub fn new(dev: Device) -> Self {
-        Self { dev }
+        Self {
+            dev,
+            tma: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
     }
 
     pub fn device(&self) -> &Device {
@@ -2062,6 +2075,53 @@ impl Kernels {
         Ok(())
     }
 
+    /// The descriptor for a Q4_G128T quant plane: `n` rows of `row_bytes`,
+    /// tiled 128 bytes by `rows` and swizzled so the fragment read is
+    /// conflict-free — see `the_128b_swizzle_is_undone_by_xor_with_the_row`.
+    ///
+    /// Cached: the same matrix is asked for every step, and a graph capture must
+    /// not build one (it is a host call, and its result is baked into the
+    /// launch as a by-value argument).
+    fn tma_desc(&self, ptr: u64, n: usize, row_bytes: usize, rows: usize) -> Result<TmaDesc> {
+        // `rows` is the box height and belongs in the key: two variants with
+        // different row groups over the same matrix need different descriptors.
+        let key = (ptr, n, row_bytes * 1024 + rows);
+        if let Some(d) = self.tma.lock().unwrap().get(&key) {
+            return Ok(*d);
+        }
+        use cudarc::driver::sys;
+        let mut d = TmaDesc([0u8; 128]);
+        // u32 elements, so a 128-byte box is 32 of them — `boxDim` is capped at
+        // 256 elements a dimension and the innermost box has to be a multiple of
+        // 16 bytes.
+        let global_dim = [(row_bytes / 4) as u64, n as u64];
+        let global_strides = [row_bytes as u64];
+        let box_dim = [32u32, rows as u32];
+        let elem_strides = [1u32, 1];
+        let r = unsafe {
+            sys::cuTensorMapEncodeTiled(
+                (&mut d as *mut TmaDesc).cast(),
+                sys::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32,
+                2,
+                ptr as *mut std::ffi::c_void,
+                global_dim.as_ptr(),
+                global_strides.as_ptr(),
+                box_dim.as_ptr(),
+                elem_strides.as_ptr(),
+                sys::CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+                sys::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+                sys::CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+                sys::CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+            )
+        };
+        anyhow::ensure!(
+            r == sys::CUresult::CUDA_SUCCESS,
+            "cuTensorMapEncodeTiled for a {n}x{row_bytes} plane: {r:?}"
+        );
+        self.tma.lock().unwrap().insert(key, d);
+        Ok(d)
+    }
+
     /// Bytes a `k`-element row occupies once quantized to Q8_1.
     pub fn q8_1_bytes(k: usize) -> usize {
         k.div_ceil(32) * Q8_1_BLOCK_BYTES
@@ -2453,6 +2513,7 @@ impl Kernels {
             || variant.starts_with("mmqy")
             || variant.starts_with("mmqk")
             || variant.starts_with("mmqc")
+            || variant.starts_with("mmqt")
             || variant.starts_with("mmqe")
         {
             Self::mmq_tiles(n_tokens)
@@ -2483,7 +2544,7 @@ impl Kernels {
         // A wide-tile name carries its own shape: `<nblk>w<warps>`, and the
         // `cp.async` variant appends `s<stages>`, which only the kernel needs.
         // `mmqsr` before `mmqs`, which is an exact name rather than a prefix.
-        let wide_named = ["mmqsr", "mmqx", "mmqa", "mmqr", "mmqfp", "mmqf", "mmqg", "mmqzg", "mmqz", "mmqy", "mmqk", "mmqc", "mmqm", "mmqnm", "mmqnx", "mmqnh", "mmqnr", "mmqe", "mmqb", "mmql", "mmqna", "mmqne"]
+        let wide_named = ["mmqsr", "mmqx", "mmqa", "mmqr", "mmqfp", "mmqf", "mmqg", "mmqzg", "mmqz", "mmqy", "mmqk", "mmqc", "mmqt", "mmqm", "mmqnm", "mmqnx", "mmqnh", "mmqnr", "mmqe", "mmqb", "mmql", "mmqna", "mmqne"]
             .iter()
             .find_map(|p| variant.strip_prefix(p).map(|shape| (*p, shape)));
         let wide_shape = wide_named.map(|(_, shape)| shape);
@@ -2660,6 +2721,7 @@ impl Kernels {
             || variant.starts_with("mmqy")
             || variant.starts_with("mmqk")
             || variant.starts_with("mmqc")
+            || variant.starts_with("mmqt")
             || variant.starts_with("mmqm")
             || variant.starts_with("mmqnm")
             || variant.starts_with("mmqnx")
@@ -2695,6 +2757,13 @@ impl Kernels {
                 // Plus the weight ring: two 128-blocks a k-tile, `mrows` rows
                 // of an 80-byte padded stride. See `MMQ_BSH_STRIDE`.
                 act + stages * 2 * rows_per_block * 80
+            } else if variant.starts_with("mmqt") {
+                // The TMA ring lands dense — both 128-blocks of a k-tile in one
+                // 128-byte row, swizzled rather than padded — plus one barrier a
+                // stage, plus 128 for the alignment the kernel rounds up to,
+                // since the shared base is only 16-byte aligned and
+                // `cp.async.bulk.tensor` wants 128.
+                act + 128 + stages * rows_per_block * 128 + stages * 8
             } else {
                 act
             }
@@ -2848,8 +2917,22 @@ impl Kernels {
             shared_mem_bytes: dyn_shared,
         };
         let (k_i, n_i, t_i) = (k as i32, n as i32, n_tokens as i32);
+        // The TMA family needs a descriptor for the quant plane, by value.
+        // Built here because this is the only place that knows the shape; the
+        // cache makes it a lookup after the first step, and a capture replays
+        // the value it was handed.
+        let desc = if variant.starts_with("mmqt") {
+            use cudarc::driver::DevicePtr;
+            let (ptr, _sync) = w.device_ptr(self.dev.stream());
+            Some(self.tma_desc(ptr, n, (k / 128) * 64, rows_per_block as usize)?)
+        } else {
+            None
+        };
         let mut b = self.dev.stream().launch_builder(&f);
         b.arg(out).arg(w).arg(x_q8_1).arg(&k_i).arg(&n_i).arg(&t_i);
+        if let Some(d) = desc.as_ref() {
+            b.arg(d);
+        }
         self.dev.profile().time("mmq", self.dev.stream(), || {
             unsafe { b.launch(cfg) }.context("mmq")?;
             Ok(())
@@ -3272,7 +3355,7 @@ impl Kernels {
             variant.starts_with("mmqf") || variant.starts_with("mmqg")
                 || variant.starts_with("mmqz") || variant.starts_with("mmqy")
                 || variant.starts_with("mmqk") || variant.starts_with("mmqc")
-                || variant.starts_with("mmqm")
+                || variant.starts_with("mmqt") || variant.starts_with("mmqm")
                 || variant.starts_with("mmqnm") || variant.starts_with("mmqnx")
                 || variant.starts_with("mmqnh") || variant.starts_with("mmqnr"),
             "mmq_f16 is for the f16-operand kernels, got {variant}"

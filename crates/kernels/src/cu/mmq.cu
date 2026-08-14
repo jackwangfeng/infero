@@ -6583,6 +6583,327 @@ MMQ_K_SET(1w8s2_4, 8, 1, 4, 2)
    warp specialization is the way out because it moves bytes without holding
    registers *and* lets one fat block use the SM's whole shared budget — which is
    what CUTLASS and Marlin are built around, and is a different kernel. */
+/* A `CUtensorMap` is 128 opaque bytes that must reach the kernel by value. */
+struct __align__(64) MmqTmaDesc { unsigned char bytes[128]; };
+
+/* `cp.async.bulk.tensor` and `mbarrier` are sm_90 and newer, and NVRTC compiles
+   this file for whatever card is present — so on an Ampere the whole module
+   fails to compile, not just this family, unless the family is guarded. The
+   host never selects `mmqt*` below sm_90; if it is asked to, the symbol is
+   absent and the error says so. */
+#if __CUDA_ARCH__ >= 900
+
+/* One `cp.async.bulk.tensor` a k-tile: `mrows` rows of 128 bytes — both
+   64-byte blocks of the tile in one row — landed swizzled so the fragment
+   read below is conflict-free. The descriptor covers the whole quant plane and
+   the host builds it once per matrix; `TILE` picks the 128-byte column and
+   `row0` the row.
+
+   A tile past the run's end still has to arrive, or the waiter never sees its
+   barrier flip — so it arrives with zero bytes expected. Rows past `n` and
+   columns past the plane are zero-filled by the copy engine, which is what the
+   `cp.async` path spelled out with a predicate. */
+#define MMQ_TB_FETCH(BUF, TILE, LIMIT)                                         \
+    do {                                                                       \
+        if (tid == 0) {                                                        \
+            const int _tl = (TILE);                                            \
+            const unsigned int _m = mbar0 + (unsigned)((BUF) * 8);             \
+            const unsigned int _t = (unsigned int)__cvta_generic_to_shared(    \
+                bsh + (size_t)(BUF) * mrows * 128);                            \
+            if (_tl < (LIMIT)) {                                               \
+                asm volatile(                                                  \
+                    "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], "      \
+                    "%1;\n" ::"r"(_m),                                         \
+                    "r"(mrows * 128));                                         \
+                asm volatile(                                                  \
+                    "cp.async.bulk.tensor.2d.shared::cluster.global"           \
+                    ".mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], "     \
+                    "[%4];\n" ::"r"(_t),                                       \
+                    "l"(&wdesc), "r"(_tl * 32), "r"(row0), "r"(_m)             \
+                    : "memory");                                               \
+            }  /* no arrive past the run: nobody waits on it */                \
+        }                                                                      \
+    } while (0)
+
+#define MMQ_T_BODY(WARPS, NBLK, TILES, STAGES)                                 \
+    extern __shared__ __align__(16) int8_t xf[];                               \
+    /* The weight ring, after the activation ring in the same allocation. */   \
+    /* `cp.async.bulk.tensor` writes to a 128-byte aligned address. */         \
+    int8_t* bsh = (int8_t*)(((size_t)(xf +                                     \
+        (STAGES) * (TILES) * MMQ_M * MMQ_XF_STRIDE) + 127) &                   \
+        ~(size_t)127);                                                         \
+    /* One barrier a stage, after the weight ring. */                          \
+    const int wring = (STAGES) * (WARPS) * (NBLK) * 8 * 128;                   \
+    unsigned long long* mbar =                                                 \
+        (unsigned long long*)(void*)(bsh + wring);                             \
+    const unsigned int mbar0 =                                                 \
+        (unsigned int)__cvta_generic_to_shared(mbar);                          \
+    int wphase[STAGES];                                                        \
+                                                                               \
+    const int tid = threadIdx.x;                                               \
+    const int lane = tid % WARP_SIZE;                                          \
+    const int warp = tid / WARP_SIZE;                                          \
+    const int nthreads = (WARPS) * WARP_SIZE;                                  \
+    const int mrows = (WARPS) * (NBLK) * 8;                                    \
+    const int tok0 = blockIdx.y * (TILES) * MMQ_M;                             \
+    const int nb_total = k / QK_G128;                                          \
+    const int k_tiles = (k + MMQ_K - 1) / MMQ_K;                               \
+    const int row_tiles = (n + mrows - 1) / mrows;                             \
+    const int x_rows = (TILES) * MMQ_M;                                        \
+    const int x_valid = min(x_rows, max(0, n_tokens - tok0));                  \
+    const uint8_t* xbytes = (const uint8_t*)xv;                                \
+                                                                               \
+    const int ar = mma_a_row(lane);                                            \
+    const int bc = mma_b_col(lane);                                            \
+    const int cq = lane % 4;                                                   \
+    const int kq = cq * 4;                                                     \
+    const int cr = mma_c_row(lane);                                            \
+    const int cc = mma_c_col(lane);                                            \
+    const int wbase = warp * (NBLK) * 8;                                       \
+    if (threadIdx.x == 0) {                                                    \
+        _Pragma("unroll") for (int _s = 0; _s < (STAGES); ++_s) {              \
+            asm volatile(                                                      \
+                "mbarrier.init.shared::cta.b64 [%0], 1;\n" ::"r"(              \
+                    mbar0 + (unsigned)(_s * 8)));                              \
+        }                                                                      \
+        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");         \
+    }                                                                          \
+    _Pragma("unroll") for (int _s = 0; _s < (STAGES); ++_s)                    \
+        wphase[_s] = 0;                                                        \
+    __syncthreads();                                                           \
+                                                                               \
+    /* The striped partition, which `mmqsr_*` measured worth 30% at four        \
+       tokens. Same arithmetic here. */                                        \
+    const int total = row_tiles * k_tiles;                                     \
+    const int iters = (total + (int)gridDim.x - 1) / (int)gridDim.x;           \
+    int flat = iters * (int)blockIdx.x;                                        \
+    const int flat_end = min(total, flat + iters);                             \
+                                                                               \
+    /* `n * nb` blocks of 64 quant bytes, then `n * nb` scale pairs. Same      \
+       total as the packed 68-byte blocks, and the quants are 16-byte aligned   \
+       where the blocks are not — which is the point, since a lane's fragment   \
+       is one `uint4`. */                                                      \
+    const uint8_t* qbase = (const uint8_t*)wq;                                 \
+    const __half2* sbase =                                                     \
+        (const __half2*)(const void*)(qbase + (size_t)n * nb_total * 64);      \
+    size_t browi[NBLK];                                                        \
+    bool brow_ok[NBLK];                                                        \
+    mma_c_f32 acc[NBLK][TILES];                                                \
+                                                                               \
+    if (x_valid < x_rows) {                                                    \
+        const int per = (x_rows - x_valid) * (MMQ_XF_ROW / 4);                 \
+        for (int i = tid; i < (STAGES) * per; i += nthreads) {                 \
+            const int s = i / per;                                             \
+            const int j = i % per;                                             \
+            const int r = x_valid + j / (MMQ_XF_ROW / 4);                      \
+            const int e = (j % (MMQ_XF_ROW / 4)) * 4;                          \
+            *(uint32_t*)(void*)(xf + (s * x_rows + r) * MMQ_XF_STRIDE + e) = 0;\
+        }                                                                      \
+    }                                                                          \
+                                                                               \
+    while (flat < flat_end) {                                                  \
+        const int nt = flat / k_tiles;                                         \
+        const int kt_lo = flat % k_tiles;                                      \
+        const int kt_hi = min(k_tiles, kt_lo + (flat_end - flat));             \
+        const int row0 = nt * mrows;                                           \
+                                                                               \
+        _Pragma("unroll") for (int j = 0; j < (NBLK); ++j) {                   \
+            const int r = row0 + wbase + j * 8 + bc;                           \
+            brow_ok[j] = r < n;                                                \
+            /* The row's byte offset, not its index: multiplying by the row  \
+               stride inside the k-loop puts a 64-bit multiply on every weight \
+               address and cost 13% when it was written that way. */          \
+            browi[j] = brow_ok[j] ? (size_t)r * nb_total : 0;                  \
+            _Pragma("unroll") for (int u = 0; u < (TILES); ++u) {              \
+                _Pragma("unroll") for (int c = 0; c < 4; ++c)                  \
+                    acc[j][u].x[c] = 0.0f;                                     \
+            }                                                                  \
+        }                                                                      \
+                                                                               \
+        _Pragma("unroll") for (int s = 0; s < (STAGES) - 1; ++s) {             \
+            MMQ_XF_FETCH(s, kt_lo + s, kt_hi);                                 \
+            MMQ_TB_FETCH(s, kt_lo + s, kt_hi);                                 \
+        }                                                                      \
+                                                                               \
+        for (int kt = kt_lo; kt < kt_hi; ++kt) {                               \
+            const int pos = (kt - kt_lo) % (STAGES);                           \
+            MMQ_CP_ASYNC_WAIT((STAGES) - 2);                                   \
+            /* The weights arrive by `cp.async.bulk.tensor`, which             \
+               reports through a barrier rather than the per-thread            \
+               `cp.async` counter. One thread waits; the block-wide            \
+               sync below publishes it. */                                     \
+            if (tid == 0) {                                                    \
+                asm volatile(                                                  \
+                    "{\n.reg .pred p;\nWT:\n"                                  \
+                    "mbarrier.try_wait.parity.shared::cta.b64 p, "             \
+                    "[%0], %1;\n"                                              \
+                    "@p bra.uni DT;\nbra.uni WT;\nDT:\n}\n" ::"r"(             \
+                        mbar0 + (unsigned)(pos * 8)),                          \
+                    "r"(wphase[pos])                                           \
+                    : "memory");                                               \
+            }                                                                  \
+            wphase[pos] ^= 1;                                                  \
+            /* Arrive, then load this k-tile's weights — global, and needing   \
+               nothing the barrier publishes — then wait. `__syncthreads` is    \
+               arrive and wait in one instruction with nothing able to happen   \
+               between them. */                                                \
+            /* The scales are the only operand still coming from global —   \
+               four bytes a row a k-tile, whose stride is `nb * 4` and so      \
+               cannot be copied contiguously — so they are what the split      \
+               barrier now has left to hide. */                                \
+            mmq_bar_arrive(nthreads);                                          \
+            uint4 yv4[2][NBLK];                                                \
+            __half2 ys2[2][NBLK], ym2[2][NBLK];                                \
+            _Pragma("unroll") for (int yb = 0; yb < 2; ++yb) {                 \
+                const int ykb = kt * 2 + yb;                                   \
+                const bool yok = ykb < nb_total;                               \
+                _Pragma("unroll") for (int j = 0; j < (NBLK); ++j) {           \
+                    __half2 yds = __floats2half2_rn(0.0f, 0.0f);               \
+                    if (brow_ok[j] && yok) yds = sbase[browi[j] + ykb];        \
+                    ys2[yb][j] = __float2half2_rn(__low2float(yds));           \
+                    ym2[yb][j] = __float2half2_rn(-__high2float(yds));         \
+                }                                                              \
+            }                                                                  \
+            mmq_bar_sync(nthreads);                                            \
+            /* Only now: these bytes were written by other threads' copies,    \
+               and `cp.async.wait` is a per-thread guarantee. */               \
+            _Pragma("unroll") for (int yb = 0; yb < 2; ++yb) {                 \
+                _Pragma("unroll") for (int j = 0; j < (NBLK); ++j) {           \
+                    /* One 128-byte row a weight row, both 64-byte blocks      \
+                       in it, and the 128B swizzle undone by                   \
+                       `chunk ^ (row & 7)` — see                               \
+                       `the_128b_swizzle_is_undone_by_xor_with_the_row`. */    \
+                    const int _r = wbase + j * 8 + bc;                         \
+                    const int _c = yb * 4 + cq;                                \
+                    yv4[yb][j] = *(const uint4*)(const void*)(                 \
+                        bsh + ((size_t)pos * mrows + _r) * 128                 \
+                            + ((_c ^ (_r & 7)) * 16));                         \
+                }                                                              \
+            }                                                                  \
+            MMQ_XF_FETCH((pos + (STAGES) - 1) % (STAGES),                      \
+                         kt + (STAGES) - 1, kt_hi);                            \
+            MMQ_TB_FETCH((pos + (STAGES) - 1) % (STAGES),                      \
+                         kt + (STAGES) - 1, kt_hi);                            \
+            const int8_t* xbuf = xf + pos * x_rows * MMQ_XF_STRIDE;            \
+                                                                               \
+            _Pragma("unroll") for (int blk = 0; blk < 2; ++blk) {              \
+                const int kb = kt * 2 + blk;                                   \
+                const bool kb_ok = kb < nb_total;                              \
+                /* One scale and one zero per row per 128 weights, broadcast   \
+                   into the halves the dequantization folds them into. */      \
+                __half2 s2[NBLK], m2[NBLK];                                    \
+                _Pragma("unroll") for (int j = 0; j < (NBLK); ++j) {           \
+                    const int sr = row0 + wbase + j * 8 + bc;                  \
+                    __half2 ds = __floats2half2_rn(0.0f, 0.0f);                \
+                    (void)ds;                                                  \
+                    s2[j] = ys2[blk][j];                                       \
+                    m2[j] = ym2[blk][j];                                       \
+                    (void)sr;                                                  \
+                }                                                              \
+                /* One 16-byte request for the four words this lane used   \
+                   to fetch separately: the transpose put (run 0 low, run 0   \
+                   high, run 1 low, run 1 high) side by side. */              \
+                uint4 wv4[NBLK];                                              \
+                _Pragma("unroll") for (int j = 0; j < (NBLK); ++j) {          \
+                    wv4[j] = yv4[blk][j];                                     \
+                }                                                              \
+                _Pragma("unroll") for (int run = 0; run < 2; ++run) {          \
+                    uint32_t v0[NBLK], v1[NBLK];                               \
+                    _Pragma("unroll") for (int j = 0; j < (NBLK); ++j) {       \
+                        v0[j] = run ? wv4[j].z : wv4[j].x;                     \
+                        v1[j] = run ? wv4[j].w : wv4[j].y;                     \
+                    }                                                          \
+                    _Pragma("unroll") for (int h = 0; h < 2; ++h) {            \
+                        const int g = blk * 4 + run + h * 2;                   \
+                        /* Two MMAs a group: k is 16 here, not 32. */          \
+                        _Pragma("unroll") for (int mm = 0; mm < 2; ++mm) {     \
+                            mma_a_f16 a[TILES];                                \
+                            _Pragma("unroll") for (int u = 0; u < (TILES);     \
+                                                   ++u) {                      \
+                                const int8_t* ap =                             \
+                                    xbuf + (u * MMQ_M + ar) * MMQ_XF_STRIDE    \
+                                    + g * 64 + mm * 32 + cq * 8;               \
+                                const int8_t* aq = ap + 8 * MMQ_XF_STRIDE;     \
+                                const uint2 lo =                               \
+                                    *(const uint2*)(const void*)ap;            \
+                                const uint2 hi =                               \
+                                    *(const uint2*)(const void*)aq;            \
+                                a[u].x[0] = lo.x;                              \
+                                a[u].x[1] = hi.x;                              \
+                                a[u].x[2] = lo.y;                              \
+                                a[u].x[3] = hi.y;                              \
+                            }                                                  \
+                            _Pragma("unroll") for (int j = 0; j < (NBLK);      \
+                                                   ++j) {                      \
+                                mma_b_f16 b;                                   \
+                                /* No `prmt`: the pack swapped bytes 1 and 2  \
+                                   so `lop3`'s mask lands on the right pair    \
+                                   and the second half is one shift away. */   \
+                                mmq_deq4_f16_repacked(mm ? v1[j] : v0[j], h,   \
+                                                      s2[j], m2[j], b.x);      \
+                                _Pragma("unroll") for (int u = 0;              \
+                                                       u < (TILES); ++u) {     \
+                                    mma_f16(acc[j][u], a[u], b);               \
+                                }                                              \
+                            }                                                  \
+                        }                                                      \
+                    }                                                          \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+                                                                               \
+        MMQ_CP_ASYNC_WAIT(0);                                                  \
+        __syncthreads();                                                       \
+                                                                               \
+        /* No epilogue: the accumulator is already the answer. */              \
+        const bool whole = (kt_lo == 0) && (kt_hi == k_tiles);                 \
+        _Pragma("unroll") for (int j = 0; j < (NBLK); ++j) {                   \
+            const int orow = row0 + wbase + j * 8 + cc;                        \
+            _Pragma("unroll") for (int u = 0; u < (TILES); ++u) {              \
+                const int ot0 = tok0 + u * MMQ_M + cr;                         \
+                const int ot1 = ot0 + 8;                                       \
+                if (ot0 < n_tokens) {                                          \
+                    if (orow < n)                                              \
+                        MMQ_PUT2(whole, (size_t)ot0 * n + orow,                \
+                                 acc[j][u].x[0]);                              \
+                    if (orow + 1 < n)                                          \
+                        MMQ_PUT2(whole, (size_t)ot0 * n + orow + 1,            \
+                                 acc[j][u].x[1]);                              \
+                }                                                              \
+                if (ot1 < n_tokens) {                                          \
+                    if (orow < n)                                              \
+                        MMQ_PUT2(whole, (size_t)ot1 * n + orow,                \
+                                 acc[j][u].x[2]);                              \
+                    if (orow + 1 < n)                                          \
+                        MMQ_PUT2(whole, (size_t)ot1 * n + orow + 1,            \
+                                 acc[j][u].x[3]);                              \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+        flat += kt_hi - kt_lo;                                                 \
+    }
+
+/* Named like the rest: mmqt<nblk>w<warps>s<stages>[_<tiles>]. The descriptor is
+   a by-value kernel parameter, which is how a `CUtensorMap` reaches a kernel. */
+#define MMQ_T_SET(SUFFIX, WARPS, NBLK, TILES, STAGES)                          \
+    extern "C" __global__ __launch_bounds__((WARPS) * WARP_SIZE) void          \
+    mmqt##SUFFIX##_q4_g128(float* __restrict__ out,                            \
+                           const void* __restrict__ wv,                        \
+                           const void* __restrict__ xv, int k, int n,          \
+                           int n_tokens,                                       \
+                           const __grid_constant__ MmqTmaDesc wdesc) {         \
+        const block_q4_g128* wq = (const block_q4_g128*)wv;                    \
+        MMQ_T_BODY(WARPS, NBLK, TILES, STAGES)                                 \
+    }
+
+MMQ_T_SET(1w8s2, 8, 1, 1, 2)
+MMQ_T_SET(1w8s2_2, 8, 1, 2, 2)
+MMQ_T_SET(1w8s3, 8, 1, 1, 3)
+MMQ_T_SET(1w8s3_2, 8, 1, 2, 3)
+MMQ_T_SET(1w8s4_2, 8, 1, 4, 3)
+
+#endif  /* __CUDA_ARCH__ >= 900 */
+
 #define MMQ_C_SET(SUFFIX, WARPS, NBLK, TILES, STAGES)                          \
     extern "C" __global__ __launch_bounds__((WARPS) * WARP_SIZE) void          \
     mmqc##SUFFIX##_q4_g128(float* __restrict__ out,                            \

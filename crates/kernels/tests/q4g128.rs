@@ -606,7 +606,13 @@ fn the_transposed_weight_layout_gives_the_same_answer() -> Result<()> {
             }
 
             let mut gemm = stream.alloc_zeros::<f32>(tokens * n)?;
-            for v in ["mmqz1w8s2", "mmqy1w8s2", "mmqy2w8s2", "mmqc1w8s2"] {
+            // `mmqt*` is the TMA family and exists only on sm_90 and newer —
+            // the kernel source guards it, so below that the symbol is absent.
+            let mut vs = vec!["mmqz1w8s2", "mmqy1w8s2", "mmqy2w8s2", "mmqc1w8s2"];
+            if dev.arch() >= 90 {
+                vs.push("mmqt1w8s2");
+            }
+            for v in vs {
             kern.mmq_f16(
                 v,
                 &mut gemm.as_view_mut(),
