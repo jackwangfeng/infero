@@ -676,11 +676,42 @@ takes the GEMM from 3.32 ms to 2.85 and the engine from 5012 to about **5395** �
 against vLLM's 5403. The ceiling of the whole direction, measured with its
 arithmetic in place, is a **tie**.
 
-**So the honest projection for a multi-day rewrite is a tie, not a win**, and
-that is worth knowing before starting rather than after. Beating vLLM here needs
-something that changes the bytes rather than the pipeline — a cheaper KV
-encoding whose attention kernel is not 2x off (see above), or a weight encoding
-below 4.25 bits, and both of those change the comparison's terms.
+**So the projection for the rewrite *alone* is a tie**, which is worth knowing
+before starting rather than after. It is not the whole projection, though,
+because 3.2% of a step is not on the GPU at all.
+
+### The 3% that is not on the GPU
+
+`gpu_ms` is 6.177 against a 6.384 ms step (32 tokens at the 5012 plateau), so
+**0.207 ms of every step is not GPU work**. The scheduler's own breakdown says
+where it is not: `gap_ms` 0.00, `issue_ms` 0.04-0.20, `advance_ms` 0.03-0.04.
+Nothing is lost *between* steps. The host blocks on the sampled tokens —
+`sample_ms` is that wait — and only then launches the next step's graph, so the
+device idles across the launch.
+
+That dependency does not actually need the host. The next step's embedding gather
+indexes by token id, and those ids are already in device memory where the sampler
+wrote them; what the host needs their *values* for is stop conditions. Deciding
+those one step late — one extra token per sequence, discarded — is what vLLM's
+async scheduling does, and it lets step N+1 be issued behind step N on the same
+stream.
+
+It matters here because it *adds* to the GEMM number rather than competing with
+it:
+
+| | worth | kind |
+|---|---:|---|
+| TMA GEMM at its measured ceiling | +7.6% → ~5395 | a new kernel |
+| issuing N+1 without the token round trip | +3.2% → ~5170 | a scheduler change |
+| **both** | **+10.8% → ~5555** | **past vLLM's 5403** |
+
+So the honest projection is no longer "a tie at best": the rewrite alone ties,
+and the rewrite with the host off the critical path wins **at the same
+configuration**. Both are real work; both are now priced.
+
+The byte-side items — a KV encoding whose attention kernel is not 2x off its
+budget (above), or weights below 4.25 bits — remain the only *cheap* paths past
+vLLM, and both change the comparison's terms.
 
 **Beating vLLM at this batch needs a GEMM that beats Marlin**, and the 14% this
 kernel cannot account for is where that would come from. Everything cheap has
