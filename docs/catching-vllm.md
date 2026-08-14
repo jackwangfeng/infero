@@ -633,6 +633,41 @@ four-stage `cp.async` pipeline and warp-level scheduling. Reaching its number
 means adopting that structure, which is the same answer the elimination table
 above gives from the other end.
 
+### What the TMA rewrite is worth, measured before writing it
+
+TMA is reachable from this codebase — runtime NVRTC at `compute_120`, a
+descriptor from `cuTensorMapEncodeTiled` passed by value, `cp.async.bulk.tensor`
+plus an `mbarrier` pipeline, no CUTLASS and no offline `nvcc`
+(`tests/tma.rs`). So the question stops being whether it works and becomes what
+it is worth, which a streaming probe answers without writing the kernel: one
+block an SM, a pipeline of TMA copies over `gate_up`'s quant plane, four cycled
+buffers, and a trivial consumer.
+
+| box | stages | shared | GB/s |
+|---|---:|---:|---:|
+| 256x64 B | 6 x 16 KiB | 96 KiB | 1358 |
+| **512x64 B** | **3 x 32 KiB** | 96 KiB | **1417** |
+| 1024x32 B | 3 x 32 KiB | 96 KiB | 1419 |
+| 1024x64 B | 1 x 64 KiB | 64 KiB | 1358 |
+
+So the ceiling of the whole direction is **1419 GB/s**, against the `cp.async`
+probe's 1345, Marlin's 1247 and this kernel's 1164 — with the roofline at 1792.
+The copy granularity matters and the depth does not: 512-byte boxes beat
+256-byte ones by 4%, and three stages beat six.
+
+That prices the rewrite. This kernel reaches 87% of its own probe (1164 of 1345);
+a TMA kernel at the same 87% of 1419 is 1235 GB/s, which takes the GEMM from
+3.32 ms to 3.13 and the engine to about **5160** — still short. At 95%, which
+warp specialization makes plausible because the consumer warps never issue a
+load, it is 1348 GB/s, 2.87 ms, and about **5370** — level with vLLM's 5403 and
+not past it.
+
+**So the honest projection for a multi-day rewrite is a tie, not a win**, and
+that is worth knowing before starting rather than after. Beating vLLM here needs
+something that changes the bytes rather than the pipeline — a cheaper KV
+encoding whose attention kernel is not 2x off (see above), or a weight encoding
+below 4.25 bits, and both of those change the comparison's terms.
+
 **Beating vLLM at this batch needs a GEMM that beats Marlin**, and the 14% this
 kernel cannot account for is where that would come from. Everything cheap has
 been measured; see the elimination table above. What is left is the architecture:
