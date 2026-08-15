@@ -101,3 +101,44 @@ fn the_wide_row_group_shapes_and_their_registers() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Which resource actually caps this GEMM's blocks an SM — asked of the driver,
+/// with the dynamic shared the engine really launches.
+///
+/// The kernel's own note says the 34.8 KB activation ring at two token tiles is
+/// what holds it to two blocks. If registers hold it to two as well, then
+/// removing the ring buys nothing, and so does trimming registers — which is
+/// the difference between "occupancy is the wall" and "occupancy is *two* walls
+/// at the same height".
+#[test]
+fn what_caps_the_blocks_an_sm() -> anyhow::Result<()> {
+    let dev = match tuili_cuda::Device::new(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skipping: no cuda device ({e})");
+            return Ok(());
+        }
+    };
+    let sm = dev.sm_count();
+    let kern = Kernels::new(dev);
+    // `MMQ_XF_STRIDE` is 544 and a stage holds `tiles * 16` rows.
+    for (name, threads, tiles, stages) in [
+        ("mmqy1w8s2_q4_g128", 256u32, 1usize, 2usize),
+        ("mmqy1w8s2_2_q4_g128", 256, 2, 2),
+    ] {
+        let (regs, _) = kern.kernel_registers("tuili_mmq", name)?;
+        let stride: usize = std::env::var("TUILI_XF_STRIDE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(544);
+        let dynamic = stages * tiles * 16 * stride;
+        let blocks = kern.occupancy_blocks("tuili_mmq", name, threads, dynamic)?;
+        eprintln!(
+            "  {name:<24} {regs:>3} regs  {:>5} B dynamic  -> {blocks} blocks/SM              ({} SMs, {} resident blocks)",
+            dynamic,
+            sm,
+            blocks * sm
+        );
+    }
+    Ok(())
+}

@@ -373,6 +373,21 @@ pub fn load_awq(
         *total += v.len() * 4;
         Ok(dev.stream().clone_htod(&v)?)
     };
+    // The same, for a tensor a checkpoint may not carry. Qwen2 and Qwen3 put a
+    // bias on q, k and v; Llama does not, and asking for one there is not an
+    // error. The GGUF loader has always read these — the AWQ path passed `None`
+    // and produced fluent-looking nonsense on a Qwen checkpoint, because a
+    // missing bias is not a crash, just a wrong answer.
+    let optional_vector = |name: &str, total: &mut usize| -> Result<Option<Vector>> {
+        match w.tensor(name) {
+            Ok(t) => {
+                let v: Vec<f32> = t.as_f16()?.iter().map(|x| f32::from(*x)).collect();
+                *total += v.len() * 4;
+                Ok(Some(dev.stream().clone_htod(&v)?))
+            }
+            Err(_) => Ok(None),
+        }
+    };
     // A quantized projection's bytes, before they reach the device: AWQ's three
     // tensors in, one packed matrix out. Split from the upload so that
     // projections which are stacked into one matrix — see `fuse_ffn` below —
@@ -564,10 +579,10 @@ pub fn load_awq(
             wk: projection(&format!("{p}.self_attn.k_proj"), &mut device_bytes)?,
             wv: projection(&format!("{p}.self_attn.v_proj"), &mut device_bytes)?,
             wo: projection(&format!("{p}.self_attn.o_proj"), &mut device_bytes)?,
-            bq: None,
-            bk: None,
-            bv: None,
-            bo: None,
+            bq: optional_vector(&format!("{p}.self_attn.q_proj.bias"), &mut device_bytes)?,
+            bk: optional_vector(&format!("{p}.self_attn.k_proj.bias"), &mut device_bytes)?,
+            bv: optional_vector(&format!("{p}.self_attn.v_proj.bias"), &mut device_bytes)?,
+            bo: optional_vector(&format!("{p}.self_attn.o_proj.bias"), &mut device_bytes)?,
             ffn_norm: vector(
                 &format!("{p}.post_attention_layernorm.weight"),
                 &mut device_bytes,

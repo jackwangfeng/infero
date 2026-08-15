@@ -2946,6 +2946,28 @@ impl Kernels {
         Ok(())
     }
 
+    /// Blocks an SM the driver will resident, for a given block size and
+    /// dynamic shared request. The answer that settles which resource binds.
+    pub fn occupancy_blocks(
+        &self,
+        module: &'static str,
+        name: &str,
+        threads: u32,
+        dynamic: usize,
+    ) -> Result<u32> {
+        let src = match module {
+            "tuili_mmq" => mmq_src(),
+            "tuili_mmvq" => mmvq_src(),
+            "tuili_ops" => ops_src(),
+            _ => quant_src(),
+        };
+        let f = self.dev.kernels().get(module, src, name)?;
+        if dynamic > 48 * 1024 {
+            tuili_cuda::set_max_dynamic_shared(&f, dynamic as u32)?;
+        }
+        Ok(f.occupancy_max_active_blocks_per_multiprocessor(threads, dynamic, None)?)
+    }
+
     /// Registers per thread and static shared bytes per block.
     ///
     /// `kernel_limits` answers whether registers cap the *block size*, which is
