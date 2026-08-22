@@ -173,6 +173,86 @@ fn main() -> Result<()> {
         ),
         Err(e) => println!("  forward at {} rows        skipped: {e:#}", k + 1),
     }
+    // ---- what actually grows with the row count --------------------------
+    //
+    // The marginal row measures 1.18 ms and by bytes it should be near nothing:
+    // the projections are flat on tensor cores, the delta rule keeps its state
+    // in registers across a block's tokens, and the extra KV a query reads is
+    // tens of microseconds. Launch overhead cannot be it either — the launch
+    // count does not depend on the row count.
+    //
+    // So take two per-kernel tables, one at one row and one at `k + 1`, and
+    // diff them. Whatever grows says its own name.
+    if model.device().profile().enabled() {
+        let one = {
+            model.device().profile().reset();
+            let _ = time_serial(
+                REPS,
+                |m: &mut Model| {
+                    let it = BatchItem::new(seq, std::slice::from_ref(&pending));
+                    m.forward_batch_device(std::slice::from_ref(&it), &mut pool)?;
+                    pool.truncate(seq, base_len2);
+                    Ok(())
+                },
+                &mut model,
+            )?;
+            model.device().profile().snapshot()
+        };
+        let many = {
+            model.device().profile().reset();
+            let _ = time_serial(
+                REPS,
+                |m: &mut Model| {
+                    let it = BatchItem::new(seq, &rows);
+                    m.forward_batch_rows(std::slice::from_ref(&it), &mut pool, &tail)?;
+                    pool.truncate(seq, base_len);
+                    Ok(())
+                },
+                &mut model,
+            )?;
+            model.device().profile().snapshot()
+        };
+        let lookup = |v: &Vec<(&'static str, tuili_cuda::profile::Entry)>, k: &str| {
+            v.iter().find(|(n, _)| *n == k).map(|(_, e)| *e)
+        };
+        let mut names: Vec<&'static str> = many.iter().map(|(n, _)| *n).collect();
+        for (n, _) in &one {
+            if !names.contains(n) {
+                names.push(n);
+            }
+        }
+        let mut lines: Vec<(f64, String)> = Vec::new();
+        for n in names {
+            let a = lookup(&one, n);
+            let b = lookup(&many, n);
+            let ms1 = a.map(|e| e.millis).unwrap_or(0.0) / REPS as f64;
+            let ms2 = b.map(|e| e.millis).unwrap_or(0.0) / REPS as f64;
+            let l1 = a.map(|e| e.launches).unwrap_or(0);
+            let l2 = b.map(|e| e.launches).unwrap_or(0);
+            let per_row = (ms2 - ms1) / k as f64;
+            lines.push((
+                per_row,
+                format!(
+                    "  {n:<22} {ms1:8.3} {ms2:8.3} {per_row:+9.3}   {}/{}",
+                    l1 / REPS as u64,
+                    l2 / REPS as u64
+                ),
+            ));
+        }
+        lines.sort_by(|a, b| b.0.total_cmp(&a.0));
+        println!(
+            "\n  {:<22} {:>8} {:>8} {:>9}   {}",
+            "kernel",
+            "1 row",
+            format!("{} rows", k + 1),
+            "per row",
+            "launches"
+        );
+        for (_, l) in &lines {
+            println!("{l}");
+        }
+    }
+
     println!(
         "\n  A pass that reads the same weights should cost the same whatever the\n  \
          row count. The batched FP8 mat-vec charges for rows instead, which is\n  \

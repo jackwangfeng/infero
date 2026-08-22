@@ -192,20 +192,83 @@ pub const MMA_ROWS: usize = 16;
 /// number of MMAs.
 pub const MMA_TOKENS: usize = 8;
 
-/// Fragment columns off one staged weight tile, and so the token counts the
-/// kernel covers in a single pass over the weights: 8, 16, 32, 64.
+/// Fragment columns off one staged weight tile, and so the token counts covered
+/// in a single pass over the weights: 8, 16, 32, 64.
 ///
 /// Prefill is what this is for. A 66-token prompt used to fall to the expansion
-/// path at five bytes a weight — 148 GB against 29.6 for the 27B's forward, and
-/// the profiler had `dequant_f8_block` and `gemm_f16` together at 17% of the
-/// probe's whole run. Each extra group is one more MMA and one more `B` fragment
-/// against a shared tile, so the weights are still read once.
+/// path at five bytes a weight — 148 GB against 29.6 for the 27B's forward.
+/// Each extra group is one more MMA and one more `B` fragment against a shared
+/// tile, so the weights are still read once.
 pub const MMA_GROUPS: [(usize, &str); 4] = [
     (1, "mma_f8_block_f32"),
     (2, "mma_f8_block_g2_f32"),
     (4, "mma_f8_block_g4_f32"),
     (8, "mma_f8_block_g8_f32"),
 ];
+
+/// The same, with four times the warps a block — for matrices too narrow to fill
+/// the machine at eight.
+///
+/// A block owns [`MMA_ROWS`] output rows whatever its warp count, so a matrix of
+/// `n` rows offers `n / 16` blocks, and the rate follows warps an SM until it
+/// saturates near 48. At eight warps, one row, measured:
+///
+/// ```text
+///        n   blocks   warps/SM     GB/s
+///     5120      320       13.6      934
+///     6144      384       16.3     1054
+///    10240      640       27.2     1271
+///    17408     1088       46.3     1413
+/// ```
+///
+/// Most of the 27B's projections are 5120 or 6144 wide, which is why a decode
+/// step's 433 launches averaged 1281 GB/s while the widest matrix reads 1413.
+/// Only two group counts are instantiated: the wide-warp kernel stages four
+/// scale blocks at once, so its shared tile is four times as large, and past two
+/// groups it would not fit.
+pub const MMA_GROUPS_W32: [(usize, &str); 2] = [
+    (1, "mma_f8_block_w32_f32"),
+    (2, "mma_f8_block_w32_g2_f32"),
+];
+
+/// Force one warp count, for the A/B that set [`MMA_WARP_TARGET`].
+///
+/// `TUILI_FP8_MMA_WARPS=8` or `=32`. Unset picks by width.
+fn mma_warp_override() -> Option<u32> {
+    static V: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TUILI_FP8_MMA_WARPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    })
+}
+
+/// Where thirty-two warps a block stops paying, in warps an SM at eight.
+///
+/// The A/B, one row, `TUILI_FP8_MMA_WARPS` forcing each:
+///
+/// ```text
+///        n   blocks   warps/SM   8 warps   32 warps
+///     5120      320       13.6       913       1158   +27%
+///     6144      384       16.3      1038       1028    -1%
+///    10240      640       27.2      1263       1237    -2%
+///    17408     1088       46.3      1404       1353    -4%
+/// ```
+///
+/// A narrow boundary, and worth having anyway: `n = 5120` is `o_proj`,
+/// `down_proj` and the GDN `out_proj`, about 130 of a decode step's 433
+/// launches. Above it the wider kernel's four-times-larger shared tile costs a
+/// couple of percent and the extra warps buy nothing, since eight already put
+/// 16 an SM in flight.
+///
+/// 15 rather than 14 or 16 because the two measured points are 13.6 and 16.3 and
+/// there is nothing in between to distinguish. Re-run the sweep on another card
+/// before trusting the number there.
+const MMA_WARP_TARGET: usize = 15;
+
+/// Streaming multiprocessors on the card this was tuned against. Only used to
+/// choose between the two warp counts, so being wrong by a little costs a little.
+const MMA_SMS: usize = 188;
 
 pub const BATCH_KERNELS: [(usize, &str); 8] = [
     (2, "mmv_f8_block_batch2_f32"),
@@ -535,28 +598,45 @@ impl Kernels {
         debug_assert!(x.len() >= n_tokens * k);
         debug_assert!(w.len() >= fp8_bytes(k, n));
 
-        // The narrowest instantiation that covers the tokens, so a single-token
-        // decode does not carry eight accumulator columns. Past 64 tokens the
-        // widest one runs and `grid.y` tiles the rest, which re-reads the
-        // weights once per tile — still ahead of expanding them.
-        let groups = n_tokens.div_ceil(MMA_TOKENS);
-        let &(groups, name) = MMA_GROUPS
+        // Two choices, in this order. First the warp count: with eight warps a
+        // block, a narrow matrix cannot fill the machine, so take thirty-two
+        // when eight would leave the SMs under the rate's saturation point and
+        // the wider shared tile still divides `k`. Then the narrowest group
+        // count that covers the tokens, so a single-token decode does not carry
+        // eight accumulator columns.
+        let blocks = n.div_ceil(MMA_ROWS);
+        let want = n_tokens.div_ceil(MMA_TOKENS);
+        let fits_wide =
+            k.is_multiple_of(32 * 16) && want <= MMA_GROUPS_W32.last().unwrap().0;
+        let wide = match mma_warp_override() {
+            Some(32) => fits_wide,
+            Some(_) => false,
+            // Below the saturation point eight warps a block leaves the machine
+            // idle; above it the wider kernel's four-times-larger shared tile is
+            // a loss. `MMA_WARP_TARGET` is where the sweep puts the boundary.
+            None => fits_wide && blocks * 8 < MMA_WARP_TARGET * MMA_SMS,
+        };
+        let table: &[(usize, &str)] = if wide { &MMA_GROUPS_W32 } else { &MMA_GROUPS };
+        let &(groups, name) = table
             .iter()
-            .find(|(g, _)| groups <= *g)
-            .unwrap_or(MMA_GROUPS.last().unwrap());
+            .find(|(g, _)| want <= *g)
+            .unwrap_or(table.last().unwrap());
+        let warps = if wide { 32u32 } else { 8u32 };
         let f = self.dev.kernels().get("tuili_fp8", fp8_src(), name)?;
-        // One block per 16-row tile, eight warps splitting the tile's k. The 16
-        // has to track the MMA's M and the kernel's shared tile together; it is
-        // not a tuning knob.
-        const BLOCK: u32 = 256;
+        // One block per 16-row tile. The 16 has to track the MMA's M and the
+        // kernel's shared tile together; it is not a tuning knob.
+        let k_tile = warps as usize * 16;
+        // The tile and the cross-warp partials share one allocation — see the
+        // kernel — so the request is whichever life needs more.
+        let shared = (2 * MMA_ROWS * (k_tile + 8) * 2).max(warps as usize * groups * 128 * 4);
         let cfg = LaunchConfig {
             grid_dim: (
-                n.div_ceil(MMA_ROWS) as u32,
+                blocks as u32,
                 n_tokens.div_ceil(groups * MMA_TOKENS) as u32,
                 1,
             ),
-            block_dim: (BLOCK, 1, 1),
-            shared_mem_bytes: 0,
+            block_dim: (warps * 32, 1, 1),
+            shared_mem_bytes: shared as u32,
         };
         let (ki, ni) = (k as i32, n as i32);
         let scols = k.div_ceil(FP8_BLOCK) as i32;

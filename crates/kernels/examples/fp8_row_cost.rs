@@ -37,6 +37,18 @@ use tuili_cuda::Device;
 use tuili_kernels::Kernels;
 use tuili_kernels::fp8::{FP8_BLOCK, fp8_bytes, repack_rows, scale_grid};
 
+/// Does the tensor-core kernel's rate depend on the output width?
+///
+/// It should. One block owns 16 rows and holds eight warps, so a matrix of `n`
+/// rows offers `n/2` warps and no more — 46 an SM at the widest projection here,
+/// but 13.6 at `n = 5120`, which is most of the 27B's matrices. In the model the
+/// kernel averages 1281 GB/s across 433 launches against the 1466 this probe
+/// measures on the widest one, and that is the obvious suspect.
+///
+/// Widths worth asking about, all of them real: 5120 is `o_proj` and the GDN
+/// `out_proj`, 6144 is `q_proj`, 10240 is a fused pair, 17408 is `gate`/`up`.
+const WIDTHS: [usize; 4] = [5120, 6144, 10240, 17408];
+
 /// The 27B's widest projection: `down_proj` is `[5120, 17408]`, and `gate`/`up`
 /// are `[17408, 5120]`. Taking the second shape means many output rows over a
 /// short contraction, which is the shape the row-interleave is about.
@@ -178,6 +190,7 @@ fn main() -> Result<()> {
             prev = ms;
         }
     }
+    width_sweep(&k, &dev)?;
     Ok(())
 }
 
@@ -202,5 +215,67 @@ fn run(
         false,
     )?;
     anyhow::ensure!(ran, "the batched mat-vec declined {n_tokens} tokens");
+    Ok(())
+}
+
+/// One row, every real output width, tensor cores only.
+///
+/// Answers whether `n` sets the rate, which decides whether the kernel needs
+/// more warps a block for the narrow matrices or whether 1281 GB/s in the model
+/// has some other cause.
+fn width_sweep(k: &Kernels, dev: &Device) -> Result<()> {
+    let stream = dev.stream().clone();
+    println!("\n  one row, tensor cores, by output width");
+    println!(
+        "  {:>7}  {:>7}  {:>9}  {:>9}  {:>9}",
+        "n", "blocks", "warps/SM", "ms", "GB/s"
+    );
+    let sms = 188.0;
+    for n in WIDTHS {
+        let mut s = 0x1234_5678_9ABC_DEF1u64;
+        let quants: Vec<u8> = (0..n * K)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let b = (s >> 24) as u8;
+                if b == 0x7F || b == 0xFF { 0x38 } else { b }
+            })
+            .collect();
+        let scales: Vec<f32> = (0..scale_grid(K, n)).map(|i| 0.3 + 0.4 * (i % 7) as f32).collect();
+        let mut buf = repack_rows(&quants, K, n)?;
+        for v in &scales {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        // Enough copies that a rep reads DRAM, as above.
+        let copies = (340 * (1 << 20) / buf.len()).max(2);
+        let weights: Vec<_> = (0..copies)
+            .map(|_| stream.clone_htod(&buf))
+            .collect::<Result<Vec<_>, _>>()?;
+        let x: Vec<f32> = (0..K).map(|i| ((i * 37 % 101) as f32 - 50.0) / 97.0).collect();
+        let d_x = stream.clone_htod(&x)?;
+        let mut d_out = stream.alloc_zeros::<f32>(n)?;
+
+        k.mma_f8_block(&mut d_out.as_view_mut(), &weights[0].as_view(), &d_x.as_view(), K, n, 1, false)?;
+        dev.synchronize()?;
+        let t0 = std::time::Instant::now();
+        for rep in 0..REPS {
+            k.mma_f8_block(
+                &mut d_out.as_view_mut(),
+                &weights[rep % copies].as_view(),
+                &d_x.as_view(),
+                K,
+                n,
+                1,
+                false,
+            )?;
+        }
+        dev.synchronize()?;
+        let ms = t0.elapsed().as_secs_f64() * 1000.0 / REPS as f64;
+        let blocks = n.div_ceil(16);
+        let warps = blocks as f64 * 8.0 / sms;
+        let gbs = (n * K) as f64 / (ms / 1000.0) / 1e9;
+        println!("  {n:>7}  {blocks:>7}  {warps:>9.1}  {ms:>9.3}  {gbs:>9.0}");
+    }
     Ok(())
 }

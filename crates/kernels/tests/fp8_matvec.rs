@@ -738,3 +738,78 @@ fn the_tensor_core_kernel_writes_a_short_final_row_tile() -> Result<()> {
     );
     Ok(())
 }
+
+/// The wide-warp instantiation, which needs `k` divisible by 512 and so is not
+/// reached by any of the tests above.
+///
+/// Thirty-two warps a block stage four scale blocks at once, which is the one
+/// place a scale can be picked from the wrong column: warp `w` must take scale
+/// block `w / 8` of the four, not the tile's first. A wrong pick is a plausible
+/// matrix, not a crash, so the oracle is the single-token kernel as elsewhere.
+#[test]
+fn the_wide_warp_tensor_core_kernel_agrees_with_the_scalar_one() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    // Four scale blocks of k, so the tile spans four distinct scales, and a
+    // width narrow enough that the dispatch chooses the wide kernel.
+    const NN: usize = 2 * FP8_BLOCK;
+    const KK: usize = 4 * FP8_BLOCK;
+
+    let quants = quant_bytes(NN * KK, 0x9f3a);
+    let grid = NN.div_ceil(FP8_BLOCK) * KK.div_ceil(FP8_BLOCK);
+    // Scales that differ across the k blocks, so taking the wrong one shows.
+    let scales: Vec<f32> = (0..grid).map(|i| 0.2 + 0.7 * (i % 4) as f32).collect();
+    let buf = packed_dims(&quants, &scales, KK, NN);
+    let d_w = stream.clone_htod(&buf)?;
+
+    for n_tokens in [1usize, 3, 9, 16] {
+        let x: Vec<f32> = (0..n_tokens)
+            .flat_map(|t| {
+                pseudo_random(KK, 0xB000 + t as u64)
+                    .into_iter()
+                    .map(move |v| v * (1.0 + 0.25 * t as f32))
+            })
+            .collect();
+        let d_x = stream.clone_htod(&x)?;
+        let mut d_mma = stream.alloc_zeros::<f32>(n_tokens * NN)?;
+        let ran = k.mma_f8_block(
+            &mut d_mma.as_view_mut(),
+            &d_w.as_view(),
+            &d_x.as_view(),
+            KK,
+            NN,
+            n_tokens,
+            false,
+        )?;
+        assert!(ran, "the tensor-core kernel declined {n_tokens} tokens");
+
+        let mut want = vec![0.0f32; n_tokens * NN];
+        for t in 0..n_tokens {
+            let d_xt = stream.clone_htod(&x[t * KK..(t + 1) * KK])?;
+            let mut d_one = stream.alloc_zeros::<f32>(NN)?;
+            k.mmv_f8_block(
+                &mut d_one.as_view_mut(),
+                &d_w.as_view(),
+                &d_xt.as_view(),
+                KK,
+                NN,
+                false,
+            )?;
+            k.device().synchronize()?;
+            want[t * NN..(t + 1) * NN].copy_from_slice(&stream.clone_dtoh(&d_one)?);
+        }
+        k.device().synchronize()?;
+        let got = stream.clone_dtoh(&d_mma)?;
+        let (worst, at) = worst_ratio(&got, &want, 1e-3, 3e-2);
+        assert!(
+            worst <= 1.0,
+            "at {n_tokens} tokens, element {at} (token {}, row {}) is {worst:.1}x \
+             the tolerance: mma {}, scalar {}",
+            at / NN,
+            at % NN,
+            got[at],
+            want[at]
+        );
+    }
+    Ok(())
+}
