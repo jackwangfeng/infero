@@ -69,10 +69,28 @@ pub const FP8_BLOCK: usize = 128;
 /// ```
 ///
 /// A three-row pass went from 41.6 ms to 28.1, and the marginal row from 6.9 ms
-/// to 2.2. The remaining 2.2 is close to what the extra `lm_head` row actually
-/// costs in bytes (1.29 GB at this step's 1049 GB/s is 1.2 ms), so the row is
-/// nearly byte-limited now, which is what makes speculation's acceptance length
-/// convert into throughput.
+/// to 2.2, which is what makes speculation's acceptance length convert into
+/// throughput.
+///
+/// **What the remaining 2.2 ms a row is, is not known.** Three explanations have
+/// been tried and measured, and all three are wrong:
+///
+/// * *Arithmetic.* A third token adds 32 FMAs per sixteen weight bytes, which
+///   totals 1.0 ms a step against a measured 4.5.
+/// * *Request count.* This is what the repack fixed, and it took the row from
+///   6.9 to 2.2 — so whatever is left is not that.
+/// * *Activation L1 bytes.* Four rows a block means the activation is read
+///   `4 bytes * weight_elements / 4` a token, so 29.6 GB a marginal row on this
+///   checkpoint, and 13 TB/s is about what L1 does — the arithmetic fits. But
+///   halving it by reading the activation as f16 measured 28.32 ms against
+///   28.09, slightly *worse*, and the draft step went 4.11 to 4.21. Reverted:
+///   f16 activations are a couple of percent off on a cancelled element (see the
+///   error model in `tests/fp8_matvec.rs`) and they bought nothing.
+///
+/// What has not been ruled out: the per-row-per-token reduction at the end of
+/// each block, which goes from four to twelve at three tokens and is a shuffle
+/// chain plus shared memory each time. That is the next thing to measure, and it
+/// wants a kernel-level probe rather than an end-to-end one.
 pub const BATCH_KERNELS: [(usize, &str); 4] = [
     (2, "mmv_f8_block_batch2_f32"),
     (4, "mmv_f8_block_batch4_f32"),
