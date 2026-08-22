@@ -33,6 +33,11 @@ pub enum Dtype {
     F32,
     F16,
     BF16,
+    /// FP8 with a four-bit exponent and a three-bit mantissa, as an FP8
+    /// checkpoint stores its projections. Never meaningful on its own: the
+    /// values are held at full E4M3 range and scaled back down by a companion
+    /// `weight_scale_inv` tensor, one entry per 128×128 block.
+    F8E4M3,
     I32,
     I64,
     U8,
@@ -44,6 +49,7 @@ impl Dtype {
             "F32" => Self::F32,
             "F16" => Self::F16,
             "BF16" => Self::BF16,
+            "F8_E4M3" => Self::F8E4M3,
             "I32" | "U32" => Self::I32,
             "I64" | "U64" => Self::I64,
             "U8" | "I8" | "BOOL" => Self::U8,
@@ -56,7 +62,7 @@ impl Dtype {
             Self::F32 | Self::I32 => 4,
             Self::F16 | Self::BF16 => 2,
             Self::I64 => 8,
-            Self::U8 => 1,
+            Self::F8E4M3 | Self::U8 => 1,
         }
     }
 }
@@ -157,6 +163,90 @@ impl Tensor<'_> {
             }
             other => bail!("{} is {other:?}, not a half-width float", self.name),
         }
+    }
+
+    /// Every E4M3 bit pattern, as the f32 it denotes.
+    ///
+    /// A byte has 256 possible values, so the decode is a table rather than
+    /// arithmetic: one lookup and one multiply per element, which matters when
+    /// the checkpoint holds 27 billion of them.
+    ///
+    /// The format is IEEE-shaped — sign, four exponent bits biased by 7, three
+    /// mantissa bits — with two departures: `exp == 0` is subnormal at
+    /// `(m/8) · 2⁻⁶`, and there are no infinities, so `0x7F` and `0xFF` are
+    /// NaN rather than ±∞.
+    fn e4m3_table() -> &'static [f32; 256] {
+        static T: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+        T.get_or_init(|| {
+            let mut t = [0.0f32; 256];
+            for (b, slot) in t.iter_mut().enumerate() {
+                let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
+                let exp = ((b >> 3) & 0x0F) as i32;
+                let mant = (b & 0x07) as f32 / 8.0;
+                *slot = if exp == 0 {
+                    sign * mant * 2f32.powi(-6)
+                } else if exp == 0x0F && (b & 0x07) == 0x07 {
+                    f32::NAN
+                } else {
+                    sign * (1.0 + mant) * 2f32.powi(exp - 7)
+                };
+            }
+            t
+        })
+    }
+
+    /// An FP8 matrix as halves, with its block scales applied.
+    ///
+    /// `scales` is the checkpoint's companion `weight_scale_inv`: one entry per
+    /// `block × block` tile of this tensor, and — despite the name — a
+    /// multiplier. The stored bytes carry the full E4M3 range, so the product is
+    /// what the weight actually is; dividing instead lands five orders of
+    /// magnitude out, which is the check that pins the direction down.
+    pub fn dequant_f8_to_f16(&self, scales: &Tensor<'_>, block: usize) -> Result<Vec<half::f16>> {
+        anyhow::ensure!(
+            self.dtype == Dtype::F8E4M3,
+            "{} is {:?}, not F8_E4M3",
+            self.name,
+            self.dtype
+        );
+        anyhow::ensure!(
+            self.shape.len() == 2 && scales.shape.len() == 2,
+            "{}: expected a 2-D matrix and a 2-D scale grid, got {:?} and {:?}",
+            self.name,
+            self.shape,
+            scales.shape
+        );
+        let (rows, cols) = (self.shape[0], self.shape[1]);
+        let (srows, scols) = (scales.shape[0], scales.shape[1]);
+        // The grid covers the matrix in ceil-divided tiles; a checkpoint whose
+        // last tile is partial is fine, one whose grid is the wrong shape is a
+        // silent mis-scaling of every block after the first row.
+        anyhow::ensure!(
+            srows == rows.div_ceil(block) && scols == cols.div_ceil(block),
+            "{}: {rows}×{cols} at block {block} wants a {}×{} scale grid, checkpoint has {srows}×{scols}",
+            self.name,
+            rows.div_ceil(block),
+            cols.div_ceil(block),
+        );
+        let q = self.data;
+        anyhow::ensure!(
+            q.len() >= rows * cols,
+            "{}: {} bytes for {rows}×{cols}",
+            self.name,
+            q.len()
+        );
+        let s = scales.to_f32()?;
+        let table = Self::e4m3_table();
+        let mut out = Vec::with_capacity(rows * cols);
+        for r in 0..rows {
+            let srow = (r / block) * scols;
+            let qrow = r * cols;
+            for c in 0..cols {
+                let v = table[q[qrow + c] as usize] * s[srow + c / block];
+                out.push(half::f16::from_f32(v));
+            }
+        }
+        Ok(out)
     }
 
     /// The payload as `i32`, for a tensor that is stored as one.
