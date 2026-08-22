@@ -34,7 +34,96 @@ pub struct SeqLayout<'a> {
     pub total_tokens: usize,
 }
 
+/// Which delta-rule kernel to run.
+///
+/// The three differ only in where the recurrent state lives while a chunk of
+/// tokens is being consumed, and that is the whole performance story: the state
+/// is `dk * dv` f32 — 64 KiB a head at this checkpoint's 128 by 128 — and it
+/// does not change size with the chunk, so a version that keeps it in global
+/// memory rereads and rewrites all of it every token, forever.
+///
+/// Microseconds a launch at the 27B's shape — 48 value heads, 16 key heads,
+/// `dk = dv = 128` — from `examples/gdn_delta_bench.rs`, on an RTX A4000
+/// (sm_86, 48 SMs) and an RTX PRO 6000 Blackwell (sm_120, 188 SMs):
+///
+/// | | 1 token, 1 seq | 1 token, 32 seqs | 512 tokens, 1 seq |
+/// |---|---|---|---|
+/// | `Global` sm_86  | 73.4 | 1047 | 17814 |
+/// | `Shared` sm_86  | 62.1 | 1757 |  3237 |
+/// | `Reg` sm_86     | 18.6 |  522 |   588 |
+/// | `Global` sm_120 | 75.6 |  180 | 21798 |
+/// | `Shared` sm_120 | 63.8 |  560 |  3393 |
+/// | `Reg` sm_120    |  8.0 |  137 |   378 |
+///
+/// The sm_86 32-sequence column is the clean one: `Global` and `Reg` both run
+/// at ~388 GB/s, 87% of that card's peak, and the 2.0x is exactly the ratio of
+/// the bytes they are obliged to move. The other columns are larger than 2x
+/// because at 48 blocks `Global` cannot saturate DRAM and at 512 tokens it
+/// streams the state 512 times — and the sm_120 32-sequence column is *smaller*
+/// than 2x because that card's 128 MB L2 holds the 96 MiB state, so its rereads
+/// never reach DRAM. See the note in `cu/gdn.cu` for the rest of that.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DeltaVariant {
+    /// `Reg` when `dk == dv == 128`, `Global` otherwise. What every caller
+    /// should use.
+    Auto,
+    /// The state stays in global memory and is streamed twice a token. Correct
+    /// for any `dk`/`dv`, and the fallback for shapes `Reg` is not instantiated
+    /// for. Only reachable by name now that the checkpoint's shape takes the
+    /// fast path, which is why the tests ask for it explicitly.
+    Global,
+    /// The state lives in registers for the whole chunk — loaded once, stored
+    /// once, two threads a column — so a token moves q, k, v and the output
+    /// rather than the state. Requires `dk == dv == 128`, and is launched with
+    /// `2 * dv` threads. See the note above `gdn_delta_rule_reg_body` for the
+    /// four choices inside it and what each alternative measured.
+    Reg,
+    /// The state lives in dynamic shared memory, loaded once and stored once.
+    /// Saves the same traffic as `Reg` and loses to it everywhere, and loses to
+    /// `Global` at 32 sequences: `(dk * dv + 2 * dk) * 4` bytes a block is one
+    /// resident block an SM, so every barrier stalls the whole SM. Needs the
+    /// opt-in dynamic-shared attribute past 48 KiB, which at 128 by 128 it is.
+    Shared,
+}
+
+impl DeltaVariant {
+    /// `Auto` resolved against the head dims; the others pass through.
+    fn resolve(self, dk: usize, dv: usize) -> Self {
+        match self {
+            // 128 is what `gdn_delta_rule_reg128_f32` is instantiated for. A
+            // second instantiation is a one-line change, but every one costs
+            // NVRTC time on a cold cache for a shape no checkpoint here uses.
+            Self::Auto if dk == 128 && dv == 128 => Self::Reg,
+            Self::Auto => Self::Global,
+            other => other,
+        }
+    }
+}
+
 impl Kernels {
+    /// Registers a thread, static shared bytes, and *spill* bytes a thread for
+    /// one of the GatedDeltaNet kernels.
+    ///
+    /// The third number is the one that matters for the register-blocked delta
+    /// rule: 128 floats of state a thread only live in registers if every loop
+    /// over `dk` unrolls, and a dynamically indexed local array compiles fine,
+    /// runs fine, and puts the state back in the DRAM the whole exercise was
+    /// about. Non-zero here means the optimization did not happen.
+    pub fn gdn_kernel_registers(&self, name: &str) -> Result<(i32, i32, i32)> {
+        let f = self.dev.kernels().get("tuili_gdn", gdn_src(), name)?;
+        Ok((f.num_regs()?, f.shared_size_bytes()?, f.local_size_bytes()?))
+    }
+
+    /// Blocks an SM the driver will make resident for a GatedDeltaNet kernel at
+    /// a given block size and dynamic shared request.
+    pub fn gdn_occupancy_blocks(&self, name: &str, threads: u32, dynamic: usize) -> Result<u32> {
+        let f = self.dev.kernels().get("tuili_gdn", gdn_src(), name)?;
+        if dynamic > 48 * 1024 {
+            tuili_cuda::set_max_dynamic_shared(&f, dynamic as u32)?;
+        }
+        Ok(f.occupancy_max_active_blocks_per_multiprocessor(threads, dynamic, None)?)
+    }
+
     /// Depthwise causal convolution with a carried window, plus SiLU.
     ///
     /// `x` and `out` are `[total_tokens, channels]`; `state` is
@@ -203,8 +292,13 @@ impl Kernels {
     /// `repeat_interleave` does, so value head `h` reads key head
     /// `h / (heads / key_heads)`.
     ///
-    /// One block a (head, sequence) pair, `dv` threads. `dv` past 1024 would
-    /// need a second dimension of work per thread; the checkpoint uses 128.
+    /// One block a (head, sequence) pair. The fallback gives a thread a column
+    /// of the state, so `dv` past 1024 would need a second dimension of work
+    /// per thread; the register version gives a column to two threads, so its
+    /// ceiling is half that. The checkpoint uses 128 either way.
+    ///
+    /// Which of the three kernels runs is [`DeltaVariant::Auto`]'s choice; see
+    /// that type for what the others cost.
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_delta_rule(
         &self,
@@ -219,6 +313,45 @@ impl Kernels {
         dk: usize,
         dv: usize,
         offsets: (usize, usize, usize, usize),
+    ) -> Result<()> {
+        self.gdn_delta_rule_variant(
+            out,
+            state,
+            qkv,
+            g,
+            beta,
+            seqs,
+            heads,
+            key_heads,
+            dk,
+            dv,
+            offsets,
+            DeltaVariant::Auto,
+        )
+    }
+
+    /// The gated delta rule, with the kernel named rather than chosen.
+    ///
+    /// Exists so the tests can hold the fallback to the same standard as the
+    /// path a served step takes: at the checkpoint's `dk = dv = 128` every
+    /// caller gets [`DeltaVariant::Reg`], and without a way to ask for
+    /// [`DeltaVariant::Global`] by name the version that covers every other
+    /// shape would go unexercised.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_delta_rule_variant(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        state: &mut CudaViewMut<'_, f32>,
+        qkv: &CudaView<'_, f32>,
+        g: &CudaView<'_, f32>,
+        beta: &CudaView<'_, f32>,
+        seqs: &SeqLayout<'_>,
+        heads: usize,
+        key_heads: usize,
+        dk: usize,
+        dv: usize,
+        offsets: (usize, usize, usize, usize),
+        variant: DeltaVariant,
     ) -> Result<()> {
         let (stride, q_off, k_off, v_off) = offsets;
         anyhow::ensure!(
@@ -240,15 +373,45 @@ impl Kernels {
         debug_assert!(v_off + heads * dv <= stride);
         debug_assert!(g.len() >= t * heads && beta.len() >= t * heads);
 
-        let f = self
-            .dev
-            .kernels()
-            .get("tuili_gdn", gdn_src(), "gdn_delta_rule_f32")?;
+        let chosen = variant.resolve(dk, dv);
+        anyhow::ensure!(
+            chosen != DeltaVariant::Reg || (dk == 128 && dv == 128),
+            "the register-blocked delta rule is instantiated for dk = dv = 128 \
+             and was asked for {dk}x{dv}; use DeltaVariant::Auto, which falls \
+             back on its own"
+        );
+        // Shared holds q and k for the token being consumed. The register
+        // version double-buffers them so it needs one barrier a token instead
+        // of two; the shared version puts the whole state after them.
+        let f32_size = std::mem::size_of::<f32>();
+        let (name, threads, shared) = match chosen {
+            // `R = 2` threads a column: 2 * dv threads, 4 * dk floats of
+            // shared. Both are the kernel's, not the caller's, choice — see
+            // the note above `gdn_delta_rule_reg_body`.
+            DeltaVariant::Reg => ("gdn_delta_rule_reg128_f32", 2 * dv, 4 * dk * f32_size),
+            DeltaVariant::Shared => (
+                "gdn_delta_rule_smem_f32",
+                dv.max(32),
+                (2 * dk + dk * dv) * f32_size,
+            ),
+            _ => ("gdn_delta_rule_f32", dv.max(32), 2 * dk * f32_size),
+        };
+        let f = self.dev.kernels().get("tuili_gdn", gdn_src(), name)?;
+        // Past 48 KiB a block the dynamic size is opt-in, and a launch that
+        // asks for more without it fails with an invalid-value error rather
+        // than falling back to something smaller.
+        if shared > 48 * 1024 {
+            tuili_cuda::set_max_dynamic_shared(&f, shared as u32).with_context(|| {
+                format!(
+                    "the shared-memory delta rule wants {shared} bytes a block \
+                     for a {dk}x{dv} state, which this device will not give it"
+                )
+            })?;
+        }
         let cfg = LaunchConfig {
             grid_dim: (heads as u32, seqs.n_seqs as u32, 1),
-            block_dim: (dv.max(32) as u32, 1, 1),
-            // q and k for the current token, shared by every thread.
-            shared_mem_bytes: (2 * dk * std::mem::size_of::<f32>()) as u32,
+            block_dim: (threads as u32, 1, 1),
+            shared_mem_bytes: shared as u32,
         };
         let (h, kh) = (heads as i32, key_heads as i32);
         let (a, b_) = (dk as i32, dv as i32);

@@ -755,3 +755,364 @@ fn the_split_is_per_head_not_per_half() -> Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// The register-blocked delta rule, and what it must not have cost.
+//
+// `DK` and `DV` above are the checkpoint's 128, so every test up to here now
+// runs `DeltaVariant::Reg` — that is the point, the fast path is the tested
+// path. What follows covers the two things that change hands as a result: the
+// global-memory version those tests used to exercise, which is now only
+// reachable by name, and the register residency the fast path depends on and
+// which no output check can see.
+// ---------------------------------------------------------------------------
+
+use tuili_kernels::gdn::DeltaVariant;
+
+/// Run the delta rule over `chunks` of one sequence with a named variant,
+/// returning the concatenated output and the final state.
+fn run_variant(
+    k: &tuili_kernels::Kernels,
+    row: &[f32],
+    g: &[f32],
+    beta: &[f32],
+    off: (usize, usize, usize, usize),
+    t_len: usize,
+    chunks: &[(usize, usize)],
+    variant: DeltaVariant,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let stream = k.device().stream().clone();
+    let stride = off.0;
+    let mut state = stream.alloc_zeros::<f32>(VAL_HEADS * DK * DV)?;
+    let mut collected = vec![0.0f32; t_len * VAL_HEADS * DV];
+    for &(start, count) in chunks {
+        let chunk = stream.clone_htod(&row[start * stride..(start + count) * stride])?;
+        let hg = stream.clone_htod(&g[start * VAL_HEADS..(start + count) * VAL_HEADS])?;
+        let hb = stream.clone_htod(&beta[start * VAL_HEADS..(start + count) * VAL_HEADS])?;
+        let f = stream.clone_htod(&[0i32])?;
+        let n = stream.clone_htod(&[count as i32])?;
+        let mut out = stream.alloc_zeros::<f32>(count * VAL_HEADS * DV)?;
+        let seqs = tuili_kernels::gdn::SeqLayout {
+            first_token: &f.as_view(),
+            n_tokens: &n.as_view(),
+            n_seqs: 1,
+            total_tokens: count,
+        };
+        k.gdn_delta_rule_variant(
+            &mut out.as_view_mut(),
+            &mut state.as_view_mut(),
+            &chunk.as_view(),
+            &hg.as_view(),
+            &hb.as_view(),
+            &seqs,
+            VAL_HEADS,
+            KEY_HEADS,
+            DK,
+            DV,
+            off,
+            variant,
+        )?;
+        k.device().synchronize()?;
+        let piece = stream.clone_dtoh(&out)?;
+        collected[start * VAL_HEADS * DV..(start + count) * VAL_HEADS * DV]
+            .copy_from_slice(&piece);
+    }
+    Ok((collected, stream.clone_dtoh(&state)?))
+}
+
+/// All three kernels compute the same recurrence, whole-sequence and split.
+///
+/// The register version reassociates both reductions — partial sums a thread
+/// and then a partner lane — so this is not a bit-for-bit comparison, but the
+/// tolerance is the same 1e-4 of peak the reference comparison uses. A
+/// register-blocking mistake does not land at 1e-5: getting the row range, the
+/// partner reduction or the barrier wrong moves the answer by whole percent.
+#[test]
+fn the_three_delta_rule_kernels_agree_with_each_other_and_the_reference() -> Result<()> {
+    let k = kernels()?;
+    let t_len = 13;
+
+    let q_small = pseudo_random(t_len * KEY_HEADS * DK, 0xb001);
+    let k_small = pseudo_random(t_len * KEY_HEADS * DK, 0xb002);
+    let v = pseudo_random(t_len * VAL_HEADS * DV, 0xb003);
+    let g = decaying(t_len * VAL_HEADS, 0xb004, 0.7);
+    let beta = betas(t_len * VAL_HEADS, 0xb005);
+    let (row, off) = packed(&q_small, &k_small, &v, t_len);
+    let (want, want_state) = reference(&q_small, &k_small, &v, &g, &beta, t_len);
+
+    let peak = want.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    let speak = want_state.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+
+    // Whole sequence in one call, and then one token at a time, which is the
+    // case where the register version has to have written its state out and
+    // read it back correctly rather than merely kept it.
+    for (label, chunks) in [
+        ("one call", vec![(0usize, t_len)]),
+        ("one token at a time", (0..t_len).map(|t| (t, 1)).collect()),
+        ("5 then 8", vec![(0usize, 5usize), (5, 8)]),
+    ] {
+        for variant in [DeltaVariant::Global, DeltaVariant::Reg, DeltaVariant::Shared] {
+            let (out, state) =
+                run_variant(&k, &row, &g, &beta, off, t_len, &chunks, variant)?;
+            let (worst, at) = max_abs_diff(&out, &want);
+            assert!(
+                worst < 1e-4 * peak.max(1e-6),
+                "{variant:?} on {label} diverged from the reference by {worst:.2e} \
+                 at {at}: got {}, reference {}",
+                out[at],
+                want[at]
+            );
+            let (sworst, sat) = max_abs_diff(&state, &want_state);
+            assert!(
+                sworst < 1e-4 * speak.max(1e-6),
+                "{variant:?} on {label} left a state {sworst:.2e} from the \
+                 reference's at {sat}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The batch properties, held against the fallback kernel by name.
+///
+/// `two_sequences_in_one_batch_keep_separate_state` above now exercises the
+/// register version, because `dk = dv = 128` there. The same two properties —
+/// no state bleed between slots, and a slot with no tokens neither read nor
+/// written — have to hold for the version every other shape gets, and after
+/// this file's shapes moved to the fast path nothing else checks that.
+#[test]
+fn the_fallback_kernels_keep_sequences_apart_and_idle_slots_untouched() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    let lens = [3usize, 5, 0];
+    let total: usize = lens.iter().sum();
+
+    let q_small = pseudo_random(total * KEY_HEADS * DK, 0xc001);
+    let k_small = pseudo_random(total * KEY_HEADS * DK, 0xc002);
+    let v = pseudo_random(total * VAL_HEADS * DV, 0xc003);
+    let g = decaying(total * VAL_HEADS, 0xc004, 0.6);
+    let beta = betas(total * VAL_HEADS, 0xc005);
+    let (row, off) = packed(&q_small, &k_small, &v, total);
+    let stride = off.0;
+    let per_seq = VAL_HEADS * DK * DV;
+
+    for variant in [DeltaVariant::Global, DeltaVariant::Shared, DeltaVariant::Reg] {
+        let d_row = stream.clone_htod(&row)?;
+        let d_g = stream.clone_htod(&g)?;
+        let d_beta = stream.clone_htod(&beta)?;
+        let first = stream.clone_htod(&[0i32, lens[0] as i32, 0])?;
+        let ntok = stream.clone_htod(&[lens[0] as i32, lens[1] as i32, 0])?;
+        let mut out = stream.alloc_zeros::<f32>(total * VAL_HEADS * DV)?;
+        let mut state = stream.alloc_zeros::<f32>(3 * per_seq)?;
+        let sentinel = vec![-12345.0f32; per_seq];
+        stream.memcpy_htod(&sentinel, &mut state.slice_mut(2 * per_seq..3 * per_seq))?;
+
+        let seqs = tuili_kernels::gdn::SeqLayout {
+            first_token: &first.as_view(),
+            n_tokens: &ntok.as_view(),
+            n_seqs: 3,
+            total_tokens: total,
+        };
+        k.gdn_delta_rule_variant(
+            &mut out.as_view_mut(),
+            &mut state.as_view_mut(),
+            &d_row.as_view(),
+            &d_g.as_view(),
+            &d_beta.as_view(),
+            &seqs,
+            VAL_HEADS,
+            KEY_HEADS,
+            DK,
+            DV,
+            off,
+            variant,
+        )?;
+        k.device().synchronize()?;
+        let batched = stream.clone_dtoh(&out)?;
+        let states = stream.clone_dtoh(&state)?;
+
+        assert!(
+            states[2 * per_seq..].iter().all(|v| *v == -12345.0),
+            "{variant:?} wrote the idle sequence slot; for the register version \
+             even the load-and-store-back round trip counts as a write"
+        );
+
+        // Each sequence alone, through the same kernel, which is what makes a
+        // difference here state bleed and not a variant disagreement.
+        let mut offset = 0usize;
+        for (s, &len) in lens.iter().enumerate() {
+            if len == 0 {
+                continue;
+            }
+            let (solo, _) = run_variant(
+                &k,
+                &row[offset * stride..(offset + len) * stride],
+                &g[offset * VAL_HEADS..(offset + len) * VAL_HEADS],
+                &beta[offset * VAL_HEADS..(offset + len) * VAL_HEADS],
+                off,
+                len,
+                &[(0, len)],
+                variant,
+            )?;
+            let slice = &batched[offset * VAL_HEADS * DV..(offset + len) * VAL_HEADS * DV];
+            let (worst, at) = max_abs_diff(slice, &solo);
+            let peak = solo.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            assert!(
+                worst < 1e-5 * peak.max(1e-6),
+                "{variant:?}: sequence {s} in a batch of three differs from the \
+                 same sequence alone by {worst:.2e} at {at}; the two are sharing \
+                 state"
+            );
+            offset += len;
+        }
+    }
+    Ok(())
+}
+
+/// A non-square head shape, which only the fallback can serve.
+///
+/// `dk != dv` sends `DeltaVariant::Auto` to the global kernel, and the register
+/// one refuses it outright rather than reading `dv` floats of a `dk`-tall
+/// column. Both are worth pinning: the refusal is what keeps a future
+/// checkpoint with a different `linear_key_head_dim` from silently reading off
+/// the end of its state.
+#[test]
+fn a_non_square_head_shape_falls_back_and_still_matches_the_reference() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    let (dk, dv) = (64usize, 128usize);
+    let (key_heads, heads) = (2usize, 6usize);
+    let rep = heads / key_heads;
+    let t_len = 7;
+
+    let key_dim = key_heads * dk;
+    let val_dim = heads * dv;
+    let stride = 2 * key_dim + val_dim;
+    let off = (stride, 0, key_dim, 2 * key_dim);
+
+    let mut qn = pseudo_random(t_len * key_dim, 0xe001);
+    let mut kn = pseudo_random(t_len * key_dim, 0xe002);
+    let v = pseudo_random(t_len * val_dim, 0xe003);
+    let g = decaying(t_len * heads, 0xe004, 0.5);
+    let beta = betas(t_len * heads, 0xe005);
+    qwen35::l2norm_rows(&mut qn, dk, 1e-6);
+    qwen35::l2norm_rows(&mut kn, dk, 1e-6);
+    for value in qn.iter_mut() {
+        *value *= (dk as f32).sqrt().recip();
+    }
+
+    let mut row = vec![0.0f32; t_len * stride];
+    for t in 0..t_len {
+        let base = t * stride;
+        row[base..base + key_dim].copy_from_slice(&qn[t * key_dim..(t + 1) * key_dim]);
+        row[base + key_dim..base + 2 * key_dim]
+            .copy_from_slice(&kn[t * key_dim..(t + 1) * key_dim]);
+        row[base + 2 * key_dim..base + stride]
+            .copy_from_slice(&v[t * val_dim..(t + 1) * val_dim]);
+    }
+
+    let q_wide = repeat_interleave(&qn, t_len, key_heads, rep, dk);
+    let k_wide = repeat_interleave(&kn, t_len, key_heads, rep, dk);
+    let mut want_state = vec![0.0f32; heads * dk * dv];
+    let want = qwen35::gated_delta_rule(
+        &q_wide, &k_wide, &v, &g, &beta, &mut want_state, t_len, heads, dk, dv, 1e-6,
+    );
+
+    let d_row = stream.clone_htod(&row)?;
+    let d_g = stream.clone_htod(&g)?;
+    let d_beta = stream.clone_htod(&beta)?;
+    let d_first = stream.clone_htod(&[0i32])?;
+    let d_ntok = stream.clone_htod(&[t_len as i32])?;
+    let mut d_out = stream.alloc_zeros::<f32>(t_len * val_dim)?;
+    let mut d_state = stream.alloc_zeros::<f32>(heads * dk * dv)?;
+    let seqs = tuili_kernels::gdn::SeqLayout {
+        first_token: &d_first.as_view(),
+        n_tokens: &d_ntok.as_view(),
+        n_seqs: 1,
+        total_tokens: t_len,
+    };
+    k.gdn_delta_rule(
+        &mut d_out.as_view_mut(),
+        &mut d_state.as_view_mut(),
+        &d_row.as_view(),
+        &d_g.as_view(),
+        &d_beta.as_view(),
+        &seqs,
+        heads,
+        key_heads,
+        dk,
+        dv,
+        off,
+    )?;
+    k.device().synchronize()?;
+    let got = stream.clone_dtoh(&d_out)?;
+    let rel = max_rel_diff(&got, &want);
+    assert!(rel < 2e-3, "the 64x128 fallback diverged by {rel:.2e}");
+    let peak = want_state.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let (worst, at) = max_abs_diff(&stream.clone_dtoh(&d_state)?, &want_state);
+    assert!(
+        worst < 1e-4 * peak,
+        "the 64x128 fallback's final state diverged by {worst:.2e} at {at}"
+    );
+
+    // And the register kernel says no rather than reading past a column.
+    let asked = k.gdn_delta_rule_variant(
+        &mut d_out.as_view_mut(),
+        &mut d_state.as_view_mut(),
+        &d_row.as_view(),
+        &d_g.as_view(),
+        &d_beta.as_view(),
+        &seqs,
+        heads,
+        key_heads,
+        dk,
+        dv,
+        off,
+        DeltaVariant::Reg,
+    );
+    assert!(
+        asked.is_err(),
+        "the register kernel accepted {dk}x{dv}, which it is not instantiated for"
+    );
+    Ok(())
+}
+
+/// The register-blocked kernel's state must be in registers, and no output
+/// check can see whether it is.
+///
+/// 64 floats of state a thread live in registers only if every loop over the
+/// row index unrolls. Write one of them with a dynamic index and the array
+/// moves to local memory, which is the same DRAM the global version streams,
+/// with worse coalescing — and the kernel still computes the right answer, so
+/// every other test in this file passes while the change it exists for has been
+/// undone. `CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES` is the only thing that says so.
+#[test]
+fn the_register_state_does_not_spill() -> Result<()> {
+    let k = kernels()?;
+    // 2 * DV threads and 4 * DK floats of shared: what the launcher sends.
+    let (regs, stat, spill) = k.gdn_kernel_registers("gdn_delta_rule_reg128_f32")?;
+    let blocks = k.gdn_occupancy_blocks("gdn_delta_rule_reg128_f32", 2 * DV as u32, 4 * DK * 4)?;
+    eprintln!(
+        "  gdn_delta_rule_reg128_f32: {regs} regs, {stat} B static shared, \
+         {spill} B spill, {blocks} blocks/SM"
+    );
+    assert_eq!(
+        spill, 0,
+        "the register-blocked delta rule spills {spill} bytes a thread; its \
+         state is in local memory, not registers, and the kernel is a slower \
+         version of the global one that still passes every correctness test"
+    );
+    // Reported, not asserted, and the reason is worth writing down: this was
+    // an `assert!(blocks >= 2)` until it was run on the part the engine
+    // actually targets. sm_86's ptxas gives the body 128 registers and two
+    // blocks an SM; sm_120's gives it 161 and therefore one. The kernel is
+    // 2.2x faster there than here regardless, so two blocks an SM was never
+    // the invariant — it was one machine's way of reaching it.
+    assert!(
+        blocks >= 1,
+        "the register-blocked delta rule fits no block an SM at all: {regs} \
+         registers over 2 * {DV} threads is past this device's budget, and the \
+         launch will fail rather than run slowly"
+    );
+    Ok(())
+}

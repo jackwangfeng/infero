@@ -12,6 +12,7 @@
 pub mod awq;
 pub mod gdn;
 pub mod turboquant;
+pub mod vision;
 mod weight;
 
 use anyhow::{Context, Result};
@@ -48,6 +49,7 @@ const MMA_CUH: &str = include_str!("cu/mma.cuh");
 const MMQ_CU: &str = include_str!("cu/mmq.cu");
 const SAMPLE_CU: &str = include_str!("cu/sample.cu");
 const GDN_CU: &str = include_str!("cu/gdn.cu");
+const VISION_CU: &str = include_str!("cu/vision.cu");
 
 /// Threads per block for the reduction kernels. 256 keeps eight warps busy
 /// without pushing occupancy off a cliff on sm_86.
@@ -80,6 +82,17 @@ fn ops_src() -> &'static str {
 fn gdn_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SRC.get_or_init(|| format!("{COMMON_CUH}\n{GDN_CU}"))
+}
+
+/// The Qwen3.5 vision tower. Separate from `ops_src` for the same reason `gdn`
+/// is, and for a second one: it reverses nearly every convention `ops.cu` is
+/// built around (LayerNorm not RMSNorm, `[all q | all k | all v]` not per-head
+/// interleaving, bidirectional not causal, two blocked rotary axes not three
+/// interleaved), so keeping the two apart keeps a reader from picking the wrong
+/// one by name.
+fn vision_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| format!("{COMMON_CUH}\n{VISION_CU}"))
 }
 
 fn sample_src() -> &'static str {
@@ -208,6 +221,22 @@ impl Kernels {
             "split_interleaved_f32",
         ] {
             self.dev.kernels().get("tuili_gdn", gdn_src(), name)?;
+        }
+        // And the vision tower, which is its own translation unit again. A
+        // multimodal request pays for these once at startup instead of stalling
+        // the first image behind NVRTC.
+        for name in [
+            "vision_layer_norm_f32",
+            "vision_gelu_tanh_f32",
+            "vision_gelu_erf_f32",
+            "vision_rope_tables_f32",
+            "vision_qkv_rope_f32",
+            "vision_attn_f32",
+            "vision_patchify_f32",
+            "vision_add_pos_embed_f32",
+            "vision_splice_f32",
+        ] {
+            self.dev.kernels().get("tuili_vision", vision_src(), name)?;
         }
         for ty in WeightType::ALL {
             // The transposed AWQ layout is read by the tensor-core GEMM and by
