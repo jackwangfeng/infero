@@ -116,10 +116,44 @@ pub fn strip_flags() -> &'static str {
 ///   f16 activations are a couple of percent off on a cancelled element (see the
 ///   error model in `tests/fp8_matvec.rs`) and they bought nothing.
 ///
-/// What has not been ruled out: the per-row-per-token reduction at the end of
-/// each block, which goes from four to twelve at three tokens and is a shuffle
-/// chain plus shared memory each time. That is the next thing to measure, and it
-/// wants a kernel-level probe rather than an end-to-end one.
+/// It is the per-row-per-token reduction at the end of each block, and
+/// `examples/fp8_row_cost.rs` shows it by removing pieces rather than by
+/// reasoning: with `TUILI_FP8_STRIP=reduce` the row curve is *flat* from one
+/// token to eight, 0.025 to 0.027 ms, against 0.064 to 0.162 with it in. The
+/// same run says something more useful about the kernel as a whole — of 0.064 ms
+/// at one token only 0.022 is moving weights, so **this kernel is not
+/// memory-bound**, and the GB/s it reports is where it lands rather than a
+/// ceiling it is pressed against.
+///
+/// Two attempts to make the reduction cheaper, both measured, both a wash:
+///
+/// * **Unroll the chains so they interleave.** Twelve five-step chains at three
+///   tokens are independent of each other, and the `break` on a runtime bound
+///   inside a `#pragma unroll` loop was sequencing them. Removing it changed
+///   nothing — 0.086 ms at three tokens either way — so the shuffles are limited
+///   by throughput, not dependency: eight warps times twelve chains times five
+///   steps is 480 instructions a block whatever their order.
+/// * **One warp a block**, which makes the reduction pure shuffle with no shared
+///   memory and no barrier, 60 instructions instead of 480:
+///
+/// ```text
+///   threads   1 tok   3 tok   marginal/row
+///        32   0.077   0.086       +0.005
+///        64   0.076   0.086       +0.005
+///       128   0.064   0.086       +0.011
+///       256   0.062   0.086       +0.014
+/// ```
+///
+///   It halves the marginal row and costs 24% at one token, because 32 threads
+///   cannot hide the weight loads' latency the way 256 can. At three tokens they
+///   land on the same number, and the wide block is better for plain decode, so
+///   256 stays.
+///
+/// Four attempts, and the conclusion is that this is a floor for a kernel of
+/// this shape: `rows * tokens` partial sums spread over 256 threads have to be
+/// combined, and combining them costs what it costs. Getting past it means not
+/// having them — a tiled GEMM keeps its accumulator in registers across the whole
+/// k loop and never reduces across threads at all.
 pub const BATCH_KERNELS: [(usize, &str); 4] = [
     (2, "mmv_f8_block_batch2_f32"),
     (4, "mmv_f8_block_batch4_f32"),
