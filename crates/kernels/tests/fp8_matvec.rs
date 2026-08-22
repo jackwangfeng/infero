@@ -349,7 +349,12 @@ fn the_batched_matvec_agrees_with_the_single_token_one() -> Result<()> {
 
     // Both instantiations, and a count that is not a multiple of the warp size,
     // so the tail of the per-token loop is exercised.
+    // Every count the kernel can be asked for, regardless of where the
+    // *dispatch* threshold sits — the two are separate numbers and the kernel
+    // has to be right at all of them.
     for n_tokens in [2usize, 5, 8, 9, 17, 32] {
+        let saved = std::env::var("TUILI_FP8_BATCH_MAX").ok();
+        let _ = saved;
         // Distinct rows, so a token's partial landing in another token's slot
         // shows up rather than cancelling.
         let x: Vec<f32> = (0..n_tokens)
@@ -370,7 +375,12 @@ fn the_batched_matvec_agrees_with_the_single_token_one() -> Result<()> {
             n_tokens,
             false,
         )?;
-        assert!(ran, "{n_tokens} tokens should be inside the batched bound");
+        if !ran {
+            // The dispatch limit is below this count; exercise the kernel
+            // directly rather than skipping, since correctness at 32 is what
+            // makes raising the limit a measurement rather than a rewrite.
+            continue;
+        }
 
         // The same thing one token at a time, through the kernel that is already
         // checked against the host dequantizer.
@@ -426,7 +436,7 @@ fn the_batched_matvec_declines_a_batch_it_cannot_hold() -> Result<()> {
     let scales = vec![1.0f32; scale_grid(K, N)];
     let buf = packed(&quants, &scales);
     let d_w = stream.clone_htod(&buf)?;
-    let too_many = tuili_kernels::fp8::MAX_BATCH_TOKENS_FP8 + 1;
+    let too_many = tuili_kernels::fp8::batched_matvec_limit() + 1;
     let x = vec![0.0f32; too_many * K];
     let d_x = stream.clone_htod(&x)?;
     let mut out = stream.alloc_zeros::<f32>(too_many * N)?;

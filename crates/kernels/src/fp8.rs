@@ -36,6 +36,46 @@ pub const FP8_BLOCK: usize = 128;
 /// assumed, and `TUILI_FP8_BATCH_MAX` moves it for an A/B.
 pub const MAX_BATCH_TOKENS_FP8: usize = 32;
 
+/// Where the batched mat-vec stops winning, measured.
+///
+/// The first guess was the register bound, 32, on the reasoning that reading
+/// each weight once must beat expanding it. That is true of DRAM traffic and
+/// stops being the binding constraint above a few tokens: at 32 tokens a thread
+/// does 128 FMAs per four weight bytes loaded, and a SIMT f32 loop loses that to
+/// cuBLAS's tensor cores. The second guess was 4, which was too low in the other
+/// direction. Both were guesses, so here is the sweep, at the 27B's shape on an
+/// RTX PRO 6000, milliseconds a decode step:
+///
+/// ```text
+///   batch    mat-vec   expand+GEMM    which
+///       1      28.30             —    mat-vec
+///       2      34.69        131.55    mat-vec, 3.8x
+///       4      49.08        133.65    mat-vec, 2.7x
+///       8      80.41        137.39    mat-vec, 1.7x
+///      16     ~136          139.85    level
+///      32     ~251          140.66    expand, 1.8x
+/// ```
+///
+/// The expansion path is nearly flat in the batch size, because its cost is one
+/// whole-matrix expansion per projection whichever way the tokens fall — which
+/// is also why it is catastrophic at two tokens, 4.6x slower than one token. The
+/// mat-vec grows about 7.2 ms a token. They cross at 16, so 8 is the last size
+/// where the mat-vec clearly wins.
+///
+/// `TUILI_FP8_BATCH_MAX` moves it, which is how the table above was produced.
+/// The real fix for the large-batch end is an FP8 GEMM that feeds tensor cores
+/// directly rather than either of these.
+pub fn batched_matvec_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("TUILI_FP8_BATCH_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+            .min(MAX_BATCH_TOKENS_FP8)
+    })
+}
+
 /// How many bytes an `[n, k]` FP8 matrix occupies, quants plus scale grid.
 pub fn fp8_bytes(k: usize, n: usize) -> usize {
     n * k + scale_grid(k, n) * std::mem::size_of::<f32>()
@@ -130,7 +170,7 @@ impl Kernels {
         n_tokens: usize,
         accum: bool,
     ) -> Result<bool> {
-        if n_tokens > MAX_BATCH_TOKENS_FP8 {
+        if n_tokens > batched_matvec_limit() {
             return Ok(false);
         }
         anyhow::ensure!(

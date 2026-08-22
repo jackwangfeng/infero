@@ -2992,7 +2992,7 @@ impl Model {
             // batched decode *slower* than before FP8: the profiler had
             // `dequant_f8_block` at 67% of a batch-32 step and batch scaling
             // down from 36.9x to 8.6x.
-            if (2..=tuili_kernels::fp8::MAX_BATCH_TOKENS_FP8).contains(&n_tokens)
+            if n_tokens >= 2
                 && kern.mmv_f8_block_batch(out, &weights, x, w.k, w.n, n_tokens, false)?
             {
                 return Ok(());
