@@ -10,6 +10,7 @@
 //! so `out[t, r] = dot(w[r, :], x[t, :])`.
 
 pub mod awq;
+pub mod gdn;
 pub mod turboquant;
 mod weight;
 
@@ -46,6 +47,7 @@ const MMVQ_CU: &str = include_str!("cu/mmvq.cu");
 const MMA_CUH: &str = include_str!("cu/mma.cuh");
 const MMQ_CU: &str = include_str!("cu/mmq.cu");
 const SAMPLE_CU: &str = include_str!("cu/sample.cu");
+const GDN_CU: &str = include_str!("cu/gdn.cu");
 
 /// Threads per block for the reduction kernels. 256 keeps eight warps busy
 /// without pushing occupancy off a cliff on sm_86.
@@ -71,6 +73,13 @@ fn ops_src() -> &'static str {
     // The MMA helpers too: `attn_decode_mma_f32` uses the same `m16n8k16`
     // fragments the GEMM does, and `mma.cuh` is where their layout is pinned.
     SRC.get_or_init(|| format!("{COMMON_CUH}\n{MMA_CUH}\n{OPS_CU}"))
+}
+
+/// The GatedDeltaNet unit. Separate from `ops_src` so that a change to the
+/// linear-attention kernels does not force every other kernel to recompile.
+fn gdn_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| format!("{COMMON_CUH}\n{GDN_CU}"))
 }
 
 fn sample_src() -> &'static str {
@@ -185,6 +194,19 @@ impl Kernels {
             "qk_norm_f32",
         ] {
             self.dev.kernels().get("tuili_ops", ops_src(), name)?;
+        }
+        // The GatedDeltaNet unit compiles separately, so warm it separately.
+        // Skipping this would push a first-token latency spike into whichever
+        // linear-attention layer ran first.
+        for name in [
+            "gdn_conv_f32",
+            "gdn_gate_decay_f32",
+            "gdn_qk_l2norm_f32",
+            "gdn_delta_rule_f32",
+            "gdn_gated_rmsnorm_f32",
+            "sigmoid_gate_f32",
+        ] {
+            self.dev.kernels().get("tuili_gdn", gdn_src(), name)?;
         }
         for ty in WeightType::ALL {
             // The transposed AWQ layout is read by the tensor-core GEMM and by
@@ -792,15 +814,66 @@ impl Kernels {
         freq_scale: f32,
         interleaved: bool,
     ) -> Result<()> {
+        self.rope_qk_partial(
+            q,
+            k,
+            positions,
+            freq_factors,
+            n_tokens,
+            n_heads,
+            n_kv_heads,
+            d_head,
+            d_head,
+            theta_base,
+            freq_scale,
+            interleaved,
+        )
+    }
+
+    /// [`Self::rope_qk`] rotating only the first `rotary_dim` of each head.
+    ///
+    /// `rotary_dim == d_head` is the full-width case and reduces to exactly the
+    /// launch and the arithmetic that shipped before this existed. Below that,
+    /// dimensions `[rotary_dim, d_head)` are not addressed at all — both
+    /// tensors are rotated in place, so their tails keep their bits — and the
+    /// frequency exponent is normalized by `rotary_dim` rather than `d_head`,
+    /// which makes the table a compression of the full frequency span into
+    /// fewer dimensions rather than its leading slice.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_qk_partial(
+        &self,
+        q: &mut CudaViewMut<'_, f32>,
+        k: &mut CudaViewMut<'_, f32>,
+        positions: &CudaView<'_, i32>,
+        freq_factors: &CudaView<'_, f32>,
+        n_tokens: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        d_head: usize,
+        rotary_dim: usize,
+        theta_base: f32,
+        freq_scale: f32,
+        interleaved: bool,
+    ) -> Result<()> {
         anyhow::ensure!(
             d_head.is_multiple_of(2),
             "d_head {d_head} must be even for rope"
+        );
+        anyhow::ensure!(
+            rotary_dim.is_multiple_of(2) && rotary_dim >= 2 && rotary_dim <= d_head,
+            "rotary_dim {rotary_dim} must be even and in 2..={d_head}"
+        );
+        anyhow::ensure!(
+            freq_factors.len() >= rotary_dim / 2,
+            "freq_factors holds {} entries, short of the {} pairs that rotate",
+            freq_factors.len(),
+            rotary_dim / 2
         );
         let f = self
             .dev
             .kernels()
             .get("tuili_ops", ops_src(), "rope_qk_f32")?;
-        let half = (d_head / 2) as u32;
+        let half = (rotary_dim / 2) as u32;
         let block = half.clamp(1, 128);
         let cfg = LaunchConfig {
             grid_dim: (
@@ -811,10 +884,11 @@ impl Kernels {
             block_dim: (block, 1, 1),
             shared_mem_bytes: 0,
         };
-        let (h, kh, dh, il) = (
+        let (h, kh, dh, rd, il) = (
             n_heads as i32,
             n_kv_heads as i32,
             d_head as i32,
+            rotary_dim as i32,
             i32::from(interleaved),
         );
         let mut b = self.dev.stream().launch_builder(&f);
@@ -825,6 +899,7 @@ impl Kernels {
             .arg(&h)
             .arg(&kh)
             .arg(&dh)
+            .arg(&rd)
             .arg(&theta_base)
             .arg(&freq_scale)
             .arg(&il);
@@ -860,24 +935,90 @@ impl Kernels {
         freq_scale: f32,
         interleaved: bool,
     ) -> Result<()> {
+        self.rope_qk_packed_partial(
+            q_dst,
+            packed,
+            stride,
+            q_off,
+            k_off,
+            positions,
+            freq_factors,
+            n_tokens,
+            n_heads,
+            n_kv_heads,
+            d_head,
+            d_head,
+            theta_base,
+            freq_scale,
+            interleaved,
+        )
+    }
+
+    /// [`Self::rope_qk_packed`] rotating only the first `rotary_dim` of each
+    /// head.
+    ///
+    /// `k` is rotated in place, so its unrotated tail stays where it is. `q`
+    /// is not: it is read out of the packed row and written to `q_dst`, so the
+    /// tail has to be *copied*, and this launch carries
+    /// `d_head - rotary_dim` extra lanes per q head to do it. Omitting that
+    /// copy is the one new way to be wrong here that still runs — `q_dst` would
+    /// keep the previous layer's values past `rotary_dim`, which on the 27B is
+    /// three quarters of every query.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_qk_packed_partial(
+        &self,
+        q_dst: &mut CudaViewMut<'_, f32>,
+        packed: &mut CudaViewMut<'_, f32>,
+        stride: usize,
+        q_off: usize,
+        k_off: usize,
+        positions: &CudaView<'_, i32>,
+        freq_factors: &CudaView<'_, f32>,
+        n_tokens: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        d_head: usize,
+        rotary_dim: usize,
+        theta_base: f32,
+        freq_scale: f32,
+        interleaved: bool,
+    ) -> Result<()> {
         anyhow::ensure!(
             d_head.is_multiple_of(2),
             "d_head {d_head} must be even for rope"
+        );
+        anyhow::ensure!(
+            rotary_dim.is_multiple_of(2) && rotary_dim >= 2 && rotary_dim <= d_head,
+            "rotary_dim {rotary_dim} must be even and in 2..={d_head}"
+        );
+        anyhow::ensure!(
+            freq_factors.len() >= rotary_dim / 2,
+            "freq_factors holds {} entries, short of the {} pairs that rotate",
+            freq_factors.len(),
+            rotary_dim / 2
         );
         anyhow::ensure!(
             packed.len() >= (n_tokens - 1) * stride + k_off + n_kv_heads * d_head,
             "packed qkv holds {} elements, short for {n_tokens} rows of {stride}",
             packed.len()
         );
+        anyhow::ensure!(
+            q_dst.len() >= n_tokens * n_heads * d_head,
+            "q_dst holds {} elements, short of {n_tokens} x {n_heads} x {d_head}",
+            q_dst.len()
+        );
         let f = self
             .dev
             .kernels()
             .get("tuili_ops", ops_src(), "rope_qk_packed_f32")?;
-        let half = (d_head / 2) as u32;
-        let block = half.clamp(1, 128);
+        // The rotating lanes plus the ones that carry q's untouched tail
+        // across. Equal to `d_head / 2` when the whole head rotates, which is
+        // the grid this kernel always had.
+        let lanes = (rotary_dim / 2 + (d_head - rotary_dim)) as u32;
+        let block = lanes.clamp(1, 128);
         let cfg = LaunchConfig {
             grid_dim: (
-                half.div_ceil(block),
+                lanes.div_ceil(block),
                 (n_heads + n_kv_heads) as u32,
                 n_tokens as u32,
             ),
@@ -885,10 +1026,11 @@ impl Kernels {
             shared_mem_bytes: 0,
         };
         let (st, qo, ko) = (stride as i32, q_off as i32, k_off as i32);
-        let (h, kh, dh, il) = (
+        let (h, kh, dh, rd, il) = (
             n_heads as i32,
             n_kv_heads as i32,
             d_head as i32,
+            rotary_dim as i32,
             i32::from(interleaved),
         );
         let mut b = self.dev.stream().launch_builder(&f);
@@ -902,6 +1044,7 @@ impl Kernels {
             .arg(&h)
             .arg(&kh)
             .arg(&dh)
+            .arg(&rd)
             .arg(&theta_base)
             .arg(&freq_scale)
             .arg(&il);

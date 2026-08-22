@@ -15,6 +15,11 @@ tracing.workspace = true
 cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "cublas", "f16", "dynamic-loading"] }
 
 [dev-dependencies]
+# A dev-dependency on the crate above this one, so that the partial-rope kernel
+# tests can check against `tuili_model::qwen35`'s host reference rather than a
+# second copy of it that would drift. Cargo permits the cycle because it only
+# exists for test targets; the library itself still depends on nothing upward.
+tuili-model.workspace = true
 tracing-subscriber.workspace = true
 rand = "0.9"
 cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "cublas", "f16", "dynamic-loading"] }

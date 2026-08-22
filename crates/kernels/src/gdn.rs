@@ -1,0 +1,320 @@
+//! Launchers for the GatedDeltaNet block and the gated-attention output gate.
+//!
+//! In a file of their own so that this work and the rotary work do not collide
+//! in `lib.rs`; the kernels themselves are in `cu/gdn.cu`.
+//!
+//! The one thing worth reading before using any of these: the recurrent state
+//! is *in-place and persistent*. Every other buffer in this engine is either an
+//! activation that dies at the end of the step or an append-only cache. A
+//! GatedDeltaNet state is read and rewritten by the same launch, carries across
+//! steps, and is per sequence. That has three consequences the callers have to
+//! respect — the state buffer's address must be stable across a CUDA graph
+//! capture and its replays, a sequence's tokens must reach the kernel
+//! contiguous and in order, and anything that rewinds the sequence (a rejected
+//! speculative draft, a cancelled request) has to restore the state rather than
+//! just moving a length counter.
+
+use anyhow::{Context, Result};
+use cudarc::driver::{CudaView, CudaViewMut, LaunchConfig, PushKernelArg};
+
+use crate::{Kernels, REDUCE_BLOCK, gdn_src};
+
+/// How the tokens of a batch map onto sequences.
+///
+/// The GatedDeltaNet kernels need this and the attention kernels do not: a
+/// state update is sequential within a sequence, so the kernel walks a
+/// sequence's tokens in order and cannot be handed an arbitrary permutation.
+/// `first_token[s]` and `n_tokens[s]` are device arrays because the kernel
+/// indexes with them; keeping them on the host would mean one launch per
+/// sequence.
+pub struct SeqLayout<'a> {
+    pub first_token: &'a CudaView<'a, i32>,
+    pub n_tokens: &'a CudaView<'a, i32>,
+    pub n_seqs: usize,
+    pub total_tokens: usize,
+}
+
+impl Kernels {
+    /// Depthwise causal convolution with a carried window, plus SiLU.
+    ///
+    /// `x` and `out` are `[total_tokens, channels]`; `state` is
+    /// `[n_seqs, channels, k - 1]`, oldest tap first, and is advanced in place.
+    /// `w` is `[channels, k]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_conv(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        x: &CudaView<'_, f32>,
+        state: &mut CudaViewMut<'_, f32>,
+        w: &CudaView<'_, f32>,
+        seqs: &SeqLayout<'_>,
+        channels: usize,
+        k: usize,
+    ) -> Result<()> {
+        // `win[8]` in the kernel bounds the carried window; the checkpoint uses
+        // k = 4. Refuse rather than overrun.
+        anyhow::ensure!(
+            (2..=8).contains(&k),
+            "conv kernel width {k} is outside the range the kernel's register \
+             window covers (2..=8)"
+        );
+        debug_assert!(out.len() >= seqs.total_tokens * channels);
+        debug_assert!(x.len() >= seqs.total_tokens * channels);
+        debug_assert!(state.len() >= seqs.n_seqs * channels * (k - 1));
+        debug_assert!(w.len() >= channels * k);
+
+        let f = self.dev.kernels().get("tuili_gdn", gdn_src(), "gdn_conv_f32")?;
+        const BLOCK: u32 = 128;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (channels as u32).div_ceil(BLOCK),
+                seqs.n_seqs as u32,
+                1,
+            ),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (c, kk) = (channels as i32, k as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out)
+            .arg(x)
+            .arg(state)
+            .arg(w)
+            .arg(seqs.first_token)
+            .arg(seqs.n_tokens)
+            .arg(&c)
+            .arg(&kk);
+        self.dev.profile().time("gdn_conv", self.dev.stream(), || {
+            unsafe { b.launch(cfg) }.context("gdn_conv")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// `beta = sigmoid(b)` and `g = -exp(A_log) * softplus(a + dt_bias)`.
+    ///
+    /// `a` and `b` are `[n_tokens, heads]`; `a_log` and `dt_bias` are `[heads]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_gate_decay(
+        &self,
+        beta: &mut CudaViewMut<'_, f32>,
+        g: &mut CudaViewMut<'_, f32>,
+        a: &CudaView<'_, f32>,
+        b_in: &CudaView<'_, f32>,
+        a_log: &CudaView<'_, f32>,
+        dt_bias: &CudaView<'_, f32>,
+        n_tokens: usize,
+        heads: usize,
+    ) -> Result<()> {
+        let n = n_tokens * heads;
+        debug_assert!(beta.len() >= n && g.len() >= n);
+        debug_assert!(a.len() >= n && b_in.len() >= n);
+        debug_assert!(a_log.len() >= heads && dt_bias.len() >= heads);
+
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_gdn", gdn_src(), "gdn_gate_decay_f32")?;
+        const BLOCK: u32 = 256;
+        let cfg = LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(BLOCK), 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (nt, h) = (n_tokens as i32, heads as i32);
+        let mut bl = self.dev.stream().launch_builder(&f);
+        bl.arg(beta)
+            .arg(g)
+            .arg(a)
+            .arg(b_in)
+            .arg(a_log)
+            .arg(dt_bias)
+            .arg(&nt)
+            .arg(&h);
+        self.dev
+            .profile()
+            .time("gdn_gate_decay", self.dev.stream(), || {
+                unsafe { bl.launch(cfg) }.context("gdn_gate_decay")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// L2-normalize each head row of `q` and `k` in place, scaling `q` by
+    /// `1/sqrt(dk)`.
+    ///
+    /// Both are `[rows, dk]` where `rows = n_tokens * key_heads`. The scale
+    /// belongs to `q` alone; putting it on both, or on neither and folding it
+    /// into the readout, changes the result.
+    pub fn gdn_qk_l2norm(
+        &self,
+        q: &mut CudaViewMut<'_, f32>,
+        k: &mut CudaViewMut<'_, f32>,
+        rows: usize,
+        dk: usize,
+        eps: f32,
+    ) -> Result<()> {
+        debug_assert!(q.len() >= rows * dk && k.len() >= rows * dk);
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_gdn", gdn_src(), "gdn_qk_l2norm_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (REDUCE_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let d = dk as i32;
+        let scale = (dk as f32).sqrt().recip();
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(q).arg(k).arg(&d).arg(&eps).arg(&scale);
+        self.dev
+            .profile()
+            .time("gdn_qk_l2norm", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("gdn_qk_l2norm")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// The gated delta rule, advancing `state` in place.
+    ///
+    /// `q` and `k` are `[total_tokens, heads, dk]` already normalized and
+    /// scaled, and already expanded from key heads to value heads. `v` and
+    /// `out` are `[total_tokens, heads, dv]`. `g` and `beta` are
+    /// `[total_tokens, heads]`. `state` is `[n_seqs, heads, dk, dv]`.
+    ///
+    /// One block a (head, sequence) pair, `dv` threads. `dv` past 1024 would
+    /// need a second dimension of work per thread; the checkpoint uses 128.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_delta_rule(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        state: &mut CudaViewMut<'_, f32>,
+        q: &CudaView<'_, f32>,
+        k: &CudaView<'_, f32>,
+        v: &CudaView<'_, f32>,
+        g: &CudaView<'_, f32>,
+        beta: &CudaView<'_, f32>,
+        seqs: &SeqLayout<'_>,
+        heads: usize,
+        dk: usize,
+        dv: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            dv <= 1024,
+            "the delta-rule kernel gives each of dv threads one column of the \
+             state; dv is {dv}, past the 1024-thread block limit"
+        );
+        let t = seqs.total_tokens;
+        debug_assert!(out.len() >= t * heads * dv);
+        debug_assert!(state.len() >= seqs.n_seqs * heads * dk * dv);
+        debug_assert!(q.len() >= t * heads * dk && k.len() >= t * heads * dk);
+        debug_assert!(v.len() >= t * heads * dv);
+        debug_assert!(g.len() >= t * heads && beta.len() >= t * heads);
+
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_gdn", gdn_src(), "gdn_delta_rule_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (heads as u32, seqs.n_seqs as u32, 1),
+            block_dim: (dv.max(32) as u32, 1, 1),
+            // q and k for the current token, shared by every thread.
+            shared_mem_bytes: (2 * dk * std::mem::size_of::<f32>()) as u32,
+        };
+        let (h, a, b_) = (heads as i32, dk as i32, dv as i32);
+        let mut bl = self.dev.stream().launch_builder(&f);
+        bl.arg(out)
+            .arg(state)
+            .arg(q)
+            .arg(k)
+            .arg(v)
+            .arg(g)
+            .arg(beta)
+            .arg(seqs.first_token)
+            .arg(seqs.n_tokens)
+            .arg(&h)
+            .arg(&a)
+            .arg(&b_);
+        self.dev
+            .profile()
+            .time("gdn_delta_rule", self.dev.stream(), || {
+                unsafe { bl.launch(cfg) }.context("gdn_delta_rule")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// `out = rms_norm(x, weight) * silu(z)`, over rows of `dv`.
+    ///
+    /// Normalize first, gate second. The other order runs and is a different
+    /// model.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_gated_rmsnorm(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        x: &CudaView<'_, f32>,
+        z: &CudaView<'_, f32>,
+        weight: &CudaView<'_, f32>,
+        rows: usize,
+        dv: usize,
+        eps: f32,
+    ) -> Result<()> {
+        debug_assert!(out.len() >= rows * dv && x.len() >= rows * dv);
+        debug_assert!(z.len() >= rows * dv && weight.len() >= dv);
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_gdn", gdn_src(), "gdn_gated_rmsnorm_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (REDUCE_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let d = dv as i32;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(x).arg(z).arg(weight).arg(&d).arg(&eps);
+        self.dev
+            .profile()
+            .time("gdn_gated_rmsnorm", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("gdn_gated_rmsnorm")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// `x *= sigmoid(gate)`, in place.
+    ///
+    /// The output gate of Qwen3.5's full-attention layers, applied before
+    /// `o_proj`. Sigmoid, not silu — the reference implementation does not read
+    /// config's `output_gate_type: "swish"`.
+    pub fn sigmoid_gate(
+        &self,
+        x: &mut CudaViewMut<'_, f32>,
+        gate: &CudaView<'_, f32>,
+        n: usize,
+    ) -> Result<()> {
+        debug_assert!(x.len() >= n && gate.len() >= n);
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_gdn", gdn_src(), "sigmoid_gate_f32")?;
+        const BLOCK: u32 = 256;
+        let cfg = LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(BLOCK), 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let count = n as i64;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(x).arg(gate).arg(&count);
+        self.dev
+            .profile()
+            .time("sigmoid_gate", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("sigmoid_gate")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+}

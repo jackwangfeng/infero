@@ -341,14 +341,30 @@ extern "C" __global__ void rope_norm_f32(float* __restrict__ x,
 // `interleaved` picks the pairing at runtime rather than through two kernels.
 // The branch is uniform across the whole grid, so it costs nothing beyond the
 // predicate.
+//
+// `rotary_dim` is how many of each head's dimensions rotate — `d_head` for
+// every model before Qwen3.5, 64 of 256 for that one. Two things follow, and
+// both of them run to completion if got wrong:
+//
+//  * the pairing is over the *rotary* half, `(i, i + rotary_dim/2)`, so the
+//    partner of dimension 0 is dimension 32 and not dimension 128;
+//  * the frequency exponent is divided by `rotary_dim`, not by `d_head`. The
+//    partial table is the same frequency span compressed into fewer
+//    dimensions, not the leading slice of the wide one. Dividing by `d_head`
+//    leaves the whole table too high-frequency at the low end, which costs
+//    long-range retrieval and nothing else.
+//
+// Dimensions at or past `rotary_dim` are never addressed here, so they keep
+// their bits by construction: this kernel rotates in place.
 extern "C" __global__ void rope_qk_f32(float* __restrict__ q,
                                        float* __restrict__ k,
                                        const int* __restrict__ positions,
                                        const float* __restrict__ freq_factors,
                                        int n_heads, int n_kv_heads, int d_head,
+                                       int rotary_dim,
                                        float theta_base, float freq_scale,
                                        int interleaved) {
-    const int half = d_head / 2;
+    const int half = rotary_dim / 2;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= half) return;
 
@@ -360,7 +376,7 @@ extern "C" __global__ void rope_qk_f32(float* __restrict__ q,
     const int heads = is_q ? n_heads : n_kv_heads;
 
     const float pos = (float)positions[token] * freq_scale;
-    const float inv_freq = __powf(theta_base, -2.0f * (float)i / (float)d_head);
+    const float inv_freq = __powf(theta_base, -2.0f * (float)i / (float)rotary_dim);
     const float angle = pos * inv_freq / freq_factors[i];
     float sin_a, cos_a;
     __sincosf(angle, &sin_a, &cos_a);
@@ -427,28 +443,49 @@ extern "C" __global__ void rope_qk_packed_f32(float* __restrict__ q_dst,
                                              const int* __restrict__ positions,
                                              const float* __restrict__ freq_factors,
                                              int n_heads, int n_kv_heads,
-                                             int d_head, float theta_base,
+                                             int d_head, int rotary_dim,
+                                             float theta_base,
                                              float freq_scale, int interleaved) {
-    const int half = d_head / 2;
+    const int half = rotary_dim / 2;
+    const int tail = d_head - rotary_dim;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= half) return;
+    // `half` lanes rotate; the `tail` lanes after them exist only to carry q's
+    // unrotated dimensions across to `q_dst`. When `rotary_dim == d_head` there
+    // are none, and this is the grid the full-width version always launched.
+    if (i >= half + tail) return;
 
     const int y = blockIdx.y;
     const int token = blockIdx.z;
     const bool is_q = y < n_heads;
     const int head = is_q ? y : y - n_heads;
 
-    const float pos = (float)positions[token] * freq_scale;
-    const float inv_freq = __powf(theta_base, -2.0f * (float)i / (float)d_head);
-    const float angle = pos * inv_freq / freq_factors[i];
-    float sin_a, cos_a;
-    __sincosf(angle, &sin_a, &cos_a);
-
     const float* src = packed + (size_t)token * stride
                      + (is_q ? q_off : k_off) + (size_t)head * d_head;
     float* dst = is_q ? q_dst + ((size_t)token * n_heads + head) * d_head
                       : packed + (size_t)token * stride + k_off
                             + (size_t)head * d_head;
+
+    if (i >= half) {
+        // The unrotated tail. `k` is rotated in place, so its tail is already
+        // where it belongs and there is nothing to do; `q` is *copied* into a
+        // separate buffer, and a partial rotation that only writes the first
+        // `rotary_dim` would leave dimensions [rotary_dim, d_head) of `q_dst`
+        // holding whatever the previous layer left there. That is the one new
+        // way this kernel can go wrong and still run: three quarters of every
+        // query head would be stale rather than absent.
+        if (is_q) {
+            const int d = rotary_dim + (i - half);
+            dst[d] = src[d];
+        }
+        return;
+    }
+
+    const float pos = (float)positions[token] * freq_scale;
+    const float inv_freq = __powf(theta_base, -2.0f * (float)i / (float)rotary_dim);
+    const float angle = pos * inv_freq / freq_factors[i];
+    float sin_a, cos_a;
+    __sincosf(angle, &sin_a, &cos_a);
+
     const int ia = interleaved ? 2 * i : i;
     const int ib = interleaved ? 2 * i + 1 : i + half;
     const float a = src[ia], b = src[ib];
