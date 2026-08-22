@@ -244,6 +244,31 @@ struct Activations {
     attn_partial: CudaSlice<f32>,
     /// Those rows, gathered and normalized.
     head_in: CudaSlice<f32>,
+    /// GatedDeltaNet scratch, allocated only for models that have such blocks.
+    gdn: Option<GdnActs>,
+}
+
+/// Activation buffers the GatedDeltaNet block needs.
+///
+/// Kept behind an `Option` because on a pure attention model every one of these
+/// is dead weight, and on Qwen3.8-27B they are not small: the packed row alone
+/// is 40 KiB a token.
+struct GdnActs {
+    /// `[chunk, conv_channels]` — the input projection's output.
+    qkv: CudaSlice<f32>,
+    /// The same after the convolution and SiLU. A separate buffer because the
+    /// convolution reads three tokens back and would otherwise consume values
+    /// it had already overwritten.
+    qkv_conv: CudaSlice<f32>,
+    /// `[chunk, value_dim]` — the output gate.
+    z: CudaSlice<f32>,
+    /// `[chunk, value_heads]` each.
+    a: CudaSlice<f32>,
+    b: CudaSlice<f32>,
+    beta: CudaSlice<f32>,
+    g: CudaSlice<f32>,
+    /// `[chunk, value_dim]` — the recurrence's output, before the gated norm.
+    core: CudaSlice<f32>,
 }
 
 /// Double-buffered staging for offloaded layers.
@@ -347,6 +372,9 @@ pub struct Model {
     use_graph: bool,
     max_logit_rows: usize,
     max_seq: usize,
+    /// Per layer, whether it mixes with a recurrence. Cached because the pool
+    /// needs it to size the state and the layer loop consults it every block.
+    layer_kinds: Vec<bool>,
     logits_host: Vec<f32>,
     /// Rows the last forward pass left in `act.logits`.
     logit_rows: usize,
@@ -571,6 +599,15 @@ impl Model {
         } else {
             None
         };
+        let layer_kinds: Vec<bool> = w.layers.iter().map(|l| l.is_linear()).collect();
+        let n_linear = layer_kinds.iter().filter(|k| **k).count();
+        if n_linear > 0 {
+            tracing::info!(
+                linear = n_linear,
+                attention = cfg.n_layers - n_linear,
+                "the block stack is not homogeneous"
+            );
+        }
         let act = Activations::new(&dev, &cfg, max_seq, max_logit_rows)?;
         let scratch = Scratch {
             w16: dev
@@ -652,6 +689,7 @@ impl Model {
             use_graph,
             max_logit_rows,
             max_seq,
+            layer_kinds,
             logit_rows: 0,
             samp: None,
             phase_ev: PhaseEvents::new(&dev)?,
@@ -760,6 +798,11 @@ impl Model {
             max_seqs,
             self.max_seq,
             self.kv_quant,
+            // Which blocks carry recurrent state. Read off the loaded weights
+            // rather than derived from the config, for the same reason the
+            // loader reads it there: the tensors are what the forward pass will
+            // actually use.
+            &self.layer_kinds,
         )
     }
 
@@ -850,8 +893,15 @@ impl Model {
         let mut logit_rows = Vec::with_capacity(n_logit_rows);
         let mut kv_len = 0usize;
 
+        // Per sequence slot: where its tokens begin in this flat batch, and how
+        // long the sequence already was. The recurrence needs the first; the
+        // reset decision needs the second.
+        let mut starts = vec![(0usize, 0usize); pool.max_seqs()];
         for item in items {
             let start = pool.len(item.seq);
+            if item.seq.0 < starts.len() {
+                starts[item.seq.0] = (token_ids.len(), start);
+            }
             let taken = pool.extend(item.seq, item.tokens.len())?;
             for (k, (&tok, &slot)) in item.tokens.iter().zip(&taken).enumerate() {
                 token_ids.push(tok as i32);
@@ -879,6 +929,36 @@ impl Model {
                 &logit_rows,
                 &mut self.act.logit_rows.slice_mut(..n_logit_rows),
             )?;
+        }
+
+        // The per-slot layout the recurrence kernels index by, and a reset for
+        // any sequence that is starting from nothing.
+        //
+        // "No tokens seen means no state" is the invariant that keeps a reused
+        // slot from carrying a previous conversation's recurrence into the next
+        // one. `KvPool::alloc` cannot enforce it — it has no device to memset
+        // with — so it is enforced here, where the length is known.
+        if pool.has_recurrent_state() {
+            let mut spans = vec![(0i32, 0i32); pool.max_seqs()];
+            for item in items {
+                let slot = item.seq.0;
+                anyhow::ensure!(
+                    slot < spans.len(),
+                    "sequence slot {slot} is past the recurrent pool's {} slots",
+                    spans.len()
+                );
+                anyhow::ensure!(
+                    spans[slot].1 == 0,
+                    "sequence slot {slot} appears twice in one batch; the \
+                     recurrence walks a sequence's tokens in order and cannot \
+                     take them in two pieces within a single call"
+                );
+                spans[slot] = (starts[slot].0 as i32, item.tokens.len() as i32);
+                if starts[slot].1 == 0 {
+                    pool.reset_recurrent(&self.dev, item.seq)?;
+                }
+            }
+            pool.set_gdn_layout(&self.dev, &spans)?;
         }
 
         // Record where the new tokens landed before anything reads the table.
@@ -934,7 +1014,16 @@ impl Model {
                 let res = (|| -> Result<()> {
                     for layer in 0..n_layers {
                         let s = self.stage_layer(layer)?;
-                        self.attention(layer, n_tokens, kv, dims, pool, s)?;
+                        // The block stack is not homogeneous on Qwen3.5: 48 of
+                        // its 64 blocks mix with a recurrence. Dispatched from
+                        // the loaded weights rather than from a stride, so a
+                        // model with a different interleaving needs no change
+                        // here.
+                        if self.layer_kinds[layer] {
+                            self.linear_attention(layer, n_tokens, pool, s)?;
+                        } else {
+                            self.attention(layer, n_tokens, kv, dims, pool, s)?;
+                        }
                         self.feed_forward(layer, n_tokens, s)?;
                         self.release_layer(s)?;
                         // `TUILI_LAYER_RMS=1` reports the residual stream's
@@ -1340,6 +1429,201 @@ impl Model {
     pub fn forward_batch(&mut self, items: &[BatchItem<'_>], pool: &mut KvPool) -> Result<&[f32]> {
         self.forward_batch_device(items, pool)?;
         self.logits_host()
+    }
+
+    /// One GatedDeltaNet block: the linear-attention mixer.
+    ///
+    /// The shape of the computation, in the order it happens:
+    ///
+    ///   xb           = rms_norm(x, attn_norm)
+    ///   qkv          = xb @ in_proj_qkv        [n, 2*key_dim + value_dim]
+    ///   z            = xb @ in_proj_z          [n, value_dim]
+    ///   a, b         = xb @ in_proj_a, in_proj_b
+    ///   qkv          = silu(depthwise_causal_conv(qkv))
+    ///   beta, g      = sigmoid(b), -exp(A_log) * softplus(a + dt_bias)
+    ///   q, k         = l2norm in place; q also scaled by 1/sqrt(dk)
+    ///   core         = gated delta rule, advancing this sequence's state
+    ///   proj         = out_proj(rms_norm(core, norm) * silu(z))
+    ///
+    /// Two things make this unlike `attention`. The state is advanced in place
+    /// and persists between calls, so the tokens of one sequence must arrive
+    /// contiguous and in order — which `forward_batch` guarantees, since it lays
+    /// a batch out sequence by sequence. And there is no KV cache and no rotary:
+    /// position enters only through the order the recurrence sees the tokens in.
+    fn linear_attention(
+        &mut self,
+        layer: usize,
+        n: usize,
+        pool: &mut KvPool,
+        slot: Option<usize>,
+    ) -> Result<()> {
+        let la = self
+            .cfg
+            .linear_attn
+            .context("a linear-attention block in a model whose config has no linear dimensions")?;
+        let d = self.cfg.d_model;
+        let eps = self.cfg.rms_eps;
+        let (key_dim, val_dim) = (la.key_dim(), la.value_dim());
+        let width = la.conv_channels();
+        let heads = la.value_heads;
+        // Asked before the activations are borrowed apart, because it takes
+        // `&self`.
+        let ffn_absorbs = self.ffn_norm_takes_residual(layer, n);
+        let ordinal = pool
+            .gdn()
+            .and_then(|g| g.ordinal_of(layer))
+            .context("no recurrent state slot for a linear-attention layer")?;
+        let n_seqs = pool.max_seqs();
+
+        // Normalize the residual stream. No fused f16 variant here: its point is
+        // to hand an f16 activation to an MMQ q/k/v group, and this block has
+        // none.
+        let (shared, shared_f16) = Self::norm_for_group(
+            &self.kern,
+            &mut self.scratch,
+            &mut self.act.xb,
+            &self.act.x.slice(..n * d),
+            &self.w.layers[layer].attn_norm.as_view(),
+            n,
+            d,
+            eps,
+            false,
+            false,
+        )?;
+
+        // The activations have to be taken apart: the projections read `xb`
+        // while writing the GatedDeltaNet buffers, and the output projection
+        // writes `proj` while reading them.
+        let Activations {
+            xb, x, proj, gdn, ..
+        } = &mut self.act;
+        let acts = gdn
+            .as_mut()
+            .context("this model has linear-attention blocks but no buffers for them")?;
+        let gw = self.w.layers[layer]
+            .gdn
+            .as_ref()
+            .expect("dispatched to the linear path for a layer with no gdn weights");
+        let stage = slot.map(|s| &self.offload.as_ref().unwrap().stage[s]);
+
+        // The four input projections share the normalized residual. Not grouped
+        // into a fused mat-vec: `in_proj_a` and `in_proj_b` are `value_heads`
+        // columns wide — 48 against 10240 — and the fusion helper wants
+        // same-shaped matrices anyway.
+        for (m, out, cols) in [
+            (&gw.in_proj_qkv, &mut acts.qkv, width),
+            (&gw.in_proj_z, &mut acts.z, val_dim),
+            (&gw.in_proj_a, &mut acts.a, heads),
+            (&gw.in_proj_b, &mut acts.b, heads),
+        ] {
+            Self::matmul_pre(
+                &self.kern,
+                &mut self.scratch,
+                &mut out.slice_mut(..n * cols),
+                m,
+                stage,
+                &xb.slice(..n * d),
+                n,
+                self.use_mmvq,
+                self.use_mmq,
+                shared,
+                shared_f16,
+            )?;
+        }
+
+        let (first, ntok, mut recurrent, mut conv) = pool.gdn_parts(ordinal);
+        let seqs = tuili_kernels::gdn::SeqLayout {
+            first_token: &first,
+            n_tokens: &ntok,
+            n_seqs,
+            total_tokens: n,
+        };
+
+        // The convolution needs a separate output: it reads three tokens back,
+        // so writing in place would consume values it had already overwritten.
+        self.kern.gdn_conv(
+            &mut acts.qkv_conv.slice_mut(..n * width),
+            &acts.qkv.slice(..n * width),
+            &mut conv,
+            &gw.conv1d.as_view(),
+            &seqs,
+            width,
+            la.conv_kernel,
+        )?;
+
+        self.kern.gdn_gate_decay(
+            &mut acts.beta.slice_mut(..n * heads),
+            &mut acts.g.slice_mut(..n * heads),
+            &acts.a.slice(..n * heads),
+            &acts.b.slice(..n * heads),
+            &gw.a_log.as_view(),
+            &gw.dt_bias.as_view(),
+            n,
+            heads,
+        )?;
+
+        // q and k are normalized where they lie, inside the packed row.
+        self.kern.gdn_qk_l2norm(
+            &mut acts.qkv_conv.slice_mut(..n * width),
+            n,
+            la.key_heads,
+            la.key_head_dim,
+            width,
+            0,
+            key_dim,
+            1e-6,
+        )?;
+
+        self.kern.gdn_delta_rule(
+            &mut acts.core.slice_mut(..n * val_dim),
+            &mut recurrent,
+            &acts.qkv_conv.slice(..n * width),
+            &acts.g.slice(..n * heads),
+            &acts.beta.slice(..n * heads),
+            &seqs,
+            heads,
+            la.key_heads,
+            la.key_head_dim,
+            la.value_head_dim,
+            (width, 0, key_dim, 2 * key_dim),
+        )?;
+
+        // Normalize each head's output, then gate it with silu(z). This order
+        // matters and the other one runs; `gdn_gated_rmsnorm` says why. `qkv` is
+        // reused as the destination — its projection has been consumed by the
+        // convolution, and this saves a `value_dim`-wide buffer a token.
+        self.kern.gdn_gated_rmsnorm(
+            &mut acts.qkv.slice_mut(..n * val_dim),
+            &acts.core.slice(..n * val_dim),
+            &acts.z.slice(..n * val_dim),
+            &gw.norm.as_view(),
+            n * heads,
+            la.value_head_dim,
+            eps,
+        )?;
+
+        Self::matmul_pre(
+            &self.kern,
+            &mut self.scratch,
+            &mut proj.slice_mut(..n * d),
+            &gw.out_proj,
+            stage,
+            &acts.qkv.slice(..n * val_dim),
+            n,
+            self.use_mmvq,
+            self.use_mmq,
+            None,
+            false,
+        )?;
+
+        // Same residual protocol as `attention`: leave the block's output in
+        // `proj` when the FFN's norm will absorb it, add it here otherwise. A
+        // disagreement drops the residual or applies it twice.
+        if !ffn_absorbs {
+            self.kern
+                .add_assign(&mut x.slice_mut(..n * d), &proj.slice(..n * d), n * d)?;
+        }
+        Ok(())
     }
 
     fn attention(
@@ -2025,7 +2309,14 @@ impl Model {
     /// layer's `attention` will do it. `TUILI_FUSE_RESIDUAL=0` turns off this
     /// one and the FFN one together.
     fn attn_norm_takes_residual(&self, layer: usize, n: usize) -> bool {
+        // The bounds check comes first: `feed_forward` asks about `layer + 1`,
+        // which is one past the end for the last block.
         if layer == 0 || layer >= self.cfg.n_layers {
+            return false;
+        }
+        // A GatedDeltaNet block has no q/k/v group, so there is no f16-reading
+        // consumer for the fused add-and-norm to feed. It adds explicitly.
+        if self.w.layers[layer].is_linear() {
             return false;
         }
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2669,6 +2960,19 @@ impl Activations {
                 "attention partials",
             )?,
             head_in: alloc_f32(max_logit_rows * d, "logit rows")?,
+            gdn: match cfg.linear_attn {
+                Some(la) => Some(GdnActs {
+                    qkv: alloc_f32(chunk * la.conv_channels(), "gdn qkv")?,
+                    qkv_conv: alloc_f32(chunk * la.conv_channels(), "gdn qkv post-conv")?,
+                    z: alloc_f32(chunk * la.value_dim(), "gdn gate")?,
+                    a: alloc_f32(chunk * la.value_heads, "gdn a")?,
+                    b: alloc_f32(chunk * la.value_heads, "gdn b")?,
+                    beta: alloc_f32(chunk * la.value_heads, "gdn beta")?,
+                    g: alloc_f32(chunk * la.value_heads, "gdn g")?,
+                    core: alloc_f32(chunk * la.value_dim(), "gdn core")?,
+                }),
+                None => None,
+            },
         })
     }
 }

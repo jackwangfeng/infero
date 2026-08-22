@@ -125,19 +125,25 @@ pub fn gelu_erf(x: f32) -> f32 {
     x * 0.5 * (1.0 + erf(x / 2.0f32.sqrt()))
 }
 
-/// Abramowitz & Stegun 7.1.26, good to ~1.5e-7 absolute — under f32's own
-/// resolution at these magnitudes, so the choice of approximation does not
-/// leak into the comparison against the reference.
+/// Abramowitz & Stegun 7.1.26, evaluated in `f64`: good to ~1.5e-7 absolute,
+/// which is under `f32`'s own resolution at these magnitudes. So the choice of
+/// approximation does not leak into the comparison against the reference —
+/// a disagreement with torch's `erf` means something other than this function.
 fn erf(x: f32) -> f32 {
-    let s = if x < 0.0 { -1.0 } else { 1.0 };
-    let x = x.abs();
-    let t = 1.0 / (1.0 + 0.327_591_1 * x);
-    let y = 1.0
-        - (((((1.061_405_429 * t - 1.453_152_027) * t) + 1.421_413_741) * t - 0.284_496_736) * t
-            + 0.254_829_592)
-            * t
-            * (-x * x).exp();
-    s * y
+    const A: [f64; 5] = [
+        0.254_829_592,
+        -0.284_496_736,
+        1.421_413_741,
+        -1.453_152_027,
+        1.061_405_429,
+    ];
+    const P: f64 = 0.327_591_1;
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs() as f64;
+    let t = 1.0 / (1.0 + P * x);
+    // Horner from the highest power down.
+    let poly = A.iter().rev().fold(0.0f64, |acc, c| acc * t + c);
+    (sign * (1.0 - poly * t * (-x * x).exp())) as f32
 }
 
 /// LayerNorm over the last dimension: subtract the mean, divide by the standard
@@ -147,18 +153,36 @@ fn erf(x: f32) -> f32 {
 /// merger's. Every normalization in the text tower is RMSNorm. Dropping the mean
 /// subtraction and the bias runs and moves the block-0 output by 0.32 out of a
 /// peak of 5.1; dropping only the mean subtraction moves it by 3.0.
+/// The reductions run in `f64` on purpose. By the last of the 27 blocks the
+/// residual stream reaches ~4200 with a row variance around 2.5e3, and a naive
+/// sequential `f32` sum of 1152 such values carries about 7e-4 of relative
+/// error — which shows up as a 1e-5 absolute disagreement with torch's blocked
+/// reduction on an output of order 0.02. That is precision, not layout, but it
+/// is large enough to swamp the tolerance a layout test wants to use. Reducing
+/// in `f64` makes this reference order-independent, so a disagreement with it
+/// means something real.
+///
+/// Two passes — mean, then variance of the centred values — rather than
+/// `E[x²] - E[x]²`, which cancels catastrophically at this magnitude.
 pub fn layer_norm_rows(x: &[f32], w: &[f32], b: &[f32], row_len: usize, eps: f32) -> Vec<f32> {
     assert_eq!(w.len(), row_len);
     assert_eq!(b.len(), row_len);
     assert_eq!(x.len() % row_len, 0);
     let mut out = Vec::with_capacity(x.len());
     for row in x.chunks(row_len) {
-        let n = row_len as f32;
-        let mean: f32 = row.iter().sum::<f32>() / n;
-        let var: f32 = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n;
-        let inv = (var + eps).sqrt().recip();
+        let n = row_len as f64;
+        let mean = row.iter().map(|v| *v as f64).sum::<f64>() / n;
+        let var = row
+            .iter()
+            .map(|v| {
+                let d = *v as f64 - mean;
+                d * d
+            })
+            .sum::<f64>()
+            / n;
+        let inv = (var + eps as f64).sqrt().recip();
         for ((v, g), c) in row.iter().zip(w).zip(b) {
-            out.push(g * ((v - mean) * inv) + c);
+            out.push((g * ((*v as f64 - mean) * inv) as f32) + c);
         }
     }
     out
@@ -376,10 +400,11 @@ pub fn vision_position_ids(grids: &[Grid], merge: usize) -> Vec<u32> {
 ///
 /// `align_corners = true`, which `Qwen3_5VisionModel::__init__` sets and the
 /// library helper's own default contradicts. With it the source coordinate is
-/// `index * (side - 1) / (size - 1)`; without it, `(index + 0.5) * side / size
-/// - 0.5`. The false variant runs and moves the position embeddings by 5.3 out
-/// of a peak of 6.6 — the position field is then simply a different function of
-/// the image, which degrades spatial grounding while leaving fluency intact.
+/// `index * (side - 1) / (size - 1)`; without it it is
+/// `(index + 0.5) * side / size - 0.5`. The false variant runs and moves the
+/// position embeddings by 5.31 out of a peak of 6.60 — the position field is
+/// then simply a different function of the image, which degrades spatial
+/// grounding while leaving fluency intact.
 pub fn pos_embed_taps(grids: &[Grid], side: usize, merge: usize) -> (Vec<usize>, Vec<f32>) {
     let mut idx = Vec::new();
     let mut wts = Vec::new();
@@ -506,8 +531,8 @@ pub fn vision_rope_tables(
     let mut sin = vec![0.0f32; n * head_dim];
     for p in 0..n {
         for (axis, &pos) in position_ids[p * 2..p * 2 + 2].iter().enumerate() {
-            for i in 0..per_axis {
-                let angle = pos as f64 * inv[i];
+            for (i, &freq) in inv.iter().enumerate() {
+                let angle = pos as f64 * freq;
                 let (s, c) = (angle.sin() as f32, angle.cos() as f32);
                 let j = axis * per_axis + i;
                 cos[p * head_dim + j] = c;

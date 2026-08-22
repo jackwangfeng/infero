@@ -15,7 +15,7 @@
 //! slots stay contiguous and a gather reads a whole head vector coalesced.
 
 use anyhow::{Context, Result};
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaSlice, CudaView, CudaViewMut};
 use half::f16;
 use tuili_cuda::Device;
 use tuili_kernels::KvQuant;
@@ -64,6 +64,19 @@ pub struct KvPool {
     /// to this pool's device pointers — a captured CUDA graph holds them and
     /// must not be replayed against a different pool's memory.
     id: u64,
+    /// The GatedDeltaNet state, when the model has linear-attention blocks.
+    ///
+    /// Here rather than beside the pool because it is per-sequence state with
+    /// exactly this lifetime and exactly this `max_seqs`, and because the way to
+    /// get it wrong is to reuse a slot without clearing it — the model then
+    /// conditions on a conversation it was never shown. Owning it means `alloc`
+    /// can clear it, rather than every caller having to remember to.
+    gdn: Option<crate::gdn_state::GdnState>,
+    /// Per sequence *slot*: where its tokens start in the batch and how many it
+    /// contributes. Zero for a slot not in this batch. Sized by `max_seqs` so a
+    /// single launch can cover the pool.
+    gdn_first: CudaSlice<i32>,
+    gdn_ntok: CudaSlice<i32>,
 }
 
 impl KvPool {
@@ -81,6 +94,7 @@ impl KvPool {
         max_seqs: usize,
         max_seq: usize,
         quant: KvQuant,
+        layer_is_linear: &[bool],
     ) -> Result<Self> {
         anyhow::ensure!(n_slots > 0 && max_seqs > 0 && max_seq > 0, "empty kv pool");
         let stream = dev.stream();
@@ -189,6 +203,38 @@ impl KvPool {
             seqs: (0..max_seqs).map(|_| None).collect(),
             bytes: bytes + max_seqs * max_seq * 4,
             id: NEXT_POOL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            gdn: match cfg.linear_attn {
+                Some(la) => {
+                    anyhow::ensure!(
+                        layer_is_linear.len() == cfg.n_layers,
+                        "the layer-kind list has {} entries for {} layers",
+                        layer_is_linear.len(),
+                        cfg.n_layers
+                    );
+                    let st = crate::gdn_state::GdnState::new(
+                        dev,
+                        layer_is_linear,
+                        crate::gdn_state::GdnShape {
+                            heads: la.value_heads,
+                            dk: la.key_head_dim,
+                            dv: la.value_head_dim,
+                            conv_channels: la.conv_channels(),
+                            conv_k: la.conv_kernel,
+                        },
+                        max_seqs,
+                    )?;
+                    tracing::info!(
+                        linear_layers = st.n_linear_layers(),
+                        mib = st.bytes() >> 20,
+                        per_seq_mib = (st.bytes() / max_seqs) >> 20,
+                        "recurrent state allocated"
+                    );
+                    Some(st)
+                }
+                None => None,
+            },
+            gdn_first: stream.alloc_zeros::<i32>(max_seqs)?,
+            gdn_ntok: stream.alloc_zeros::<i32>(max_seqs)?,
         })
     }
 
@@ -310,6 +356,65 @@ impl KvPool {
         state.slots.extend_from_slice(&taken);
         state.len += n;
         Ok(taken)
+    }
+
+    /// The GatedDeltaNet state, when this model has any.
+    pub(crate) fn gdn(&mut self) -> Option<&mut crate::gdn_state::GdnState> {
+        self.gdn.as_mut()
+    }
+
+    /// Whether this pool carries recurrent state at all.
+    pub fn has_recurrent_state(&self) -> bool {
+        self.gdn.is_some()
+    }
+
+    /// Zero one sequence's recurrent and convolution state.
+    ///
+    /// Called for a sequence at length zero: a fresh sequence, or one just
+    /// reset. The invariant is "no tokens seen means no state", which is why
+    /// this needs no dirty flag — `alloc` cannot do it because it has no device
+    /// to memset with, and a flag would be one more thing to forget.
+    pub fn reset_recurrent(&mut self, dev: &Device, id: SeqId) -> Result<()> {
+        if let Some(g) = self.gdn.as_mut() {
+            g.reset(dev, id)?;
+        }
+        Ok(())
+    }
+
+    /// The batch layout the recurrence kernels index by sequence slot, together
+    /// with one layer's state.
+    ///
+    /// Returned as one call because the layout is read while the state is
+    /// written, and they are separate fields — asking for them separately would
+    /// be a mutable borrow overlapping an immutable one for no reason.
+    pub(crate) fn gdn_parts(
+        &mut self,
+        ordinal: usize,
+    ) -> (
+        CudaView<'_, i32>,
+        CudaView<'_, i32>,
+        CudaViewMut<'_, f32>,
+        CudaViewMut<'_, f32>,
+    ) {
+        let g = self.gdn.as_mut().expect("no recurrent state in this pool");
+        let (recurrent, conv) = g.layer_views(ordinal);
+        (
+            self.gdn_first.as_view(),
+            self.gdn_ntok.as_view(),
+            recurrent,
+            conv,
+        )
+    }
+
+    /// Fill the per-slot batch layout. `spans[slot]` is `(first token, count)`.
+    pub(crate) fn set_gdn_layout(&mut self, dev: &Device, spans: &[(i32, i32)]) -> Result<()> {
+        anyhow::ensure!(spans.len() == self.max_seqs, "layout covers the wrong slots");
+        let first: Vec<i32> = spans.iter().map(|s| s.0).collect();
+        let ntok: Vec<i32> = spans.iter().map(|s| s.1).collect();
+        let stream = dev.stream();
+        stream.memcpy_htod(&first, &mut self.gdn_first)?;
+        stream.memcpy_htod(&ntok, &mut self.gdn_ntok)?;
+        Ok(())
     }
 
     /// Drop the tail of a sequence back to `len` tokens, returning its slots.

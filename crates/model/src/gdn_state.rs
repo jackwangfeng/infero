@@ -159,6 +159,22 @@ impl GdnState {
         self.conv.slice_mut(ordinal * n..(ordinal + 1) * n)
     }
 
+    /// Both of one layer's state buffers at once, since a block advances both.
+    pub fn layer_views(
+        &mut self,
+        ordinal: usize,
+    ) -> (
+        cudarc::driver::CudaViewMut<'_, f32>,
+        cudarc::driver::CudaViewMut<'_, f32>,
+    ) {
+        let rn = self.shape.state_floats() * self.max_seqs;
+        let cn = self.shape.conv_floats() * self.max_seqs;
+        (
+            self.recurrent.slice_mut(ordinal * rn..(ordinal + 1) * rn),
+            self.conv.slice_mut(ordinal * cn..(ordinal + 1) * cn),
+        )
+    }
+
     /// How many sequence slots a launch covers.
     pub fn max_seqs(&self) -> usize {
         self.max_seqs

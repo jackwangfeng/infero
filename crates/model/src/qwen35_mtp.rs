@@ -252,12 +252,27 @@ pub fn fuse_embedding_and_hidden(
 
     let e = rms_norm_offset_rows(embeds, w.pre_fc_norm_embedding, d_model, eps);
     let h = rms_norm_offset_rows(hidden, w.pre_fc_norm_hidden, d_model, eps);
+    let cat = concat_embedding_then_hidden(&e, &h, t_len, d_model);
+    let fused = linear(&cat, w.fc, t_len, 2 * d_model, d_model);
+    (e, h, fused)
+}
 
-    // Build the concatenation explicitly rather than folding it into two
-    // half-GEMMs. A real kernel will do the latter — `fc[:, :d] @ e + fc[:, d:]
-    // @ h`, no copy — and that is fine, but writing it that way here would put
-    // the ordering decision inside an index expression instead of on the surface
-    // where it can be read.
+/// `[normalized embedding | normalized hidden]`, row by row — the ordering
+/// decision, on its own, so that a test can exercise *this function* rather than
+/// rebuild the concatenation alongside it and end up checking its own copy.
+///
+/// A real kernel will not materialize this at all; it will compute
+/// `fc[:, :d] @ e + fc[:, d:] @ h` and skip the copy entirely. That is fine and
+/// equivalent, but writing it that way here would bury the ordering inside an
+/// index expression instead of leaving it on the surface where it can be read.
+pub fn concat_embedding_then_hidden(
+    e: &[f32],
+    h: &[f32],
+    t_len: usize,
+    d_model: usize,
+) -> Vec<f32> {
+    assert_eq!(e.len(), t_len * d_model);
+    assert_eq!(h.len(), t_len * d_model);
     let mut cat = vec![0.0f32; t_len * 2 * d_model];
     for t in 0..t_len {
         cat[t * 2 * d_model..t * 2 * d_model + d_model]
@@ -265,8 +280,7 @@ pub fn fuse_embedding_and_hidden(
         cat[t * 2 * d_model + d_model..(t + 1) * 2 * d_model]
             .copy_from_slice(&h[t * d_model..(t + 1) * d_model]);
     }
-    let fused = linear(&cat, w.fc, t_len, 2 * d_model, d_model);
-    (e, h, fused)
+    cat
 }
 
 /// One Qwen3.5 full-attention decoder layer, pre-norm with two residuals.

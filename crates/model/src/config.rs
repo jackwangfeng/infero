@@ -57,6 +57,47 @@ pub struct Config {
     pub tied_embeddings: bool,
     /// Rotary pairing: `2i` with `2i+1` rather than `i` with `i + d/2`.
     pub interleaved_rope: bool,
+    /// Set when some of this model's blocks mix with a recurrence rather than
+    /// with attention. `None` for every model tuili loaded before Qwen3.5.
+    pub linear_attn: Option<LinearAttnConfig>,
+}
+
+/// The GatedDeltaNet dimensions, when a model has such blocks.
+///
+/// Kept as a separate struct rather than five `Option` fields on `Config` so
+/// that "this model has linear attention" is one question rather than five that
+/// could disagree.
+#[derive(Debug, Clone, Copy)]
+pub struct LinearAttnConfig {
+    /// How many key heads the projection produces — fewer than the value heads.
+    pub key_heads: usize,
+    /// The width the recurrence actually runs at.
+    pub value_heads: usize,
+    pub key_head_dim: usize,
+    pub value_head_dim: usize,
+    /// Depthwise convolution width; the carried window is one shorter.
+    pub conv_kernel: usize,
+}
+
+impl LinearAttnConfig {
+    pub fn key_dim(&self) -> usize {
+        self.key_heads * self.key_head_dim
+    }
+
+    pub fn value_dim(&self) -> usize {
+        self.value_heads * self.value_head_dim
+    }
+
+    /// The packed `[q | k | v]` row's width, which is also the convolution's
+    /// channel count.
+    pub fn conv_channels(&self) -> usize {
+        2 * self.key_dim() + self.value_dim()
+    }
+
+    /// How many value heads share one key head.
+    pub fn heads_per_key(&self) -> usize {
+        self.value_heads / self.key_heads
+    }
 }
 
 impl Config {
@@ -151,6 +192,9 @@ impl Config {
                 .unwrap_or(1.0),
             tied_embeddings: f.get_tensor("output.weight").is_none(),
             interleaved_rope: INTERLEAVED_ROPE.contains(&arch.as_str()),
+            // No GGUF conversion of a linear-attention model exists; when one
+            // does it will need its own metadata keys rather than a guess.
+            linear_attn: None,
         })
     }
 
@@ -284,6 +328,47 @@ impl Config {
                 .or_else(|| dims["tie_word_embeddings"].as_bool())
                 .unwrap_or(false),
             interleaved_rope: false,
+            // Present only when the checkpoint says some layers are linear. All
+            // five dimensions come from one place or none of them do: a
+            // partially-specified linear-attention config would produce a
+            // plausible width for one of them and a wrong one for another.
+            linear_attn: match (
+                dims["linear_num_key_heads"].as_u64(),
+                dims["linear_num_value_heads"].as_u64(),
+                dims["linear_key_head_dim"].as_u64(),
+                dims["linear_value_head_dim"].as_u64(),
+                dims["linear_conv_kernel_dim"].as_u64(),
+            ) {
+                (Some(kh), Some(vh), Some(kd), Some(vd), Some(ck)) => {
+                    let (kh, vh) = (kh as usize, vh as usize);
+                    anyhow::ensure!(
+                        kh > 0 && vh > 0 && vh.is_multiple_of(kh),
+                        "{vh} linear value heads do not divide into {kh} key \
+                         heads, so the repeat_interleave expansion the \
+                         recurrence needs is not defined"
+                    );
+                    anyhow::ensure!(
+                        ck >= 2,
+                        "a depthwise convolution of width {ck} has no window to \
+                         carry between steps"
+                    );
+                    Some(LinearAttnConfig {
+                        key_heads: kh,
+                        value_heads: vh,
+                        key_head_dim: kd as usize,
+                        value_head_dim: vd as usize,
+                        conv_kernel: ck as usize,
+                    })
+                }
+                (None, None, None, None, None) => None,
+                _ => anyhow::bail!(
+                    "this config names some of the linear-attention dimensions \
+                     and not others; all five of linear_num_key_heads, \
+                     linear_num_value_heads, linear_key_head_dim, \
+                     linear_value_head_dim and linear_conv_kernel_dim are needed \
+                     to size the recurrence"
+                ),
+            },
         })
     }
 
