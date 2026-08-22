@@ -200,6 +200,13 @@ def capture_linear(headers, cfg, x, dump):
     dump("linear.dt_bias", dt_bias)
     dump("linear.norm_w", norm_w)
 
+    # Rows straddling both split boundaries, so a test can confirm where q ends
+    # and k begins rather than inheriting this capture's own split.
+    bnd = [0, key_dim - 1, key_dim, 2 * key_dim - 1, 2 * key_dim,
+           2 * key_dim + val_dim - 1]
+    dump("linear.qkv_boundary_rows", torch.tensor(bnd, dtype=torch.float32))
+    dump("linear.qkv_boundary_w", w_qkv[bnd])
+
     qkv = x @ w_qkv.T                                     # [T, 10240]
     z = x @ w_z.T                                         # [T, 6144]
     a = x @ w_a.T                                         # [T, 48]
@@ -269,6 +276,20 @@ def capture_full(headers, cfg, x, dump, pos_offset=0, tag="full"):
 
     # The layout trap: view to [T, heads, 2*head_dim] and split the LAST dim,
     # so q and the gate interleave per head. [all q | all gate] also "works".
+    # A layout test needs the weight rows, not just the split result. Under the
+    # interleaved reading, q[t, h, d] uses row h*2*hd + d and gate[t, h, d] uses
+    # row h*2*hd + hd + d; under [all q | all gate] it would be h*hd + d and
+    # nh*hd + h*hd + d. Dumping these specific rows lets a test distinguish them
+    # instead of trusting whichever split the capture happened to make.
+    probe_rows = []
+    for h in (0, 1, nh - 1):
+        for d in (0, 1, hd - 1):
+            probe_rows += [h * 2 * hd + d, h * 2 * hd + hd + d,
+                           h * hd + d, nh * hd + h * hd + d]
+    probe_rows = sorted(set(probe_rows))
+    dump("full.q_proj_probe_rows", torch.tensor(probe_rows, dtype=torch.float32))
+    dump("full.q_proj_probe_w", w_q[probe_rows])
+
     qg = (x @ w_q.T).reshape(T, nh, 2 * hd)
     q, gate = qg[..., :hd], qg[..., hd:]
     dump("full.q_pre_norm", q.contiguous())
@@ -323,6 +344,12 @@ def main():
     ap.add_argument("model_dir")
     ap.add_argument("out_dir")
     ap.add_argument("--tokens", type=int, default=12)
+    ap.add_argument("--real-input", metavar="DIR",
+                    help="use activations dumped by qwen35_real_prefix.py as the "
+                         "block inputs instead of synthetic noise. Strongly "
+                         "preferred: random input runs the block far below "
+                         "rms_norm_eps, where the gated norm does nothing and "
+                         "the capture cannot discriminate its formulation.")
     args = ap.parse_args()
 
     cfg = json.load(open(os.path.join(args.model_dir, "config.json")))["text_config"]
@@ -357,18 +384,43 @@ def main():
               f"[{flat.min():+.5f}, {flat.max():+.5f}]  "
               f"nonfinite={int((~flat.isfinite()).sum())}")
 
-    # A fixed, reproducible input at a plausible activation scale. Whatever it
-    # is, both implementations see the same bytes.
+    # The input scale is not cosmetic. Both blocks receive
+    # `input_layernorm(hidden_states)`, whose per-element distribution is
+    # `unit-RMS noise * layernorm weight`. An earlier version of this script used
+    # randn * 0.02, which put mean(core_attn_out^2) around 6e-12 — five orders
+    # below rms_norm_eps of 1e-6. The eps then dominated every RMS denominator,
+    # so the gated norm degenerated to a constant 1/sqrt(eps) scale and the
+    # capture could not tell "normalize then gate" from "gate then normalize".
+    # A capture in a regime where the operation under test does nothing blesses
+    # anything. So build the input the way the model actually produces it.
     torch.manual_seed(20260822)
-    x = torch.randn(args.tokens, cfg["hidden_size"], dtype=torch.float32) * 0.02
-    dump("input", x)
+    ln = load_f32(headers, "model.language_model.layers.0.input_layernorm.weight")
+    dump("input_layernorm_weight", ln)
+
+    def real(layer):
+        meta = json.load(open(os.path.join(args.real_input, "real_prefix.json")))
+        name = f"real_input.layer{layer}"
+        shape = meta["arrays"][name]
+        raw = open(os.path.join(args.real_input, name + ".f32"), "rb").read()
+        t = torch.frombuffer(bytearray(raw), dtype=torch.float32).reshape(shape)
+        return t[: args.tokens].clone()
+
+    if args.real_input:
+        x_lin, x_full = real(0), real(3)
+        manifest["input_source"] = "real activations from qwen35_real_prefix.py"
+    else:
+        x_lin = torch.randn(args.tokens, cfg["hidden_size"], dtype=torch.float32) * ln
+        x_full = x_lin
+        manifest["input_source"] = "synthetic noise * input_layernorm weight"
+    dump("input", x_lin)
+    dump("input_full", x_full)
 
     print("== GatedDeltaNet (layer 0)")
-    capture_linear(headers, cfg, x, dump)
+    capture_linear(headers, cfg, x_lin, dump)
     print("== gated attention (layer 3), positions 0..T")
-    capture_full(headers, cfg, x, dump)
+    capture_full(headers, cfg, x_full, dump)
     print("== gated attention (layer 3), positions 130000..")
-    capture_full(headers, cfg, x, dump, pos_offset=130000, tag="full_far")
+    capture_full(headers, cfg, x_full, dump, pos_offset=130000, tag="full_far")
 
     manifest["verified_against_transformers"] = verified
     with open(os.path.join(args.out_dir, "manifest.json"), "w") as fh:

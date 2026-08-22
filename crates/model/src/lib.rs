@@ -20,6 +20,7 @@
 
 mod cache;
 pub mod config;
+pub mod qwen35;
 mod sampling;
 pub mod weights;
 
