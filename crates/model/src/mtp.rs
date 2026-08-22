@@ -385,6 +385,17 @@ impl MtpHead {
         self.run(kern, embed, &[drafted], &[position])
     }
 
+    /// One draft step's kernels: four small uploads, then eighteen launches.
+    ///
+    /// **A CUDA graph over this buys nothing.** Eighteen kernels at one row looks
+    /// like launch latency, and capturing them — keyed on `(rows, kv bucket)`,
+    /// bucketed at 64 the way the text side's decode graphs are — measured 4.11
+    /// ms against 4.19 at k=2. The capture was correct (all six of the head's
+    /// tests passed with it, reference output and acceptance length included);
+    /// it was simply nothing to gain, because the draft has been within 0.75 ms
+    /// of its byte bound since the vocabulary projection moved to `mmvq`. The
+    /// 120 GB/s I thought this ran at came from subtracting an assumed
+    /// `lm_head` time from the total, and the assumption was wrong.
     fn run(
         &mut self,
         kern: &Kernels,
