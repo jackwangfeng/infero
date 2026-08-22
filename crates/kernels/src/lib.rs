@@ -104,7 +104,12 @@ fn fp8_src() -> &'static str {
     // for `examples/fp8_row_cost.rs` to attribute the marginal row's cost. The
     // defines change the source, so they change the NVRTC cache key — a stripped
     // build cannot be confused with a serving one.
-    SRC.get_or_init(|| format!("{COMMON_CUH}\n{}\n{FP8_CU}", crate::fp8::strip_flags()))
+    SRC.get_or_init(|| {
+        format!(
+            "{COMMON_CUH}\n{MMA_CUH}\n{}\n{FP8_CU}",
+            crate::fp8::strip_flags()
+        )
+    })
 }
 
 fn sample_src() -> &'static str {

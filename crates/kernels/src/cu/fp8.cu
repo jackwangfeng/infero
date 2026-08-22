@@ -381,3 +381,219 @@ extern "C" __global__ void fp8_repack_rows(unsigned char* __restrict__ dst,
     *(unsigned int*)(void*)(dst + (size_t)g * FP8_ROW_GROUP * k
                             + (size_t)c * (FP8_ROW_GROUP * 4) + (size_t)r * 4) = w;
 }
+
+// ---- tensor cores ------------------------------------------------------------
+//
+// The batched mat-vec's marginal row is 81% per-token multiply-accumulate
+// (`examples/fp8_row_cost.rs`, and see `fp8::BATCH_KERNELS` for how two earlier
+// readings of that probe were wrong). Its inner loop issues sixteen scalar FMAs
+// per chunk per token and lands at a seventh of the f32 FMA bound. One
+// `mma.m16n8k16` does 2048 MACs in one instruction, so even wasting thirteen of
+// its sixteen N columns at three tokens it issues twelve times fewer.
+//
+// The block shape follows from wanting warps resident. A warp that owns 16 rows
+// and all of k needs only `n / 16` warps for the whole matrix — 1088 here, or
+// 5.8 an SM, far too few to hide a DRAM read. So a block owns *one* 16-row tile
+// and its eight warps split k, each taking one of the eight `k=16` steps inside
+// a 128-wide scale block. That gives 1088 blocks of 8 warps, one barrier a scale
+// block, and a single cross-warp sum of 16x8 floats at the end.
+//
+// Three things the layout gets for free:
+//
+//   * A 16-row tile never straddles a 128-row scale block, so there is exactly
+//     one scale per (tile, k-block) and it multiplies an f32 accumulator after
+//     eight MMAs — the block-scale semantics, without touching the operands.
+//   * The repacked weights put a group's 128-wide k-block in 512 contiguous
+//     bytes, so staging is one `uint4` a lane and nothing is strided.
+//   * Activations are `[token][k]` with k contiguous, which is exactly the
+//     `B` fragment's own layout, so `B` needs no transpose.
+//
+// The A tile's shared row stride is 136 halves rather than 128. At 128 the
+// fragment gather (lane L reads row L/4 at half (L%4)*2) puts eight rows on the
+// same bank and conflicts eight ways; 136 shifts each row by four banks and lane
+// L lands on bank ((L/4)*68 + L%4) % 32, which is a permutation of 0..31.
+#define FP8_MMA_STRIDE 136
+
+// Two e4m3 bytes to two halves in one instruction.
+//
+// The staging loop runs this once per two weight bytes — 89M times for one of
+// the 27B's wide projections — so the arithmetic version costs real time:
+// `e4m3_to_f32` is a handful of shifts and a subnormal branch, then
+// `__float2half` rounds back down. sm_89 and up have the conversion in hardware
+// and it is exact in both directions, e4m3's 3 mantissa bits fitting inside
+// f16's 10.
+__device__ __forceinline__ unsigned e4m3x2_to_half2(unsigned short two) {
+#if __CUDA_ARCH__ >= 890
+    unsigned h;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h) : "h"(two));
+    return h;
+#else
+    const __half2 v = __floats2half2_rn(e4m3_to_f32(two & 0xFFu),
+                                        e4m3_to_f32((two >> 8) & 0xFFu));
+    return *(const unsigned*)(const void*)&v;
+#endif
+}
+
+// `GROUPS` fragment columns off one staged weight tile.
+//
+// Prefill is why. The fragment's N is eight, so up to eight tokens ride along
+// for nothing — but a 66-token prompt does not, and the expansion path it fell
+// to costs five bytes a weight against this one's one: 148 GB against 29.6 for
+// the 27B's forward. Each extra group is one more MMA and one more `B` fragment
+// against the *same* shared tile, so `GROUPS = 8` covers 64 tokens in a single
+// pass over the weights.
+//
+// Past `GROUPS * 8` tokens, `blockIdx.y` tiles the rest and the weights are
+// re-read once per tile. That is the point where a real N-blocked GEMM should
+// take over; until then two passes still beat five bytes a weight.
+template <int GROUPS>
+__device__ __forceinline__ void mma_f8_group_body(
+        float* __restrict__ out, const unsigned char* __restrict__ w,
+        const float* __restrict__ x, int k, int n, int scale_cols,
+        int n_tokens, int accum) {
+#if __CUDA_ARCH__ >= 800
+    const int row0 = blockIdx.x * 16;
+    // First token this block owns. Blocks past the token count do nothing.
+    const int tok0 = blockIdx.y * (GROUPS * 8);
+    if (tok0 >= n_tokens) return;
+    if (row0 >= n) return;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+
+    __shared__ __half tile[16 * FP8_MMA_STRIDE];
+    // Eight partial `16 x 8*GROUPS` tiles, one a warp, summed once at the end.
+    __shared__ float red[8][GROUPS * 16 * 8];
+
+    const int padded = ((n + FP8_ROW_GROUP - 1) / FP8_ROW_GROUP) * FP8_ROW_GROUP;
+    const float* scales = (const float*)(w + (size_t)padded * k);
+    const float* srow = scales + (size_t)(row0 / 128) * scale_cols;
+
+    // Fragment coordinates. `ar`/`bc`/`cr` are all `lane / 4`; naming them
+    // separately keeps each use readable against the PTX tables.
+    const int ar = mma_a_row(lane);
+    const int bc = mma_b_col(lane);
+    const int k0 = mma_k0_f16(lane);
+    const int cr = mma_c_row(lane);
+    const int cc = mma_c_col(lane);
+
+    mma_c_f32 acc[GROUPS];
+#pragma unroll
+    for (int g = 0; g < GROUPS; ++g) acc[g] = mma_c_f32{{0.0f, 0.0f, 0.0f, 0.0f}};
+    const int kblocks = k / 128;
+
+    for (int kb = 0; kb < kblocks; ++kb) {
+        // Stage 16 rows x 128 k of weights as f16. Four groups of four rows,
+        // 512 contiguous bytes each; threads 0..127 take one `uint4` apiece.
+        __syncthreads();
+        if (threadIdx.x < 128) {
+            const int gl = threadIdx.x / 32;          // group within the tile
+            const int c = threadIdx.x % 32;           // chunk within the k-block
+            const unsigned char* src = w
+                + (size_t)(row0 / FP8_ROW_GROUP + gl) * FP8_ROW_GROUP * k
+                + (size_t)kb * 512 + (size_t)c * 16;
+            const uint4 q = *(const uint4*)(const void*)src;
+            const unsigned int word[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                // Row `4*gl + r`, k positions `4*c .. 4*c+3`. The scale is not
+                // applied here: e4m3 values are exact in f16, and folding a
+                // scale in could overflow it.
+                const uint2 h = make_uint2(
+                    e4m3x2_to_half2((unsigned short)(word[r] & 0xFFFFu)),
+                    e4m3x2_to_half2((unsigned short)(word[r] >> 16)));
+                *(uint2*)(void*)&tile[(4 * gl + r) * FP8_MMA_STRIDE + 4 * c] = h;
+            }
+        }
+        __syncthreads();
+
+        // One MMA a warp: warp `w` takes k [kb*128 + w*16, +16).
+        const int ko = kb * 128 + warp * 16;
+        mma_a_f16 a;
+        a.x[0] = *(const unsigned*)(const void*)&tile[ar * FP8_MMA_STRIDE + warp * 16 + k0];
+        a.x[1] = *(const unsigned*)(const void*)&tile[(ar + 8) * FP8_MMA_STRIDE + warp * 16 + k0];
+        a.x[2] = *(const unsigned*)(const void*)&tile[ar * FP8_MMA_STRIDE + warp * 16 + k0 + 8];
+        a.x[3] = *(const unsigned*)(const void*)&tile[(ar + 8) * FP8_MMA_STRIDE + warp * 16 + k0 + 8];
+
+        // One scale per (16-row tile, 128-wide k block), applied to the f32
+        // accumulator. This is the whole of block-scaled FP8.
+        const float s = srow[kb];
+
+        // `B` is [token][k] with k contiguous, which is the fragment's layout.
+        // Columns past `n_tokens` contribute zero rather than reading out of
+        // bounds, so the accumulator's unused columns stay unused.
+#pragma unroll
+        for (int g = 0; g < GROUPS; ++g) {
+            const int tok = tok0 + g * 8 + bc;
+            mma_b_f16 b = {{0u, 0u}};
+            if (tok < n_tokens) {
+                const float* xp = x + (size_t)tok * k + ko + k0;
+                const __half2 lo = __floats2half2_rn(xp[0], xp[1]);
+                const __half2 hi = __floats2half2_rn(xp[8], xp[9]);
+                b.x[0] = *(const unsigned*)(const void*)&lo;
+                b.x[1] = *(const unsigned*)(const void*)&hi;
+            }
+            mma_c_f32 c_local = {{0.0f, 0.0f, 0.0f, 0.0f}};
+            mma_f16(c_local, a, b);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) acc[g].x[i] += s * c_local.x[i];
+        }
+    }
+
+    // Each warp deposits its partials, then the block sums the eight.
+    __syncthreads();
+#pragma unroll
+    for (int g = 0; g < GROUPS; ++g) {
+        float* rg = &red[warp][g * 16 * 8];
+        rg[cr * 8 + cc + 0] = acc[g].x[0];
+        rg[cr * 8 + cc + 1] = acc[g].x[1];
+        rg[(cr + 8) * 8 + cc + 0] = acc[g].x[2];
+        rg[(cr + 8) * 8 + cc + 1] = acc[g].x[3];
+    }
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < GROUPS * 16 * 8; i += blockDim.x) {
+        const int g = i / (16 * 8);
+        const int rem = i % (16 * 8);
+        const int r = rem / 8;
+        const int t = tok0 + g * 8 + (rem % 8);
+        if (t >= n_tokens || row0 + r >= n) continue;
+        float sum = 0.0f;
+#pragma unroll
+        for (int wi = 0; wi < 8; ++wi) sum += red[wi][i];
+        float* o = out + (size_t)t * n + row0 + r;
+        *o = accum ? *o + sum : sum;
+    }
+#else
+    (void)out; (void)w; (void)x; (void)k; (void)n; (void)scale_cols;
+    (void)n_tokens; (void)accum;
+#endif
+}
+
+extern "C" __global__ void mma_f8_block_f32(float* __restrict__ out,
+                                            const unsigned char* __restrict__ w,
+                                            const float* __restrict__ x,
+                                            int k, int n, int scale_cols,
+                                            int n_tokens, int accum) {
+    mma_f8_group_body<1>(out, w, x, k, n, scale_cols, n_tokens, accum);
+}
+
+extern "C" __global__ void mma_f8_block_g2_f32(
+        float* __restrict__ out, const unsigned char* __restrict__ w,
+        const float* __restrict__ x, int k, int n, int scale_cols, int n_tokens,
+        int accum) {
+    mma_f8_group_body<2>(out, w, x, k, n, scale_cols, n_tokens, accum);
+}
+
+extern "C" __global__ void mma_f8_block_g4_f32(
+        float* __restrict__ out, const unsigned char* __restrict__ w,
+        const float* __restrict__ x, int k, int n, int scale_cols, int n_tokens,
+        int accum) {
+    mma_f8_group_body<4>(out, w, x, k, n, scale_cols, n_tokens, accum);
+}
+
+extern "C" __global__ void mma_f8_block_g8_f32(
+        float* __restrict__ out, const unsigned char* __restrict__ w,
+        const float* __restrict__ x, int k, int n, int scale_cols, int n_tokens,
+        int accum) {
+    mma_f8_group_body<8>(out, w, x, k, n, scale_cols, n_tokens, accum);
+}

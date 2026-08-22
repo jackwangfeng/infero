@@ -143,6 +143,12 @@ fn main() -> Result<()> {
         t
     };
 
+    // Everything above — the prime, the warm-up, the two-row pass — is a
+    // different shape from a decode step, and a report that mixes them says
+    // `gemm_f16` runs once a step when in truth that is prefill expanding a
+    // matrix the tensor-core path declines at 29 tokens. Reset here so the
+    // table below is one decode step and nothing else.
+    model.device().profile().reset();
     let base_len2 = pool.len(seq);
     let plain_serial = time_serial(
         REPS,

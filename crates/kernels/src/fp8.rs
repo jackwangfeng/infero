@@ -116,7 +116,7 @@ pub fn strip_flags() -> &'static str {
 ///   f16 activations are a couple of percent off on a cancelled element (see the
 ///   error model in `tests/fp8_matvec.rs`) and they bought nothing.
 ///
-It is the per-token arithmetic, and getting to that answer took two
+/// It is the per-token arithmetic, and getting to that answer took two
 /// corrections to the probe that found it. `examples/fp8_row_cost.rs` removes
 /// pieces of the kernel instead of reasoning about them, and its first two
 /// versions were both measuring the wrong thing:
@@ -183,6 +183,30 @@ It is the per-token arithmetic, and getting to that answer took two
 /// combined, and combining them costs what it costs. Getting past it means not
 /// having them — a tiled GEMM keeps its accumulator in registers across the whole
 /// k loop and never reduces across threads at all.
+/// Output rows a tensor-core block owns: the M of `mma.m16n8k16`.
+pub const MMA_ROWS: usize = 16;
+
+/// Tokens one fragment column holds: the N of `mma.m16n8k16`.
+///
+/// Eight is the instruction's own width, so one token and eight cost the same
+/// number of MMAs.
+pub const MMA_TOKENS: usize = 8;
+
+/// Fragment columns off one staged weight tile, and so the token counts the
+/// kernel covers in a single pass over the weights: 8, 16, 32, 64.
+///
+/// Prefill is what this is for. A 66-token prompt used to fall to the expansion
+/// path at five bytes a weight — 148 GB against 29.6 for the 27B's forward, and
+/// the profiler had `dequant_f8_block` and `gemm_f16` together at 17% of the
+/// probe's whole run. Each extra group is one more MMA and one more `B` fragment
+/// against a shared tile, so the weights are still read once.
+pub const MMA_GROUPS: [(usize, &str); 4] = [
+    (1, "mma_f8_block_f32"),
+    (2, "mma_f8_block_g2_f32"),
+    (4, "mma_f8_block_g4_f32"),
+    (8, "mma_f8_block_g8_f32"),
+];
+
 pub const BATCH_KERNELS: [(usize, &str); 8] = [
     (2, "mmv_f8_block_batch2_f32"),
     (3, "mmv_f8_block_batch3_f32"),
@@ -472,6 +496,88 @@ impl Kernels {
                 Ok(())
             })?;
         Ok(())
+    }
+
+    /// The same product on tensor cores: `mma.m16n8k16`, f16 operands, f32
+    /// accumulator.
+    ///
+    /// Why this exists is on `mma_f8_block_f32` in the `.cu`, and in one line it
+    /// is that the scalar path's marginal row is 81% per-token arithmetic issued
+    /// sixteen FMA instructions at a time. `MMA_TOKENS` is the N of the fragment,
+    /// so anything up to eight tokens costs the same as one — the columns past
+    /// `n_tokens` are fed zeros and their accumulators are never read.
+    ///
+    /// Requires `k % 128 == 0`, which is the scale block and holds for every
+    /// projection in the 27B. Returns whether it ran.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mma_f8_block(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        w: &CudaView<'_, u8>,
+        x: &CudaView<'_, f32>,
+        k: usize,
+        n: usize,
+        n_tokens: usize,
+        accum: bool,
+    ) -> Result<bool> {
+        // Where this stops being the cheaper path, by bytes a weight. The
+        // widest instantiation covers 64 tokens a pass, so it reads the matrix
+        // `ceil(m / 64)` times at one byte a weight; expanding reads one and
+        // writes two and reads two back, five bytes a weight, whatever `m` is.
+        // Five passes is where they meet. Derived, not measured — the crossover
+        // is worth a sweep once a long prompt is the thing being timed.
+        if !k.is_multiple_of(FP8_BLOCK)
+            || n_tokens > 4 * MMA_GROUPS.last().unwrap().0 * MMA_TOKENS
+        {
+            return Ok(false);
+        }
+        debug_assert!(out.len() >= n_tokens * n);
+        debug_assert!(x.len() >= n_tokens * k);
+        debug_assert!(w.len() >= fp8_bytes(k, n));
+
+        // The narrowest instantiation that covers the tokens, so a single-token
+        // decode does not carry eight accumulator columns. Past 64 tokens the
+        // widest one runs and `grid.y` tiles the rest, which re-reads the
+        // weights once per tile — still ahead of expanding them.
+        let groups = n_tokens.div_ceil(MMA_TOKENS);
+        let &(groups, name) = MMA_GROUPS
+            .iter()
+            .find(|(g, _)| groups <= *g)
+            .unwrap_or(MMA_GROUPS.last().unwrap());
+        let f = self.dev.kernels().get("tuili_fp8", fp8_src(), name)?;
+        // One block per 16-row tile, eight warps splitting the tile's k. The 16
+        // has to track the MMA's M and the kernel's shared tile together; it is
+        // not a tuning knob.
+        const BLOCK: u32 = 256;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                n.div_ceil(MMA_ROWS) as u32,
+                n_tokens.div_ceil(groups * MMA_TOKENS) as u32,
+                1,
+            ),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (ki, ni) = (k as i32, n as i32);
+        let scols = k.div_ceil(FP8_BLOCK) as i32;
+        let toks = n_tokens as i32;
+        let acc = i32::from(accum);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out)
+            .arg(w)
+            .arg(x)
+            .arg(&ki)
+            .arg(&ni)
+            .arg(&scols)
+            .arg(&toks)
+            .arg(&acc);
+        self.dev
+            .profile()
+            .time("mma_f8_block", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("mma_f8_block")?;
+                Ok(())
+            })?;
+        Ok(true)
     }
 
     /// `out[t] = W x[t]` for a handful of tokens, reading each weight once.

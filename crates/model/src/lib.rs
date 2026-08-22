@@ -1338,6 +1338,9 @@ impl Model {
             && Kernels::has_mmq(head.ty)
             && self.kern.device().arch() >= 80
             && Self::mmq_shape_ok(head);
+        // Asked and answered: this checkpoint's head is Q8_0, 248320 x 5120,
+        // and at one row it takes `mmvq` — 885 us for 1.29 GB, which is 1460
+        // GB/s and the same rate the FP8 projections get. Nothing to win here.
         if head_int && n_logit_rows == 1 {
             let bytes = Kernels::q8_1_bytes(d);
             self.kern.quantize_q8_1(
@@ -3057,6 +3060,25 @@ impl Model {
             // batched decode *slower* than before FP8: the profiler had
             // `dequant_f8_block` at 67% of a batch-32 step and batch scaling
             // down from 36.9x to 8.6x.
+            // Tensor cores first, at every token count including one. The
+            // scalar mat-vec's inner loop issues sixteen FMA instructions per
+            // chunk per token and lands at a seventh of the f32 FMA bound; one
+            // `mma.m16n8k16` does the same 2048 MACs in one instruction. On the
+            // 27B's widest projection, milliseconds, against a pure weight-load
+            // floor of 0.061:
+            //
+            //   tokens   scalar     mma
+            //        1    0.073   0.063
+            //        2    0.082   0.064
+            //        3    0.100   0.063
+            //        4    0.106   0.064
+            //        8    0.174   0.067
+            //
+            // Flat in tokens, because eight is the fragment's own N — and ahead
+            // even at one token, where it wastes seven of those eight columns.
+            if kern.mma_f8_block(out, &weights, x, w.k, w.n, n_tokens, false)? {
+                return Ok(());
+            }
             if n_tokens >= 2
                 && kern.mmv_f8_block_batch(out, &weights, x, w.k, w.n, n_tokens, false)?
             {
@@ -3074,6 +3096,23 @@ impl Model {
             // Above one token the answer is a GEMM. Expand the weights into the
             // f16 staging buffer the float path already uses, and convert the
             // activation the same way that path does.
+            // Warn once, because reaching here is a performance bug and the
+            // profiler cannot say so: it reports kernels, not shapes, and the
+            // last time `dequant_f8_block` showed up at 153 us a launch it took
+            // three wrong guesses to find out the caller was prefill.
+            {
+                use std::sync::OnceLock;
+                static SEEN: OnceLock<()> = OnceLock::new();
+                if SEEN.set(()).is_ok() {
+                    tracing::warn!(
+                        k = w.k,
+                        n = w.n,
+                        n_tokens,
+                        k_mod_128 = w.k % 128,
+                        "FP8 expansion path taken"
+                    );
+                }
+            }
             let n_x = n_tokens * w.k;
             let elems = w.elements();
             anyhow::ensure!(

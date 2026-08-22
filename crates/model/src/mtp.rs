@@ -1120,6 +1120,12 @@ fn matmul(
     // reasons: at one token a mat-vec is the right kernel shape, and at a few
     // tokens reading each weight once beats expanding the matrix.
     if w.ty == tuili_kernels::WeightType::F8E4M3 {
+        // Tensor cores whenever they will take the shape, which is every token
+        // count up to eight and any `k` that is a multiple of the scale block.
+        // The table is on the same branch in `Model::matmul_pre`.
+        if kern.mma_f8_block(out, &weights, x, w.k, w.n, n_tokens, false)? {
+            return Ok(());
+        }
         if n_tokens == 1 {
             return kern.mmv_f8_block(out, &weights, x, w.k, w.n, false);
         }

@@ -569,3 +569,172 @@ fn a_row_count_that_does_not_divide_the_row_tile_still_writes_every_row() -> Res
     }
     Ok(())
 }
+
+/// Does the tensor-core kernel compute the same product as the scalar one?
+///
+/// The oracle is `mmv_f8_block`, one token at a time — the kernel that is
+/// already checked against the host dequantizer — for the same reason the
+/// row-tail test uses it: a row here sums hundreds of products of magnitude ~15
+/// into a result of ~20, so an f16 reference matrix's own rounding is amplified
+/// past any tolerance worth asserting.
+///
+/// The tolerance is not a fudge factor, it is the one difference between the two
+/// paths. The MMA takes f16 operands, so each activation is rounded once at a
+/// relative 2^-11 = 4.9e-4; the weights are e4m3 and exact in f16. The dot
+/// product's absolute error is therefore about `4.9e-4 * sum|w_i x_i|`, and
+/// with random signs `sum|w_i x_i|` is around `sqrt(K)` times the result, so the
+/// error is `4.9e-4 * sqrt(384) = 9.6e-3` of a typical magnitude. `worst_ratio`'s
+/// floor is a fraction of the peak, which is what that is, so 3e-2 leaves 3x of
+/// slack over the estimate and would still catch a wrong fragment index — those
+/// are wrong by whole factors, not by percent.
+#[test]
+fn the_tensor_core_kernel_agrees_with_the_scalar_one() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    let quants = quant_bytes(N * K, 0x7ac0);
+    let scales: Vec<f32> = (0..scale_grid(K, N))
+        .map(|i| 0.25 + 0.6 * (i % 5) as f32)
+        .collect();
+    let buf = packed(&quants, &scales);
+    let d_w = stream.clone_htod(&buf)?;
+
+    // One, every count inside a fragment, and counts that cross into a second
+    // group (9), a third (17, 33) and a second `grid.y` tile (66, 129) — the
+    // three places a token index can be built wrong and still look plausible.
+    for n_tokens in [1usize, 2, 3, 5, 8, 9, 17, 33, 66, 129] {
+        let x: Vec<f32> = (0..n_tokens)
+            .flat_map(|t| {
+                pseudo_random(K, 0x9000 + t as u64)
+                    .into_iter()
+                    .map(move |v| v * (1.0 + 0.5 * t as f32))
+            })
+            .collect();
+        let d_x = stream.clone_htod(&x)?;
+
+        let mut d_mma = stream.alloc_zeros::<f32>(n_tokens * N)?;
+        let ran = k.mma_f8_block(
+            &mut d_mma.as_view_mut(),
+            &d_w.as_view(),
+            &d_x.as_view(),
+            K,
+            N,
+            n_tokens,
+            false,
+        )?;
+        assert!(ran, "the tensor-core kernel declined {n_tokens} tokens");
+
+        let mut want = vec![0.0f32; n_tokens * N];
+        for t in 0..n_tokens {
+            let d_xt = stream.clone_htod(&x[t * K..(t + 1) * K])?;
+            let mut d_one = stream.alloc_zeros::<f32>(N)?;
+            k.mmv_f8_block(
+                &mut d_one.as_view_mut(),
+                &d_w.as_view(),
+                &d_xt.as_view(),
+                K,
+                N,
+                false,
+            )?;
+            k.device().synchronize()?;
+            want[t * N..(t + 1) * N].copy_from_slice(&stream.clone_dtoh(&d_one)?);
+        }
+        k.device().synchronize()?;
+        let got = stream.clone_dtoh(&d_mma)?;
+
+        let (worst, at) = worst_ratio(&got, &want, 1e-3, 3e-2);
+        assert!(
+            worst <= 1.0,
+            "at {n_tokens} tokens, element {at} (token {}, row {}) is {worst:.1}x \
+             the tolerance: mma {}, scalar {}",
+            at / N,
+            at % N,
+            got[at],
+            want[at]
+        );
+
+        // A kernel that wrote one token's answer into every slot would pass the
+        // comparison above at `n_tokens = 1` and fail silently beyond it.
+        if n_tokens > 1 {
+            let first = &got[..N];
+            let last = &got[(n_tokens - 1) * N..];
+            assert!(
+                worst_ratio(last, first, 1e-5, 1e-6).0 > 10.0,
+                "at {n_tokens} tokens the first and last token's outputs are the same"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The 16-row tile does not divide every output width, and the short final tile
+/// must still write its rows and no others.
+#[test]
+fn the_tensor_core_kernel_writes_a_short_final_row_tile() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    // Not a multiple of 16, and past one scale row-block so the tail sits in a
+    // different scale row than the head.
+    const NN: usize = 2 * FP8_BLOCK + 5;
+    const KK: usize = 2 * FP8_BLOCK;
+
+    let quants = quant_bytes(NN * KK, 0x7b11);
+    let grid = NN.div_ceil(FP8_BLOCK) * KK.div_ceil(FP8_BLOCK);
+    let scales: Vec<f32> = (0..grid).map(|i| 0.3 + 0.5 * (i % 5) as f32).collect();
+    let buf = packed_dims(&quants, &scales, KK, NN);
+    let d_w = stream.clone_htod(&buf)?;
+
+    let n_tokens = 3usize;
+    let x: Vec<f32> = (0..n_tokens)
+        .flat_map(|t| (0..KK).map(move |i| ((i * 7 + t * 13) % 23) as f32 * 0.05 - 0.5))
+        .collect();
+    let d_x = stream.clone_htod(&x)?;
+
+    // A sentinel the kernel has to overwrite, so an unwritten row is a loud
+    // failure rather than a plausible zero.
+    let mut d_mma = stream.clone_htod(&vec![f32::NAN; n_tokens * NN])?;
+    let ran = k.mma_f8_block(
+        &mut d_mma.as_view_mut(),
+        &d_w.as_view(),
+        &d_x.as_view(),
+        KK,
+        NN,
+        n_tokens,
+        false,
+    )?;
+    assert!(ran, "the tensor-core kernel declined the short tile");
+
+    let mut want = vec![0.0f32; n_tokens * NN];
+    for t in 0..n_tokens {
+        let d_xt = stream.clone_htod(&x[t * KK..(t + 1) * KK])?;
+        let mut d_one = stream.alloc_zeros::<f32>(NN)?;
+        k.mmv_f8_block(
+            &mut d_one.as_view_mut(),
+            &d_w.as_view(),
+            &d_xt.as_view(),
+            KK,
+            NN,
+            false,
+        )?;
+        k.device().synchronize()?;
+        want[t * NN..(t + 1) * NN].copy_from_slice(&stream.clone_dtoh(&d_one)?);
+    }
+    k.device().synchronize()?;
+    let got = stream.clone_dtoh(&d_mma)?;
+    assert!(
+        got.iter().all(|v| v.is_finite()),
+        "{} of {} outputs were never written",
+        got.iter().filter(|v| !v.is_finite()).count(),
+        got.len()
+    );
+    let (worst, at) = worst_ratio(&got, &want, 1e-3, 3e-2);
+    assert!(
+        worst <= 1.0,
+        "element {at} (token {}, row {} of {NN}) is {worst:.1}x the tolerance: \
+         mma {}, scalar {}",
+        at / NN,
+        at % NN,
+        got[at],
+        want[at]
+    );
+    Ok(())
+}

@@ -99,9 +99,13 @@ fn main() -> Result<()> {
         (N * K) >> 20,
         if strip.is_empty() { "none" } else { &strip }
     );
-    println!("  {:>6}  {:>9}  {:>9}  {:>10}", "tokens", "ms", "GB/s", "marginal");
+    println!(
+        "  {:>6}  {:>9}  {:>9}  {:>10}  {:>9}  {:>10}",
+        "tokens", "ms", "GB/s", "marginal", "mma ms", "mma marg"
+    );
 
     let mut prev = 0.0f64;
+    let mut prev_mma = 0.0f64;
     for n_tokens in [1usize, 2, 3, 4, 8] {
         let x: Vec<f32> = (0..n_tokens * K)
             .map(|i| ((i * 37 % 101) as f32 - 50.0) / 97.0)
@@ -128,7 +132,48 @@ fn main() -> Result<()> {
         } else {
             format!("{:+.3} ms", (ms - prev) / (n_tokens - 1) as f64)
         };
-        println!("  {n_tokens:>6}  {ms:>9.3}  {gbs:>9.0}  {marginal:>10}");
+
+        // The same product on tensor cores, in the same loop so the two share
+        // every other condition: the same resident copies, the same activations,
+        // the same rep count.
+        let mut mma = String::from("-");
+        let mut mma_marginal = String::from("-");
+        if k.mma_f8_block(
+            &mut d_out.as_view_mut(),
+            &weights[0].as_view(),
+            &d_x.as_view(),
+            K,
+            N,
+            n_tokens,
+            false,
+        )? {
+            dev.synchronize()?;
+            let t1 = std::time::Instant::now();
+            for rep in 0..REPS {
+                k.mma_f8_block(
+                    &mut d_out.as_view_mut(),
+                    &weights[rep % COPIES].as_view(),
+                    &d_x.as_view(),
+                    K,
+                    N,
+                    n_tokens,
+                    false,
+                )?;
+            }
+            dev.synchronize()?;
+            let ms1 = t1.elapsed().as_secs_f64() * 1000.0 / REPS as f64;
+            mma = format!("{ms1:.3}");
+            if n_tokens > 1 {
+                mma_marginal =
+                    format!("{:+.3} ms", (ms1 - prev_mma) / (n_tokens - 1) as f64);
+            } else {
+                prev_mma = ms1;
+            }
+        }
+
+        println!(
+            "  {n_tokens:>6}  {ms:>9.3}  {gbs:>9.0}  {marginal:>10}  {mma:>9}  {mma_marginal:>10}"
+        );
         if n_tokens == 1 {
             prev = ms;
         }
