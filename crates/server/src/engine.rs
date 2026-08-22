@@ -134,10 +134,18 @@ impl Engine {
         let info = ModelInfo {
             id: derive_model_id(path, &cfg.name),
             path: path.to_string(),
+            // The GGUF file states its own dominant type; a safetensors
+            // checkpoint does not, so ask the loaded weights. The fallback used
+            // to be the literal "AWQ-INT4", which was true of every
+            // safetensors model tuili could load and is now a lie: an FP8
+            // checkpoint reported itself as INT4 while running FP8 kernels.
+            // Nothing computed from this — the dispatch reads `WeightType` —
+            // but a status line that names the wrong encoding is worse than one
+            // that says nothing.
             quant: gguf
                 .as_ref()
                 .and_then(|f| f.dominant_type().map(|t| t.to_string()))
-                .unwrap_or_else(|| "AWQ-INT4".into()),
+                .unwrap_or_else(|| model.dominant_weight_type().to_string()),
             context_length: cfg.context_length,
             max_seq: model.max_seq(),
             weights_mib: gguf

@@ -770,6 +770,16 @@ impl Model {
         self.w.n_offloaded()
     }
 
+    /// Which encoding most of the weights are in, by bytes.
+    ///
+    /// For a safetensors checkpoint this is the only place the answer exists:
+    /// the file states dtypes per tensor and the loader may re-encode them, so
+    /// what the model is *running* is a property of the loaded matrices rather
+    /// than of the file.
+    pub fn dominant_weight_type(&self) -> tuili_kernels::WeightType {
+        self.w.dominant_type()
+    }
+
     /// (VRAM, pinned host) bytes held by weights, staging included.
     pub fn weight_bytes(&self) -> (usize, usize) {
         (
