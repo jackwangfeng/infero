@@ -49,8 +49,9 @@ extern "C" __global__ void gdn_conv_f32(float* __restrict__ out,
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
     const int seq = blockIdx.y;
-    const int t0 = first_token[seq];
     const int nt = n_tok[seq];
+    if (nt <= 0) return;   // a slot not in this batch
+    const int t0 = first_token[seq];
     const int hist = k - 1;
 
     float* st = state + ((size_t)seq * channels + c) * hist;
@@ -100,20 +101,27 @@ extern "C" __global__ void gdn_gate_decay_f32(float* __restrict__ beta_out,
     g_out[idx] = -__expf(a_log[h]) * sp;
 }
 
-// L2-normalize each head's row of q and k, then scale q by 1/sqrt(dk).
+// L2-normalize each head's row of q and k in place, then scale q by 1/sqrt(dk).
 //
 // The reference does both inside its kernel (`use_qk_l2norm_in_kernel=True`),
 // and the scale lands on q only. `eps` is added to the sum of squares, not to
 // the norm, matching the FLA convention the reference cites.
 //
-// `q` and `k` are `[n_tokens, key_heads, dk]` and are normalized in place. One
-// block a (token, head) pair; the block reduces over dk.
-extern "C" __global__ void gdn_qk_l2norm_f32(float* __restrict__ q,
-                                             float* __restrict__ k,
-                                             int dk, float eps, float q_scale) {
-    const size_t row = (size_t)blockIdx.x * dk;
-    float* qr = q + row;
-    float* kr = k + row;
+// q and k are normalized where they lie, inside the packed
+// `[q | k | v]` row that the input projection produced — `stride` is the row's
+// width and `q_off`/`k_off` locate them. Copying them out first would cost a
+// pass over 4 KiB a token for nothing.
+//
+// One block a (token, key head) pair; the block reduces over dk.
+extern "C" __global__ void gdn_qk_l2norm_f32(float* __restrict__ qkv,
+                                             int key_heads, int dk,
+                                             int stride, int q_off, int k_off,
+                                             float eps, float q_scale) {
+    const int token = blockIdx.x / key_heads;
+    const int head = blockIdx.x % key_heads;
+    float* base = qkv + (size_t)token * stride + (size_t)head * dk;
+    float* qr = base + q_off;
+    float* kr = base + k_off;
 
     float qa = 0.0f, ka = 0.0f;
     for (int i = threadIdx.x; i < dk; i += blockDim.x) {
@@ -137,47 +145,59 @@ extern "C" __global__ void gdn_qk_l2norm_f32(float* __restrict__ q,
 //   S      += k_t ⊗ delta
 //   o_t     = qᵀ S                  the same contraction, with q
 //
-// Layout: `state` is `[n_seqs, heads, dk, dv]`; `q`, `k` are
-// `[n_tokens, heads, dk]` already normalized and scaled; `v` and `out` are
-// `[n_tokens, heads, dv]`. q and k arrive already expanded from key heads to
-// value heads — head `h` reads key head `h / (heads / key_heads)`, the
-// `repeat_interleave` grouping. Expanding modularly instead also runs.
+// Layout: `state` is `[n_seqs, heads, dk, dv]`; `qkv` holds q, k and v in one
+// row per token, `stride` wide, at `q_off`, `k_off` and `v_off`, with q and k
+// already normalized and q already scaled. `out` is `[n_tokens, heads, dv]`.
+//
+// The head expansion happens here rather than by materializing a wider q and k.
+// There are `key_heads` key heads against `heads` value heads — 16 against 48 in
+// this checkpoint — and the reference widens them with `repeat_interleave`, so
+// value head `h` reads key head `h / (heads / key_heads)`. Expanding modularly
+// (`h % key_heads`) also runs, and gives a different model.
 //
 // One block a (head, sequence); thread `j` owns column `j` of S, so the reads
 // `S[i * dv + j]` are contiguous across the block. Two passes over S per token:
 // the first cannot be merged with the second because `delta` needs the whole
-// `kv_mem` reduction before the update can start. Holding S in registers
-// across the whole chunk would remove the traffic entirely and is the obvious
-// next step; this version keeps it in global memory because it is the one that
-// can be read against a reference.
+// `kv_mem` reduction before the update can start. Holding S in registers across
+// the whole chunk would remove the traffic entirely and is the obvious next
+// step; this version keeps it in global memory because it is the one that can be
+// read against a reference.
 extern "C" __global__ void gdn_delta_rule_f32(float* __restrict__ out,
                                               float* __restrict__ state,
-                                              const float* __restrict__ q,
-                                              const float* __restrict__ k,
-                                              const float* __restrict__ v,
+                                              const float* __restrict__ qkv,
                                               const float* __restrict__ g,
                                               const float* __restrict__ beta,
                                               const int* __restrict__ first_token,
                                               const int* __restrict__ n_tok,
-                                              int heads, int dk, int dv) {
+                                              int heads, int key_heads,
+                                              int dk, int dv,
+                                              int stride, int q_off, int k_off,
+                                              int v_off) {
     extern __shared__ float shared[];
     float* qs = shared;          // dk
     float* ks = shared + dk;     // dk
 
     const int head = blockIdx.x;
     const int seq = blockIdx.y;
-    const int t0 = first_token[seq];
     const int nt = n_tok[seq];
+    // A sequence not in this batch has no tokens, and its block exits here.
+    // That is what lets one launch cover the whole pool of sequence slots
+    // without the caller compacting anything.
+    if (nt <= 0) return;
+    const int t0 = first_token[seq];
     const int j = threadIdx.x;
+    const int khead = head / (heads / key_heads);
 
     float* S = state + ((size_t)seq * heads + head) * (size_t)dk * dv;
 
     for (int n = 0; n < nt; ++n) {
         const int t = t0 + n;
-        const size_t vec = ((size_t)t * heads + head) * dk;
+        const float* row = qkv + (size_t)t * stride;
+        const float* qsrc = row + q_off + (size_t)khead * dk;
+        const float* ksrc = row + k_off + (size_t)khead * dk;
         for (int i = threadIdx.x; i < dk; i += blockDim.x) {
-            qs[i] = q[vec + i];
-            ks[i] = k[vec + i];
+            qs[i] = qsrc[i];
+            ks[i] = ksrc[i];
         }
         __syncthreads();
 
@@ -185,13 +205,14 @@ extern "C" __global__ void gdn_delta_rule_f32(float* __restrict__ out,
         const float b = beta[(size_t)t * heads + head];
 
         if (j < dv) {
+            const float v_tj = row[v_off + (size_t)head * dv + j];
             float kv = 0.0f;
             for (int i = 0; i < dk; ++i) {
                 const float s = S[(size_t)i * dv + j] * decay;
                 S[(size_t)i * dv + j] = s;
                 kv += s * ks[i];
             }
-            const float delta = (v[((size_t)t * heads + head) * dv + j] - kv) * b;
+            const float delta = (v_tj - kv) * b;
             float o = 0.0f;
             for (int i = 0; i < dk; ++i) {
                 const float s = S[(size_t)i * dv + j] + ks[i] * delta;

@@ -210,6 +210,61 @@ fn the_gate_and_decay_match_the_reference() -> Result<()> {
     Ok(())
 }
 
+/// Build one packed `[q | k | v]` row per token, with q and k at key-head width
+/// and already normalized the way the reference does. Returns the buffer and
+/// `(stride, q_off, k_off, v_off)`.
+fn packed(q_small: &[f32], k_small: &[f32], v: &[f32], t_len: usize)
+    -> (Vec<f32>, (usize, usize, usize, usize))
+{
+    let key_dim = KEY_HEADS * DK;
+    let val_dim = VAL_HEADS * DV;
+    let stride = 2 * key_dim + val_dim;
+    let mut qn = q_small.to_vec();
+    let mut kn = k_small.to_vec();
+    qwen35::l2norm_rows(&mut qn, DK, 1e-6);
+    qwen35::l2norm_rows(&mut kn, DK, 1e-6);
+    for value in qn.iter_mut() {
+        *value *= (DK as f32).sqrt().recip();
+    }
+    let mut row = vec![0.0f32; t_len * stride];
+    for t in 0..t_len {
+        let base = t * stride;
+        row[base..base + key_dim].copy_from_slice(&qn[t * key_dim..(t + 1) * key_dim]);
+        row[base + key_dim..base + 2 * key_dim]
+            .copy_from_slice(&kn[t * key_dim..(t + 1) * key_dim]);
+        row[base + 2 * key_dim..base + stride]
+            .copy_from_slice(&v[t * val_dim..(t + 1) * val_dim]);
+    }
+    (row, (stride, 0, key_dim, 2 * key_dim))
+}
+
+/// The host reference's answer for the same inputs, expanding q and k the way
+/// `repeat_interleave` does.
+fn reference(
+    q_small: &[f32],
+    k_small: &[f32],
+    v: &[f32],
+    g: &[f32],
+    beta: &[f32],
+    t_len: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let q = repeat_interleave(q_small, t_len, KEY_HEADS, REP, DK);
+    let kk = repeat_interleave(k_small, t_len, KEY_HEADS, REP, DK);
+    let mut state = vec![0.0f32; VAL_HEADS * DK * DV];
+    let out = qwen35::gated_delta_rule(
+        &q, &kk, v, g, beta, &mut state, t_len, VAL_HEADS, DK, DV, 1e-6,
+    );
+    (out, state)
+}
+
+fn decaying(n: usize, seed: u64, scale: f32) -> Vec<f32> {
+    pseudo_random(n, seed).iter().map(|v| -(v.abs()) * scale).collect()
+}
+
+fn betas(n: usize, seed: u64) -> Vec<f32> {
+    pseudo_random(n, seed).iter().map(|v| qwen35::sigmoid(*v)).collect()
+}
+
 #[test]
 fn the_delta_rule_matches_the_reference() -> Result<()> {
     let k = kernels()?;
@@ -219,42 +274,13 @@ fn the_delta_rule_matches_the_reference() -> Result<()> {
     let q_small = pseudo_random(t_len * KEY_HEADS * DK, 0x9001);
     let k_small = pseudo_random(t_len * KEY_HEADS * DK, 0x9002);
     let v = pseudo_random(t_len * VAL_HEADS * DV, 0x9003);
-    // g must be non-positive, beta in (0, 1) — the shapes the producing kernel
-    // guarantees.
-    let g: Vec<f32> = pseudo_random(t_len * VAL_HEADS, 0x9004)
-        .iter()
-        .map(|v| -(v.abs()) * 0.7)
-        .collect();
-    let beta: Vec<f32> = pseudo_random(t_len * VAL_HEADS, 0x9005)
-        .iter()
-        .map(|v| qwen35::sigmoid(*v))
-        .collect();
+    let g = decaying(t_len * VAL_HEADS, 0x9004, 0.7);
+    let beta = betas(t_len * VAL_HEADS, 0x9005);
 
-    let q = repeat_interleave(&q_small, t_len, KEY_HEADS, REP, DK);
-    let kk = repeat_interleave(&k_small, t_len, KEY_HEADS, REP, DK);
+    let (row, off) = packed(&q_small, &k_small, &v, t_len);
+    let (want, want_state) = reference(&q_small, &k_small, &v, &g, &beta, t_len);
 
-    // The kernel takes q and k already normalized and scaled, so normalize on
-    // the host with the same reference the l2norm kernel is checked against.
-    let mut qn = q.clone();
-    let mut kn = kk.clone();
-    qwen35::l2norm_rows(&mut qn, DK, 1e-6);
-    qwen35::l2norm_rows(&mut kn, DK, 1e-6);
-    for value in qn.iter_mut() {
-        *value *= (DK as f32).sqrt().recip();
-    }
-
-    let mut want_state = vec![0.0f32; VAL_HEADS * DK * DV];
-    // The reference normalizes internally, so hand it the un-normalized inputs
-    // and compare against the kernel's pre-normalized ones. Both paths do the
-    // same normalization; that it is the same is what `the_l2norm_and_scale...`
-    // checks separately.
-    let want = qwen35::gated_delta_rule(
-        &q, &kk, &v, &g, &beta, &mut want_state, t_len, VAL_HEADS, DK, DV, 1e-6,
-    );
-
-    let d_q = stream.clone_htod(&qn)?;
-    let d_k = stream.clone_htod(&kn)?;
-    let d_v = stream.clone_htod(&v)?;
+    let d_row = stream.clone_htod(&row)?;
     let d_g = stream.clone_htod(&g)?;
     let d_beta = stream.clone_htod(&beta)?;
     let d_first = stream.clone_htod(&[0i32])?;
@@ -271,15 +297,15 @@ fn the_delta_rule_matches_the_reference() -> Result<()> {
     k.gdn_delta_rule(
         &mut d_out.as_view_mut(),
         &mut d_state.as_view_mut(),
-        &d_q.as_view(),
-        &d_k.as_view(),
-        &d_v.as_view(),
+        &d_row.as_view(),
         &d_g.as_view(),
         &d_beta.as_view(),
         &seqs,
         VAL_HEADS,
+        KEY_HEADS,
         DK,
         DV,
+        off,
     )?;
     k.device().synchronize()?;
 
@@ -297,33 +323,23 @@ fn the_delta_rule_matches_the_reference() -> Result<()> {
         want_state[at]
     );
 
-    // The modular head expansion — the other plausible way to widen 4 key
-    // heads to 12 — must give a different answer, or this test is compatible
-    // with getting it wrong.
-    let mut modular_q = vec![0.0f32; q.len()];
-    let mut modular_k = vec![0.0f32; kk.len()];
+    // The kernel expands 4 key heads to 12 value heads internally. The modular
+    // expansion is the other plausible reading; if it gave the same answer this
+    // test would pass under either, so require that it does not.
+    let mut mod_q = vec![0.0f32; t_len * VAL_HEADS * DK];
+    let mut mod_k = vec![0.0f32; t_len * VAL_HEADS * DK];
     for t in 0..t_len {
         for h in 0..VAL_HEADS {
             let src = h % KEY_HEADS;
             let from = (t * KEY_HEADS + src) * DK;
             let to = (t * VAL_HEADS + h) * DK;
-            modular_q[to..to + DK].copy_from_slice(&q_small[from..from + DK]);
-            modular_k[to..to + DK].copy_from_slice(&k_small[from..from + DK]);
+            mod_q[to..to + DK].copy_from_slice(&q_small[from..from + DK]);
+            mod_k[to..to + DK].copy_from_slice(&k_small[from..from + DK]);
         }
     }
     let mut other_state = vec![0.0f32; VAL_HEADS * DK * DV];
     let other = qwen35::gated_delta_rule(
-        &modular_q,
-        &modular_k,
-        &v,
-        &g,
-        &beta,
-        &mut other_state,
-        t_len,
-        VAL_HEADS,
-        DK,
-        DV,
-        1e-6,
+        &mod_q, &mod_k, &v, &g, &beta, &mut other_state, t_len, VAL_HEADS, DK, DV, 1e-6,
     );
     let spread = max_rel_diff(&other, &want);
     assert!(
@@ -340,43 +356,22 @@ fn the_recurrence_carries_state_across_calls() -> Result<()> {
     let k = kernels()?;
     let stream = k.device().stream().clone();
     let t_len = 10;
-    let split = 4;
 
     let q_small = pseudo_random(t_len * KEY_HEADS * DK, 0x7001);
     let k_small = pseudo_random(t_len * KEY_HEADS * DK, 0x7002);
     let v = pseudo_random(t_len * VAL_HEADS * DV, 0x7003);
-    let g: Vec<f32> = pseudo_random(t_len * VAL_HEADS, 0x7004)
-        .iter()
-        .map(|v| -(v.abs()) * 0.5)
-        .collect();
-    let beta: Vec<f32> = pseudo_random(t_len * VAL_HEADS, 0x7005)
-        .iter()
-        .map(|v| qwen35::sigmoid(*v))
-        .collect();
-
-    let mut qn = repeat_interleave(&q_small, t_len, KEY_HEADS, REP, DK);
-    let mut kn = repeat_interleave(&k_small, t_len, KEY_HEADS, REP, DK);
-    qwen35::l2norm_rows(&mut qn, DK, 1e-6);
-    qwen35::l2norm_rows(&mut kn, DK, 1e-6);
-    for value in qn.iter_mut() {
-        *value *= (DK as f32).sqrt().recip();
-    }
+    let g = decaying(t_len * VAL_HEADS, 0x7004, 0.5);
+    let beta = betas(t_len * VAL_HEADS, 0x7005);
+    let (row, off) = packed(&q_small, &k_small, &v, t_len);
+    let stride = off.0;
 
     let run = |chunks: &[(usize, usize)]| -> Result<(Vec<f32>, Vec<f32>)> {
         let mut state = stream.alloc_zeros::<f32>(VAL_HEADS * DK * DV)?;
         let mut collected = vec![0.0f32; t_len * VAL_HEADS * DV];
         for &(start, count) in chunks {
-            let hq = qn[start * VAL_HEADS * DK..(start + count) * VAL_HEADS * DK].to_vec();
-            let hk = kn[start * VAL_HEADS * DK..(start + count) * VAL_HEADS * DK].to_vec();
-            let hv = v[start * VAL_HEADS * DV..(start + count) * VAL_HEADS * DV].to_vec();
-            let hg = g[start * VAL_HEADS..(start + count) * VAL_HEADS].to_vec();
-            let hb = beta[start * VAL_HEADS..(start + count) * VAL_HEADS].to_vec();
-            let (dq, dk_, dv_) = (
-                stream.clone_htod(&hq)?,
-                stream.clone_htod(&hk)?,
-                stream.clone_htod(&hv)?,
-            );
-            let (dg, db) = (stream.clone_htod(&hg)?, stream.clone_htod(&hb)?);
+            let chunk = stream.clone_htod(&row[start * stride..(start + count) * stride])?;
+            let hg = stream.clone_htod(&g[start * VAL_HEADS..(start + count) * VAL_HEADS])?;
+            let hb = stream.clone_htod(&beta[start * VAL_HEADS..(start + count) * VAL_HEADS])?;
             let f = stream.clone_htod(&[0i32])?;
             let n = stream.clone_htod(&[count as i32])?;
             let mut out = stream.alloc_zeros::<f32>(count * VAL_HEADS * DV)?;
@@ -389,15 +384,15 @@ fn the_recurrence_carries_state_across_calls() -> Result<()> {
             k.gdn_delta_rule(
                 &mut out.as_view_mut(),
                 &mut state.as_view_mut(),
-                &dq.as_view(),
-                &dk_.as_view(),
-                &dv_.as_view(),
-                &dg.as_view(),
-                &db.as_view(),
+                &chunk.as_view(),
+                &hg.as_view(),
+                &hb.as_view(),
                 &seqs,
                 VAL_HEADS,
+                KEY_HEADS,
                 DK,
                 DV,
+                off,
             )?;
             k.device().synchronize()?;
             let piece = stream.clone_dtoh(&out)?;
@@ -408,30 +403,29 @@ fn the_recurrence_carries_state_across_calls() -> Result<()> {
     };
 
     let (whole, whole_state) = run(&[(0, t_len)])?;
-    let (split_out, split_state) = run(&[(0, split), (split, t_len - split)])?;
-
     let peak = whole.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    let (worst, at) = max_abs_diff(&split_out, &whole);
-    assert!(
-        worst < 1e-4 * peak.max(1e-6),
-        "prefilling {split} tokens and then continuing gave a different answer \
-         from one call, by {worst:.2e} at {at}; the carried state is wrong, \
-         which makes decode a different model from prefill"
-    );
     let speak = whole_state.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    let (sworst, _) = max_abs_diff(&split_state, &whole_state);
-    assert!(sworst < 1e-4 * speak.max(1e-6), "the carried state diverged");
 
-    // One token at a time, which is what decode actually does.
-    let steps: Vec<(usize, usize)> = (0..t_len).map(|t| (t, 1)).collect();
-    let (stepped, stepped_state) = run(&steps)?;
-    let (worst, at) = max_abs_diff(&stepped, &whole);
-    assert!(
-        worst < 1e-4 * peak.max(1e-6),
-        "stepping one token at a time diverged by {worst:.2e} at {at}"
-    );
-    let (sworst, _) = max_abs_diff(&stepped_state, &whole_state);
-    assert!(sworst < 1e-4 * speak.max(1e-6), "the stepped state diverged");
+    // Prefill four, then continue with the rest — and then one token at a time,
+    // which is what decode does.
+    for (label, chunks) in [
+        ("a 4-token prefill then the rest", vec![(0usize, 4usize), (4, t_len - 4)]),
+        ("one token at a time", (0..t_len).map(|t| (t, 1)).collect()),
+    ] {
+        let (out, state) = run(&chunks)?;
+        let (worst, at) = max_abs_diff(&out, &whole);
+        assert!(
+            worst < 1e-4 * peak.max(1e-6),
+            "{label} gave a different answer from one call, by {worst:.2e} at \
+             {at}; the carried state is wrong, which makes decode a different \
+             model from prefill"
+        );
+        let (sworst, _) = max_abs_diff(&state, &whole_state);
+        assert!(
+            sworst < 1e-4 * speak.max(1e-6),
+            "{label} left a different state, off by {sworst:.2e}"
+        );
+    }
     Ok(())
 }
 
@@ -439,87 +433,73 @@ fn the_recurrence_carries_state_across_calls() -> Result<()> {
 fn two_sequences_in_one_batch_keep_separate_state() -> Result<()> {
     let k = kernels()?;
     let stream = k.device().stream().clone();
-    // Sequence A gets 3 tokens, sequence B gets 5, laid out back to back.
-    let lens = [3usize, 5];
+    // Sequence A gets 3 tokens, B gets 5, and slot 2 is idle — the idle slot is
+    // the point: one launch covers the whole pool, and a sequence with no
+    // tokens must neither run nor have its state touched.
+    let lens = [3usize, 5, 0];
     let total: usize = lens.iter().sum();
 
-    let mut qn = repeat_interleave(
-        &pseudo_random(total * KEY_HEADS * DK, 0x3001),
-        total,
-        KEY_HEADS,
-        REP,
-        DK,
-    );
-    let mut kn = repeat_interleave(
-        &pseudo_random(total * KEY_HEADS * DK, 0x3002),
-        total,
-        KEY_HEADS,
-        REP,
-        DK,
-    );
+    let q_small = pseudo_random(total * KEY_HEADS * DK, 0x3001);
+    let k_small = pseudo_random(total * KEY_HEADS * DK, 0x3002);
     let v = pseudo_random(total * VAL_HEADS * DV, 0x3003);
-    let g: Vec<f32> = pseudo_random(total * VAL_HEADS, 0x3004)
-        .iter()
-        .map(|v| -(v.abs()) * 0.6)
-        .collect();
-    let beta: Vec<f32> = pseudo_random(total * VAL_HEADS, 0x3005)
-        .iter()
-        .map(|v| qwen35::sigmoid(*v))
-        .collect();
-    qwen35::l2norm_rows(&mut qn, DK, 1e-6);
-    qwen35::l2norm_rows(&mut kn, DK, 1e-6);
-    for value in qn.iter_mut() {
-        *value *= (DK as f32).sqrt().recip();
-    }
+    let g = decaying(total * VAL_HEADS, 0x3004, 0.6);
+    let beta = betas(total * VAL_HEADS, 0x3005);
+    let (row, off) = packed(&q_small, &k_small, &v, total);
+    let stride = off.0;
 
-    let dq = stream.clone_htod(&qn)?;
-    let dk_ = stream.clone_htod(&kn)?;
-    let dv_ = stream.clone_htod(&v)?;
-    let dg = stream.clone_htod(&g)?;
-    let db = stream.clone_htod(&beta)?;
-    let first = stream.clone_htod(&[0i32, lens[0] as i32])?;
-    let ntok = stream.clone_htod(&[lens[0] as i32, lens[1] as i32])?;
+    let d_row = stream.clone_htod(&row)?;
+    let d_g = stream.clone_htod(&g)?;
+    let d_beta = stream.clone_htod(&beta)?;
+    let first = stream.clone_htod(&[0i32, lens[0] as i32, 0])?;
+    let ntok = stream.clone_htod(&[lens[0] as i32, lens[1] as i32, 0])?;
     let mut out = stream.alloc_zeros::<f32>(total * VAL_HEADS * DV)?;
-    let mut state = stream.alloc_zeros::<f32>(2 * VAL_HEADS * DK * DV)?;
+    let mut state = stream.alloc_zeros::<f32>(3 * VAL_HEADS * DK * DV)?;
+    // A sentinel in the idle slot, to catch a launch that writes there anyway.
+    let sentinel = vec![-12345.0f32; VAL_HEADS * DK * DV];
+    stream.memcpy_htod(
+        &sentinel,
+        &mut state.slice_mut(2 * VAL_HEADS * DK * DV..3 * VAL_HEADS * DK * DV),
+    )?;
 
     let seqs = tuili_kernels::gdn::SeqLayout {
         first_token: &first.as_view(),
         n_tokens: &ntok.as_view(),
-        n_seqs: 2,
+        n_seqs: 3,
         total_tokens: total,
     };
     k.gdn_delta_rule(
         &mut out.as_view_mut(),
         &mut state.as_view_mut(),
-        &dq.as_view(),
-        &dk_.as_view(),
-        &dv_.as_view(),
-        &dg.as_view(),
-        &db.as_view(),
+        &d_row.as_view(),
+        &d_g.as_view(),
+        &d_beta.as_view(),
         &seqs,
         VAL_HEADS,
+        KEY_HEADS,
         DK,
         DV,
+        off,
     )?;
     k.device().synchronize()?;
     let batched = stream.clone_dtoh(&out)?;
+    let states = stream.clone_dtoh(&state)?;
 
-    // The same two sequences, alone. If the batched kernel let them share a
-    // state, the second one's output would differ — and only the second one's,
-    // which is why running both separately matters.
+    assert!(
+        states[2 * VAL_HEADS * DK * DV..].iter().all(|v| *v == -12345.0),
+        "the idle sequence slot was written; a launch covering the whole pool \
+         has to leave slots with no tokens alone"
+    );
+
+    // Each sequence alone. Only the second one would show state bleed, which is
+    // why both are run rather than just checking the first.
     let mut offset = 0usize;
     for (s, &len) in lens.iter().enumerate() {
-        let hq = qn[offset * VAL_HEADS * DK..(offset + len) * VAL_HEADS * DK].to_vec();
-        let hk = kn[offset * VAL_HEADS * DK..(offset + len) * VAL_HEADS * DK].to_vec();
-        let hv = v[offset * VAL_HEADS * DV..(offset + len) * VAL_HEADS * DV].to_vec();
-        let hg = g[offset * VAL_HEADS..(offset + len) * VAL_HEADS].to_vec();
-        let hb = beta[offset * VAL_HEADS..(offset + len) * VAL_HEADS].to_vec();
-        let (aq, ak, av) = (
-            stream.clone_htod(&hq)?,
-            stream.clone_htod(&hk)?,
-            stream.clone_htod(&hv)?,
-        );
-        let (ag, ab) = (stream.clone_htod(&hg)?, stream.clone_htod(&hb)?);
+        if len == 0 {
+            continue;
+        }
+        let chunk = stream.clone_htod(&row[offset * stride..(offset + len) * stride])?;
+        let hg = stream.clone_htod(&g[offset * VAL_HEADS..(offset + len) * VAL_HEADS])?;
+        let hb = stream.clone_htod(&beta[offset * VAL_HEADS..(offset + len) * VAL_HEADS])?;
         let f = stream.clone_htod(&[0i32])?;
         let n = stream.clone_htod(&[len as i32])?;
         let mut alone = stream.alloc_zeros::<f32>(len * VAL_HEADS * DV)?;
@@ -533,15 +513,15 @@ fn two_sequences_in_one_batch_keep_separate_state() -> Result<()> {
         k.gdn_delta_rule(
             &mut alone.as_view_mut(),
             &mut alone_state.as_view_mut(),
-            &aq.as_view(),
-            &ak.as_view(),
-            &av.as_view(),
-            &ag.as_view(),
-            &ab.as_view(),
+            &chunk.as_view(),
+            &hg.as_view(),
+            &hb.as_view(),
             &one,
             VAL_HEADS,
+            KEY_HEADS,
             DK,
             DV,
+            off,
         )?;
         k.device().synchronize()?;
         let solo = stream.clone_dtoh(&alone)?;
@@ -550,7 +530,7 @@ fn two_sequences_in_one_batch_keep_separate_state() -> Result<()> {
         let peak = solo.iter().fold(0.0f32, |m, x| m.max(x.abs()));
         assert!(
             worst < 1e-5 * peak.max(1e-6),
-            "sequence {s} in a batch of two differs from the same sequence \
+            "sequence {s} in a batch of three differs from the same sequence \
              alone by {worst:.2e} at {at}; the two are sharing state"
         );
         offset += len;
@@ -562,42 +542,65 @@ fn two_sequences_in_one_batch_keep_separate_state() -> Result<()> {
 fn the_l2norm_and_scale_match_the_reference() -> Result<()> {
     let k = kernels()?;
     let stream = k.device().stream().clone();
-    let rows = 6 * KEY_HEADS;
-    let q = pseudo_random(rows * DK, 0x1a1a);
-    let kk = pseudo_random(rows * DK, 0x2b2b);
+    let t_len = 6;
+    let key_dim = KEY_HEADS * DK;
+    let val_dim = VAL_HEADS * DV;
+    let stride = 2 * key_dim + val_dim;
 
-    let mut want_q = q.clone();
-    let mut want_k = kk.clone();
-    qwen35::l2norm_rows(&mut want_q, DK, 1e-6);
-    qwen35::l2norm_rows(&mut want_k, DK, 1e-6);
-    for value in want_q.iter_mut() {
-        *value *= (DK as f32).sqrt().recip();
+    // A full packed row, so the test also establishes that v is left alone.
+    let row = pseudo_random(t_len * stride, 0x1a1a);
+
+    let mut want = row.clone();
+    for t in 0..t_len {
+        let base = t * stride;
+        let mut q = want[base..base + key_dim].to_vec();
+        let mut kk = want[base + key_dim..base + 2 * key_dim].to_vec();
+        qwen35::l2norm_rows(&mut q, DK, 1e-6);
+        qwen35::l2norm_rows(&mut kk, DK, 1e-6);
+        for v in q.iter_mut() {
+            *v *= (DK as f32).sqrt().recip();
+        }
+        want[base..base + key_dim].copy_from_slice(&q);
+        want[base + key_dim..base + 2 * key_dim].copy_from_slice(&kk);
     }
 
-    let mut dq = stream.clone_htod(&q)?;
-    let mut dk_ = stream.clone_htod(&kk)?;
+    let mut d_row = stream.clone_htod(&row)?;
     k.gdn_qk_l2norm(
-        &mut dq.as_view_mut(),
-        &mut dk_.as_view_mut(),
-        rows,
+        &mut d_row.as_view_mut(),
+        t_len,
+        KEY_HEADS,
         DK,
+        stride,
+        0,
+        key_dim,
         1e-6,
     )?;
     k.device().synchronize()?;
-    let (worst, at) = max_abs_diff(&stream.clone_dtoh(&dq)?, &want_q);
-    assert!(worst < 1e-6, "q disagreed by {worst:.2e} at {at}");
-    let (worst, at) = max_abs_diff(&stream.clone_dtoh(&dk_)?, &want_k);
-    assert!(worst < 1e-6, "k disagreed by {worst:.2e} at {at}");
+    let got = stream.clone_dtoh(&d_row)?;
+    let (worst, at) = max_abs_diff(&got, &want);
+    assert!(worst < 1e-6, "the packed row disagreed by {worst:.2e} at {at}");
 
-    // The scale must be on q alone. If it were on both, k's rows would no
-    // longer have unit norm — check that they do.
-    let got_k = stream.clone_dtoh(&dk_)?;
-    for row in got_k.chunks(DK) {
-        let n: f32 = row.iter().map(|v| v * v).sum::<f32>().sqrt();
-        assert!(
-            (n - 1.0).abs() < 1e-4,
-            "a k row has norm {n}; the 1/sqrt(dk) scale leaked onto k"
+    // v must be untouched, bit for bit: it shares the row and nothing should
+    // have written into it.
+    for t in 0..t_len {
+        let vs = t * stride + 2 * key_dim;
+        assert_eq!(
+            &got[vs..vs + val_dim],
+            &row[vs..vs + val_dim],
+            "v was modified at token {t}"
         );
+    }
+
+    // The scale must be on q alone: k's rows must still have unit norm.
+    for t in 0..t_len {
+        for h in 0..KEY_HEADS {
+            let base = t * stride + key_dim + h * DK;
+            let n: f32 = got[base..base + DK].iter().map(|v| v * v).sum::<f32>().sqrt();
+            assert!(
+                (n - 1.0).abs() < 1e-4,
+                "k row (t{t}, h{h}) has norm {n}; the 1/sqrt(dk) scale leaked onto k"
+            );
+        }
     }
     Ok(())
 }

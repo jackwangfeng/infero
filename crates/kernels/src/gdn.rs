@@ -140,34 +140,49 @@ impl Kernels {
         Ok(())
     }
 
-    /// L2-normalize each head row of `q` and `k` in place, scaling `q` by
-    /// `1/sqrt(dk)`.
+    /// L2-normalize each key head's row of `q` and `k` in place, scaling `q`
+    /// by `1/sqrt(dk)`.
     ///
-    /// Both are `[rows, dk]` where `rows = n_tokens * key_heads`. The scale
+    /// `qkv` is `[n_tokens, stride]` — the packed row the input projection
+    /// produced — and `q_off`/`k_off` locate q and k inside it. The scale
     /// belongs to `q` alone; putting it on both, or on neither and folding it
     /// into the readout, changes the result.
+    #[allow(clippy::too_many_arguments)]
     pub fn gdn_qk_l2norm(
         &self,
-        q: &mut CudaViewMut<'_, f32>,
-        k: &mut CudaViewMut<'_, f32>,
-        rows: usize,
+        qkv: &mut CudaViewMut<'_, f32>,
+        n_tokens: usize,
+        key_heads: usize,
         dk: usize,
+        stride: usize,
+        q_off: usize,
+        k_off: usize,
         eps: f32,
     ) -> Result<()> {
-        debug_assert!(q.len() >= rows * dk && k.len() >= rows * dk);
+        debug_assert!(qkv.len() >= n_tokens * stride);
+        debug_assert!(q_off + key_heads * dk <= stride);
+        debug_assert!(k_off + key_heads * dk <= stride);
         let f = self
             .dev
             .kernels()
             .get("tuili_gdn", gdn_src(), "gdn_qk_l2norm_f32")?;
         let cfg = LaunchConfig {
-            grid_dim: (rows as u32, 1, 1),
+            grid_dim: ((n_tokens * key_heads) as u32, 1, 1),
             block_dim: (REDUCE_BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
-        let d = dk as i32;
+        let (kh, d) = (key_heads as i32, dk as i32);
+        let (st, qo, ko) = (stride as i32, q_off as i32, k_off as i32);
         let scale = (dk as f32).sqrt().recip();
         let mut b = self.dev.stream().launch_builder(&f);
-        b.arg(q).arg(k).arg(&d).arg(&eps).arg(&scale);
+        b.arg(qkv)
+            .arg(&kh)
+            .arg(&d)
+            .arg(&st)
+            .arg(&qo)
+            .arg(&ko)
+            .arg(&eps)
+            .arg(&scale);
         self.dev
             .profile()
             .time("gdn_qk_l2norm", self.dev.stream(), || {
@@ -179,10 +194,14 @@ impl Kernels {
 
     /// The gated delta rule, advancing `state` in place.
     ///
-    /// `q` and `k` are `[total_tokens, heads, dk]` already normalized and
-    /// scaled, and already expanded from key heads to value heads. `v` and
-    /// `out` are `[total_tokens, heads, dv]`. `g` and `beta` are
+    /// `qkv` is `[total_tokens, stride]` holding q, k and v at `q_off`, `k_off`
+    /// and `v_off`, with q and k already normalized and q already scaled. `out`
+    /// is `[total_tokens, heads, dv]`. `g` and `beta` are
     /// `[total_tokens, heads]`. `state` is `[n_seqs, heads, dk, dv]`.
+    ///
+    /// `key_heads` may be smaller than `heads`; the kernel expands them the way
+    /// `repeat_interleave` does, so value head `h` reads key head
+    /// `h / (heads / key_heads)`.
     ///
     /// One block a (head, sequence) pair, `dv` threads. `dv` past 1024 would
     /// need a second dimension of work per thread; the checkpoint uses 128.
@@ -191,26 +210,34 @@ impl Kernels {
         &self,
         out: &mut CudaViewMut<'_, f32>,
         state: &mut CudaViewMut<'_, f32>,
-        q: &CudaView<'_, f32>,
-        k: &CudaView<'_, f32>,
-        v: &CudaView<'_, f32>,
+        qkv: &CudaView<'_, f32>,
         g: &CudaView<'_, f32>,
         beta: &CudaView<'_, f32>,
         seqs: &SeqLayout<'_>,
         heads: usize,
+        key_heads: usize,
         dk: usize,
         dv: usize,
+        offsets: (usize, usize, usize, usize),
     ) -> Result<()> {
+        let (stride, q_off, k_off, v_off) = offsets;
         anyhow::ensure!(
             dv <= 1024,
             "the delta-rule kernel gives each of dv threads one column of the \
              state; dv is {dv}, past the 1024-thread block limit"
         );
+        anyhow::ensure!(
+            key_heads > 0 && heads.is_multiple_of(key_heads),
+            "{heads} value heads do not divide into {key_heads} key heads, so \
+             the repeat_interleave expansion is not defined"
+        );
         let t = seqs.total_tokens;
         debug_assert!(out.len() >= t * heads * dv);
         debug_assert!(state.len() >= seqs.n_seqs * heads * dk * dv);
-        debug_assert!(q.len() >= t * heads * dk && k.len() >= t * heads * dk);
-        debug_assert!(v.len() >= t * heads * dv);
+        debug_assert!(qkv.len() >= t * stride);
+        debug_assert!(q_off + key_heads * dk <= stride);
+        debug_assert!(k_off + key_heads * dk <= stride);
+        debug_assert!(v_off + heads * dv <= stride);
         debug_assert!(g.len() >= t * heads && beta.len() >= t * heads);
 
         let f = self
@@ -223,20 +250,25 @@ impl Kernels {
             // q and k for the current token, shared by every thread.
             shared_mem_bytes: (2 * dk * std::mem::size_of::<f32>()) as u32,
         };
-        let (h, a, b_) = (heads as i32, dk as i32, dv as i32);
+        let (h, kh) = (heads as i32, key_heads as i32);
+        let (a, b_) = (dk as i32, dv as i32);
+        let (st, qo, ko, vo) = (stride as i32, q_off as i32, k_off as i32, v_off as i32);
         let mut bl = self.dev.stream().launch_builder(&f);
         bl.arg(out)
             .arg(state)
-            .arg(q)
-            .arg(k)
-            .arg(v)
+            .arg(qkv)
             .arg(g)
             .arg(beta)
             .arg(seqs.first_token)
             .arg(seqs.n_tokens)
             .arg(&h)
+            .arg(&kh)
             .arg(&a)
-            .arg(&b_);
+            .arg(&b_)
+            .arg(&st)
+            .arg(&qo)
+            .arg(&ko)
+            .arg(&vo);
         self.dev
             .profile()
             .time("gdn_delta_rule", self.dev.stream(), || {

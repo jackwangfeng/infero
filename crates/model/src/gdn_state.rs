@@ -62,9 +62,19 @@ impl GdnShape {
 /// layer index: only 48 of the 27B's 64 layers have state, and numbering them
 /// densely keeps the allocation from being 25% empty.
 pub struct GdnState {
-    /// `[max_seqs, n_linear, heads, dk, dv]`
+    /// `[n_linear, max_seqs, heads, dk, dv]` — **layer-major**.
+    ///
+    /// Layer-major rather than sequence-major so that one layer's states for
+    /// every sequence are contiguous and indexed by `SeqId`. That is what lets
+    /// a single launch cover the whole batch: the kernel takes
+    /// `[n_seqs, heads, dk, dv]` and uses `blockIdx.y` as the slot, so passing
+    /// this layer's slice and a per-slot token count is enough. Sequences not
+    /// in the batch get a count of zero and their blocks exit immediately.
+    ///
+    /// The alternative, sequence-major, would need a slot-indirection array in
+    /// the kernel — one more thing to get wrong, for no gain.
     recurrent: CudaSlice<f32>,
-    /// `[max_seqs, n_linear, conv_channels, conv_k - 1]`
+    /// `[n_linear, max_seqs, conv_channels, conv_k - 1]`, same reasoning.
     conv: CudaSlice<f32>,
     shape: GdnShape,
     n_linear: usize,
@@ -126,37 +136,32 @@ impl GdnState {
 
     fn recurrent_span(&self, seq: SeqId, ordinal: usize) -> std::ops::Range<usize> {
         let n = self.shape.state_floats();
-        let base = (seq.0 * self.n_linear + ordinal) * n;
+        let base = (ordinal * self.max_seqs + seq.0) * n;
         base..base + n
     }
 
     fn conv_span(&self, seq: SeqId, ordinal: usize) -> std::ops::Range<usize> {
         let n = self.shape.conv_floats();
-        let base = (seq.0 * self.n_linear + ordinal) * n;
+        let base = (ordinal * self.max_seqs + seq.0) * n;
         base..base + n
     }
 
-    /// A view of one sequence's recurrent state for one linear layer.
-    ///
-    /// The kernel takes `[n_seqs, heads, dk, dv]` and indexes sequence 0, so a
-    /// batch of several sequences needs their states adjacent. They are not:
-    /// the pool is sequence-major, so one layer's states are strided by
-    /// `n_linear`. Batched decode therefore issues one launch per sequence for
-    /// now — see `batched_is_one_launch_per_sequence` in the tests for why that
-    /// is correct rather than merely convenient, and `Self::relayout` for the
-    /// shape a single launch would need.
-    pub fn recurrent_mut(
-        &mut self,
-        seq: SeqId,
-        ordinal: usize,
-    ) -> cudarc::driver::CudaViewMut<'_, f32> {
-        let span = self.recurrent_span(seq, ordinal);
-        self.recurrent.slice_mut(span)
+    /// One linear layer's recurrent state for *every* sequence slot, which is
+    /// what a single batched launch takes.
+    pub fn recurrent_layer_mut(&mut self, ordinal: usize) -> cudarc::driver::CudaViewMut<'_, f32> {
+        let n = self.shape.state_floats() * self.max_seqs;
+        self.recurrent.slice_mut(ordinal * n..(ordinal + 1) * n)
     }
 
-    pub fn conv_mut(&mut self, seq: SeqId, ordinal: usize) -> cudarc::driver::CudaViewMut<'_, f32> {
-        let span = self.conv_span(seq, ordinal);
-        self.conv.slice_mut(span)
+    /// One linear layer's convolution windows for every sequence slot.
+    pub fn conv_layer_mut(&mut self, ordinal: usize) -> cudarc::driver::CudaViewMut<'_, f32> {
+        let n = self.shape.conv_floats() * self.max_seqs;
+        self.conv.slice_mut(ordinal * n..(ordinal + 1) * n)
+    }
+
+    /// How many sequence slots a launch covers.
+    pub fn max_seqs(&self) -> usize {
+        self.max_seqs
     }
 
     /// Zero every layer's state for one sequence.
