@@ -65,9 +65,7 @@ fn json_token(src: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\":");
     let at = src.find(&needle)? + needle.len();
     let rest = &src[at..];
-    let end = rest
-        .find(|c| c == ',' || c == '}')
-        .unwrap_or(rest.len());
+    let end = rest.find([',', '}']).unwrap_or(rest.len());
     Some(rest[..end].trim().to_string())
 }
 

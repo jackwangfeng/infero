@@ -210,7 +210,7 @@ pub fn prepare_frame(
 ) -> PreparedFrame {
     let factor = patch * merge;
     assert!(
-        target_h % factor == 0 && target_w % factor == 0,
+        target_h.is_multiple_of(factor) && target_w.is_multiple_of(factor),
         "{target_h}x{target_w} is not a multiple of patch * merge = {factor}; \
          smart_resize rounds to that and not to patch, because an odd grid makes \
          `grid / merge` truncate and the position field then describes pixels the \

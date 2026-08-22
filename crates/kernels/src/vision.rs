@@ -217,7 +217,7 @@ impl Kernels {
         theta: f32,
     ) -> Result<()> {
         anyhow::ensure!(
-            rope_dim * 2 == head_dim && rope_dim % 2 == 0,
+            rope_dim * 2 == head_dim && rope_dim.is_multiple_of(2),
             "vision rope wants rope_dim = head_dim / 2 with two equal axes; got \
              rope_dim {rope_dim} for head_dim {head_dim}"
         );
@@ -271,7 +271,7 @@ impl Kernels {
         head_dim: usize,
     ) -> Result<()> {
         anyhow::ensure!(
-            head_dim % 2 == 0,
+            head_dim.is_multiple_of(2),
             "rotate_half pairs i with i + head_dim/2, so head_dim must be even; \
              got {head_dim}"
         );
@@ -393,8 +393,8 @@ impl Kernels {
         shape: &VisionShape,
     ) -> Result<()> {
         anyhow::ensure!(
-            height % (shape.patch * shape.merge) == 0
-                && width % (shape.patch * shape.merge) == 0,
+            height.is_multiple_of(shape.patch * shape.merge)
+                && width.is_multiple_of(shape.patch * shape.merge),
             "a {height}x{width} frame does not tile into whole {}x{} \
              spatial-merge blocks; smart_resize rounds to patch * merge = {}, \
              not to patch",
@@ -643,7 +643,7 @@ impl VisionGeometry {
             pos_ids.len()
         );
         anyhow::ensure!(
-            interp_idx.len() == interp_wts.len() && interp_idx.len() % n == 0,
+            interp_idx.len() == interp_wts.len() && interp_idx.len().is_multiple_of(n),
             "the position-embedding taps do not divide into {n} patches"
         );
         let taps = interp_idx.len() / n;
@@ -754,7 +754,7 @@ pub struct VisionScratch {
 impl VisionScratch {
     pub fn new(dev: &tuili_cuda::Device, shape: &VisionShape, max_patches: usize) -> Result<Self> {
         anyhow::ensure!(
-            max_patches % shape.merge_unit() == 0,
+            max_patches.is_multiple_of(shape.merge_unit()),
             "the merger folds {} patches into a token, so a call's patch count \
              must be a multiple of it; got {max_patches}",
             shape.merge_unit()
@@ -827,7 +827,7 @@ pub fn vision_forward(
         shape.depth
     );
     anyhow::ensure!(
-        n % shape.merge_unit() == 0,
+        n.is_multiple_of(shape.merge_unit()),
         "{n} patches do not group into whole 2x2 blocks; smart_resize rounds to \
          patch * merge for exactly this reason"
     );

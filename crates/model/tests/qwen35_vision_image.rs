@@ -45,7 +45,7 @@ fn cases() -> Vec<Case> {
         let needle = format!("\"{key}\":");
         let at = seg.find(&needle).unwrap() + needle.len();
         let rest = &seg[at..];
-        let end = rest.find(|c| c == ',' || c == '}').unwrap_or(rest.len());
+        let end = rest.find([',', '}']).unwrap_or(rest.len());
         rest[..end].parse().unwrap()
     };
     flat.split("{\"name\":\"")
@@ -383,7 +383,8 @@ fn the_preprocessing_path_produces_a_whole_patch_grid() {
         // Rounding to `patch` instead would sometimes give an odd grid; record
         // when it does, so the reason for the factor is visible here too.
         if let Some((bh, bw)) = vref::smart_resize(h, w, d.patch, min_px, max_px) {
-            let odd = (bh / d.patch) % d.merge != 0 || (bw / d.patch) % d.merge != 0;
+            let odd = !(bh / d.patch).is_multiple_of(d.merge)
+                || !(bw / d.patch).is_multiple_of(d.merge);
             if odd {
                 eprintln!(
                     "  (rounding to patch={} would have given {}x{} — an odd grid)",
