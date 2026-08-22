@@ -102,6 +102,11 @@ pub struct Layer {
     pub bk: Option<Vector>,
     pub bv: Option<Vector>,
     pub bo: Option<Vector>,
+    /// Qwen3 normalizes each head of `q` and `k` with its own learned
+    /// `[d_head]` weight, before the rotary. Absent on llama and qwen2, where
+    /// the attention biases play the role these replaced.
+    pub q_norm: Option<Vector>,
+    pub k_norm: Option<Vector>,
     pub ffn_norm: Vector,
     pub w_gate: Matrix,
     pub w_up: Matrix,
@@ -222,6 +227,9 @@ impl Weights {
                 bk: upload_optional_vector(dev, f, &t("attn_k.bias"), &mut device_bytes)?,
                 bv: upload_optional_vector(dev, f, &t("attn_v.bias"), &mut device_bytes)?,
                 bo: upload_optional_vector(dev, f, &t("attn_output.bias"), &mut device_bytes)?,
+                // Qwen3's per-head q/k norms; llama.cpp names them this way.
+                q_norm: upload_optional_vector(dev, f, &t("attn_q_norm.weight"), &mut device_bytes)?,
+                k_norm: upload_optional_vector(dev, f, &t("attn_k_norm.weight"), &mut device_bytes)?,
                 ffn_norm: upload_vector(dev, f, &t("ffn_norm.weight"), &mut device_bytes)?,
                 w_gate: matrices.next().unwrap(),
                 w_up: matrices.next().unwrap(),
@@ -369,7 +377,10 @@ pub fn load_awq(
     };
     let vector = |name: &str, total: &mut usize| -> Result<Vector> {
         let t = w.tensor(name)?;
-        let v: Vec<f32> = t.as_f16()?.iter().map(|x| f32::from(*x)).collect();
+        // `to_f32` rather than `as_f16`: Qwen3's AWQ export stores the norm
+        // weights as BF16 even though the AWQ scales are F16, and an F16-only
+        // read rejects the checkpoint on `model.norm.weight`.
+        let v = t.to_f32()?;
         *total += v.len() * 4;
         Ok(dev.stream().clone_htod(&v)?)
     };
@@ -381,7 +392,7 @@ pub fn load_awq(
     let optional_vector = |name: &str, total: &mut usize| -> Result<Option<Vector>> {
         match w.tensor(name) {
             Ok(t) => {
-                let v: Vec<f32> = t.as_f16()?.iter().map(|x| f32::from(*x)).collect();
+                let v = t.to_f32()?;
                 *total += v.len() * 4;
                 Ok(Some(dev.stream().clone_htod(&v)?))
             }
@@ -395,10 +406,14 @@ pub fn load_awq(
     let projection_bytes = |prefix: &str| -> Result<(Vec<u8>, WeightType, usize, usize)> {
         let qw = w.tensor(&format!("{prefix}.qweight"))?;
         let (k, n) = (qw.shape[0], qw.shape[1] * 8);
+        // The scales are BF16 in Qwen3's AWQ export, not F16 — bound to a local
+        // so the converted halves outlive the borrow `AwqTensor` takes.
+        let scales_t = w.tensor(&format!("{prefix}.scales"))?;
+        let scales = scales_t.to_f16()?;
         let packed = AwqTensor {
             qweight: qw.as_i32()?,
             qzeros: w.tensor(&format!("{prefix}.qzeros"))?.as_i32()?,
-            scales: w.tensor(&format!("{prefix}.scales"))?.as_f16()?,
+            scales: scales.as_ref(),
             in_features: k,
             out_features: n,
         }
@@ -511,8 +526,27 @@ pub fn load_awq(
     };
 
     let embd = w.tensor("model.embed_tokens.weight")?;
+    // `to_f16` rather than `embd.data`: this uploaded the mapping's bytes and
+    // labelled them `F16`, which reinterprets bf16 bit patterns as halves when
+    // the checkpoint stores BF16 — no error, just a wrong number for every
+    // token. Qwen3's AWQ export writes every float as BF16; Llama-3.1 and
+    // Qwen2.5 write F16, which is why the raw upload had never been wrong
+    // before and why both of those models kept working while Qwen3 produced
+    // degenerate repetition.
+    //
+    // The embedding is the first operation in the forward pass, so this is the
+    // one place where being wrong is invisible downstream: the block that
+    // follows normalizes the magnitude away, leaving a residual stream whose
+    // RMS climbs smoothly through all 36 layers while carrying nonsense. A
+    // magnitude curve cannot detect it; only comparing values can.
+    let embd_halves = embd.to_f16()?;
+    // Safety: f16 is a transparent u16, so these are already the little-endian
+    // halves the device expects; the view does not outlive `embd_halves`.
+    let embd_bytes = unsafe {
+        std::slice::from_raw_parts(embd_halves.as_ptr() as *const u8, embd_halves.len() * 2)
+    };
     let token_embd = upload(
-        embd.data,
+        embd_bytes,
         WeightType::F16,
         embd.shape[1],
         embd.shape[0],
@@ -529,11 +563,35 @@ pub fn load_awq(
         // path reads 558 MB at 90 GB/s, and the question is whether that is the
         // bytes or the layout: a Q8_0 block is 34 bytes, so its quants are only
         // ever halfword-aligned and `mmq_load_w_q8_0` reads them two at a time.
+        // `to_f16` rather than `h.data` / `as_f16`: Qwen3's AWQ export stores
+        // lm_head as BF16. Uploading its bytes as `WeightType::F16` would
+        // reinterpret bf16 bit patterns as halves — no error, just wrong
+        // numbers everywhere the vocab projection is read.
+        let halves = h.to_f16()?;
+        // The two working control checkpoints both store lm_head as F16, so
+        // `to_f16` returns a borrow for them and its BF16 branch was never
+        // exercised by a model known to produce sane output. Log the first few
+        // converted values so they can be checked against the file directly.
+        if std::env::var_os("TUILI_LM_HEAD_PROBE").is_some() {
+            let head: Vec<f32> = halves.iter().take(8).map(|x| f32::from(*x)).collect();
+            tracing::info!(
+                dtype = ?h.dtype,
+                n = halves.len(),
+                ?head,
+                "lm_head probe: first 8 converted values"
+            );
+        }
         if std::env::var("TUILI_LM_HEAD").as_deref() == Ok("f16") {
-            tracing::info!(mib = h.data.len() >> 20, "vocab projection kept f16");
-            Some(upload(h.data, WeightType::F16, k, n, &mut device_bytes)?)
+            tracing::info!(mib = (halves.len() * 2) >> 20, "vocab projection kept f16");
+            // Safety: f16 is a transparent u16, so the halves are already the
+            // little-endian byte layout the device wants; the view does not
+            // outlive `halves`.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(halves.as_ptr() as *const u8, halves.len() * 2)
+            };
+            Some(upload(bytes, WeightType::F16, k, n, &mut device_bytes)?)
         } else {
-            let q = quantize_f16_to_q8_0(h.as_f16()?, k).context("quantizing lm_head")?;
+            let q = quantize_f16_to_q8_0(halves.as_ref(), k).context("quantizing lm_head")?;
             tracing::info!(
                 from_mib = h.data.len() >> 20,
                 to_mib = q.len() >> 20,
@@ -555,7 +613,7 @@ pub fn load_awq(
             let free = dev.mem_info().map(|(f, _)| f).unwrap_or(0);
             let want = n * k * 17 / 16;
             if want * 3 < free {
-                let q = tuili_kernels::awq::quantize_f16_to_q8_0_split(h.as_f16()?, k)
+                let q = tuili_kernels::awq::quantize_f16_to_q8_0_split(h.to_f16()?.as_ref(), k)
                     .context("quantizing lm_head, split")?;
                 tracing::info!(mib = q.len() >> 20, "vocab projection also split");
                 Some(upload(&q, WeightType::Q8_0S, k, n, &mut device_bytes)?)
@@ -583,6 +641,8 @@ pub fn load_awq(
             bk: optional_vector(&format!("{p}.self_attn.k_proj.bias"), &mut device_bytes)?,
             bv: optional_vector(&format!("{p}.self_attn.v_proj.bias"), &mut device_bytes)?,
             bo: optional_vector(&format!("{p}.self_attn.o_proj.bias"), &mut device_bytes)?,
+            q_norm: optional_vector(&format!("{p}.self_attn.q_norm.weight"), &mut device_bytes)?,
+            k_norm: optional_vector(&format!("{p}.self_attn.k_norm.weight"), &mut device_bytes)?,
             ffn_norm: vector(
                 &format!("{p}.post_attention_layernorm.weight"),
                 &mut device_bytes,
