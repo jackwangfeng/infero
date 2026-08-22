@@ -327,3 +327,118 @@ fn the_matvec_and_the_expanded_gemm_agree() -> Result<()> {
     );
     Ok(())
 }
+
+/// The batched mat-vec must agree with the single-token one, token for token.
+///
+/// It is not a small variation on it: the accumulators are per-token registers
+/// and the reduction goes through shared memory across warps rather than through
+/// `block_reduce_sum`, which cannot be called in a loop. So this is a separate
+/// kernel that happens to compute the same thing, and the way it would go wrong
+/// is one token's partial landing in another's slot — which a single-token test
+/// cannot see at all.
+#[test]
+fn the_batched_matvec_agrees_with_the_single_token_one() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    let quants = quant_bytes(N * K, 0x3141);
+    let scales: Vec<f32> = (0..scale_grid(K, N))
+        .map(|i| 0.2 + 0.9 * (i % 7) as f32)
+        .collect();
+    let buf = packed(&quants, &scales);
+    let d_w = stream.clone_htod(&buf)?;
+
+    // Both instantiations, and a count that is not a multiple of the warp size,
+    // so the tail of the per-token loop is exercised.
+    for n_tokens in [2usize, 5, 8, 9, 17, 32] {
+        // Distinct rows, so a token's partial landing in another token's slot
+        // shows up rather than cancelling.
+        let x: Vec<f32> = (0..n_tokens)
+            .flat_map(|t| {
+                pseudo_random(K, 0x5000 + t as u64)
+                    .into_iter()
+                    .map(move |v| v * (1.0 + t as f32))
+            })
+            .collect();
+        let d_x = stream.clone_htod(&x)?;
+        let mut d_batch = stream.alloc_zeros::<f32>(n_tokens * N)?;
+        let ran = k.mmv_f8_block_batch(
+            &mut d_batch.as_view_mut(),
+            &d_w.as_view(),
+            &d_x.as_view(),
+            K,
+            N,
+            n_tokens,
+            false,
+        )?;
+        assert!(ran, "{n_tokens} tokens should be inside the batched bound");
+
+        // The same thing one token at a time, through the kernel that is already
+        // checked against the host dequantizer.
+        let mut want = vec![0.0f32; n_tokens * N];
+        for t in 0..n_tokens {
+            let d_xt = stream.clone_htod(&x[t * K..(t + 1) * K])?;
+            let mut d_one = stream.alloc_zeros::<f32>(N)?;
+            k.mmv_f8_block(
+                &mut d_one.as_view_mut(),
+                &d_w.as_view(),
+                &d_xt.as_view(),
+                K,
+                N,
+                false,
+            )?;
+            k.device().synchronize()?;
+            want[t * N..(t + 1) * N].copy_from_slice(&stream.clone_dtoh(&d_one)?);
+        }
+        k.device().synchronize()?;
+        let got = stream.clone_dtoh(&d_batch)?;
+        // Both accumulate in f32 in the same order per thread, so the only
+        // difference is the cross-warp reduction's shape.
+        let (worst, at) = worst_ratio(&got, &want, 1e-5, 1e-6);
+        assert!(
+            worst <= 1.0,
+            "at {n_tokens} tokens, element {at} (token {}, row {}) is {worst:.1}x \
+             the tolerance: batched {}, single {}",
+            at / N,
+            at % N,
+            got[at],
+            want[at]
+        );
+
+        // And the tokens must not be identical to each other, or a kernel that
+        // wrote one token's answer everywhere would pass.
+        let first = &got[..N];
+        let last = &got[(n_tokens - 1) * N..];
+        assert!(
+            worst_ratio(last, first, 1e-5, 1e-6).0 > 10.0,
+            "every token got the same answer at {n_tokens} tokens, so this test \
+             cannot see a token index mistake"
+        );
+    }
+    Ok(())
+}
+
+/// Past the bound the batched kernel declines rather than running wrong.
+#[test]
+fn the_batched_matvec_declines_a_batch_it_cannot_hold() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    let quants = quant_bytes(N * K, 0x1);
+    let scales = vec![1.0f32; scale_grid(K, N)];
+    let buf = packed(&quants, &scales);
+    let d_w = stream.clone_htod(&buf)?;
+    let too_many = tuili_kernels::fp8::MAX_BATCH_TOKENS_FP8 + 1;
+    let x = vec![0.0f32; too_many * K];
+    let d_x = stream.clone_htod(&x)?;
+    let mut out = stream.alloc_zeros::<f32>(too_many * N)?;
+    let ran = k.mmv_f8_block_batch(
+        &mut out.as_view_mut(),
+        &d_w.as_view(),
+        &d_x.as_view(),
+        K,
+        N,
+        too_many,
+        false,
+    )?;
+    assert!(!ran, "it should decline rather than silently truncate");
+    Ok(())
+}

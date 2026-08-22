@@ -27,6 +27,15 @@ use crate::{Kernels, fp8_src};
 /// The scale grid's block size, in both directions.
 pub const FP8_BLOCK: usize = 128;
 
+/// Above this many tokens, expand and call a GEMM instead of the batched
+/// mat-vec.
+///
+/// The mat-vec holds one accumulator a token in registers, so its cost in
+/// occupancy grows with the batch while a GEMM's does not. 32 is where the
+/// second instantiation tops out; the crossover is measured rather than
+/// assumed, and `TUILI_FP8_BATCH_MAX` moves it for an A/B.
+pub const MAX_BATCH_TOKENS_FP8: usize = 32;
+
 /// How many bytes an `[n, k]` FP8 matrix occupies, quants plus scale grid.
 pub fn fp8_bytes(k: usize, n: usize) -> usize {
     n * k + scale_grid(k, n) * std::mem::size_of::<f32>()
@@ -96,6 +105,77 @@ impl Kernels {
                 Ok(())
             })?;
         Ok(())
+    }
+
+    /// `out[t] = W x[t]` for a handful of tokens, reading each weight once.
+    ///
+    /// The case the expansion path was getting badly wrong: expanding to f16 and
+    /// calling cuBLAS costs five bytes a weight against resident f16's two, and
+    /// at a few tokens the weights still dominate — so batched decode ended up
+    /// with 2.5x the traffic it had before FP8. Here the weight lands in
+    /// registers and every token reuses it.
+    ///
+    /// `x` is `[n_tokens, k]`, `out` is `[n_tokens, n]`. Returns whether it ran:
+    /// past `MAX_BATCH_TOKENS_FP8` a GEMM is the right answer and the caller
+    /// should take the expansion path, where the cost amortizes over enough
+    /// tokens to stop mattering.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mmv_f8_block_batch(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        w: &CudaView<'_, u8>,
+        x: &CudaView<'_, f32>,
+        k: usize,
+        n: usize,
+        n_tokens: usize,
+        accum: bool,
+    ) -> Result<bool> {
+        if n_tokens > MAX_BATCH_TOKENS_FP8 {
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            k.is_multiple_of(4),
+            "the mat-vec reads a row four bytes at a time; k is {k}"
+        );
+        debug_assert!(out.len() >= n_tokens * n);
+        debug_assert!(x.len() >= n_tokens * k);
+        debug_assert!(w.len() >= fp8_bytes(k, n));
+
+        // Two instantiations rather than one at 32: the accumulators are
+        // registers, so a block that only needs eight of them should not pay for
+        // thirty-two. Which one runs is decided here, not by the kernel.
+        let name = if n_tokens <= 8 {
+            "mmv_f8_block_batch8_f32"
+        } else {
+            "mmv_f8_block_batch32_f32"
+        };
+        let f = self.dev.kernels().get("tuili_fp8", fp8_src(), name)?;
+        const BLOCK: u32 = 256;
+        let cfg = LaunchConfig {
+            grid_dim: (n as u32, 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (ki, ni) = (k as i32, n as i32);
+        let scols = k.div_ceil(FP8_BLOCK) as i32;
+        let nt = n_tokens as i32;
+        let acc = i32::from(accum);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out)
+            .arg(w)
+            .arg(x)
+            .arg(&ki)
+            .arg(&ni)
+            .arg(&scols)
+            .arg(&nt)
+            .arg(&acc);
+        self.dev
+            .profile()
+            .time("mmv_f8_block_batch", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("mmv_f8_block_batch")?;
+                Ok(())
+            })?;
+        Ok(true)
     }
 
     /// Expand an FP8 matrix to f16 on the device, for the batched path.

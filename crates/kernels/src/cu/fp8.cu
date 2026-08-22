@@ -39,16 +39,24 @@ __device__ __forceinline__ float e4m3_to_f32(unsigned int b) {
 
 // out[row] = sum over k of w[row, i] * x[i], with w's blocks scaled.
 //
-// One block an output row. Within it, one warp per 128-wide slice of k, because
-// that is exactly the span a single scale covers: the warp reduces its slice
-// with shuffles, multiplies by the scale once, and adds to a running total. A
-// scale applied per weight instead would be 128 times the multiplies for the
-// same answer; applied per row it would be the wrong answer.
+// One block an output row, threads striding over the row.
+//
+// The scale is folded into each product rather than applied to a per-slice sum,
+// which is what lets the loads pipeline. Distributing it is exact:
+//
+//     sum_kb s_kb * sum_{i in kb} w_i x_i  ==  sum_kb sum_{i in kb} s_kb w_i x_i
+//
+// The first version did the inner sum with a shuffle reduction and then scaled,
+// which put a five-step cross-lane reduction between one load and the next — so
+// a warp had at most one outstanding memory request and none of the latency was
+// hidden. This way every lane keeps its own running total, all the loads are
+// independent, and there is exactly one reduction at the end. It costs one extra
+// multiply per four weights instead of one per 128, which is nothing next to a
+// byte of DRAM per weight.
 //
 // A lane reads four consecutive bytes as one aligned 32-bit load, so a warp's
-// read of its slice is a single 128-byte transaction. Both `row * k` and
-// `kb * 128` are multiples of four for every projection in this checkpoint, and
-// the caller checks it.
+// read is a single 128-byte transaction. `row * k` and `kb * 128` are multiples
+// of four for every projection in this checkpoint, and the launcher checks it.
 extern "C" __global__ void mmv_f8_block_f32(float* __restrict__ out,
                                             const unsigned char* __restrict__ w,
                                             const float* __restrict__ x,
@@ -57,48 +65,131 @@ extern "C" __global__ void mmv_f8_block_f32(float* __restrict__ out,
     const int row = blockIdx.x;
     if (row >= n) return;
 
-    const int warps = blockDim.x / WARP_SIZE;
-    const int warp = threadIdx.x / WARP_SIZE;
-    const int lane = threadIdx.x % WARP_SIZE;
-    const int n_kb = (k + 127) / 128;
-
-    // The scale grid sits after the quants.
     const float* scales = (const float*)(w + (size_t)n * k);
     const float* srow = scales + (size_t)(row / 128) * scale_cols;
     const unsigned char* wrow = w + (size_t)row * k;
 
     float acc = 0.0f;
-    for (int kb = warp; kb < n_kb; kb += warps) {
-        const int base = kb * 128;
-        float part = 0.0f;
-        const int i0 = base + lane * 4;
+    // Each thread walks the row in 4-element strides. `i0 / 128` is the slice it
+    // is in, and a 4-element group never straddles two slices because 128 is a
+    // multiple of 4 — which is what makes one scale per group correct.
+    for (int i0 = threadIdx.x * 4; i0 < k; i0 += blockDim.x * 4) {
+        const float s = srow[i0 >> 7];
         if (i0 + 3 < k) {
-            const unsigned int packed = ((const unsigned int*)(wrow + base))[lane];
-            part = e4m3_to_f32(packed & 0xFFu) * x[i0]
-                 + e4m3_to_f32((packed >> 8) & 0xFFu) * x[i0 + 1]
-                 + e4m3_to_f32((packed >> 16) & 0xFFu) * x[i0 + 2]
-                 + e4m3_to_f32((packed >> 24) & 0xFFu) * x[i0 + 3];
+            const unsigned int packed = *(const unsigned int*)(wrow + i0);
+            acc += s * (e4m3_to_f32(packed & 0xFFu) * x[i0]
+                      + e4m3_to_f32((packed >> 8) & 0xFFu) * x[i0 + 1]
+                      + e4m3_to_f32((packed >> 16) & 0xFFu) * x[i0 + 2]
+                      + e4m3_to_f32((packed >> 24) & 0xFFu) * x[i0 + 3]);
         } else {
-            // A trailing partial slice. Every projection in this checkpoint has
-            // k a multiple of 128 so this never runs, but a kernel that reads
-            // past the row when it does would be a silent corruption rather
-            // than a crash.
-            for (int j = 0; j < 4; ++j) {
-                const int i = i0 + j;
-                if (i < k) part += e4m3_to_f32(wrow[i]) * x[i];
+            for (int j = 0; j < 4 && i0 + j < k; ++j) {
+                acc += s * e4m3_to_f32(wrow[i0 + j]) * x[i0 + j];
             }
         }
-        for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
-            part += __shfl_down_sync(FULL_MASK, part, off);
-        }
-        if (lane == 0) acc += part * srow[kb];
     }
 
-    // Only lane 0 of each warp carries a partial.
-    const float total = block_reduce_sum(lane == 0 ? acc : 0.0f);
-    // `accum` folds the residual add into the projection that feeds it, the way
-    // the other mat-vecs do.
+    const float total = block_reduce_sum(acc);
     if (threadIdx.x == 0) out[row] = accum ? out[row] + total : total;
+}
+
+// The same, for a handful of tokens at once.
+//
+// This is the case the expansion path was getting badly wrong. Expanding a
+// matrix to f16 and handing it to cuBLAS costs one byte read, two written and
+// two read back — five bytes a weight against the two that resident f16 cost —
+// and at a few tokens the weights still dominate, so it made batched decode
+// 2.5x more memory traffic than before FP8 rather than less. The profiler put
+// `dequant_f8_block` at 67% of a batch-32 step and batch scaling fell from
+// 36.9x to 8.6x.
+//
+// Here each weight is read once and spent on every token, which is the whole
+// point of batching. `TOKENS` is a compile-time bound so the accumulators live
+// in registers; above it, a real GEMM is the right answer and the expansion
+// path amortizes over enough tokens to be fine.
+//
+// `x` is `[n_tokens, k]` and `out` is `[n_tokens, n]`, both row-major, matching
+// what the rest of the engine passes around.
+template <int TOKENS>
+__device__ __forceinline__ void mmv_f8_block_batch_body(
+        float* __restrict__ out, const unsigned char* __restrict__ w,
+        const float* __restrict__ x, int k, int n, int scale_cols, int n_tokens,
+        int accum) {
+    const int row = blockIdx.x;
+    if (row >= n) return;
+
+    const float* scales = (const float*)(w + (size_t)n * k);
+    const float* srow = scales + (size_t)(row / 128) * scale_cols;
+    const unsigned char* wrow = w + (size_t)row * k;
+
+    float acc[TOKENS];
+#pragma unroll
+    for (int t = 0; t < TOKENS; ++t) acc[t] = 0.0f;
+
+    for (int i0 = threadIdx.x * 4; i0 < k; i0 += blockDim.x * 4) {
+        const float s = srow[i0 >> 7];
+        float wv[4];
+        if (i0 + 3 < k) {
+            const unsigned int packed = *(const unsigned int*)(wrow + i0);
+            wv[0] = s * e4m3_to_f32(packed & 0xFFu);
+            wv[1] = s * e4m3_to_f32((packed >> 8) & 0xFFu);
+            wv[2] = s * e4m3_to_f32((packed >> 16) & 0xFFu);
+            wv[3] = s * e4m3_to_f32((packed >> 24) & 0xFFu);
+        } else {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                wv[j] = (i0 + j < k) ? s * e4m3_to_f32(wrow[i0 + j]) : 0.0f;
+            }
+        }
+        // The weight is in registers now; every token reuses it.
+#pragma unroll
+        for (int t = 0; t < TOKENS; ++t) {
+            if (t >= n_tokens) break;
+            const float* xt = x + (size_t)t * k;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                if (i0 + j < k) acc[t] += wv[j] * xt[i0 + j];
+            }
+        }
+    }
+
+    // One reduction a token. Warp-level first, then across warps through shared
+    // memory — `block_reduce_sum` cannot be called in a loop, since its static
+    // shared result would be overwritten while slower threads still read it.
+    __shared__ float partial[32][TOKENS];
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int warps = blockDim.x / WARP_SIZE;
+#pragma unroll
+    for (int t = 0; t < TOKENS; ++t) {
+        if (t >= n_tokens) break;
+        float v = acc[t];
+        for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+            v += __shfl_down_sync(FULL_MASK, v, off);
+        }
+        if (lane == 0) partial[warp][t] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < TOKENS && threadIdx.x < n_tokens) {
+        const int t = threadIdx.x;
+        float sum = 0.0f;
+        for (int wi = 0; wi < warps; ++wi) sum += partial[wi][t];
+        float* o = out + (size_t)t * n + row;
+        *o = accum ? *o + sum : sum;
+    }
+}
+
+extern "C" __global__ void mmv_f8_block_batch8_f32(
+        float* __restrict__ out, const unsigned char* __restrict__ w,
+        const float* __restrict__ x, int k, int n, int scale_cols, int n_tokens,
+        int accum) {
+    mmv_f8_block_batch_body<8>(out, w, x, k, n, scale_cols, n_tokens, accum);
+}
+
+extern "C" __global__ void mmv_f8_block_batch32_f32(
+        float* __restrict__ out, const unsigned char* __restrict__ w,
+        const float* __restrict__ x, int k, int n, int scale_cols, int n_tokens,
+        int accum) {
+    mmv_f8_block_batch_body<32>(out, w, x, k, n, scale_cols, n_tokens, accum);
 }
 
 // The same weights, dequantized to f16 for the batched path.

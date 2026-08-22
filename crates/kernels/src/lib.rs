@@ -231,7 +231,12 @@ impl Kernels {
             self.dev.kernels().get("tuili_gdn", gdn_src(), name)?;
         }
         // The FP8 unit, warmed the same way and for the same reason.
-        for name in ["mmv_f8_block_f32", "dequant_f8_block_f16"] {
+        for name in [
+            "mmv_f8_block_f32",
+            "mmv_f8_block_batch8_f32",
+            "mmv_f8_block_batch32_f32",
+            "dequant_f8_block_f16",
+        ] {
             self.dev.kernels().get("tuili_fp8", fp8_src(), name)?;
         }
         // And the vision tower, which is its own translation unit again. A

@@ -2985,6 +2985,18 @@ impl Model {
         // step at 86.8 us a launch — so the mat-vec replaces both the byte count
         // and the wrong kernel shape.
         if w.ty == tuili_kernels::WeightType::F8E4M3 {
+            // A handful of tokens reads each weight once and spends it on all of
+            // them, which is what batching is for. The expansion path below
+            // costs five bytes a weight — one read, two written, two read back —
+            // against resident f16's two, so taking it at a few tokens made
+            // batched decode *slower* than before FP8: the profiler had
+            // `dequant_f8_block` at 67% of a batch-32 step and batch scaling
+            // down from 36.9x to 8.6x.
+            if (2..=tuili_kernels::fp8::MAX_BATCH_TOKENS_FP8).contains(&n_tokens)
+                && kern.mmv_f8_block_batch(out, &weights, x, w.k, w.n, n_tokens, false)?
+            {
+                return Ok(());
+            }
             if n_tokens == 1 {
                 // `accum` is not offered here. The callers that want the fused
                 // residual add pass it through a separate argument on the
