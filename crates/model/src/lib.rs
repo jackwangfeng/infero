@@ -21,6 +21,8 @@
 mod cache;
 pub mod config;
 pub mod qwen35;
+pub mod qwen35_mtp;
+pub mod qwen35_vision;
 mod sampling;
 pub mod weights;
 
