@@ -570,3 +570,79 @@ fn a_real_drafter_reaches_a_useful_acceptance_length() -> Result<()> {
     );
     Ok(())
 }
+
+/// A gap in the drafter's history is refused, by name, rather than papered over.
+///
+/// The scheduler leans on this. The drafter's cache only advances on the rounds
+/// that run, so any step that skips speculation — a second sequence arriving is
+/// the ordinary one — leaves it behind, and it cannot catch up: `mtp_hidden`
+/// holds the rows of the *last* pass, so the hidden states for the gap are gone.
+/// `Scheduler::speculative_step` therefore compares the feed's first position
+/// against `MtpHead::cached` and stops speculating for that sequence.
+///
+/// That check is only worth having because this one exists underneath it. If
+/// priming across a gap were allowed, the drafter would attend over slots nobody
+/// wrote — zeros, or another request's keys — and the scheduler's guard would be
+/// dead code that nothing would notice the loss of. Two concurrent requests to
+/// the 27B reached exactly here, as a 500 carrying this message.
+///
+/// It is an `Err`, not a panic: it is a reachable condition about state, not a
+/// broken invariant, and the server turns it into a skip.
+#[test]
+fn priming_the_drafter_across_a_gap_is_an_error() -> Result<()> {
+    let _gpu = gpu_lock();
+    let Some((mut model, tok)) = load("qwen2.5-0.5b-instruct-q8_0.gguf", 8)? else {
+        return Ok(());
+    };
+    let prompt = tok.encode(PROMPT, Some(false), false);
+    let cfg = model.config().clone();
+    const K: usize = 2;
+    let head = synthetic_head(model.device(), &cfg, prompt.len().max(K + 1), model.max_seq())?;
+    model.install_mtp_head(head)?;
+
+    let mut pool = model.new_pool(512, 1)?;
+    model.enable_speculation(K, &pool)?;
+    let seq = pool.alloc().unwrap();
+    let pending = prime(&mut model, &mut pool, seq, &prompt)?;
+
+    // Contiguous first, so that the failure below is the gap and not the setup.
+    let feed = DraftFeed::after_prefill(&prompt, pending);
+    model.draft_with_head(K, &feed)?;
+    let reached = model.mtp_head().expect("installed above").cached();
+    // The prompt's rows, plus one slot for each draft after the first: a
+    // `k`-token draft re-enters the head `k - 1` times through
+    // `step_from_own_output`, and each of those writes a key. This is the drafter
+    // running ahead of the target, which is the whole point of it, and the reason
+    // the next round starts with `truncate`.
+    assert_eq!(
+        reached,
+        prompt.len() + (K - 1),
+        "priming over the prompt plus {} self-steps",
+        K - 1
+    );
+
+    // Now ask for a row well past where the cache reaches, which is what a
+    // sequence that decoded without speculation for a while looks like.
+    let hole = reached + 5;
+    let gapped = DraftFeed {
+        rows: 0..1,
+        positions: vec![hole],
+        shifted: vec![pending],
+    };
+    let err = model
+        .draft_with_head(K, &gapped)
+        .expect_err("a gap in the drafter's history has to be refused");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("hole") && msg.contains(&hole.to_string()),
+        "the refusal should name the gap and where it is, got: {msg}"
+    );
+    // And the refusal left the cache where it was, so a caller that skips this
+    // round and comes back contiguous is still in business.
+    assert_eq!(
+        model.mtp_head().expect("installed above").cached(),
+        reached,
+        "a refused prime must not move the drafter's cache"
+    );
+    Ok(())
+}

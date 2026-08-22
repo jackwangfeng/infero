@@ -213,7 +213,12 @@ enum Reading {
 /// The norms get their `+1` here because that is where
 /// `weights::norm_offset` puts it: the kernels see a plain gain and the
 /// convention lives at load time. `Reading::PlainNorms` skips it.
-fn head_from_capture(dev: &Device, c: &Capture, reading: Reading) -> Result<MtpHead> {
+fn head_from_capture_width(
+    dev: &Device,
+    c: &Capture,
+    reading: Reading,
+    width: usize,
+) -> Result<MtpHead> {
     let dims = c.dims();
     let d = dims.d_model;
     let offset = if reading == Reading::PlainNorms { 0.0 } else { 1.0 };
@@ -273,7 +278,12 @@ fn head_from_capture(dev: &Device, c: &Capture, reading: Reading) -> Result<MtpH
         },
         device_bytes: 0,
     };
-    MtpHead::new(dev, w, dims, c.shape("output")[0], 128)
+    MtpHead::new(dev, w, dims, width, 128)
+}
+
+/// The head sized for the capture's whole token run in one step.
+fn head_from_capture(dev: &Device, c: &Capture, reading: Reading) -> Result<MtpHead> {
+    head_from_capture_width(dev, c, reading, c.shape("output")[0])
 }
 
 /// A stand-in embedding matrix whose row `i` is the capture's `inputs_embeds[i]`.
@@ -907,4 +917,83 @@ fn the_loader_adds_one_to_exactly_the_norms_that_are_stored_as_deltas() -> Resul
     let want = pattern(kv_heads * d_head * d, 2);
     assert_eq!(got, want, "k_proj came back different from what was written");
     Ok(())
+}
+
+/// Priming over a feed wider than the head, in chunks, is the same model.
+///
+/// This is the test that was missing when speculation first ran on the server.
+/// The head is built for one draft step's width, but the first round of a request
+/// primes it over the whole prompt — `DraftFeed::after_prefill` insists on that,
+/// because the drafter attends over its own cache and a cache with holes is a
+/// different model. Nothing checked the two claims against each other, so a
+/// 62-token prompt walked 62 rows into a 3-row buffer and cudarc's slice returned
+/// `None`. Every existing test here happens to pass a feed that fits.
+///
+/// So: 32 real tokens through a head built for 32, and the same 32 through a head
+/// built for 7. The second takes five chunks. What must hold is not merely that
+/// it runs — it is that the rows agree, which is the substance of "a cache with
+/// holes is a different model" stated as a check. It also pins the return value,
+/// because `rows` describes the *last* chunk and a caller still using the feed's
+/// width would read a row that chunk never wrote.
+///
+/// The control matters as much as the tolerance: comparing against neighbouring
+/// rows has to be far worse, or the test would pass on any two runs that happened
+/// to produce smooth output.
+#[test]
+fn chunked_priming_agrees_with_one_wide_step() -> Result<()> {
+    let _gpu = gpu_lock();
+    with_capture("chunked priming", |c| {
+        let dev = Device::new(0)?;
+        let kern = Kernels::new(dev.clone());
+        kern.warm_up()?;
+        let d = c.u("hidden_size");
+        let t = c.shape("output")[0];
+        const WIDTH: usize = 7;
+        assert!(t > WIDTH, "the capture's {t} tokens have to exceed {WIDTH}");
+        let hidden = dev.stream().clone_htod(c.get("target.final_hidden"))?;
+        let positions: Vec<usize> = (0..t).collect();
+
+        // One step, the way the passing tests do it.
+        let whole = {
+            let mut head = head_from_capture(&dev, c, Reading::Reference)?;
+            let (embed, ids) = stub_embedding(&dev, c)?;
+            head.step(&kern, &embed, &ids, &positions, &hidden.as_view())?;
+            let out = dev.stream().clone_dtoh(&head.output())?;
+            dev.synchronize()?;
+            assert_eq!(out.len(), t * d);
+            out
+        };
+
+        // The same feed, five chunks, into a head that cannot hold it whole.
+        let mut head = head_from_capture_width(&dev, c, Reading::Reference, WIDTH)?;
+        let (embed, ids) = stub_embedding(&dev, c)?;
+        let last = head.prime(&kern, &embed, &ids, &positions, &hidden.as_view())?;
+        let chunked = dev.stream().clone_dtoh(&head.output())?;
+        dev.synchronize()?;
+
+        // The final chunk holds `t % WIDTH` rows — 4 of the 32 — and `prime`
+        // reports the last token's index *within it*.
+        let tail = if t % WIDTH == 0 { WIDTH } else { t % WIDTH };
+        assert_eq!(chunked.len(), tail * d, "the last chunk's rows");
+        assert_eq!(last, tail - 1, "the row `prime` points at");
+        assert_eq!(head.cached(), t, "the drafter's cache after priming");
+
+        let start = t - tail;
+        let aligned = relative_l2(&chunked, &whole[start * d..]);
+        // Shifted by one row: the same numbers, read at the wrong offset.
+        let shifted = relative_l2(&chunked, &whole[(start - 1) * d..(t - 1) * d]);
+        eprintln!(
+            "chunked vs one step: aligned {aligned:.3e}, off by one row {shifted:.3e}"
+        );
+        assert!(
+            aligned < 5e-3,
+            "chunked priming diverged from the one-step pass, relative L2 {aligned:.3e}"
+        );
+        assert!(
+            shifted > aligned * 20.0,
+            "the off-by-one control is only {shifted:.3e} against {aligned:.3e}, so \
+             this comparison would pass on misaligned rows too"
+        );
+        Ok(())
+    })
 }

@@ -188,7 +188,10 @@ impl MtpHead {
             scores: alloc(dims.heads * t * max_seq, "attention scores")?,
             proj: alloc(t * d, "projection")?,
             out: alloc(t * d, "head output")?,
-            logits: alloc(t * dims.vocab, "draft logits")?,
+            // One row, not `t`: `logits_row` projects a single row on demand and
+            // every draft reads exactly one. At a vocabulary of 248320 the
+            // difference is 993 KiB a row against nothing gained.
+            logits: alloc(dims.vocab, "draft logits")?,
             x16: stream.alloc_zeros::<f16>(t * (2 * d).max(dims.d_ff).max(da))?,
             ids: stream.alloc_zeros::<i32>(t)?,
             positions: stream.alloc_zeros::<i32>(t)?,
@@ -279,10 +282,72 @@ impl MtpHead {
             hidden.len(),
             self.dims.d_model
         );
+        anyhow::ensure!(
+            n <= self.max_tokens,
+            "{n} rows into a head built for {}; call `prime` for a feed that \
+             may be wider than one step",
+            self.max_tokens
+        );
         self.dev
             .stream()
             .memcpy_dtod(hidden, &mut self.hidden_in.slice_mut(..n * self.dims.d_model))?;
         self.run(kern, embed, shifted_ids, positions)
+    }
+
+    /// [`MtpHead::step`] over a feed of any width, in chunks.
+    ///
+    /// Priming after a prefill covers the whole prompt — `DraftFeed::after_prefill`
+    /// says why, and it is not optional: the drafter attends over its own cache,
+    /// and a cache with holes is a different model. But three of this head's
+    /// buffers are `max_tokens` wide in a way that cannot absorb a prompt.
+    /// `scores` is `heads * max_tokens * max_seq`, which at 2048 rows and 8192
+    /// slots is 1.6 TB. So the head stays narrow and the feed is split.
+    ///
+    /// This is a chunked prefill, and `run` already permits it: it asserts
+    /// `positions[0] <= len` and appends at absolute positions, so a chunk
+    /// starting where the cache ends is exactly the legal case. What it does not
+    /// do is renumber rows, which is the return value — the last chunk's index of
+    /// the final token, since `rows` only ever describes the most recent chunk.
+    /// A caller that keeps using `feed.rows.len() - 1` reads a row the last chunk
+    /// never wrote.
+    pub fn prime(
+        &mut self,
+        kern: &Kernels,
+        embed: &Matrix,
+        shifted_ids: &[u32],
+        positions: &[usize],
+        hidden: &CudaView<'_, f32>,
+    ) -> Result<usize> {
+        let n = shifted_ids.len();
+        anyhow::ensure!(n > 0, "priming the drafter with no rows");
+        anyhow::ensure!(
+            n == positions.len(),
+            "{n} shifted ids against {} positions",
+            positions.len()
+        );
+        let d = self.dims.d_model;
+        anyhow::ensure!(
+            hidden.len() >= n * d,
+            "the hidden states hold {} floats, {n} rows of {d} needed",
+            hidden.len(),
+        );
+        let width = self.max_tokens;
+        let mut last_row = 0;
+        let mut start = 0;
+        while start < n {
+            let end = (start + width).min(n);
+            let chunk = hidden.slice(start * d..end * d);
+            self.step(
+                kern,
+                embed,
+                &shifted_ids[start..end],
+                &positions[start..end],
+                &chunk,
+            )?;
+            last_row = end - start - 1;
+            start = end;
+        }
+        Ok(last_row)
     }
 
     /// The same, feeding the head its **own** previous output as the hidden
@@ -683,6 +748,15 @@ impl MtpHead {
         self.rows
     }
 
+    /// How far the drafter's own cache reaches, in positions.
+    ///
+    /// Observable because chunked priming's whole job is to leave this where a
+    /// single wide step would have: `rows` describes only the last chunk, so it
+    /// cannot answer whether the earlier ones landed.
+    pub fn cached(&self) -> usize {
+        self.len
+    }
+
     /// `head @ out[row]`, brought back to the host.
     ///
     /// `head` is the text model's `lm_head`. The head has none of its own —
@@ -794,10 +868,13 @@ impl crate::Model {
     /// Load the checkpoint's MTP head and keep it beside the text model.
     ///
     /// Returns false when the checkpoint has no head, which is not an error — it
-    /// is most of them. `max_draft_rows` bounds one draft step's width: the first
-    /// step of a round covers every token the verification pass confirmed, so
-    /// `k + 1` is enough for speculative decoding and more only helps a caller
-    /// that wants to prime the drafter over a whole prompt.
+    /// is most of them.
+    ///
+    /// `max_draft_rows` bounds **one chunk**, not the feed: priming after a
+    /// prefill covers the whole prompt, and [`MtpHead::prime`] splits it. It has
+    /// to be at least `k + 1`, the width of a verification round's feed, since
+    /// that one is not split usefully — and larger only trades launches for the
+    /// `heads * rows * max_seq` score buffer.
     pub fn load_mtp_head(
         &mut self,
         dir: impl AsRef<std::path::Path>,
@@ -849,6 +926,10 @@ impl crate::Model {
         self.mtp.as_mut()
     }
 
+    pub fn mtp_head(&self) -> Option<&MtpHead> {
+        self.mtp.as_ref()
+    }
+
     /// Draft `k` tokens with the head, from the hidden states the last forward
     /// pass produced.
     ///
@@ -891,12 +972,15 @@ impl crate::Model {
                 .context("no captured hidden states")?
                 .slice(hidden_rows.start * d..hidden_rows.end * d);
             head.truncate(positions[0]);
-            head.step(&self.kern, &self.w.token_embd, shifted_ids, positions, &hidden)?;
+            // `prime`, not `step`: after a prefill the feed is the whole prompt
+            // and the head is built for one draft step's width. The row it
+            // returns is the final token's index within the last chunk.
+            let mut row =
+                head.prime(&self.kern, &self.w.token_embd, shifted_ids, positions, &hidden)?;
             let lm = self.w.output.as_ref().unwrap_or(&self.w.token_embd);
             let mut drafted = Vec::with_capacity(k);
             // The window the repetition penalty reads, extended per draft.
             let mut window: Vec<u32> = history.to_vec();
-            let mut row = rows - 1;
             let mut position = positions[rows - 1];
             let (mut token, mut q) =
                 head.draft_row_sampled(&self.kern, lm, row, sampler, &window)?;
@@ -949,10 +1033,10 @@ impl crate::Model {
             // without bound. This is the drafter's coordinate system, one behind
             // the target's — see `MtpHead::truncate`.
             head.truncate(positions[0]);
-            head.step(&self.kern, &self.w.token_embd, shifted_ids, positions, &hidden)?;
+            let mut row =
+                head.prime(&self.kern, &self.w.token_embd, shifted_ids, positions, &hidden)?;
             let lm = self.w.output.as_ref().unwrap_or(&self.w.token_embd);
             let mut drafted = Vec::with_capacity(k);
-            let mut row = rows - 1;
             let mut position = positions[rows - 1];
             let mut token = head.draft_row(&self.kern, lm, row)?;
             drafted.push(token);

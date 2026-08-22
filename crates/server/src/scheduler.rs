@@ -53,6 +53,17 @@ struct Running {
     /// not go through the speculative path, since a plain decode step leaves the
     /// drafter's cache a token behind.
     spec_feed: Option<tuili_model::spec::DraftFeed>,
+    /// Set once the drafter's cache has fallen behind this sequence and cannot
+    /// be caught up. Latched, so the explanation is logged once rather than per
+    /// step, and so the check that follows it stays cheap.
+    spec_desynced: bool,
+    /// Verification rounds this sequence ran, and tokens they emitted.
+    ///
+    /// Per request rather than per server: the mean acceptance length is the
+    /// number the speedup is proportional to, and averaging it across requests
+    /// that speculated and requests that could not says nothing about either.
+    spec_rounds: u64,
+    spec_emitted: u64,
 }
 
 impl Running {
@@ -143,7 +154,14 @@ impl Scheduler {
         if k == 0 {
             return Ok(false);
         }
-        if !self.model.load_mtp_head(dir, k + 1)? {
+        // Not `k + 1`. That is the verification feed's width, and it was the
+        // wrong bound: the first round of a request primes the drafter over the
+        // whole prompt, so a 62-token prompt walked 62 rows into a 3-row buffer.
+        // The head chunks the feed now, and this is the chunk — wide enough that
+        // an ordinary prompt is one pass, narrow enough that `scores` stays at
+        // `heads * 64 * max_seq` rather than a prompt's worth of it.
+        const PRIME_CHUNK: usize = 64;
+        if !self.model.load_mtp_head(dir, PRIME_CHUNK.max(k + 1))? {
             tracing::info!("this checkpoint has no MTP head; speculation stays off");
             return Ok(false);
         }
@@ -211,24 +229,76 @@ impl Scheduler {
         }
         let idx = 0usize;
         let k = self.spec_k;
+        // Each skip is named, because "speculation is on" and "speculation is
+        // running" are different claims and only the second one is worth
+        // anything. A round that never fires looks exactly like a round that
+        // fires and accepts nothing.
+        let skip = |why: &'static str| -> Result<bool> {
+            tracing::debug!(why, "speculative step skipped");
+            Ok(false)
+        };
         {
             let r = &self.running[idx];
-            if !r.prompt_complete() || r.next.is_none() || r.sampler.params().is_greedy() {
-                return Ok(false);
+            if !r.prompt_complete() {
+                return skip("still prefilling");
+            }
+            if r.next.is_none() {
+                return skip("no pending token");
+            }
+            if r.sampler.params().is_greedy() {
+                return skip("greedy request");
             }
             if r.spec_feed.is_none() {
-                return Ok(false);
+                return skip("no drafter feed from the last pass");
+            }
+            if r.spec_desynced {
+                return skip("drafter desynced earlier in this sequence");
             }
         }
         // The verification pass appends `k + 1` tokens before rolling back to
         // the accepted prefix, so the slots have to be there for the whole pass.
-        if self.pool.free_slots() < k + 1 || self.pool.headroom(self.running[idx].seq) < k + 1 {
-            return Ok(false);
+        if self.pool.free_slots() < k + 1 {
+            return skip("pool has no free slots");
+        }
+        if self.pool.headroom(self.running[idx].seq) < k + 1 {
+            return skip("sequence is at its context limit");
         }
 
         let seq = self.running[idx].seq;
         let pending = self.running[idx].next.expect("checked above");
         let feed = self.running[idx].spec_feed.take().expect("checked above");
+
+        // The drafter keeps a cache of its own, and it only advances on the
+        // rounds that run. Any step that skips speculation — a second sequence
+        // arriving is the ordinary one — leaves it behind the sequence, and it
+        // cannot catch up: `mtp_hidden` holds the rows of the *last* pass, so the
+        // hidden states for the gap are gone by the time anyone notices.
+        //
+        // Priming across the gap anyway would be reading slots nobody wrote.
+        // That is not a correctness question — verification uses the target
+        // model's distribution, so a bad draft only lowers the acceptance rate —
+        // but it is a cost with no upside, so the sequence stops speculating
+        // instead. Two concurrent requests used to reach this as a 500 from
+        // `MtpHead::run`'s own guard, which is where the gap was first seen.
+        let cached = self.model.mtp_head().map_or(0, |h| h.cached());
+        // An empty feed would slip past the comparison below and then fail
+        // inside `prime`, which is a 500 for a condition the scheduler can see.
+        let Some(first) = feed.positions.first().copied() else {
+            return skip("empty drafter feed");
+        };
+        if first > cached {
+            if !self.running[idx].spec_desynced {
+                self.running[idx].spec_desynced = true;
+                tracing::info!(
+                    seq = seq.0,
+                    position = first,
+                    cached,
+                    "the drafter fell behind this sequence; it will decode \
+                     without speculation from here"
+                );
+            }
+            return Ok(false);
+        }
         // The window the repetition penalty reads, which both sides have to
         // score against — see `verify_draft_sampled`.
         let history: Vec<u32> = {
@@ -238,6 +308,12 @@ impl Scheduler {
             r.sampler.window(&h).to_vec()
         };
 
+        tracing::debug!(
+            first = feed.positions.first().copied(),
+            rows = feed.rows.len(),
+            cached = self.model.mtp_head().map(|h| h.cached()),
+            "speculative round"
+        );
         let draft = {
             let r = &mut self.running[idx];
             self.model
@@ -258,6 +334,8 @@ impl Scheduler {
         self.steps += 1;
         self.spec_steps += 1;
         self.spec_tokens += outcome.tokens.len() as u64;
+        self.running[idx].spec_rounds += 1;
+        self.running[idx].spec_emitted += outcome.tokens.len() as u64;
 
         // Every emitted token goes through the same bookkeeping a plain step's
         // single token does, in order, and the first one that ends the sequence
@@ -544,6 +622,9 @@ impl Scheduler {
                 next: None,
                 sampled: 0,
                 spec_feed: None,
+                spec_desynced: false,
+                spec_rounds: 0,
+                spec_emitted: 0,
                 generated: Vec::new(),
                 sampler: Sampler::new(req.params),
                 partial: Vec::new(),
@@ -746,6 +827,13 @@ impl Scheduler {
             queued_ms = queued.as_millis(),
             total_ms = r.admitted.elapsed().as_millis(),
             reason = reason.as_str(),
+            // The mean acceptance length, or absent when this request never
+            // speculated. `1.0` would mean the drafter ran and was rejected
+            // every time, which is a different thing entirely and has to look
+            // different in the log.
+            accept_len = (r.spec_rounds > 0)
+                .then(|| r.spec_emitted as f64 / r.spec_rounds as f64),
+            spec_rounds = (r.spec_rounds > 0).then_some(r.spec_rounds),
             "request complete"
         );
 
