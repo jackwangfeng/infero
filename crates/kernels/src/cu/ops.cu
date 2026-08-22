@@ -7,6 +7,39 @@
 
 // ---- normalization ------------------------------------------------------
 
+// Per-head RMS norm, in place, over one head's `d_head` lane of a row.
+//
+// Qwen3 normalizes each attention head of q and k on its own, with a learned
+// `[d_head]` weight, before the rotary. Applying it after would rotate the
+// unnormalized vector and give a different answer, and skipping it entirely
+// gives fluent nonsense rather than an error — the same failure shape as the
+// dropped QKV biases, so this is checked against a CPU reference in
+// `tests/qk_norm.rs` rather than against itself.
+//
+// `row_stride` and `offset` exist because the fused QKV path leaves k inside
+// the packed `[q | k | v]` row rather than in a buffer of its own: q is
+// contiguous at stride `n_heads * d_head`, k sits at `offset = d` with the
+// packed row's stride. One block a (token, head) pair.
+extern "C" __global__ void qk_norm_f32(float* __restrict__ buf,
+                                       const float* __restrict__ weight,
+                                       int n_heads, int d_head, int row_stride,
+                                       int offset, float eps) {
+    const int token = blockIdx.x / n_heads;
+    const int head = blockIdx.x % n_heads;
+    float* h = buf + (size_t)token * row_stride + offset + (size_t)head * d_head;
+
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < d_head; i += blockDim.x) {
+        const float v = h[i];
+        acc += v * v;
+    }
+    const float scale = rsqrtf(block_reduce_sum(acc) / (float)d_head + eps);
+
+    for (int i = threadIdx.x; i < d_head; i += blockDim.x) {
+        h[i] = h[i] * scale * weight[i];
+    }
+}
+
 // out[t, :] = x[t, :] * rsqrt(mean(x[t, :]^2) + eps) * weight
 extern "C" __global__ void rms_norm_f32(float* __restrict__ out,
                                         const float* __restrict__ x,

@@ -182,6 +182,7 @@ impl Kernels {
             "attn_flash_reduce_f16_f32",
             "rope_qk_packed_f32",
             "store_kv2_packed_f16",
+            "qk_norm_f32",
         ] {
             self.dev.kernels().get("tuili_ops", ops_src(), name)?;
         }
@@ -258,6 +259,52 @@ impl Kernels {
     // ---- normalization and elementwise ----------------------------------
 
     /// `out[t, :] = rms_norm(x[t, :]) * weight`
+    /// Per-head RMS norm in place, over the `d_head` lane of each head.
+    ///
+    /// `row_stride` and `offset` locate the heads inside `buf`: the fused QKV
+    /// path leaves k packed in the `[q | k | v]` row, so it is normalized where
+    /// it lies rather than after a scatter. Qwen3 applies this to q and k
+    /// before the rotary; models without the weights skip the call entirely.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qk_norm(
+        &self,
+        buf: &mut CudaViewMut<'_, f32>,
+        weight: &CudaView<'_, f32>,
+        n_tokens: usize,
+        n_heads: usize,
+        d_head: usize,
+        row_stride: usize,
+        offset: usize,
+        eps: f32,
+    ) -> Result<()> {
+        debug_assert!(weight.len() >= d_head);
+        debug_assert!(buf.len() >= (n_tokens - 1) * row_stride + offset + n_heads * d_head);
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_ops", ops_src(), "qk_norm_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: ((n_tokens * n_heads) as u32, 1, 1),
+            block_dim: (REDUCE_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (nh, dh) = (n_heads as i32, d_head as i32);
+        let (rs, off) = (row_stride as i32, offset as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(buf)
+            .arg(weight)
+            .arg(&nh)
+            .arg(&dh)
+            .arg(&rs)
+            .arg(&off)
+            .arg(&eps);
+        self.dev.profile().time("qk_norm", self.dev.stream(), || {
+            unsafe { b.launch(cfg) }.context("qk_norm")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     pub fn rms_norm(
         &self,
         out: &mut CudaViewMut<'_, f32>,
