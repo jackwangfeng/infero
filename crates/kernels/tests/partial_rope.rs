@@ -112,8 +112,10 @@ fn relative_l2(got: &[f32], want: &[f32]) -> f32 {
 /// bits — for the in-place Q+K kernel.
 ///
 /// The tolerance is set by the kernel's fast-math intrinsics: `__powf` and
-/// `__sincosf` against the reference's `f64` angle. The two mistakes this must
-/// not hide are checked below to be orders of magnitude larger.
+/// `__sincosf` against the reference's `f64` angle. Measured 1.7e-5 on sm_120
+/// at these positions, so 2e-4 leaves an order of magnitude and no more; the
+/// two mistakes it must not hide land at 2.2, five orders away, which the next
+/// test checks rather than assumes.
 #[test]
 fn partial_rope_matches_the_host_reference() -> Result<()> {
     let k = kernels()?;
@@ -150,7 +152,7 @@ fn partial_rope_matches_the_host_reference() -> Result<()> {
         let want = reference(src, &pos, heads, ROTARY_DIM);
         let (abs, at) = max_abs_diff(got, &want);
         assert!(
-            abs < 2e-3,
+            abs < 2e-4,
             "{name}: kernel and host reference differ by {abs} at {at} \
              (element {}, reference {})",
             got[at],
@@ -176,7 +178,7 @@ fn partial_rope_matches_the_host_reference() -> Result<()> {
 
 /// The two mistakes the tolerance above must not be able to hide.
 ///
-/// `2e-3` is a wide window when the values are O(1), so this measures how far
+/// `2e-4` is still a wide window when the values are O(1), so this measures how far
 /// each wrong reading actually lands. If either came within the tolerance the
 /// test above would be blessing it.
 #[test]
@@ -226,7 +228,7 @@ fn the_wrong_frequency_width_and_the_wrong_pairing_are_far_outside_the_tolerance
         assert!(
             abs > 0.1,
             "{name} came within {abs} of the kernel's answer at element {at}; \
-             the 2e-3 tolerance in the reference test would have accepted it, so \
+             the 2e-4 tolerance in the reference test would have accepted it, so \
              that test is not evidence about this choice"
         );
         eprintln!("{name}: max abs diff from the kernel {abs:.3}");
@@ -489,7 +491,7 @@ fn the_packed_path_copies_qs_unrotated_tail() -> Result<()> {
     }
     let want_q = reference(&q_src, &pos, N_HEADS, ROTARY_DIM);
     let (abs, at) = max_abs_diff(&got_q, &want_q);
-    assert!(abs < 2e-3, "packed q differs from the reference by {abs} at {at}");
+    assert!(abs < 2e-4, "packed q differs from the reference by {abs} at {at}");
     eprintln!("packed q: max abs diff from the host reference {abs:.2e}");
 
     // The tail is a copy, so it must be bit-identical to the packed source.
@@ -510,7 +512,7 @@ fn the_packed_path_copies_qs_unrotated_tail() -> Result<()> {
     for t in 0..N_TOKENS {
         let row = &got_packed[t * stride + da..t * stride + da + kv];
         let (abs, at) = max_abs_diff(row, &want_k[t * kv..(t + 1) * kv]);
-        assert!(abs < 2e-3, "packed k at token {t} differs by {abs} at {at}");
+        assert!(abs < 2e-4, "packed k at token {t} differs by {abs} at {at}");
         for h in 0..N_KV_HEADS {
             let off = h * D_HEAD;
             assert_eq!(
@@ -615,8 +617,9 @@ fn shifting_all_positions_leaves_the_score_matrix_unchanged() -> Result<()> {
     let (q1, k1) = roped(1024, 1024)?;
     let near = relative_l2(&scores(&q1, &k1), &base);
     eprintln!("shift 1024: relative L2 {near:.2e}");
+    // Measured 3.8e-6 on sm_120.
     assert!(
-        near < 1e-3,
+        near < 1e-4,
         "shifting every position by 1024 moved the scores by {near:.2e} \
          relative, far more than f32 phase noise explains"
     );
@@ -628,8 +631,10 @@ fn shifting_all_positions_leaves_the_score_matrix_unchanged() -> Result<()> {
     let (q2, k2) = roped(130_000, 130_000)?;
     let far = relative_l2(&scores(&q2, &k2), &base);
     eprintln!("shift 130000: relative L2 {far:.2e}");
+    // Measured 6.3e-4, two orders above the shift-1024 case, which is what
+    // 0.008 rad of phase quantization buys you at that magnitude.
     assert!(
-        far < 5e-2,
+        far < 5e-3,
         "shifting every position by 130000 moved the scores by {far:.2e} \
          relative, which is more than the f32 phase quantization at that \
          magnitude accounts for"

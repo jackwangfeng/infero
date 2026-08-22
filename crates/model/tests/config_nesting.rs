@@ -136,6 +136,200 @@ fn the_two_widths_still_agree_on_a_conventional_model() {
     assert_eq!(cfg.d_attn(), cfg.d_model, "20 heads of 256 is 5120");
 }
 
+// ------------------------------------------------------- rope_parameters
+//
+// `rope_theta` and `partial_rotary_factor` sit in
+// `text_config.rope_parameters`, one level below the dimensions. Reading them
+// off `text_config` does not fail; it finds nothing and substitutes a default.
+// So every test here has to show that the *other* reading produces a different
+// answer, otherwise it is compatible with the bug it is meant to catch.
+
+/// The real 27B shape: dimensions on `text_config`, rope settings one level
+/// further in. `rope_theta` appears only in `rope_parameters`.
+fn qwen35_shaped(rope_parameters: serde_json::Value) -> serde_json::Value {
+    let mut j = qwen38_shaped(serde_json::json!({
+        "num_attention_heads": 24,
+        "head_dim": 256,
+    }));
+    // Drop the flat spelling so nothing can be read from it by accident.
+    j["text_config"]
+        .as_object_mut()
+        .unwrap()
+        .remove("rope_theta");
+    j["text_config"]["rope_parameters"] = rope_parameters;
+    j
+}
+
+/// The checkpoint's own `rope_parameters` block.
+fn real_rope_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "rope_type": "default",
+        "rope_theta": 10000000.0,
+        "partial_rotary_factor": 0.25,
+        "mrope_interleaved": true,
+        "mrope_section": [11, 11, 10],
+    })
+}
+
+/// `rope_theta` comes out of `rope_parameters`, and — the part that makes this
+/// a test rather than a restatement — the reading that ignores the nesting
+/// produces 10000 instead, which is what shipped before this fix.
+#[test]
+fn rope_theta_is_read_from_rope_parameters() {
+    let j = qwen35_shaped(real_rope_parameters());
+    let cfg = Config::from_hf(&j, "qwen35").expect("the real config shape should parse");
+    assert_eq!(cfg.rope_theta, 10_000_000.0);
+
+    // The other reading: `text_config.rope_theta`, which this config does not
+    // have. Confirm it really is absent, so the assertion above is evidence
+    // about where the value was found and not just about its value.
+    assert!(
+        j["text_config"]["rope_theta"].is_null(),
+        "this fixture must not carry the flat spelling, or the test cannot \
+         distinguish the two readings"
+    );
+    assert_ne!(
+        cfg.rope_theta, 10_000.0,
+        "10000 is the default a parser reaching for the flat spelling lands on; \
+         getting it here means the nesting is still being ignored"
+    );
+}
+
+/// The flat spelling still wins where there is no `rope_parameters` — every
+/// checkpoint before this one — and the nested one wins where both exist.
+#[test]
+fn rope_theta_prefers_the_nested_spelling_but_still_reads_the_flat_one() {
+    // Flat only: unchanged behaviour.
+    let mut flat = qwen35_shaped(serde_json::json!({ "rope_type": "default" }));
+    flat["text_config"]["rope_theta"] = serde_json::json!(1_000_000.0);
+    assert_eq!(Config::from_hf(&flat, "m").unwrap().rope_theta, 1_000_000.0);
+
+    // Both, disagreeing: `rope_parameters` is the authoritative spelling, and
+    // the two values are different so the assertion picks a side.
+    let mut both = qwen35_shaped(real_rope_parameters());
+    both["text_config"]["rope_theta"] = serde_json::json!(1_000_000.0);
+    let cfg = Config::from_hf(&both, "m").unwrap();
+    assert_eq!(cfg.rope_theta, 10_000_000.0, "rope_parameters wins");
+    assert_ne!(cfg.rope_theta, 1_000_000.0, "the flat value must lose");
+}
+
+/// 24 heads of 256 with a factor of 0.25: 64 dimensions rotate, 192 do not.
+#[test]
+fn the_27b_rotates_64_of_its_256_dimensions() {
+    let j = qwen35_shaped(real_rope_parameters());
+    let cfg = Config::from_hf(&j, "qwen35").unwrap();
+    assert_eq!(cfg.d_head, 256);
+    assert_eq!(cfg.rotary_dim, 64, "int(256 * 0.25)");
+    assert_ne!(
+        cfg.rotary_dim, cfg.d_head,
+        "a rotary width equal to d_head is exactly the bug: it rotates the \
+         whole head and normalizes the frequencies by 256"
+    );
+    // And the per-pair frequency table follows the rotary width, not d_head.
+    assert_eq!(cfg.rope_freq_factors(&j).len(), 32, "rotary_dim / 2");
+}
+
+/// `partial_rotary_factor` is duplicated on the real checkpoint, so both
+/// locations have to be read — and each has to be read *on its own*, which is
+/// what these two halves establish separately.
+#[test]
+fn partial_rotary_factor_is_read_from_either_location() {
+    // Nested only.
+    let nested = qwen35_shaped(real_rope_parameters());
+    assert!(nested["text_config"]["partial_rotary_factor"].is_null());
+    assert_eq!(Config::from_hf(&nested, "m").unwrap().rotary_dim, 64);
+
+    // Flat only: `rope_parameters` exists but says nothing about the factor,
+    // so a parser that only looks inside it would fall back to the full width.
+    let mut flat = qwen35_shaped(serde_json::json!({
+        "rope_type": "default",
+        "rope_theta": 10000000.0,
+    }));
+    flat["text_config"]["partial_rotary_factor"] = serde_json::json!(0.25);
+    assert!(flat["text_config"]["rope_parameters"]["partial_rotary_factor"].is_null());
+    let cfg = Config::from_hf(&flat, "m").unwrap();
+    assert_eq!(cfg.rotary_dim, 64);
+    assert_ne!(
+        cfg.rotary_dim, cfg.d_head,
+        "256 is what a nested-only reader would report for this config"
+    );
+
+    // Both, agreeing, which is the real file.
+    let mut both = qwen35_shaped(real_rope_parameters());
+    both["text_config"]["partial_rotary_factor"] = serde_json::json!(0.25);
+    assert_eq!(Config::from_hf(&both, "m").unwrap().rotary_dim, 64);
+}
+
+/// No factor anywhere means the whole head rotates. This is the regression
+/// guard for every model tuili already runs: `rotary_dim` has to default to
+/// `d_head` exactly, in both config shapes and in the GGUF path.
+#[test]
+fn the_rotary_width_defaults_to_the_whole_head() {
+    // Nested config with a `rope_parameters` that mentions no factor.
+    let j = qwen35_shaped(serde_json::json!({
+        "rope_type": "default",
+        "rope_theta": 10000000.0,
+    }));
+    let cfg = Config::from_hf(&j, "m").unwrap();
+    assert_eq!(cfg.rotary_dim, cfg.d_head);
+    assert_eq!(cfg.rotary_dim, 256);
+
+    // No `rope_parameters` object at all.
+    let flat = serde_json::json!({
+        "model_type": "qwen3",
+        "hidden_size": 4096,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "num_hidden_layers": 36,
+        "intermediate_size": 12288,
+        "vocab_size": 151936,
+        "rope_theta": 1000000.0,
+    });
+    let cfg = Config::from_hf(&flat, "qwen3-8b").unwrap();
+    assert_eq!(cfg.rotary_dim, 128);
+    assert_eq!(cfg.rotary_dim, cfg.d_head);
+    assert_eq!(cfg.rope_freq_factors(&flat).len(), 64, "d_head / 2");
+}
+
+/// A factor of 1.0 is the same thing said explicitly, and must not come out one
+/// dimension short through a rounding accident.
+#[test]
+fn a_factor_of_one_rotates_the_whole_head() {
+    let j = qwen35_shaped(serde_json::json!({
+        "rope_type": "default",
+        "rope_theta": 10000000.0,
+        "partial_rotary_factor": 1.0,
+    }));
+    let cfg = Config::from_hf(&j, "m").unwrap();
+    assert_eq!(cfg.rotary_dim, 256);
+}
+
+/// A factor that lands on an odd width cannot be paired, and has to be refused
+/// rather than silently truncated to something workable.
+#[test]
+fn a_factor_giving_an_odd_rotary_width_is_refused() {
+    // int(256 * 0.1) == 25.
+    let j = qwen35_shaped(serde_json::json!({
+        "rope_type": "default",
+        "partial_rotary_factor": 0.1,
+    }));
+    let err = Config::from_hf(&j, "m")
+        .expect_err("an odd rotary width must not load")
+        .to_string();
+    assert!(err.contains("25"), "the error should name the width: {err}");
+
+    // And one above 1.0, which would rotate past the end of the head.
+    let j = qwen35_shaped(serde_json::json!({
+        "rope_type": "default",
+        "partial_rotary_factor": 1.5,
+    }));
+    assert!(
+        Config::from_hf(&j, "m").is_err(),
+        "a rotary width wider than d_head must not load"
+    );
+}
+
 /// An odd head dimension cannot be rotated in pairs, and that check has to
 /// survive reading from the nested object.
 #[test]

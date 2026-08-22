@@ -92,8 +92,13 @@ impl LayerBlob {
     }
 }
 
-pub struct Layer {
-    pub attn_norm: Vector,
+/// The softmax-attention half of a block.
+///
+/// Its own struct because Qwen3.5 has blocks that do not have one: 48 of its 64
+/// layers mix with a recurrence instead. Before that every model tuili loaded
+/// had exactly one kind of block, so these fields sat directly on `Layer` and
+/// the forward pass could reach them unconditionally.
+pub struct AttnWeights {
     pub wq: Matrix,
     pub wk: Matrix,
     pub wv: Matrix,
@@ -107,6 +112,47 @@ pub struct Layer {
     /// the attention biases play the role these replaced.
     pub q_norm: Option<Vector>,
     pub k_norm: Option<Vector>,
+    /// `q`, `k` and `v` stacked along `n`, under `TUILI_FUSE_FFN`. One matmul
+    /// and a scatter instead of three; see `stacked` in `load_awq`.
+    pub w_qkv: Option<Matrix>,
+    /// True when `wq` produces `2 * d_attn` columns: a query and a gate
+    /// interleaved per head, which Qwen3.5's attention blocks carry and
+    /// nothing before them did.
+    pub output_gate: bool,
+}
+
+/// The GatedDeltaNet half of a block.
+///
+/// Field names follow the checkpoint's tensor names rather than being
+/// translated, because the mapping is the thing most likely to be got wrong and
+/// a reader should be able to check it against `notes/qwen3.5-architecture.md`
+/// without a glossary.
+pub struct GdnWeights {
+    /// `[d_model, 2 * key_dim + value_dim]` — q, k and v in one projection.
+    pub in_proj_qkv: Matrix,
+    /// `[d_model, value_dim]` — the output gate, value-shaped.
+    pub in_proj_z: Matrix,
+    /// `[d_model, value_heads]` — the per-head decay input.
+    pub in_proj_a: Matrix,
+    /// `[d_model, value_heads]` — the per-head write strength.
+    pub in_proj_b: Matrix,
+    /// `[conv_channels, conv_k]`, depthwise, no bias.
+    pub conv1d: Vector,
+    pub a_log: Vector,
+    pub dt_bias: Vector,
+    /// `[value_head_dim]`, the gated RMSNorm's gain.
+    pub norm: Vector,
+    /// `[value_dim, d_model]`.
+    pub out_proj: Matrix,
+}
+
+pub struct Layer {
+    pub attn_norm: Vector,
+    /// The mixer. Exactly one of these is `Some`; which one is decided by the
+    /// checkpoint's `layer_types`, not by a stride, because Qwen3.5 states the
+    /// pattern explicitly and a future model need not repeat every fourth.
+    pub attn: Option<AttnWeights>,
+    pub gdn: Option<GdnWeights>,
     pub ffn_norm: Vector,
     pub w_gate: Matrix,
     pub w_up: Matrix,
@@ -114,9 +160,6 @@ pub struct Layer {
     /// `gate` and `up` stacked along `n`, under `TUILI_FUSE_FFN`. One matmul
     /// instead of two; see `stacked` in `load_awq`.
     pub w_gate_up: Option<Matrix>,
-    /// `q`, `k` and `v` stacked along `n`, under `TUILI_FUSE_FFN`. One matmul
-    /// and a scatter instead of three; see `stacked` in `load_awq`.
-    pub w_qkv: Option<Matrix>,
     /// Present when this layer's matrices are streamed rather than resident.
     pub blob: Option<LayerBlob>,
 }
@@ -124,6 +167,25 @@ pub struct Layer {
 impl Layer {
     pub fn is_offloaded(&self) -> bool {
         self.blob.is_some()
+    }
+
+    /// The attention half, for a layer the caller has already established has
+    /// one.
+    ///
+    /// Panics rather than returning an error: reaching here on a
+    /// linear-attention layer means the block dispatch is wrong, which is a bug
+    /// in this file's caller and not a condition to recover from. The message
+    /// names the layer kind so the dispatch is the first place to look.
+    pub fn attn(&self) -> &AttnWeights {
+        self.attn.as_ref().expect(
+            "asked for the attention weights of a linear-attention layer; \
+             the block dispatch did not consult Layer::is_linear",
+        )
+    }
+
+    /// True for a GatedDeltaNet block.
+    pub fn is_linear(&self) -> bool {
+        self.gdn.is_some()
     }
 }
 
@@ -218,24 +280,32 @@ impl Weights {
 
             layers.push(Layer {
                 attn_norm: upload_vector(dev, f, &t("attn_norm.weight"), &mut device_bytes)?,
-                wq: matrices.next().unwrap(),
-                wk: matrices.next().unwrap(),
-                wv: matrices.next().unwrap(),
-                wo: matrices.next().unwrap(),
-                // Qwen2 carries QKV biases; Llama does not.
-                bq: upload_optional_vector(dev, f, &t("attn_q.bias"), &mut device_bytes)?,
-                bk: upload_optional_vector(dev, f, &t("attn_k.bias"), &mut device_bytes)?,
-                bv: upload_optional_vector(dev, f, &t("attn_v.bias"), &mut device_bytes)?,
-                bo: upload_optional_vector(dev, f, &t("attn_output.bias"), &mut device_bytes)?,
-                // Qwen3's per-head q/k norms; llama.cpp names them this way.
-                q_norm: upload_optional_vector(dev, f, &t("attn_q_norm.weight"), &mut device_bytes)?,
-                k_norm: upload_optional_vector(dev, f, &t("attn_k_norm.weight"), &mut device_bytes)?,
+                // No GGUF conversion of a linear-attention model exists yet, so
+                // every block out of this path is a softmax-attention one.
+                attn: Some(AttnWeights {
+                    wq: matrices.next().unwrap(),
+                    wk: matrices.next().unwrap(),
+                    wv: matrices.next().unwrap(),
+                    wo: matrices.next().unwrap(),
+                    // Qwen2 carries QKV biases; Llama does not.
+                    bq: upload_optional_vector(dev, f, &t("attn_q.bias"), &mut device_bytes)?,
+                    bk: upload_optional_vector(dev, f, &t("attn_k.bias"), &mut device_bytes)?,
+                    bv: upload_optional_vector(dev, f, &t("attn_v.bias"), &mut device_bytes)?,
+                    bo: upload_optional_vector(dev, f, &t("attn_output.bias"), &mut device_bytes)?,
+                    // Qwen3's per-head q/k norms; llama.cpp names them this way.
+                    q_norm: upload_optional_vector(
+                        dev, f, &t("attn_q_norm.weight"), &mut device_bytes)?,
+                    k_norm: upload_optional_vector(
+                        dev, f, &t("attn_k_norm.weight"), &mut device_bytes)?,
+                    w_qkv: None,
+                    output_gate: false,
+                }),
+                gdn: None,
                 ffn_norm: upload_vector(dev, f, &t("ffn_norm.weight"), &mut device_bytes)?,
                 w_gate: matrices.next().unwrap(),
                 w_up: matrices.next().unwrap(),
                 w_down: matrices.next().unwrap(),
                 w_gate_up: None,
-                w_qkv: None,
                 blob,
             });
         }
@@ -300,10 +370,10 @@ impl Weights {
                 );
                 Ok(())
             };
-            expect(&l.wq, d, da, "attn_q")?;
-            expect(&l.wk, d, kv_dim, "attn_k")?;
-            expect(&l.wv, d, kv_dim, "attn_v")?;
-            expect(&l.wo, da, d, "attn_output")?;
+            expect(&l.attn().wq, d, da, "attn_q")?;
+            expect(&l.attn().wk, d, kv_dim, "attn_k")?;
+            expect(&l.attn().wv, d, kv_dim, "attn_v")?;
+            expect(&l.attn().wo, da, d, "attn_output")?;
             expect(&l.w_gate, d, cfg.d_ff, "ffn_gate")?;
             expect(&l.w_up, d, cfg.d_ff, "ffn_up")?;
             expect(&l.w_down, cfg.d_ff, d, "ffn_down")?;
@@ -315,7 +385,7 @@ impl Weights {
     pub fn dominant_type(&self) -> WeightType {
         let mut totals: std::collections::HashMap<WeightType, usize> = Default::default();
         for l in &self.layers {
-            for m in [&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down] {
+            for m in [&l.attn().wq, &l.attn().wk, &l.attn().wv, &l.attn().wo, &l.w_gate, &l.w_up, &l.w_down] {
                 *totals.entry(m.ty).or_default() += m.n_bytes;
             }
         }
@@ -633,33 +703,119 @@ pub fn load_awq(
     device_bytes += freq_factors.len() * 4;
     let rope_freqs = dev.stream().clone_htod(freq_factors)?;
 
+    // Where the decoder layers live. A multimodal checkpoint nests the text
+    // model under `language_model`, so the same layer is
+    // `model.language_model.layers.0` there and `model.layers.0` everywhere
+    // else. Probe rather than branch on the architecture name: the prefix is a
+    // property of how the checkpoint was exported, not of the model.
+    let layer_prefix = ["model.layers", "model.language_model.layers"]
+        .into_iter()
+        .find(|pre| {
+            [
+                "input_layernorm.weight",
+                "self_attn.q_proj.weight",
+                "linear_attn.in_proj_qkv.weight",
+            ]
+            .iter()
+            .any(|leaf| w.get(&format!("{pre}.0.{leaf}")).is_some())
+        })
+        .context(
+            "found no layer 0 under `model.layers` or `model.language_model.layers`; \
+             the checkpoint's tensor names are not one this loader recognises",
+        )?;
+    tracing::info!(prefix = layer_prefix, "decoder layers");
+
     let mut layers = Vec::with_capacity(cfg.n_layers);
     for i in 0..cfg.n_layers {
-        let p = format!("model.layers.{i}");
+        let p = format!("{layer_prefix}.{i}");
+        // Which mixer this block has, decided by which tensors exist.
+        //
+        // `text_config.layer_types` says the same thing, and reading it would
+        // work. The tensors are the stronger signal: if the config and the
+        // weights ever disagree, this way fails with a missing tensor at the
+        // layer in question, where trusting the config would slice a projection
+        // that is not there — or worse, find one of the right size and mean
+        // something else by it. Deriving the pattern from
+        // `full_attention_interval` instead would additionally bake in a stride
+        // that this checkpoint happens to have and the next need not.
+        let is_linear = w
+            .get(&format!("{p}.linear_attn.in_proj_qkv.weight"))
+            .is_some();
+
+        let attn = if is_linear {
+            None
+        } else {
+            let wq = projection(&format!("{p}.self_attn.q_proj"), &mut device_bytes)?;
+            // `q_proj` producing twice the attention width means it carries a
+            // gate interleaved with the query, per head. Detected from the
+            // shape rather than from the config's `attn_output_gate`, because
+            // the shape is what the rest of the code has to agree with.
+            let output_gate = wq.n == 2 * cfg.d_attn();
+            anyhow::ensure!(
+                wq.n == cfg.d_attn() || output_gate,
+                "layer {i} q_proj has {} columns; expected {} for a plain query \
+                 or {} for a query and its gate",
+                wq.n,
+                cfg.d_attn(),
+                2 * cfg.d_attn(),
+            );
+            Some(AttnWeights {
+                wq,
+                wk: projection(&format!("{p}.self_attn.k_proj"), &mut device_bytes)?,
+                wv: projection(&format!("{p}.self_attn.v_proj"), &mut device_bytes)?,
+                wo: projection(&format!("{p}.self_attn.o_proj"), &mut device_bytes)?,
+                bq: optional_vector(&format!("{p}.self_attn.q_proj.bias"), &mut device_bytes)?,
+                bk: optional_vector(&format!("{p}.self_attn.k_proj.bias"), &mut device_bytes)?,
+                bv: optional_vector(&format!("{p}.self_attn.v_proj.bias"), &mut device_bytes)?,
+                bo: optional_vector(&format!("{p}.self_attn.o_proj.bias"), &mut device_bytes)?,
+                q_norm: optional_vector(
+                    &format!("{p}.self_attn.q_norm.weight"), &mut device_bytes)?,
+                k_norm: optional_vector(
+                    &format!("{p}.self_attn.k_norm.weight"), &mut device_bytes)?,
+                // The fused QKV stack assumes three same-shaped projections of
+                // one input; a gated q_proj is twice as wide as the stack
+                // expects, so leave it unfused rather than mis-slice it.
+                w_qkv: if output_gate {
+                    None
+                } else {
+                    stacked3(
+                        &format!("{p}.self_attn.q_proj"),
+                        &format!("{p}.self_attn.k_proj"),
+                        &format!("{p}.self_attn.v_proj"),
+                        &mut device_bytes,
+                    )?
+                },
+                output_gate,
+            })
+        };
+
+        let gdn = if is_linear {
+            let l = format!("{p}.linear_attn");
+            Some(GdnWeights {
+                in_proj_qkv: projection(&format!("{l}.in_proj_qkv"), &mut device_bytes)?,
+                in_proj_z: projection(&format!("{l}.in_proj_z"), &mut device_bytes)?,
+                in_proj_a: projection(&format!("{l}.in_proj_a"), &mut device_bytes)?,
+                in_proj_b: projection(&format!("{l}.in_proj_b"), &mut device_bytes)?,
+                conv1d: vector(&format!("{l}.conv1d.weight"), &mut device_bytes)?,
+                a_log: vector(&format!("{l}.A_log"), &mut device_bytes)?,
+                dt_bias: vector(&format!("{l}.dt_bias"), &mut device_bytes)?,
+                norm: vector(&format!("{l}.norm.weight"), &mut device_bytes)?,
+                out_proj: projection(&format!("{l}.out_proj"), &mut device_bytes)?,
+            })
+        } else {
+            None
+        };
+
         layers.push(Layer {
             attn_norm: vector(&format!("{p}.input_layernorm.weight"), &mut device_bytes)?,
-            wq: projection(&format!("{p}.self_attn.q_proj"), &mut device_bytes)?,
-            wk: projection(&format!("{p}.self_attn.k_proj"), &mut device_bytes)?,
-            wv: projection(&format!("{p}.self_attn.v_proj"), &mut device_bytes)?,
-            wo: projection(&format!("{p}.self_attn.o_proj"), &mut device_bytes)?,
-            bq: optional_vector(&format!("{p}.self_attn.q_proj.bias"), &mut device_bytes)?,
-            bk: optional_vector(&format!("{p}.self_attn.k_proj.bias"), &mut device_bytes)?,
-            bv: optional_vector(&format!("{p}.self_attn.v_proj.bias"), &mut device_bytes)?,
-            bo: optional_vector(&format!("{p}.self_attn.o_proj.bias"), &mut device_bytes)?,
-            q_norm: optional_vector(&format!("{p}.self_attn.q_norm.weight"), &mut device_bytes)?,
-            k_norm: optional_vector(&format!("{p}.self_attn.k_norm.weight"), &mut device_bytes)?,
+            attn,
+            gdn,
             ffn_norm: vector(
                 &format!("{p}.post_attention_layernorm.weight"),
                 &mut device_bytes,
             )?,
             w_gate: projection(&format!("{p}.mlp.gate_proj"), &mut device_bytes)?,
             w_up: projection(&format!("{p}.mlp.up_proj"), &mut device_bytes)?,
-            w_qkv: stacked3(
-                &format!("{p}.self_attn.q_proj"),
-                &format!("{p}.self_attn.k_proj"),
-                &format!("{p}.self_attn.v_proj"),
-                &mut device_bytes,
-            )?,
             w_gate_up: stacked(
                 &format!("{p}.mlp.gate_proj"),
                 &format!("{p}.mlp.up_proj"),

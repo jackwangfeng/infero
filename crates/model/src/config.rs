@@ -41,6 +41,16 @@ pub struct Config {
     pub context_length: usize,
     pub rms_eps: f32,
     pub rope_theta: f32,
+    /// How many of each head's dimensions the rotary embedding touches.
+    ///
+    /// `d_head` for every model tuili loaded before Qwen3.5, which is why this
+    /// was not a field. Qwen3.5 rotates `int(head_dim * partial_rotary_factor)`
+    /// = 64 of its 256 and passes the remaining 192 through untouched, and the
+    /// frequency exponent is normalized by *this* width rather than by `d_head`
+    /// — so the table is not the leading slice of the full-width one. Both
+    /// mistakes run to completion and cost long-range retrieval only, which is
+    /// the hardest kind of wrong to attribute.
+    pub rotary_dim: usize,
     /// Linear RoPE scaling; 1.0 unless the model was trained with it.
     pub rope_freq_scale: f32,
     /// True when the output projection reuses the embedding matrix.
@@ -129,6 +139,12 @@ impl Config {
                 .f32(&key("attention.layer_norm_rms_epsilon"))
                 .unwrap_or(1e-5),
             rope_theta: f.f32(&key("rope.freq_base")).unwrap_or(10_000.0),
+            // GGUF's `rope.dimension_count` *is* the rotary width, and it is
+            // already what `d_head` was read from above; the two coincide for
+            // every architecture that reaches this path, since the check that
+            // `d_head * n_heads == d_model` rules out the partial-rope models.
+            // A GGUF conversion of one would need this to become its own key.
+            rotary_dim: d_head,
             rope_freq_scale: f
                 .f32(&key("rope.scaling.factor"))
                 .map(|s| if s > 0.0 { 1.0 / s } else { 1.0 })
@@ -198,6 +214,49 @@ impl Config {
             "d_head {d_head} must be even for rotary embeddings"
         );
 
+        // `rope_theta` and `partial_rotary_factor` live in
+        // `text_config.rope_parameters`, one level below the dimensions.
+        // Reading them off `dims` does not fail — it finds nothing and falls
+        // back to the 10000 default, which is a base 1000x too small on this
+        // checkpoint. That does not break anything nearby: the low-frequency
+        // dimensions are the ones that carry long distances, so the model keeps
+        // answering local questions correctly and loses retrieval across a long
+        // context. Nothing points at the rope table.
+        //
+        // The older flat spelling is still accepted, because that is where
+        // every checkpoint before this one put it and there is no announcement
+        // of which layout an exporter used.
+        let rope = &dims["rope_parameters"];
+        let rope_theta = rope["rope_theta"]
+            .as_f64()
+            .or_else(|| dims["rope_theta"].as_f64())
+            .unwrap_or(10_000.0) as f32;
+
+        // `partial_rotary_factor` genuinely appears in both places on this
+        // checkpoint, so either spelling has to be read.
+        let partial = rope["partial_rotary_factor"]
+            .as_f64()
+            .or_else(|| dims["partial_rotary_factor"].as_f64());
+        // `int(head_dim * partial_rotary_factor)` — truncation, matching the
+        // reference's `int()`. Absent means the whole head rotates, which is
+        // every model before this one.
+        let rotary_dim = match partial {
+            Some(f) => (d_head as f64 * f) as usize,
+            None => d_head,
+        };
+        anyhow::ensure!(
+            rotary_dim >= 2 && rotary_dim <= d_head && rotary_dim.is_multiple_of(2),
+            "partial_rotary_factor {partial:?} gives a rotary width of \
+             {rotary_dim} out of d_head {d_head}; it must be even and in 2..=d_head"
+        );
+        if rotary_dim != d_head {
+            tracing::info!(
+                rotary_dim,
+                d_head,
+                "partial rotary embeddings: the tail of each head is not rotated"
+            );
+        }
+
         Ok(Self {
             arch,
             name: name.to_string(),
@@ -210,7 +269,8 @@ impl Config {
             vocab_size: u("vocab_size")?,
             context_length: u("max_position_embeddings").unwrap_or(4096),
             rms_eps: dims["rms_norm_eps"].as_f64().unwrap_or(1e-5) as f32,
-            rope_theta: dims["rope_theta"].as_f64().unwrap_or(10_000.0) as f32,
+            rope_theta,
+            rotary_dim,
             // Llama 3's scaling is per-dimension rather than a single factor;
             // it arrives through `rope_freq_factors` instead. A plain linear
             // `factor` would go here.
@@ -236,8 +296,13 @@ impl Config {
     /// ramps between — ignoring it costs nothing at position zero and
     /// progressively more further along, which reads as output that starts
     /// fine and drifts.
+    ///
+    /// The returned length is `rotary_dim / 2`, one per rotated pair, which is
+    /// `d_head / 2` on every model that rotates the whole head. The exponent is
+    /// normalized by `rotary_dim` for the same reason the table is: a partial
+    /// schedule is a compressed table, not a prefix of the wide one.
     pub fn rope_freq_factors(&self, j: &serde_json::Value) -> Vec<f32> {
-        let half = self.d_head / 2;
+        let half = self.rotary_dim / 2;
         // Same nesting as `from_hf`: a multimodal config puts the language
         // model's rope settings in `text_config`.
         let s = if j["text_config"].is_object() {
@@ -259,7 +324,7 @@ impl Config {
         tracing::info!(factor, low, high, orig, "using llama3 rope frequency scaling");
         (0..half)
             .map(|i| {
-                let inv_freq = self.rope_theta.powf(-2.0 * i as f32 / self.d_head as f32);
+                let inv_freq = self.rope_theta.powf(-2.0 * i as f32 / self.rotary_dim as f32);
                 let wavelen = std::f32::consts::TAU / inv_freq;
                 if wavelen < high_wl {
                     1.0
@@ -296,7 +361,7 @@ impl std::fmt::Display for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} ({}) {} layers, d_model {}, {} heads / {} kv, d_head {}, ffn {}, vocab {}, ctx {}, rope {}",
+            "{} ({}) {} layers, d_model {}, {} heads / {} kv, d_head {}, rotary {}, ffn {}, vocab {}, ctx {}, theta {}, rope {}",
             self.name,
             self.arch,
             self.n_layers,
@@ -304,9 +369,11 @@ impl std::fmt::Display for Config {
             self.n_heads,
             self.n_kv_heads,
             self.d_head,
+            self.rotary_dim,
             self.d_ff,
             self.vocab_size,
             self.context_length,
+            self.rope_theta,
             if self.interleaved_rope {
                 "interleaved"
             } else {

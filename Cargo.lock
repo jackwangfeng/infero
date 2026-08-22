@@ -2212,6 +2212,7 @@ dependencies = [
  "tracing-subscriber",
  "tuili-cuda",
  "tuili-gguf",
+ "tuili-model",
  "tuili-safetensors",
 ]
 

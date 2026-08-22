@@ -20,6 +20,7 @@
 
 mod cache;
 pub mod config;
+pub mod gdn_state;
 pub mod qwen35;
 pub mod qwen35_mtp;
 pub mod qwen35_vision;
@@ -1373,7 +1374,7 @@ impl Model {
         // writes their input. They read the same normalized residual, so
         // quantizing per matrix did the same work three times.
         let want_q = self.use_mmvq
-            && [&l.wq, &l.wk, &l.wv]
+            && [&l.attn().wq, &l.attn().wk, &l.attn().wv]
                 .iter()
                 .all(|w| Kernels::has_mmvq(w.ty) && w.k == d);
         // Only when this group will actually take the f16 GEMM: at one token
@@ -1381,8 +1382,8 @@ impl Model {
         let want_h = self.use_mmq
             && n > 1
             && n <= tuili_kernels::MMQ_MAX_TOKENS
-            && Kernels::mmq_f16_variant_for(l.wq.ty).is_some()
-            && [&l.wq, &l.wk, &l.wv].iter().all(|w| {
+            && Kernels::mmq_f16_variant_for(l.attn().wq.ty).is_some()
+            && [&l.attn().wq, &l.attn().wk, &l.attn().wv].iter().all(|w| {
                 matches!(
                     w.ty,
                     tuili_kernels::WeightType::Q4G128
@@ -1422,32 +1423,32 @@ impl Model {
         // Two hundred and twenty-five mat-vecs back to back run at 328 GB/s
         // where one alone runs at 392 — each drains before the next can start
         // — and merging this group and the FFN's removes ninety-six of those.
-        if Self::fusable(&[&l.wq, &l.wk, &l.wv], shared, n, self.use_mmvq) {
+        if Self::fusable(&[&l.attn().wq, &l.attn().wk, &l.attn().wv], shared, n, self.use_mmvq) {
             let bytes = Kernels::q8_1_bytes(d);
             let (q, k_, v) = (&mut self.act.q, &mut self.act.k, &mut self.act.v);
             self.kern.mmvq_fused3(
                 &mut q.slice_mut(..d),
                 &mut k_.slice_mut(..kv_dim),
                 &mut v.slice_mut(..kv_dim),
-                &l.wq.view(stage)?,
-                &l.wk.view(stage)?,
-                &l.wv.view(stage)?,
-                l.wq.ty,
+                &l.attn().wq.view(stage)?,
+                &l.attn().wk.view(stage)?,
+                &l.attn().wv.view(stage)?,
+                l.attn().wq.ty,
                 &self.scratch.q8_1.slice(..bytes),
                 d,
-                [l.wq.n, l.wk.n, l.wv.n],
+                [l.attn().wq.n, l.attn().wk.n, l.attn().wv.n],
             )?;
             for (bias, out, cols) in [
-                (&l.bq, &mut self.act.q, da),
-                (&l.bk, &mut self.act.k, kv_dim),
-                (&l.bv, &mut self.act.v, kv_dim),
+                (&l.attn().bq, &mut self.act.q, da),
+                (&l.attn().bk, &mut self.act.k, kv_dim),
+                (&l.attn().bv, &mut self.act.v, kv_dim),
             ] {
                 if let Some(b) = bias {
                     self.kern
                         .add_bias(&mut out.slice_mut(..n * cols), &b.as_view(), cols, n)?;
                 }
             }
-        } else if let Some(w) = l.w_qkv.as_ref().filter(|_| n > 1 && want_h) {
+        } else if let Some(w) = l.attn().w_qkv.as_ref().filter(|_| n > 1 && want_h) {
             // One matmul for all three, then a scatter. Separately they cost
             // 14.7 + 8.5 + 8.5 us a layer at a batch of 32 because the two
             // narrow ones cannot fill the device; stacked they cost 16.7. The
@@ -1476,9 +1477,9 @@ impl Model {
             // scatter into three buffers is 1.5 MB and a launch a layer for an
             // index change. Biases and the quantized KV path still want the
             // unpacked form, and neither is on this model's decode path.
-            packed_qkv = l.bq.is_none()
-                && l.bk.is_none()
-                && l.bv.is_none()
+            packed_qkv = l.attn().bq.is_none()
+                && l.attn().bk.is_none()
+                && l.attn().bv.is_none()
                 && self.tq.is_none();
             if !packed_qkv {
                 self.kern.split_qkv(
@@ -1492,9 +1493,9 @@ impl Model {
                 )?;
             }
             for (bias, out, cols) in [
-                (&l.bq, &mut self.act.q, da),
-                (&l.bk, &mut self.act.k, kv_dim),
-                (&l.bv, &mut self.act.v, kv_dim),
+                (&l.attn().bq, &mut self.act.q, da),
+                (&l.attn().bk, &mut self.act.k, kv_dim),
+                (&l.attn().bv, &mut self.act.v, kv_dim),
             ] {
                 if let Some(b) = bias {
                     self.kern
@@ -1503,9 +1504,9 @@ impl Model {
             }
         } else {
         for (w, bias, out, cols) in [
-            (&l.wq, &l.bq, &mut self.act.q, da),
-            (&l.wk, &l.bk, &mut self.act.k, kv_dim),
-            (&l.wv, &l.bv, &mut self.act.v, kv_dim),
+            (&l.attn().wq, &l.attn().bq, &mut self.act.q, da),
+            (&l.attn().wk, &l.attn().bk, &mut self.act.k, kv_dim),
+            (&l.attn().wv, &l.attn().bv, &mut self.act.v, kv_dim),
         ] {
             Self::matmul_pre(
                 &self.kern,
@@ -1553,7 +1554,7 @@ impl Model {
         static NO_QK_NORM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let skip_qk_norm = *NO_QK_NORM.get_or_init(|| std::env::var_os("TUILI_NO_QK_NORM").is_some());
 
-        if let Some(qn) = l.q_norm.as_ref().filter(|_| !skip_qk_norm) {
+        if let Some(qn) = l.attn().q_norm.as_ref().filter(|_| !skip_qk_norm) {
             let (buf, stride, len) = if packed_qkv {
                 (&mut self.act.gate, fused_w, n * fused_w)
             } else {
@@ -1578,7 +1579,7 @@ impl Model {
         // the same assumed layout, so a wrong assumption is wrong in both.
         if std::env::var_os("TUILI_QK_NORM_PROBE").is_some()
             && !skip_qk_norm
-            && let Some(qn) = l.q_norm.as_ref()
+            && let Some(qn) = l.attn().q_norm.as_ref()
         {
             let stream = self.kern.device().stream();
             let width = if packed_qkv { fused_w } else { da };
@@ -1602,7 +1603,7 @@ impl Model {
             tracing::info!(?rms, packed = packed_qkv, "qk_norm probe: RMS(q/w) per head, want 1.0");
         }
 
-        if let Some(kn) = l.k_norm.as_ref().filter(|_| !skip_qk_norm) {
+        if let Some(kn) = l.attn().k_norm.as_ref().filter(|_| !skip_qk_norm) {
             let (buf, stride, offset, len) = if packed_qkv {
                 (&mut self.act.gate, fused_w, da, n * fused_w)
             } else {
@@ -1629,7 +1630,7 @@ impl Model {
         // a weaker check, it is a check of something else.
         if std::env::var_os("TUILI_QK_NORM_PROBE").is_some()
             && !skip_qk_norm
-            && let Some(kn) = l.k_norm.as_ref()
+            && let Some(kn) = l.attn().k_norm.as_ref()
         {
             let stream = self.kern.device().stream();
             let (base, span) = if packed_qkv { (da, fused_w) } else { (0, kv_dim) };
@@ -1656,25 +1657,29 @@ impl Model {
 
         if packed_qkv {
             let (q, packed) = (&mut self.act.q, &mut self.act.gate);
-            self.kern.rope_qk_packed(
+            self.kern.rope_qk_packed_partial(
                 &mut q.slice_mut(..n * da),
                 &mut packed.slice_mut(..n * fused_w),
                 fused_w,
                 0,
-                d,
+                da,
                 &self.act.positions.slice(..n),
                 &self.w.rope_freqs.as_view(),
                 n,
                 cfg.n_heads,
                 cfg.n_kv_heads,
                 cfg.d_head,
+                // `rotary_dim` equals `d_head` on every model before Qwen3.5,
+                // so this call is unchanged for all of them; there it is 64 of
+                // 256 and the tail passes through.
+                cfg.rotary_dim,
                 cfg.rope_theta,
                 cfg.rope_freq_scale,
                 cfg.interleaved_rope,
             )?;
         } else {
             let (q, k) = (&mut self.act.q, &mut self.act.k);
-            self.kern.rope_qk(
+            self.kern.rope_qk_partial(
                 &mut q.slice_mut(..n * da),
                 &mut k.slice_mut(..n * kv_dim),
                 &self.act.positions.slice(..n),
@@ -1683,6 +1688,7 @@ impl Model {
                 cfg.n_heads,
                 cfg.n_kv_heads,
                 cfg.d_head,
+                cfg.rotary_dim,
                 cfg.rope_theta,
                 cfg.rope_freq_scale,
                 cfg.interleaved_rope,
@@ -1752,12 +1758,12 @@ impl Model {
                     && n > 1
                     && n <= tuili_kernels::MMQ_MAX_TOKENS
                     && matches!(
-                        l.wo.ty,
+                        l.attn().wo.ty,
                         tuili_kernels::WeightType::Q4G128
                             | tuili_kernels::WeightType::Q4G128T
                     )
-                    && Kernels::mmq_f16_variant_for_shape(l.wo.ty, l.wo.n).is_some()
-                    && Self::mmq_shape_ok(&l.wo);
+                    && Kernels::mmq_f16_variant_for_shape(l.attn().wo.ty, l.attn().wo.n).is_some()
+                    && Self::mmq_shape_ok(&l.attn().wo);
                 // The fused decode kernel measures *level* with the three it
                 // replaces on a microbenchmark, and wins by 4.7% in the served
                 // engine — 4150 tok/s to 4344 at 32 clients. The difference is
@@ -1954,7 +1960,7 @@ impl Model {
 
         // Straight into the residual stream: this projection's result is only
         // ever added to it, and the mat-vec can do that itself.
-        if l.bo.is_none() && Self::residual_fusable(&l.wo, n, self.use_mmvq) {
+        if l.attn().bo.is_none() && Self::residual_fusable(&l.attn().wo, n, self.use_mmvq) {
             let bytes = Kernels::q8_1_bytes(d);
             self.kern.quantize_q8_1(
                 &mut self.scratch.q8_1.slice_mut(..bytes),
@@ -1963,11 +1969,11 @@ impl Model {
             )?;
             self.kern.mmvq_add(
                 &mut self.act.x.slice_mut(..d),
-                &l.wo.view(stage)?,
-                l.wo.ty,
+                &l.attn().wo.view(stage)?,
+                l.attn().wo.ty,
                 &self.scratch.q8_1.slice(..bytes),
                 d,
-                l.wo.n,
+                l.attn().wo.n,
             )?;
             return Ok(());
         }
@@ -1976,7 +1982,7 @@ impl Model {
             &self.kern,
             &mut self.scratch,
             &mut self.act.proj.slice_mut(..n * d),
-            &l.wo,
+            &l.attn().wo,
             stage,
             &self.act.attn.slice(..n * da),
             n,
@@ -1985,7 +1991,7 @@ impl Model {
             None,
             attn_f16,
         )?;
-        if let Some(b) = &l.bo {
+        if let Some(b) = &l.attn().bo {
             self.kern
                 .add_bias(&mut self.act.proj.slice_mut(..n * d), &b.as_view(), d, n)?;
         }
@@ -2034,8 +2040,8 @@ impl Model {
         let consumer = self.use_mmq
             && n > 1
             && n <= tuili_kernels::MMQ_MAX_TOKENS
-            && Kernels::mmq_f16_variant_for(l.wq.ty).is_some()
-            && [&l.wq, &l.wk, &l.wv].iter().all(|w| {
+            && Kernels::mmq_f16_variant_for(l.attn().wq.ty).is_some()
+            && [&l.attn().wq, &l.attn().wk, &l.attn().wv].iter().all(|w| {
                 matches!(
                     w.ty,
                     tuili_kernels::WeightType::Q4G128 | tuili_kernels::WeightType::Q4G128T
