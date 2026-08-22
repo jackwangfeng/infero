@@ -142,6 +142,12 @@ impl Read for BodyReader {
 }
 
 /// GET `/health`, so the header can say what is actually loaded.
+///
+/// Only tuili answers that with a body. vLLM and llama.cpp return a bare 200,
+/// so a failure to parse it is not a failure to reach a server — fall back to
+/// `/v1/models`, which every OpenAI-compatible server serves, and show what it
+/// reports. The header then carries fewer fields rather than the client
+/// refusing to start.
 pub fn health(addr: &str) -> Result<Health> {
     let mut body = send(addr, "GET", "/health", None)?;
     let status = body.status;
@@ -150,15 +156,39 @@ pub fn health(addr: &str) -> Result<Health> {
     if status != 200 {
         bail!("health returned {status}");
     }
-    let v: serde_json::Value = serde_json::from_str(&text).context("parsing /health")?;
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(v) if v.get("model").is_some() => Ok(Health {
+            model: v["model"].as_str().unwrap_or("unknown").to_string(),
+            quantization: v["quantization"].as_str().unwrap_or("?").to_string(),
+            kv_quant: v["kv_quant"].as_str().unwrap_or("f16").to_string(),
+            max_seq: v["max_seq"].as_u64().unwrap_or(0) as usize,
+            max_seqs: v["max_seqs"].as_u64().unwrap_or(1) as usize,
+            queue_depth: v["queue_depth"].as_u64().unwrap_or(0),
+            offloaded_layers: v["offloaded_layers"].as_u64().unwrap_or(0) as usize,
+        }),
+        _ => foreign_health(addr),
+    }
+}
+
+/// What `/v1/models` can tell us about a server that is not tuili.
+fn foreign_health(addr: &str) -> Result<Health> {
+    let mut body = send(addr, "GET", "/v1/models", None)?;
+    let status = body.status;
+    let mut text = String::new();
+    body.read_to_string(&mut text)?;
+    if status != 200 {
+        bail!("neither /health nor /v1/models answered with a model ({status})");
+    }
+    let v: serde_json::Value = serde_json::from_str(&text).context("parsing /v1/models")?;
+    let first = v["data"].get(0).cloned().unwrap_or_default();
     Ok(Health {
-        model: v["model"].as_str().unwrap_or("unknown").to_string(),
-        quantization: v["quantization"].as_str().unwrap_or("?").to_string(),
-        kv_quant: v["kv_quant"].as_str().unwrap_or("f16").to_string(),
-        max_seq: v["max_seq"].as_u64().unwrap_or(0) as usize,
-        max_seqs: v["max_seqs"].as_u64().unwrap_or(1) as usize,
-        queue_depth: v["queue_depth"].as_u64().unwrap_or(0),
-        offloaded_layers: v["offloaded_layers"].as_u64().unwrap_or(0) as usize,
+        model: first["id"].as_str().unwrap_or("unknown").to_string(),
+        quantization: "?".to_string(),
+        kv_quant: "?".to_string(),
+        max_seq: first["max_model_len"].as_u64().unwrap_or(0) as usize,
+        max_seqs: 0,
+        queue_depth: 0,
+        offloaded_layers: 0,
     })
 }
 
