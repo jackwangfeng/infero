@@ -91,6 +91,74 @@ impl Tensor<'_> {
         Ok(&body[..self.n_elements()])
     }
 
+    /// The payload as `f32`, whatever real dtype it is stored as.
+    ///
+    /// Norm weights and biases are wanted as f32 on the device, and an export
+    /// is free to store them in any float width — Qwen3's AWQ checkpoint writes
+    /// every float as BF16 (norms, lm_head, and the AWQ scales alike), so a
+    /// loader that only accepts F16 rejects the file on `model.norm.weight`
+    /// before it reaches a single layer. Converting here keeps the dtype
+    /// question out of the model loader, which never wanted the borrowed
+    /// `&[f16]` anyway: both call sites mapped it straight to f32.
+    pub fn to_f32(&self) -> Result<Vec<f32>> {
+        let n = self.n_elements();
+        match self.dtype {
+            Dtype::F16 => Ok(self.as_f16()?.iter().map(|x| f32::from(*x)).collect()),
+            Dtype::BF16 => {
+                // Safety: same contract as `as_f16` — a packed little-endian
+                // array in a mapping that outlives the slice; alignment checked.
+                let (head, body, _) = unsafe { self.data.align_to::<u16>() };
+                anyhow::ensure!(head.is_empty(), "{} is not 2-byte aligned", self.name);
+                // bf16 is the high half of an f32, so widening is exact.
+                Ok(body[..n]
+                    .iter()
+                    .map(|b| f32::from_bits((*b as u32) << 16))
+                    .collect())
+            }
+            Dtype::F32 => {
+                let (head, body, _) = unsafe { self.data.align_to::<f32>() };
+                anyhow::ensure!(head.is_empty(), "{} is not 4-byte aligned", self.name);
+                Ok(body[..n].to_vec())
+            }
+            other => bail!("{} is {other:?}, not a float type", self.name),
+        }
+    }
+
+    /// The payload as `f16`, borrowed when it already is and converted when not.
+    ///
+    /// The Q8_0 quantizer wants halves, and a big matrix is not worth widening
+    /// to f32 just to narrow it again — so this borrows for an F16 checkpoint
+    /// and only allocates for a BF16 one.
+    ///
+    /// bf16 carries f32's exponent range while f16 stops at ±65504, so the
+    /// narrowing can overflow. Weights sit far inside that range in practice,
+    /// but `f16::from_f32` saturates to infinity rather than complaining, and an
+    /// infinity in a projection matrix is the kind of fault that shows up as
+    /// plausible-looking output rather than a crash. Refuse instead.
+    pub fn to_f16(&self) -> Result<std::borrow::Cow<'_, [half::f16]>> {
+        match self.dtype {
+            Dtype::F16 => Ok(std::borrow::Cow::Borrowed(self.as_f16()?)),
+            Dtype::BF16 => {
+                let (head, body, _) = unsafe { self.data.align_to::<u16>() };
+                anyhow::ensure!(head.is_empty(), "{} is not 2-byte aligned", self.name);
+                let mut out = Vec::with_capacity(self.n_elements());
+                for b in &body[..self.n_elements()] {
+                    let wide = f32::from_bits((*b as u32) << 16);
+                    let narrow = half::f16::from_f32(wide);
+                    anyhow::ensure!(
+                        narrow.is_finite() || !wide.is_finite(),
+                        "{} has a value outside f16 range ({wide:e}); \
+                         narrowing it would silently become infinity",
+                        self.name
+                    );
+                    out.push(narrow);
+                }
+                Ok(std::borrow::Cow::Owned(out))
+            }
+            other => bail!("{} is {other:?}, not a half-width float", self.name),
+        }
+    }
+
     /// The payload as `i32`, for a tensor that is stored as one.
     pub fn as_i32(&self) -> Result<&[i32]> {
         anyhow::ensure!(
