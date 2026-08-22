@@ -61,33 +61,17 @@
 //! full-attention KV cache and touches no recurrent state at all. That is the
 //! single most consequential fact for scheduling, so it gets checked twice.
 
-use crate::qwen35::{
-    apply_partial_rope, causal_attention, sigmoid, silu, split_q_and_gate,
-};
+use crate::qwen35::{apply_partial_rope, causal_attention, sigmoid, silu, split_q_and_gate};
 
-/// RMSNorm with a **unit-offset** learned gain: `(1 + w) * x / rms(x)`.
+/// The offset RMSNorm form, delegating to the shared reference.
 ///
-/// This is `Qwen3_5RMSNorm`. Not to be confused with
-/// [`crate::qwen35::rms_norm_rows`], which is `w * x / rms(x)` and is the right
-/// formula for exactly one norm in this architecture — `Qwen3_5RMSNormGated`,
-/// the GatedDeltaNet output norm. The two classes differ only in this `1.0 +`
-/// and in how their weights are initialized, so a checkpoint tells you which is
-/// which: a `Qwen3_5RMSNorm` weight sits near zero, a `Qwen3_5RMSNormGated`
-/// weight sits near one.
-///
-/// `eps` is added to the mean square, inside the square root — not to the rms.
+/// A local copy of this used to live here. It has been replaced by a call into
+/// `qwen35::rms_norm_rows` so that the tests exercise the code the engine ships
+/// rather than a second implementation that could drift — which is the same
+/// mistake, one level up, as a test that recomputes a stage the way the
+/// implementation does.
 pub fn rms_norm_offset_rows(x: &[f32], w: &[f32], row_len: usize, eps: f32) -> Vec<f32> {
-    assert_eq!(w.len(), row_len);
-    assert!(x.len().is_multiple_of(row_len));
-    let mut out = Vec::with_capacity(x.len());
-    for row in x.chunks(row_len) {
-        let mean_sq: f32 = row.iter().map(|v| v * v).sum::<f32>() / row_len as f32;
-        let inv = (mean_sq + eps).sqrt().recip();
-        for (v, g) in row.iter().zip(w) {
-            out.push((1.0 + g) * (v * inv));
-        }
-    }
-    out
+    crate::qwen35::rms_norm_rows(x, w, row_len, eps, 1.0)
 }
 
 /// `y[t, o] = sum_i x[t, i] * w[o, i]`, with no bias.
@@ -487,7 +471,10 @@ pub fn accept_stochastic(
         tokens.push(draft[j]);
     }
     tokens.push(bonus);
-    Accepted { tokens, accepted: k }
+    Accepted {
+        tokens,
+        accepted: k,
+    }
 }
 
 // --------------------------------------------- rolling back a recurrent state

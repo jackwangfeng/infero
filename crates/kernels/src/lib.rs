@@ -205,6 +205,7 @@ impl Kernels {
             "gdn_delta_rule_f32",
             "gdn_gated_rmsnorm_f32",
             "sigmoid_gate_f32",
+            "split_interleaved_f32",
         ] {
             self.dev.kernels().get("tuili_gdn", gdn_src(), name)?;
         }

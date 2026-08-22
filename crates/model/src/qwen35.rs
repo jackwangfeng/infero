@@ -140,14 +140,36 @@ pub fn l2norm_rows(x: &mut [f32], row_len: usize, eps: f32) {
 }
 
 /// RMSNorm with a learned gain, over the last dimension.
-pub fn rms_norm_rows(x: &[f32], w: &[f32], row_len: usize, eps: f32) -> Vec<f32> {
+///
+/// `gain_offset` is the trap. Qwen3.5 has two RMSNorm classes and they differ by
+/// exactly this:
+///
+/// - `Qwen3_5RMSNorm` initializes its weight to **zeros** and computes
+///   `normalized * (1 + weight)`. Every regular norm in the text model is one of
+///   these: `input_layernorm`, `post_attention_layernorm`, the final `norm`, and
+///   the per-head `q_norm` and `k_norm`. Pass `1.0`.
+/// - `Qwen3_5RMSNormGated` initializes to **ones** and computes
+///   `weight * normalized`. Only the GatedDeltaNet output norm
+///   (`linear_attn.norm`) is one of these. Pass `0.0`.
+///
+/// Reading the weights cannot settle which is which. The two populations do
+/// separate on average — an `input_layernorm` centred at 0.036 would be
+/// annihilated by the plain form — but they overlap: some trained `q_norm`
+/// deltas exceed 0.5 while some `linear_attn.norm` gains fall below 1.5. Only
+/// the consuming class decides, so this takes the offset as an argument rather
+/// than guessing from the data.
+///
+/// Getting it wrong on `q_norm` scales every query by roughly 0.23 instead of
+/// 1.23 and inverts the sign wherever the delta is negative, which is a model
+/// that talks fluently and means something else.
+pub fn rms_norm_rows(x: &[f32], w: &[f32], row_len: usize, eps: f32, gain_offset: f32) -> Vec<f32> {
     assert_eq!(w.len(), row_len);
     let mut out = Vec::with_capacity(x.len());
     for row in x.chunks(row_len) {
         let mean_sq: f32 = row.iter().map(|v| v * v).sum::<f32>() / row_len as f32;
         let inv = (mean_sq + eps).sqrt().recip();
         for (v, g) in row.iter().zip(w) {
-            out.push(g * (v * inv));
+            out.push((gain_offset + g) * (v * inv));
         }
     }
     out

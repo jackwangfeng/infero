@@ -450,12 +450,55 @@ pub fn load_awq(
             storage: Storage::Device(dev.stream().clone_htod(bytes)?),
         })
     };
+    // Qwen3.5 stores most of its norm weights as a *delta from one*:
+    // `Qwen3_5RMSNorm` initializes to zeros and computes
+    // `normalized * (1 + weight)`, where every other model tuili loads
+    // initializes to ones and computes `weight * normalized`. Adding the one
+    // here, at load, means every norm kernel stays as it is — the alternative
+    // was a variant of `rms_norm` and `qk_norm` each.
+    //
+    // The exception is `linear_attn.norm`, which is `Qwen3_5RMSNormGated` and
+    // does use the plain form. Two conventions in one checkpoint.
+    //
+    // Which form a tensor wants follows from the class that consumes it, not
+    // from the tensor: the two populations overlap. An `input_layernorm`
+    // centred at 0.036 would be annihilated by the plain form, but some trained
+    // `q_norm` deltas exceed 0.5 and some gated gains fall below 1.5, so a
+    // mean-based guess gets those wrong. Hence a name rule, not a data rule.
+    // A whitelist, not a blacklist. This same loader path reads the attention
+    // biases and the GatedDeltaNet's `A_log`, `dt_bias` and `conv1d.weight`,
+    // none of which are norms; a blacklist that forgot one of those would add
+    // one to a bias or to a decay exponent. A whitelist that forgets a norm
+    // leaves that norm on the old convention, which is bad but confined.
+    let offset_norms = cfg.arch == "qwen3_5";
+    let norm_offset = move |name: &str| -> f32 {
+        const OFFSET_FORM: &[&str] = &[
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "self_attn.q_norm.weight",
+            "self_attn.k_norm.weight",
+        ];
+        let is_offset_form = OFFSET_FORM.iter().any(|suffix| name.ends_with(suffix))
+            // The final norm before the vocabulary projection. Matched exactly
+            // rather than by suffix, because `linear_attn.norm.weight` and
+            // `visual.merger.norm.weight` also end in `norm.weight` and neither
+            // is this one.
+            || name == "model.norm.weight"
+            || name == "model.language_model.norm.weight";
+        if offset_norms && is_offset_form { 1.0 } else { 0.0 }
+    };
     let vector = |name: &str, total: &mut usize| -> Result<Vector> {
         let t = w.tensor(name)?;
         // `to_f32` rather than `as_f16`: Qwen3's AWQ export stores the norm
         // weights as BF16 even though the AWQ scales are F16, and an F16-only
         // read rejects the checkpoint on `model.norm.weight`.
-        let v = t.to_f32()?;
+        let mut v = t.to_f32()?;
+        let off = norm_offset(name);
+        if off != 0.0 {
+            for x in v.iter_mut() {
+                *x += off;
+            }
+        }
         *total += v.len() * 4;
         Ok(dev.stream().clone_htod(&v)?)
     };
@@ -467,7 +510,13 @@ pub fn load_awq(
     let optional_vector = |name: &str, total: &mut usize| -> Result<Option<Vector>> {
         match w.tensor(name) {
             Ok(t) => {
-                let v = t.to_f32()?;
+                let mut v = t.to_f32()?;
+                let off = norm_offset(name);
+                if off != 0.0 {
+                    for x in v.iter_mut() {
+                        *x += off;
+                    }
+                }
                 *total += v.len() * 4;
                 Ok(Some(dev.stream().clone_htod(&v)?))
             }

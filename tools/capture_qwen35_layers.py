@@ -93,9 +93,22 @@ def l2norm(x, eps=1e-6):
     return x * torch.rsqrt((x * x).sum(-1, keepdim=True) + eps)
 
 
-def rms_norm(x, w, eps=1e-6):
+def rms_norm(x, w, eps=1e-6, gain_offset=0.0):
+    """RMSNorm with a learned gain, and the offset that decides which class.
+
+    `Qwen3_5RMSNorm` stores its weight as a delta from one and computes
+    `normalized * (1 + w)`; `Qwen3_5RMSNormGated` stores a gain and computes
+    `w * normalized`. Pass 1.0 for the former — every regular norm in the text
+    model, including q_norm and k_norm — and 0.0 for the latter, which is only
+    `linear_attn.norm`.
+
+    An earlier version of this file had no offset, so it and
+    `qwen35.rs::rms_norm_rows` agreed with each other and both got q_norm and
+    k_norm wrong. Neither was checked against the library, which is the one
+    stage of this capture that was not — see cross_check_against_transformers.
+    """
     v = x.float().pow(2).mean(-1, keepdim=True)
-    return w * (x.float() * torch.rsqrt(v + eps))
+    return (gain_offset + w) * (x.float() * torch.rsqrt(v + eps))
 
 
 def recurrent_gated_delta(q, k, v, g, beta):
@@ -170,6 +183,40 @@ def cross_check_against_transformers(cfg):
     except Exception as e:  # noqa: BLE001
         print(f"   (chunked path not runnable here: {e})")
 
+    # The norms. This check was missing, and its absence is exactly why the
+    # offset form went unnoticed: the recurrence was checked against the library
+    # and the norms were not, so `rms_norm` here and `rms_norm_rows` in Rust
+    # agreed with each other on a reading neither had confirmed.
+    torch.manual_seed(11)
+    x = torch.randn(4, 64)
+    w = torch.randn(64) * 0.3
+
+    plain = m.Qwen3_5RMSNormGated(64, eps=1e-6)
+    with torch.no_grad():
+        plain.weight.copy_(w)
+    # The gated class needs a gate; a gate of large positive values makes
+    # silu(gate) ~= gate, so divide it back out to isolate the norm.
+    gate = torch.full_like(x, 30.0)
+    ref_plain = plain(x, gate) / torch.nn.functional.silu(gate)
+    mine_plain = rms_norm(x, w, 1e-6, gain_offset=0.0)
+    d_plain = (ref_plain - mine_plain).abs().max().item()
+
+    offset = m.Qwen3_5RMSNorm(64, eps=1e-6)
+    with torch.no_grad():
+        offset.weight.copy_(w)
+    ref_offset = offset(x)
+    mine_offset = rms_norm(x, w, 1e-6, gain_offset=1.0)
+    d_offset = (ref_offset - mine_offset).abs().max().item()
+
+    print(f"Qwen3_5RMSNormGated (plain w):  Δ={d_plain:.2e}")
+    print(f"Qwen3_5RMSNorm      ((1+w)  ):  Δ={d_offset:.2e}")
+    # And the two forms must differ, or the offset is not pinned by anything.
+    spread = (ref_offset - ref_plain).abs().max().item()
+    print(f"the two forms differ by {spread:.2e}, so the offset matters")
+    ok = ok and d_plain < 2e-5 and d_offset < 2e-5 and spread > 1e-2
+    if not (d_plain < 2e-5 and d_offset < 2e-5):
+        print("DISAGREE on the norms")
+
     if not ok:
         raise SystemExit("the transcription disagrees with the reference; "
                          "fix it before capturing anything")
@@ -242,7 +289,9 @@ def capture_linear(headers, cfg, x, dump):
     dump("linear.core_attn_out", core)
     dump("linear.final_state", state)
 
-    normed = rms_norm(core.reshape(-1, dv), norm_w, cfg["rms_norm_eps"])
+    # Qwen3_5RMSNormGated: a plain gain, no offset. The one norm in this model
+    # that is not the offset form.
+    normed = rms_norm(core.reshape(-1, dv), norm_w, cfg["rms_norm_eps"], gain_offset=0.0)
     gated = normed * F.silu(z.reshape(-1, dv).float())
     dump("linear.after_gated_norm", gated)
 
@@ -297,8 +346,9 @@ def capture_full(headers, cfg, x, dump, pos_offset=0, tag="full"):
 
     k = (x @ w_k.T).reshape(T, nkv, hd)
     v = (x @ w_v.T).reshape(T, nkv, hd)
-    q = rms_norm(q, qn, cfg["rms_norm_eps"])
-    k = rms_norm(k, kn, cfg["rms_norm_eps"])
+    # Qwen3_5RMSNorm: the weight is a delta from one.
+    q = rms_norm(q, qn, cfg["rms_norm_eps"], gain_offset=1.0)
+    k = rms_norm(k, kn, cfg["rms_norm_eps"], gain_offset=1.0)
     dump("full.q_post_norm", q)
     dump("full.k_post_norm", k)
 

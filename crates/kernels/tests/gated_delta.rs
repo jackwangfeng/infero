@@ -618,7 +618,7 @@ fn the_gated_rmsnorm_matches_the_reference_and_normalizes_first() -> Result<()> 
     let w: Vec<f32> = (0..DV).map(|i| 0.78 + (i % 7) as f32 * 0.02).collect();
     let eps = 1e-6f32;
 
-    let normed = qwen35::rms_norm_rows(&x, &w, DV, eps);
+    let normed = qwen35::rms_norm_rows(&x, &w, DV, eps, 0.0);
     let want: Vec<f32> = normed
         .iter()
         .zip(&z)
@@ -650,7 +650,7 @@ fn the_gated_rmsnorm_matches_the_reference_and_normalizes_first() -> Result<()> 
         .zip(&z)
         .map(|(v, zz)| v * qwen35::silu(*zz))
         .collect();
-    let other = qwen35::rms_norm_rows(&pre, &w, DV, eps);
+    let other = qwen35::rms_norm_rows(&pre, &w, DV, eps, 0.0);
     let spread = max_rel_diff(&other, &want);
     assert!(
         spread > 1e-2,
@@ -693,6 +693,65 @@ fn the_output_gate_is_sigmoid_not_silu() -> Result<()> {
         spread > 1e-2,
         "silu and sigmoid agreed to {spread:.2e} on this input, so this test \
          does not establish which the checkpoint wants"
+    );
+    Ok(())
+}
+
+/// The query and its gate interleave per head, and the split down the middle —
+/// the other plausible reading of the same buffer — must give a different
+/// answer.
+///
+/// Head 0 cannot distinguish the two, which is why this checks a head past the
+/// first. A test that only looked at head 0 would bless either layout.
+#[test]
+fn the_split_is_per_head_not_per_half() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    let (t_len, heads, hd) = (5usize, 6usize, 16usize);
+    let n = t_len * heads * hd;
+
+    let src = pseudo_random(2 * n, 0x8f8f);
+    let mut want_q = vec![0.0f32; n];
+    let mut want_gate = vec![0.0f32; n];
+    for t in 0..t_len {
+        for h in 0..heads {
+            let row = (t * heads + h) * 2 * hd;
+            let dst = (t * heads + h) * hd;
+            want_q[dst..dst + hd].copy_from_slice(&src[row..row + hd]);
+            want_gate[dst..dst + hd].copy_from_slice(&src[row + hd..row + 2 * hd]);
+        }
+    }
+
+    let d_src = stream.clone_htod(&src)?;
+    let mut d_q = stream.alloc_zeros::<f32>(n)?;
+    let mut d_gate = stream.alloc_zeros::<f32>(n)?;
+    k.split_interleaved(
+        &mut d_q.as_view_mut(),
+        &mut d_gate.as_view_mut(),
+        &d_src.as_view(),
+        t_len,
+        heads,
+        hd,
+    )?;
+    k.device().synchronize()?;
+    let (worst, at) = max_abs_diff(&stream.clone_dtoh(&d_q)?, &want_q);
+    assert_eq!(worst, 0.0, "q disagreed at {at}; this is a copy, not arithmetic");
+    let (worst, at) = max_abs_diff(&stream.clone_dtoh(&d_gate)?, &want_gate);
+    assert_eq!(worst, 0.0, "gate disagreed at {at}");
+
+    // `[all queries | all gates]`: for head 0 it agrees, past that it does not.
+    let half_split_q = &src[..n];
+    let mut differing_heads = 0;
+    for h in 0..heads {
+        let dst = h * hd; // token 0
+        if half_split_q[dst..dst + hd] != want_q[dst..dst + hd] {
+            differing_heads += 1;
+        }
+    }
+    assert!(
+        differing_heads >= heads - 1,
+        "only {differing_heads} of {heads} heads distinguish the interleaved \
+         layout from the halved one; this test would not catch the mistake"
     );
     Ok(())
 }

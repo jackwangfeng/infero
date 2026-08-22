@@ -269,3 +269,34 @@ extern "C" __global__ void sigmoid_gate_f32(float* __restrict__ x,
     if (i >= n) return;
     x[i] *= 1.0f / (1.0f + __expf(-gate[i]));
 }
+
+// De-interleave a projection that produced a value and its gate per head.
+//
+// Qwen3.5's `q_proj` emits `heads * 2 * head_dim` columns, read as
+// `[heads, 2 * head_dim]` with the query first and the gate second *within each
+// head*. So the query's heads are strided by `2 * head_dim`, which no existing
+// kernel's layout covers — `qk_norm` takes an offset and a row stride but
+// assumes a head's lanes are contiguous from there.
+//
+// The other reading, `[all queries | all gates]`, is a plain split with no
+// kernel at all. It runs, and it is wrong: for every head past the first it
+// reads the wrong columns. See `the_split_is_per_head_not_per_half` in
+// tests/gated_delta.rs.
+//
+// One thread an output element of `q`; `gate` gets the matching one.
+extern "C" __global__ void split_interleaved_f32(float* __restrict__ q,
+                                                 float* __restrict__ gate,
+                                                 const float* __restrict__ src,
+                                                 int heads, int head_dim,
+                                                 long long n) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int lane = (int)(i % head_dim);
+    const long long head_ix = i / head_dim;          // token * heads + head
+    const int head = (int)(head_ix % heads);
+    const long long token = head_ix / heads;
+    const long long row = token * (long long)heads * 2 * head_dim
+                        + (long long)head * 2 * head_dim;
+    q[i] = src[row + lane];
+    gate[i] = src[row + head_dim + lane];
+}

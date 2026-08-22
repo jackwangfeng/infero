@@ -244,6 +244,9 @@ struct Activations {
     attn_partial: CudaSlice<f32>,
     /// Those rows, gathered and normalized.
     head_in: CudaSlice<f32>,
+    /// The attention output gate, `[chunk, d_attn]`. Allocated only for models
+    /// whose attention blocks carry one.
+    attn_gate: Option<CudaSlice<f32>>,
     /// GatedDeltaNet scratch, allocated only for models that have such blocks.
     gdn: Option<GdnActs>,
 }
@@ -1771,7 +1774,10 @@ impl Model {
                     &mut self.act.k.slice_mut(..n * kv_dim),
                     &mut self.act.v.slice_mut(..n * kv_dim),
                     &self.act.gate.slice(..n * fused_w),
-                    d,
+                    // q's width inside the fused row, which is the attention
+                    // interior's — not the residual's. The two are equal on
+                    // every model but Qwen3.5.
+                    da,
                     kv_dim,
                     n,
                 )?;
@@ -1787,11 +1793,54 @@ impl Model {
                 }
             }
         } else {
+        // A gated q projection is twice as wide and its two halves interleave
+        // per head, so it lands in `gate` and is de-interleaved rather than
+        // written straight to `q`. Everything downstream then sees the same
+        // shapes it always did.
+        if l.attn().output_gate {
+            anyhow::ensure!(
+                l.attn().bq.is_none(),
+                "layer {layer} has both an output gate and a q bias; the bias \
+                 would be 2 * d_attn wide and this path does not know which \
+                 half it applies to"
+            );
+            Self::matmul_pre(
+                &self.kern,
+                &mut self.scratch,
+                &mut self.act.gate.slice_mut(..n * 2 * da),
+                &l.attn().wq,
+                stage,
+                &self.act.xb.slice(..n * d),
+                n,
+                self.use_mmvq,
+                self.use_mmq,
+                shared,
+                shared_f16,
+            )?;
+            let Activations {
+                q, gate, attn_gate, ..
+            } = &mut self.act;
+            let ag = attn_gate
+                .as_mut()
+                .context("a gated attention layer with no gate buffer allocated")?;
+            self.kern.split_interleaved(
+                &mut q.slice_mut(..n * da),
+                &mut ag.slice_mut(..n * da),
+                &gate.slice(..n * 2 * da),
+                n,
+                cfg.n_heads,
+                cfg.d_head,
+            )?;
+        }
         for (w, bias, out, cols) in [
             (&l.attn().wq, &l.attn().bq, &mut self.act.q, da),
             (&l.attn().wk, &l.attn().bk, &mut self.act.k, kv_dim),
             (&l.attn().wv, &l.attn().bv, &mut self.act.v, kv_dim),
         ] {
+            // q is already done when it was gated.
+            if std::ptr::eq(w, &l.attn().wq) && l.attn().output_gate {
+                continue;
+            }
             Self::matmul_pre(
                 &self.kern,
                 &mut self.scratch,
@@ -2260,6 +2309,22 @@ impl Model {
                 l.attn().wo.n,
             )?;
             return Ok(());
+        }
+
+        // The output gate, applied to the attention output before the output
+        // projection reads it. Sigmoid, not silu: the reference implementation
+        // does not read config's `output_gate_type: "swish"`, and the two give
+        // different answers. See `the_output_gate_is_sigmoid_not_silu`.
+        if l.attn().output_gate {
+            let Activations { attn, attn_gate, .. } = &mut self.act;
+            let ag = attn_gate
+                .as_ref()
+                .context("a gated attention layer with no gate buffer allocated")?;
+            self.kern.sigmoid_gate(
+                &mut attn.slice_mut(..n * da),
+                &ag.slice(..n * da),
+                n * da,
+            )?;
         }
 
         Self::matmul_pre(
@@ -2960,6 +3025,11 @@ impl Activations {
                 "attention partials",
             )?,
             head_in: alloc_f32(max_logit_rows * d, "logit rows")?,
+            attn_gate: if cfg.attn_output_gate {
+                Some(alloc_f32(chunk * d_attn, "attention output gate")?)
+            } else {
+                None
+            },
             gdn: match cfg.linear_attn {
                 Some(la) => Some(GdnActs {
                     qkv: alloc_f32(chunk * la.conv_channels(), "gdn qkv")?,

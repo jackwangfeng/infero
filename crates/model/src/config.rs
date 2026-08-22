@@ -60,6 +60,14 @@ pub struct Config {
     /// Set when some of this model's blocks mix with a recurrence rather than
     /// with attention. `None` for every model tuili loaded before Qwen3.5.
     pub linear_attn: Option<LinearAttnConfig>,
+    /// Whether the attention blocks carry an output gate, which makes `q_proj`
+    /// twice as wide.
+    ///
+    /// Read from the config only to decide whether to allocate the gate buffer.
+    /// What the forward pass *acts* on is `q_proj`'s actual column count, and
+    /// the loader refuses a checkpoint where the two disagree — the config
+    /// cannot silently change the arithmetic.
+    pub attn_output_gate: bool,
 }
 
 /// The GatedDeltaNet dimensions, when a model has such blocks.
@@ -195,6 +203,7 @@ impl Config {
             // No GGUF conversion of a linear-attention model exists; when one
             // does it will need its own metadata keys rather than a guess.
             linear_attn: None,
+            attn_output_gate: false,
         })
     }
 
@@ -332,6 +341,7 @@ impl Config {
             // five dimensions come from one place or none of them do: a
             // partially-specified linear-attention config would produce a
             // plausible width for one of them and a wrong one for another.
+            attn_output_gate: dims["attn_output_gate"].as_bool().unwrap_or(false),
             linear_attn: match (
                 dims["linear_num_key_heads"].as_u64(),
                 dims["linear_num_value_heads"].as_u64(),

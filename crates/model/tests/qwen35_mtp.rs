@@ -191,11 +191,9 @@ fn relative_l2(got: &[f32], want: &[f32]) -> f32 {
 fn margin(a: &[f32], b: &[f32], rel: f32, scale: f32) -> f32 {
     let peak = b.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     let floor = scale * peak.max(f32::MIN_POSITIVE);
-    a.iter()
-        .zip(b)
-        .fold(0.0f32, |m, (&x, &y)| {
-            m.max((x - y).abs() / (floor + rel * y.abs()))
-        })
+    a.iter().zip(b).fold(0.0f32, |m, (&x, &y)| {
+        m.max((x - y).abs() / (floor + rel * y.abs()))
+    })
 }
 
 // ------------------------------------------------------------- the RMSNorm form
@@ -220,7 +218,11 @@ fn every_norm_in_the_head_uses_the_unit_offset_form() {
 
         for (input, weight, output) in [
             ("inputs_embeds", "w.pre_fc_norm_embedding", "emb_normed"),
-            ("target.final_hidden", "w.pre_fc_norm_hidden", "hidden_normed"),
+            (
+                "target.final_hidden",
+                "w.pre_fc_norm_hidden",
+                "hidden_normed",
+            ),
             ("layer_out", "w.norm", "output"),
             ("fc_out", "w.input_layernorm", "layer.pre_attn_norm_out"),
         ] {
@@ -232,7 +234,7 @@ fn every_norm_in_the_head_uses_the_unit_offset_form() {
 
             // And the plain form must be nowhere near, or this test would pass
             // under either reading and is not evidence.
-            let plain = qwen35::rms_norm_rows(x, w, d, eps);
+            let plain = qwen35::rms_norm_rows(x, w, d, eps, 0.0);
             let m = margin(&plain, want, 2e-6, 1e-7);
             assert!(
                 m > 1e3,
@@ -283,11 +285,7 @@ fn the_fc_input_puts_the_embedding_before_the_hidden_state() {
         let e = c.get("emb_normed");
         let h = c.get("hidden_normed");
         let fc_out = c.get("fc_out");
-        let rows: Vec<usize> = c
-            .get("fc_probe_rows")
-            .iter()
-            .map(|v| *v as usize)
-            .collect();
+        let rows: Vec<usize> = c.get("fc_probe_rows").iter().map(|v| *v as usize).collect();
         let w = c.get("fc_probe_w");
         assert_eq!(c.shape("fc_probe_w")[1], 2 * d, "fc rows are 2*hidden wide");
 
@@ -298,9 +296,8 @@ fn the_fc_input_puts_the_embedding_before_the_hidden_state() {
             for t in 0..t_len {
                 let et = &e[t * d..(t + 1) * d];
                 let ht = &h[t * d..(t + 1) * d];
-                let dot = |a: &[f32], b: &[f32]| -> f32 {
-                    a.iter().zip(b).map(|(x, y)| x * y).sum()
-                };
+                let dot =
+                    |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum() };
                 let embedding_first = dot(lo, et) + dot(hi, ht);
                 let hidden_first = dot(lo, ht) + dot(hi, et);
                 let want = fc_out[t * d + row];
@@ -448,11 +445,7 @@ fn fusing_the_two_inputs_reproduces_the_reference_stages() {
         // A stand-in `fc` built from the probe rows: a [rows, 2d] matrix whose
         // output is the probed columns of the real one. Same code path, same
         // ordering decision, small enough to be in the capture.
-        let rows: Vec<usize> = c
-            .get("fc_probe_rows")
-            .iter()
-            .map(|v| *v as usize)
-            .collect();
+        let rows: Vec<usize> = c.get("fc_probe_rows").iter().map(|v| *v as usize).collect();
         let probe_w = c.get("fc_probe_w").to_vec();
         let w = MtpWeights {
             pre_fc_norm_embedding: c.get("w.pre_fc_norm_embedding"),
@@ -527,7 +520,10 @@ fn the_heads_layer_is_gated_full_attention_with_q_and_gate_interleaved() {
             nh * 2 * hd,
             "q_proj should be heads * 2 * head_dim wide for the output gate"
         );
-        assert_eq!(c.shape("layer.v_proj_out")[1], c.u("num_key_value_heads") * hd);
+        assert_eq!(
+            c.shape("layer.v_proj_out")[1],
+            c.u("num_key_value_heads") * hd
+        );
 
         let x = c.get("layer.pre_attn_norm_out");
         let rows: Vec<usize> = c
@@ -606,7 +602,7 @@ fn the_per_head_q_and_k_norms_use_the_unit_offset_form_before_rope() {
                 1e-7,
                 &format!("(1+w) norm of {input}"),
             );
-            let m = margin(&qwen35::rms_norm_rows(x, w, hd, eps), want, 3e-6, 1e-7);
+            let m = margin(&qwen35::rms_norm_rows(x, w, hd, eps, 0.0), want, 3e-6, 1e-7);
             assert!(
                 m > 1e2,
                 "the plain `w *` reading of {weight} lands within {m:.1e} \
@@ -642,22 +638,24 @@ fn the_heads_attention_gate_and_residuals_match_the_reference() {
         qwen35::apply_partial_rope(&mut q, cos, sin, t_len, nh, hd, dims.rotary_dim);
         qwen35::apply_partial_rope(&mut k, cos, sin, t_len, nkv, hd, dims.rotary_dim);
 
-        let ctx = qwen35::causal_attention(
-            &q,
-            &k,
-            c.get("layer.v_proj_out"),
-            t_len,
-            t_len,
-            nh,
-            nkv,
-            hd,
-        );
+        let ctx =
+            qwen35::causal_attention(&q, &k, c.get("layer.v_proj_out"), t_len, t_len, nh, nkv, hd);
 
         // The gate is the second half of each head's q_proj slice.
         let (_, gate) = qwen35::split_q_and_gate(c.get("layer.q_proj_out"), t_len, nh, hd);
-        let gated: Vec<f32> = ctx.iter().zip(&gate).map(|(o, g)| o * sigmoid(*g)).collect();
+        let gated: Vec<f32> = ctx
+            .iter()
+            .zip(&gate)
+            .map(|(o, g)| o * sigmoid(*g))
+            .collect();
         let want = c.get("layer.o_proj_in");
-        agree(&gated, want, 2e-3, 1e-5, "attention output times sigmoid(gate)");
+        agree(
+            &gated,
+            want,
+            2e-3,
+            1e-5,
+            "attention output times sigmoid(gate)",
+        );
 
         // silu instead of sigmoid — what config's `output_gate_type = "swish"`
         // would suggest, and what the implementation ignores — must be far off.
@@ -689,7 +687,12 @@ fn the_heads_attention_gate_and_residuals_match_the_reference() {
         let attn = c.get("layer.o_proj_out");
         let after_attn: Vec<f32> = fc_out.iter().zip(attn).map(|(a, b)| a + b).collect();
         agree(
-            &rms_norm_offset_rows(&after_attn, c.get("w.post_attention_layernorm"), d, dims.eps),
+            &rms_norm_offset_rows(
+                &after_attn,
+                c.get("w.post_attention_layernorm"),
+                d,
+                dims.eps,
+            ),
             c.get("layer.post_attn_norm_out"),
             3e-5,
             1e-6,
@@ -737,7 +740,10 @@ fn the_head_finishes_with_its_own_final_norm() {
         // Skipping it entirely is the other plausible reading — a head that
         // returned the layer output straight to lm_head would run.
         let m = margin(c.get("layer_out"), c.get("output"), 2e-6, 1e-7);
-        assert!(m > 1e3, "mtp.norm changes almost nothing ({m:.1e} tolerances)");
+        assert!(
+            m > 1e3,
+            "mtp.norm changes almost nothing ({m:.1e} tolerances)"
+        );
     });
 }
 
@@ -777,7 +783,12 @@ fn the_composed_head_reproduces_the_reference_output() {
         let eps = c.f("rms_norm_eps");
         let t_len = c.shape("output")[0];
 
-        let e = rms_norm_offset_rows(c.get("inputs_embeds"), c.get("w.pre_fc_norm_embedding"), d, eps);
+        let e = rms_norm_offset_rows(
+            c.get("inputs_embeds"),
+            c.get("w.pre_fc_norm_embedding"),
+            d,
+            eps,
+        );
         let h = rms_norm_offset_rows(
             c.get("target.final_hidden"),
             c.get("w.pre_fc_norm_hidden"),
@@ -785,7 +796,13 @@ fn the_composed_head_reproduces_the_reference_output() {
             eps,
         );
         agree(&e, c.get("emb_normed"), 2e-6, 1e-7, "stage 1: emb_normed");
-        agree(&h, c.get("hidden_normed"), 2e-6, 1e-7, "stage 2: hidden_normed");
+        agree(
+            &h,
+            c.get("hidden_normed"),
+            2e-6,
+            1e-7,
+            "stage 2: hidden_normed",
+        );
         // stage 3 (fc) is checked against probe rows in
         // `fusing_the_two_inputs_reproduces_the_reference_stages`; take the
         // reference's fc_out from here on.
@@ -861,20 +878,28 @@ fn the_whole_head_matches_end_to_end_when_the_weights_are_captured() {
             t_len,
             dims,
         );
-        agree(&got.emb_normed, c.get("emb_normed"), 2e-6, 1e-7, "emb_normed");
-        agree(&got.hidden_normed, c.get("hidden_normed"), 2e-6, 1e-7, "hidden_normed");
+        agree(
+            &got.emb_normed,
+            c.get("emb_normed"),
+            2e-6,
+            1e-7,
+            "emb_normed",
+        );
+        agree(
+            &got.hidden_normed,
+            c.get("hidden_normed"),
+            2e-6,
+            1e-7,
+            "hidden_normed",
+        );
         agree(&got.fc_out, c.get("fc_out"), 3e-4, 2e-6, "fc_out");
         agree(&got.layer_out, c.get("layer_out"), 3e-3, 2e-5, "layer_out");
         agree(&got.output, c.get("output"), 3e-3, 2e-5, "output");
 
         // The swapped concat, run through the same composed head: it must land
         // nowhere near, or this end-to-end check would pass under either order.
-        let swapped = concat_embedding_then_hidden(
-            &got.hidden_normed,
-            &got.emb_normed,
-            t_len,
-            dims.d_model,
-        );
+        let swapped =
+            concat_embedding_then_hidden(&got.hidden_normed, &got.emb_normed, t_len, dims.d_model);
         let fc_swapped = linear(
             &swapped,
             c.get("w.fc"),
@@ -883,7 +908,10 @@ fn the_whole_head_matches_end_to_end_when_the_weights_are_captured() {
             dims.d_model,
         );
         let m = margin(&fc_swapped, c.get("fc_out"), 3e-4, 2e-6);
-        assert!(m > 1e3, "the swapped concat lands within {m:.1e} tolerances");
+        assert!(
+            m > 1e3,
+            "the swapped concat lands within {m:.1e} tolerances"
+        );
     });
 }
 
@@ -975,7 +1003,10 @@ fn greedy_acceptance_emits_exactly_what_plain_decoding_would_have() {
     for draft in [vec![], vec![1], vec![1, 2], vec![1, 2, 3]] {
         let target: Vec<u32> = (0..draft.len() as u32 + 1).map(|i| 100 + i).collect();
         let a = accept_greedy(&draft, &target);
-        assert!(!a.tokens.is_empty(), "a verification step emitted no tokens");
+        assert!(
+            !a.tokens.is_empty(),
+            "a verification step emitted no tokens"
+        );
         assert!(a.tokens.len() <= draft.len() + 1);
     }
 
@@ -1029,7 +1060,9 @@ fn replaying_the_accepted_prefix_restores_the_state_exactly() {
     let v: Vec<f32> = (0..t_len * heads * dv).map(|_| next()).collect();
     // beta near 1 on purpose: that is where inverting the recurrence would blow
     // up, and the journal must not care.
-    let beta: Vec<f32> = (0..t_len * heads).map(|_| 0.999 + 0.0005 * next()).collect();
+    let beta: Vec<f32> = (0..t_len * heads)
+        .map(|_| 0.999 + 0.0005 * next())
+        .collect();
     let g: Vec<f32> = (0..t_len * heads).map(|_| -0.05 * (next() + 1.5)).collect();
     let initial: Vec<f32> = (0..heads * dk * dv).map(|_| next()).collect();
 

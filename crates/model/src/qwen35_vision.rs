@@ -153,6 +153,7 @@ fn erf(x: f32) -> f32 {
 /// merger's. Every normalization in the text tower is RMSNorm. Dropping the mean
 /// subtraction and the bias runs and moves the block-0 output by 0.32 out of a
 /// peak of 5.1; dropping only the mean subtraction moves it by 3.0.
+///
 /// The reductions run in `f64` on purpose. By the last of the 27 blocks the
 /// residual stream reaches ~4200 with a row variance around 2.5e3, and a naive
 /// sequential `f32` sum of 1152 such values carries about 7e-4 of relative

@@ -562,7 +562,7 @@ fn the_gated_rmsnorm_normalizes_before_it_gates() {
         let w = c.get("linear.norm_w");
         let eps = c.f("rms_norm_eps");
 
-        let normed = rms_norm_rows(core, w, dv, eps);
+        let normed = rms_norm_rows(core, w, dv, eps, 0.0);
         let got: Vec<f32> = normed
             .iter()
             .zip(z)
@@ -573,7 +573,7 @@ fn the_gated_rmsnorm_normalizes_before_it_gates() {
         // Gate first, then normalize: a different answer, so the order is
         // actually pinned by this test.
         let pre: Vec<f32> = core.iter().zip(z).map(|(o, zz)| o * silu(*zz)).collect();
-        let other = rms_norm_rows(&pre, w, dv, eps);
+        let other = rms_norm_rows(&pre, w, dv, eps, 0.0);
         let want = c.get("linear.after_gated_norm");
         let differs = other
             .iter()

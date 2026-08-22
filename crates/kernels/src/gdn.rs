@@ -316,6 +316,47 @@ impl Kernels {
         Ok(())
     }
 
+    /// Split a `[tokens, heads, 2 * head_dim]` projection into its value and
+    /// its gate.
+    ///
+    /// `q` and `gate` are each `[tokens, heads, head_dim]`. The query and the
+    /// gate interleave per head, so this is a strided gather rather than a
+    /// split down the middle — the split down the middle also runs.
+    pub fn split_interleaved(
+        &self,
+        q: &mut CudaViewMut<'_, f32>,
+        gate: &mut CudaViewMut<'_, f32>,
+        src: &CudaView<'_, f32>,
+        n_tokens: usize,
+        heads: usize,
+        head_dim: usize,
+    ) -> Result<()> {
+        let n = n_tokens * heads * head_dim;
+        debug_assert!(q.len() >= n && gate.len() >= n);
+        debug_assert!(src.len() >= 2 * n);
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_gdn", gdn_src(), "split_interleaved_f32")?;
+        const BLOCK: u32 = 256;
+        let cfg = LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(BLOCK), 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (h, hd) = (heads as i32, head_dim as i32);
+        let count = n as i64;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(q).arg(gate).arg(src).arg(&h).arg(&hd).arg(&count);
+        self.dev
+            .profile()
+            .time("split_interleaved", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("split_interleaved")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     /// `x *= sigmoid(gate)`, in place.
     ///
     /// The output gate of Qwen3.5's full-attention layers, applied before
