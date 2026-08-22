@@ -717,6 +717,77 @@ impl MtpHead {
         let logits = self.logits_row(kern, head, row)?;
         Ok(argmax(logits))
     }
+
+    /// One drafted token, sampled the way the request asked for, with the
+    /// probability the draft assigned it.
+    ///
+    /// The probability is the other half of the acceptance rule, and it has to
+    /// come from the same transformation the target's will — temperature, top-k,
+    /// top-p, repetition penalty — which is why this borrows the request's own
+    /// sampler rather than taking a temperature.
+    ///
+    /// Drafting by argmax and accepting stochastically is also valid: the draft
+    /// is then a point mass, the ratio `p_target / p_draft` becomes
+    /// `p_target(t)`, and the rule still preserves the target's distribution
+    /// exactly. It just accepts rarely, because a point mass is a poor proposal
+    /// — at temperature 0.7 the target's own top token typically carries 0.3 to
+    /// 0.7 of the mass, so roughly half the drafts die. Sampling the draft at
+    /// the request's temperature is what makes the ratio close to one whenever
+    /// the two models agree.
+    pub fn draft_row_sampled(
+        &mut self,
+        kern: &Kernels,
+        head: &Matrix,
+        row: usize,
+        sampler: &mut crate::Sampler,
+        history: &[u32],
+    ) -> Result<(u32, Vec<(u32, f32)>)> {
+        let logits = self.logits_row(kern, head, row)?;
+        anyhow::ensure!(
+            !sampler.params().is_greedy(),
+            "draft_row_sampled needs a sampling distribution; a greedy request \
+             takes the greedy acceptance rule"
+        );
+        let draw = sampler.next_draw();
+        let (dist, total) = sampler.distribution(logits, history);
+        let token = crate::Sampler::pick(dist, total, draw);
+        // The *whole* distribution, normalized, not just the sampled token's
+        // probability.
+        //
+        // The acceptance rule's residual is `(p_target - q)+` at every token,
+        // and `q` is this. Keeping only `q(drafted)` and subtracting it at that
+        // one token treats the drafter as a point mass, which it is not once it
+        // has sampled — and the composition then does not reproduce the target's
+        // distribution. Measured, that error put one token 0.0745 away from its
+        // probability, about a hundred standard errors.
+        //
+        // The cost is the truncated support, so top_k pairs — 40 for a typical
+        // request, against a 248320-entry vocabulary.
+        let q: Vec<(u32, f32)> = dist
+            .iter()
+            .map(|(t, w)| (*t, (*w as f64 / total) as f32))
+            .collect();
+        anyhow::ensure!(
+            q.iter().any(|(t, w)| *t == token && *w > 0.0),
+            "the draft sampled {token}, which carries no weight in its own \
+             distribution"
+        );
+        Ok((token, q))
+    }
+}
+
+/// One drafted token and the distribution it came from.
+///
+/// The distribution is here rather than a single probability because the
+/// acceptance rule's residual is `(p_target - q)+` at every token. Carrying only
+/// `q(token)` and subtracting it at that one place treats a sampled draft as a
+/// point mass; the composition then does not reproduce the target's
+/// distribution, and the error is large — a hundred standard errors on the
+/// largest bin in simulation, not a rounding difference.
+pub struct Drafted {
+    pub token: u32,
+    /// The drafter's normalized distribution over its truncated support.
+    pub q: Vec<(u32, f32)>,
 }
 
 impl crate::Model {
@@ -785,6 +856,65 @@ impl crate::Model {
     /// [`crate::spec::DraftFeed::after_prefill`] for the first round. Steps after
     /// the first feed the head its own output and add one to the position, which
     /// is what makes `k > 1` possible from a one-layer head.
+    /// A draft plus the probability the drafter gave each token.
+    ///
+    /// The sampled counterpart of [`Model::draft_with_head`]. The history grows
+    /// as the draft does: token `j`'s distribution is conditioned on the drafts
+    /// before it, and the repetition penalty reads that window, so passing a
+    /// stale history would score every draft against the wrong distribution.
+    pub fn draft_with_head_sampled(
+        &mut self,
+        k: usize,
+        feed: &crate::spec::DraftFeed,
+        sampler: &mut crate::Sampler,
+        history: &[u32],
+    ) -> anyhow::Result<Vec<Drafted>> {
+        anyhow::ensure!(k > 0, "a draft of no tokens");
+        let d = self.cfg.d_model;
+        let hidden_rows = feed.rows.clone();
+        let (positions, shifted_ids) = (&feed.positions, &feed.shifted);
+        let rows = hidden_rows.len();
+        anyhow::ensure!(
+            rows == positions.len() && rows == shifted_ids.len(),
+            "{rows} hidden rows against {} positions and {} ids",
+            positions.len(),
+            shifted_ids.len()
+        );
+        let mut head = self
+            .mtp
+            .take()
+            .context("this model has no MTP head; call load_mtp_head first")?;
+        let res = (|| -> anyhow::Result<Vec<Drafted>> {
+            let hidden = self
+                .mtp_hidden
+                .as_ref()
+                .context("no captured hidden states")?
+                .slice(hidden_rows.start * d..hidden_rows.end * d);
+            head.truncate(positions[0]);
+            head.step(&self.kern, &self.w.token_embd, shifted_ids, positions, &hidden)?;
+            let lm = self.w.output.as_ref().unwrap_or(&self.w.token_embd);
+            let mut drafted = Vec::with_capacity(k);
+            // The window the repetition penalty reads, extended per draft.
+            let mut window: Vec<u32> = history.to_vec();
+            let mut row = rows - 1;
+            let mut position = positions[rows - 1];
+            let (mut token, mut q) =
+                head.draft_row_sampled(&self.kern, lm, row, sampler, &window)?;
+            drafted.push(Drafted { token, q });
+            for _ in 1..k {
+                window.push(token);
+                position += 1;
+                head.step_from_own_output(&self.kern, &self.w.token_embd, token, position, row)?;
+                row = 0;
+                (token, q) = head.draft_row_sampled(&self.kern, lm, row, sampler, &window)?;
+                drafted.push(Drafted { token, q });
+            }
+            Ok(drafted)
+        })();
+        self.mtp = Some(head);
+        res
+    }
+
     pub fn draft_with_head(
         &mut self,
         k: usize,

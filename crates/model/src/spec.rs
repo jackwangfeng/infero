@@ -595,6 +595,178 @@ impl Model {
         })
     }
 
+    /// Verify a sampled draft, preserving the request's own distribution.
+    ///
+    /// The rule is rejection sampling: accept draft `j` with probability
+    /// `min(1, p_target / p_draft)`, and on the first rejection emit a token
+    /// drawn from the residual `(p_target - p_draft)+`. That is what makes
+    /// speculation a pure speedup rather than a different sampler — the output
+    /// distribution is the target's, exactly, whatever the drafter does.
+    ///
+    /// Both probabilities come from [`crate::Sampler::distribution`], so the
+    /// transformation the request asked for is applied once, in one place. The
+    /// history matters and grows: position `j`'s distribution is conditioned on
+    /// the tokens before it, drafts included, and the repetition penalty reads
+    /// that window. Scoring every position against the prompt's window would
+    /// silently mis-measure both sides.
+    pub fn verify_draft_sampled(
+        &mut self,
+        seq: SeqId,
+        pool: &mut KvPool,
+        pending: u32,
+        draft: &[crate::mtp::Drafted],
+        sampler: &mut crate::Sampler,
+        history: &[u32],
+    ) -> Result<SpecOutcome> {
+        let n = draft.len() + 1;
+        anyhow::ensure!(
+            n <= self.max_logit_rows,
+            "verifying {} candidates needs {n} logit rows, the model was built \
+             for {}",
+            draft.len(),
+            self.max_logit_rows
+        );
+        anyhow::ensure!(
+            !sampler.params().is_greedy(),
+            "a greedy request takes `verify_draft`, whose acceptance rule is \
+             exact rather than a ratio"
+        );
+        let len_before = pool.len(seq);
+        let mut candidates = Vec::with_capacity(n);
+        candidates.push(pending);
+        candidates.extend(draft.iter().map(|d| d.token));
+
+        if let Some(r) = self.gdn_rollback.as_mut() {
+            r.arm(seq.0, n)?;
+        }
+        let rows = {
+            let item = BatchItem::new(seq, &candidates);
+            let r = self.forward_batch_rows(std::slice::from_ref(&item), pool, &[n]);
+            if let (true, Some(j)) = (r.is_err(), self.gdn_rollback.as_mut()) {
+                j.disarm();
+            }
+            r?
+        };
+        anyhow::ensure!(rows == n, "asked for {n} logit rows and got {rows}");
+
+        let vocab = self.cfg.vocab_size;
+        // Copied out because building each row's distribution borrows the
+        // sampler mutably while the logits live in `self`.
+        let logits: Vec<f32> = self.logits_host()?.to_vec();
+
+        // Walk the draft, extending the window as tokens are accepted.
+        let mut window: Vec<u32> = history.to_vec();
+        window.push(pending);
+        let mut tokens: Vec<u32> = Vec::with_capacity(n);
+        let mut accepted = 0usize;
+        for (j, d) in draft.iter().enumerate() {
+            let token = d.token;
+            let row = &logits[j * vocab..(j + 1) * vocab];
+            // Both draws come out before the distribution borrows the sampler.
+            // Taking them unconditionally also keeps the generator's sequence
+            // independent of which branch runs, so a seed reproduces the same
+            // stream whether a draft was accepted or not.
+            let draw = sampler.next_draw();
+            let residual_draw = sampler.next_draw();
+            let (dist, total) = sampler.distribution(row, &window);
+            let p_target = dist
+                .iter()
+                .find(|(t, _)| *t == token)
+                .map(|(_, w)| *w as f64 / total)
+                .unwrap_or(0.0);
+            let p_draft = d
+                .q
+                .iter()
+                .find(|(t, _)| *t == token)
+                .map(|(_, w)| *w)
+                .unwrap_or(0.0);
+            // A drafted token outside the target's truncated support has
+            // probability zero there and is always rejected — which is correct
+            // and is also how top-k and top-p keep speculation from smuggling
+            // in tokens the request excluded.
+            if p_draft > 0.0 && p_target / p_draft as f64 >= draw {
+                tokens.push(token);
+                window.push(token);
+                accepted += 1;
+                continue;
+            }
+            // Rejected: draw from the residual (p_target - p_draft)+, which is
+            // what makes the composition exact. The draft's mass sits entirely
+            // on `token`, so the residual is the target with that one entry
+            // reduced.
+            let recovered = Self::draw_residual(dist, total, &d.q, residual_draw);
+            tokens.push(recovered);
+            break;
+        }
+        if accepted == draft.len() {
+            // Every draft survived, so the target's own extra row is a free
+            // token — the bonus that makes k accepted drafts worth k + 1.
+            let row = &logits[draft.len() * vocab..(draft.len() + 1) * vocab];
+            let draw = sampler.next_draw();
+            let (dist, total) = sampler.distribution(row, &window);
+            tokens.push(crate::Sampler::pick(dist, total, draw));
+        }
+        debug_assert!(!tokens.is_empty(), "a step has to emit something");
+
+        let acc = crate::qwen35_mtp::Accepted {
+            tokens: tokens.clone(),
+            accepted,
+        };
+        self.settle(seq, pool, len_before, &acc)?;
+        let keep = accepted + 1;
+        let mut shifted: Vec<u32> = candidates[1..keep].to_vec();
+        shifted.push(*tokens.last().expect("a step emits at least one"));
+        let feed = DraftFeed {
+            rows: 0..keep,
+            positions: (len_before..len_before + keep).collect(),
+            shifted,
+        };
+        Ok(SpecOutcome {
+            tokens,
+            accepted,
+            drafted: draft.len(),
+            feed,
+        })
+    }
+
+    /// Sample from `(p_target - q)+`, normalized, where `q` is the drafter's
+    /// whole distribution.
+    ///
+    /// Public so a test can drive the rule this engine actually uses rather than
+    /// a transcription of it. A test that reimplements the rule and agrees with
+    /// itself is the failure mode that cost this project a day already.
+    pub fn draw_residual(
+        dist: &[(u32, f32)],
+        total: f64,
+        q: &[(u32, f32)],
+        draw: f64,
+    ) -> u32 {
+        let q_of = |tok: u32| {
+            q.iter()
+                .find(|(t, _)| *t == tok)
+                .map(|(_, w)| *w as f64)
+                .unwrap_or(0.0)
+        };
+        let mut residual: Vec<(u32, f32)> = Vec::with_capacity(dist.len());
+        let mut sum = 0.0f64;
+        for &(t, w) in dist {
+            // `q` is subtracted at every token, not only the drafted one. See
+            // `Drafted::q`.
+            let r = w as f64 / total - q_of(t);
+            if r > 0.0 {
+                residual.push((t, r as f32));
+                sum += r;
+            }
+        }
+        if residual.is_empty() || sum <= 0.0 {
+            // The target's support is entirely covered by the draft's, which can
+            // only happen when the two agree completely. Any token of that
+            // shared support is a correct draw; the first is the most likely.
+            return dist.first().map(|(t, _)| *t).unwrap_or(0);
+        }
+        crate::Sampler::pick(&residual, sum, draw)
+    }
+
     /// Roll every kind of per-sequence memory back to the accepted prefix.
     fn settle(
         &mut self,
