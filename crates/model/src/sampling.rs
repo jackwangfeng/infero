@@ -102,11 +102,50 @@ impl Sampler {
     /// [`Sampler::sample`] with the draw supplied rather than taken.
     pub fn sample_with_draw(&mut self, logits: &[f32], history: &[u32], draw: f64) -> u32 {
         debug_assert!(!logits.is_empty());
-
         if self.params.is_greedy() {
             return self.greedy(logits, history);
         }
+        let total = self.build_distribution(logits, history);
+        Self::pick(&self.candidates, total, draw)
+    }
 
+    /// The distribution this sampler would draw from, and its total.
+    ///
+    /// `(token, weight)` pairs over the surviving support, *unnormalized* — a
+    /// weight divided by the returned total is the token's probability. Left
+    /// unnormalized so that [`Sampler::pick`] compares against the same numbers
+    /// it always did; normalizing first is the same arithmetic in exact terms
+    /// and not in float, and this function exists to be the single definition of
+    /// what the sampler's distribution *is*.
+    ///
+    /// Speculative decoding needs exactly this. Its acceptance rule is a ratio
+    /// of the target's probability to the draft's, and both have to be measured
+    /// under the transformation the request asked for — temperature, top-k,
+    /// top-p, repetition penalty. A second implementation of that pipeline for
+    /// the speculative path would be a second chance to get it subtly wrong, and
+    /// the failure would be a shifted output distribution: not a crash, not
+    /// obviously worse text, just no longer the distribution the caller
+    /// specified.
+    ///
+    /// Greedy has no distribution in this sense; callers must handle it
+    /// separately, as `sample_with_draw` does.
+    pub fn distribution(&mut self, logits: &[f32], history: &[u32]) -> (&[(u32, f32)], f64) {
+        // A real assertion, not a debug one. Rejection sampling against a point
+        // mass is a different acceptance rule, so a speculative path that
+        // reached here with a greedy sampler would be applying the wrong rule —
+        // and a `debug_assert` would let exactly that through in the build that
+        // serves requests.
+        assert!(
+            !self.params.is_greedy(),
+            "a greedy sampler has no distribution to draw from; the caller has \
+             to choose the point-mass acceptance rule deliberately"
+        );
+        let total = self.build_distribution(logits, history);
+        (&self.candidates, total)
+    }
+
+    /// Everything from the raw logits to the truncated, weighted support.
+    fn build_distribution(&mut self, logits: &[f32], history: &[u32]) -> f64 {
         self.candidates.clear();
         self.candidates.extend(
             logits
@@ -117,18 +156,6 @@ impl Sampler {
         );
 
         self.apply_repetition_penalty(history);
-
-        if self.params.is_greedy() {
-            let best = self
-                .candidates
-                .iter()
-                .copied()
-                .fold(
-                    (0u32, f32::NEG_INFINITY),
-                    |a, b| if b.1 > a.1 { b } else { a },
-                );
-            return best.0;
-        }
 
         // Partition, then sort only the survivors.
         //
@@ -169,9 +196,13 @@ impl Sampler {
             self.candidates.truncate(keep.max(1));
             total = self.candidates.iter().map(|c| c.1 as f64).sum();
         }
+        total
+    }
 
+    /// Choose from a distribution built by [`Sampler::distribution`].
+    pub fn pick(dist: &[(u32, f32)], total: f64, draw: f64) -> u32 {
         let mut r = draw * total;
-        for c in &self.candidates {
+        for c in dist {
             r -= c.1 as f64;
             if r <= 0.0 {
                 return c.0;
@@ -179,7 +210,7 @@ impl Sampler {
         }
         // Float drift can leave `r` marginally positive; the last candidate is
         // the correct answer in that case.
-        self.candidates.last().map(|c| c.0).unwrap_or(0)
+        dist.last().map(|c| c.0).unwrap_or(0)
     }
 
     /// Argmax with the repetition penalty applied, without materializing the
