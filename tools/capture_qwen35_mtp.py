@@ -66,6 +66,7 @@ and the Rust test refuses such a capture.
 import argparse
 import ast
 import inspect
+import itertools
 import json
 import os
 import sys
@@ -431,6 +432,55 @@ def rope_tables(theta, rot, positions, dtype):
     return emb.cos().to(dtype)[None], emb.sin().to(dtype)[None]
 
 
+def check_rope_tables_against_reference(cfg, cfg_obj):
+    """`rope_tables` above, against `Qwen3_5TextRotaryEmbedding`.
+
+    The table is the one thing in this file that the behavioural check cannot
+    settle. It feeds the reference's own decoder layers, so an error in it
+    degrades the target model — but gracefully: the top-1 agreement stays
+    plausible while long-range attention rots, which is the signature the
+    head_dim-vs-rot normalization mistake produces. So compare against the
+    reference's `inv_freq` directly and require the wrong reading to be visible.
+    """
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as m
+
+    ref = m.Qwen3_5TextRotaryEmbedding(cfg_obj)
+    rot = int(cfg["head_dim"] * cfg["partial_rotary_factor"])
+    theta = cfg["rope_theta"]
+    if ref.inv_freq.shape[0] != rot // 2:
+        raise SystemExit(
+            f"the reference builds {ref.inv_freq.shape[0]} rotary frequencies, "
+            f"this capture builds rot//2 = {rot // 2}. partial_rotary_factor or "
+            f"head_dim is being read from the wrong place.")
+
+    # A 2-D `position_ids` is expanded into three identical rows, so
+    # `apply_interleaved_mrope` is a no-op and what comes back is the plain
+    # partial table this capture builds. (The interleaving is pinned separately,
+    # in tools/capture_qwen35_vision.py, straight out of the reference method.)
+    pos = torch.tensor([[0, 1, 2, 5, 31]])
+    cos_ref, sin_ref = ref(torch.zeros(1, pos.shape[1], 1), pos)
+    cos, sin = rope_tables(theta, rot, pos[0], torch.float32)
+    d_inv = (1.0 / (theta ** (torch.arange(0, rot, 2, dtype=torch.float64) / rot))
+             - ref.inv_freq.double()).abs().max().item()
+    d_cos = (cos[0] - cos_ref[0]).abs().max().item()
+    d_sin = (sin[0] - sin_ref[0]).abs().max().item()
+    wrong = 1.0 / (theta ** (torch.arange(0, rot, 2, dtype=torch.float64)
+                             / cfg["head_dim"]))
+    sep = (wrong - ref.inv_freq.double()).abs().max().item()
+    print(f"  rope inv_freq vs Qwen3_5TextRotaryEmbedding: Δ={d_inv:.2e}  "
+          f"cos Δ={d_cos:.2e}  sin Δ={d_sin:.2e}")
+    print(f"  (normalizing the exponent by head_dim={cfg['head_dim']} instead of "
+          f"rot={rot} moves inv_freq by {sep:.3e})")
+    if d_inv > 1e-7 or d_cos > 2e-6 or d_sin > 2e-6:
+        raise SystemExit("the rope table disagrees with the reference's; fix it "
+                         "before capturing anything")
+    if sep < 1e-2:
+        raise SystemExit("the head_dim-normalized table is indistinguishable "
+                         "here; this check is decorative")
+    return {"d_inv_freq": d_inv, "d_cos": d_cos, "d_sin": d_sin,
+            "head_dim_normalized_separation": sep}
+
+
 def causal_mask(t_len, dtype):
     """Additive causal mask.
 
@@ -575,6 +625,237 @@ class MtpHead(torch.nn.Module):
         return self.norm(out)[0], stages
 
 
+# ------------------------------------------------------- the acceptance rule
+#
+# `qwen35_mtp.rs`'s `accept_greedy` and `accept_stochastic` are transcriptions of
+# vLLM's `rejection_greedy_sample_kernel` and `rejection_random_sample_kernel`,
+# and nothing checked them. They are not floating-point arithmetic, which is why
+# they were easy to overlook, but they are exactly as silent when wrong: an
+# off-by-one in where the bonus token goes, or accepting on `>` instead of `>=`,
+# changes the emitted sequence and nothing crashes. In the greedy case a wrong
+# rule breaks the property the whole design rests on — that speculation emits
+# bit-identically what unspeculated greedy decoding would have.
+#
+# Both kernels take plain pointers, so they can be launched directly on a small
+# hand-built battery without any of vLLM's scheduling machinery. They are triton,
+# so this needs a GPU; when there is none the arrays are simply absent and the
+# Rust test skips rather than passing vacuously.
+
+
+def acceptance_battery(seed=20260822):
+    """Cases that exercise every branch of the rule, on GPU, via vLLM's kernels.
+
+    Returns a dict of arrays, or None if the kernels cannot be launched here.
+    """
+    if not torch.cuda.is_available():
+        print("  !! no GPU: vLLM's rejection kernels are triton and cannot run, "
+              "so accept_greedy / accept_stochastic stay unchecked here")
+        return None
+    try:
+        from vllm.v1.sample.rejection_sampler import (
+            PLACEHOLDER_TOKEN_ID,
+            rejection_greedy_sample_kernel,
+            rejection_random_sample_kernel,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"  !! cannot import vLLM's rejection sampler ({e}); "
+              f"accept_greedy / accept_stochastic stay unchecked")
+        return None
+
+    dev = "cuda"
+    vocab, max_spec = 16, 4
+    gen = torch.Generator().manual_seed(seed)
+    # Draft lengths 1..max_spec, and for each length one case that rejects at
+    # every position plus one that accepts everything — so "emit the bonus" and
+    # "emit the target's own token and stop" both occur, at both ends.
+    lens, drafts, targets = [], [], []
+    for length in range(1, max_spec + 1):
+        for reject_at in list(range(length)) + [None]:
+            lens.append(length)
+            d = torch.randint(0, vocab, (length,), generator=gen)
+            t = d.clone()
+            if reject_at is not None:
+                t[reject_at] = (d[reject_at] + 1 + int(
+                    torch.randint(0, vocab - 1, (1,), generator=gen))) % vocab
+                # Beyond the first mismatch the target's tokens are arbitrary and
+                # must be ignored; make them differ so a rule that keeps reading
+                # past the rejection is visible.
+                for j in range(reject_at + 1, length):
+                    t[j] = (d[j] + 3) % vocab
+            drafts.append(d)
+            targets.append(t)
+    batch = len(lens)
+    n = sum(lens)
+    cu = torch.tensor(list(itertools.accumulate(lens)), dtype=torch.int32,
+                      device=dev)
+    draft = torch.cat(drafts).to(torch.int32).to(dev)
+    targ = torch.cat(targets).to(torch.int32).to(dev)
+    bonus = torch.arange(1000, 1000 + batch, dtype=torch.int32, device=dev)
+
+    greedy = torch.full((batch, max_spec + 1), PLACEHOLDER_TOKEN_ID,
+                        dtype=torch.int32, device=dev)
+    rejection_greedy_sample_kernel[(batch,)](
+        greedy, cu, draft, targ, bonus, None, max_spec, None, None,
+        SYNTHETIC_MODE=False)
+
+    # The stochastic rule. Probabilities are built so the ratio straddles the
+    # uniform draw in both directions, and one row has p_draft == 0 exactly —
+    # the case vLLM guards against dividing by, where the ratio would be +inf
+    # and would accept a token the draft model considers impossible.
+    dp = torch.rand(n, vocab, generator=gen) + 1e-3
+    tp = torch.rand(n, vocab, generator=gen) + 1e-3
+    dcpu = draft.cpu().long()
+    dp[3, dcpu[3]] = 0.0
+    dp = (dp / dp.sum(-1, keepdim=True)).to(dev)
+    tp = (tp / tp.sum(-1, keepdim=True)).to(dev)
+    uniform = torch.rand(n, generator=gen).to(dev)
+    recovered = torch.randint(0, vocab, (n,), generator=gen).to(torch.int32).to(dev)
+    is_greedy = torch.zeros(batch, dtype=torch.bool, device=dev)
+    random_out = torch.full((batch, max_spec + 1), PLACEHOLDER_TOKEN_ID,
+                            dtype=torch.int32, device=dev)
+    rejection_random_sample_kernel[(batch,)](
+        random_out, cu, draft, dp, tp, bonus, recovered, uniform, is_greedy,
+        max_spec, vocab, None, NO_DRAFT_PROBS=False, SYNTHETIC_MODE=False)
+
+    idx = torch.arange(n, device=dev)
+    p_draft = dp[idx, draft.long()]
+    p_target = tp[idx, draft.long()]
+    accepted_g = (greedy != PLACEHOLDER_TOKEN_ID).sum(-1)
+    accepted_r = (random_out != PLACEHOLDER_TOKEN_ID).sum(-1)
+    print(f"  vLLM's rejection kernels on {batch} cases, {n} draft tokens: "
+          f"greedy emits {accepted_g.tolist()}")
+    print(f"  {'':>4}stochastic emits {accepted_r.tolist()}, "
+          f"{int((p_draft == 0).sum())} zero draft probability")
+    # The battery has to contain rejections and full acceptances, or it proves
+    # nothing about either branch.
+    lens_t = torch.tensor(lens, device=dev)
+    if not ((accepted_g == lens_t + 1).any() and (accepted_g <= lens_t).any()):
+        raise SystemExit("the acceptance battery has no full acceptance or no "
+                         "rejection; it cannot pin the rule")
+
+    return {
+        "accept.num_draft": torch.tensor(lens, dtype=torch.float32),
+        "accept.draft": draft.float().cpu(),
+        "accept.target_argmax": targ.float().cpu(),
+        "accept.bonus": bonus.float().cpu(),
+        "accept.greedy_out": greedy.float().cpu(),
+        "accept.p_draft": p_draft.float().cpu(),
+        "accept.p_target": p_target.float().cpu(),
+        "accept.uniform": uniform.float().cpu(),
+        "accept.recovered": recovered.float().cpu(),
+        "accept.random_out": random_out.float().cpu(),
+        "accept.placeholder": torch.tensor([float(PLACEHOLDER_TOKEN_ID)]),
+    }
+
+
+# ------------------------------------------------ a whole layer, small enough
+#
+# The taps above pin every *transition* inside the head's decoder layer, but not
+# the transitions' composition, and not the MLP at all: `q_proj` alone is 251 MB
+# in f32, so the real layer's weights cannot be dumped for a Rust test to run
+# end to end. The pieces that go unchecked as a result are exactly the ones with
+# a mirror image that runs — `silu` on `gate_proj` rather than on `up_proj`, the
+# two residual adds, whether the second norm sees the post-attention stream.
+#
+# So build the same class at a size that fits: `Qwen3_5DecoderLayer` from the
+# reference, random weights, 40 wide. Every weight, the input and the output get
+# dumped, and the Rust `full_attention_layer` then answers to the library
+# directly instead of to a decomposition of it. 40x40 matrices are not a
+# numerical stand-in for 5120x5120 ones and are not meant to be — the real
+# checkpoint's activations are what the stagewise checks are for. This is for
+# layout and composition, where size is irrelevant.
+
+
+SYNTH = {"d_model": 40, "heads": 6, "kv_heads": 2, "head_dim": 8,
+         "rotary_dim": 4, "d_ff": 56, "tokens": 9, "rope_theta": 1e7}
+
+
+def synthetic_layer_capture(cfg):
+    """One small `Qwen3_5DecoderLayer` and one small `Qwen3_5MLP`, with weights.
+
+    Returns (arrays, config). Nothing here is a transcription: the tensors come
+    out of the reference's own modules, and the only thing this file decides is
+    which of them to write down.
+    """
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as m
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+
+    s = dict(SYNTH)
+    hd, nh = s["head_dim"], s["heads"]
+    obj = Qwen3_5TextConfig(
+        vocab_size=64, hidden_size=s["d_model"], intermediate_size=s["d_ff"],
+        num_hidden_layers=2, num_attention_heads=nh,
+        num_key_value_heads=s["kv_heads"], head_dim=hd,
+        rms_norm_eps=cfg["rms_norm_eps"], hidden_act=cfg["hidden_act"],
+        layer_types=["linear_attention", "full_attention"],
+        rope_parameters={"rope_type": "default", "rope_theta": s["rope_theta"],
+                         "partial_rotary_factor": s["rotary_dim"] / hd,
+                         "mrope_section": [1, 1, 0], "mrope_interleaved": True},
+    )
+    obj._attn_implementation = "eager"
+    layer = m.Qwen3_5DecoderLayer(obj, 1).to(torch.float32).eval()
+    gen = torch.Generator().manual_seed(20260822)
+    with torch.no_grad():
+        for p in layer.parameters():
+            p.copy_(torch.randn(p.shape, generator=gen) * 0.4)
+
+    if type(layer.self_attn).__name__ != "Qwen3_5Attention":
+        raise SystemExit("layer_types[1]='full_attention' did not build a "
+                         "Qwen3_5Attention")
+    # `ACT2FN[...]` hands back a fresh module each time, so identity says
+    # nothing; compare what it computes. The Rust `swiglu_mlp` hard-codes silu.
+    probe = torch.linspace(-8, 8, 401)
+    d_act = (layer.mlp.act_fn(probe)
+             - torch.nn.functional.silu(probe)).abs().max().item()
+    d_gelu = (layer.mlp.act_fn(probe)
+              - torch.nn.functional.gelu(probe)).abs().max().item()
+    if d_act > 1e-6:
+        raise SystemExit(f"the MLP activation is not silu (Δ={d_act:.2e}); "
+                         f"hidden_act says {cfg['hidden_act']!r}")
+    if d_gelu < 1e-2:
+        raise SystemExit("silu and gelu are indistinguishable on this probe")
+
+    T = s["tokens"]
+    x = torch.randn(T, s["d_model"], generator=gen)
+    pe = rope_tables(s["rope_theta"], s["rotary_dim"], torch.arange(T),
+                     torch.float32)
+    with torch.no_grad():
+        out = layer(x[None], position_embeddings=pe,
+                    attention_mask=causal_mask(T, torch.float32))
+        out = (out[0] if isinstance(out, tuple) else out)[0]
+        # The MLP on its own, on its own input, so a failure localizes. The
+        # mirror image — silu on up_proj instead of gate_proj — must not
+        # reproduce it, or the dump is not evidence about the orientation.
+        mx = torch.randn(T, s["d_model"], generator=gen)
+        my = layer.mlp(mx)
+        mirror = layer.mlp.down_proj(layer.mlp.gate_proj(mx)
+                                    * layer.mlp.act_fn(layer.mlp.up_proj(mx)))
+    sep = (mirror - my).abs().max().item() / my.abs().max().item()
+    print(f"  synthetic layer: {s['d_model']} wide, {T} tokens; the mirrored "
+          f"SwiGLU (silu on up_proj) differs by {sep:.3e} of peak")
+    if sep < 1e-2:
+        raise SystemExit("silu on gate_proj and silu on up_proj give nearly the "
+                         "same answer on this input; the dump would bless both")
+
+    sa = layer.self_attn
+    arrays = {
+        "synth.x": x, "synth.out": out,
+        "synth.rope_cos": pe[0][0], "synth.rope_sin": pe[1][0],
+        "synth.mlp_x": mx, "synth.mlp_y": my,
+        "synth.w.input_layernorm": layer.input_layernorm.weight,
+        "synth.w.post_attention_layernorm": layer.post_attention_layernorm.weight,
+        "synth.w.q_norm": sa.q_norm.weight, "synth.w.k_norm": sa.k_norm.weight,
+        "synth.w.q_proj": sa.q_proj.weight, "synth.w.k_proj": sa.k_proj.weight,
+        "synth.w.v_proj": sa.v_proj.weight, "synth.w.o_proj": sa.o_proj.weight,
+        "synth.w.gate_proj": layer.mlp.gate_proj.weight,
+        "synth.w.up_proj": layer.mlp.up_proj.weight,
+        "synth.w.down_proj": layer.mlp.down_proj.weight,
+    }
+    s["eps"] = cfg["rms_norm_eps"]
+    s["mirrored_swiglu_separation"] = sep
+    return arrays, s
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model_dir")
@@ -620,6 +901,11 @@ def main():
     full_idx = cfg_obj.layer_types.index("full_attention")
     print(f"  the head's decoder layer is built as layer_types[{full_idx}] = "
           f"{cfg_obj.layer_types[full_idx]}")
+    rope_check = check_rope_tables_against_reference(cfg, cfg_obj)
+    synth_arrays, synth_cfg = synthetic_layer_capture(cfg)
+    accept_arrays = acceptance_battery()
+    if accept_arrays:
+        synth_arrays.update(accept_arrays)
 
     # ---- tokens. Real text, so the hidden states are on the model's manifold;
     # the top-1 agreement check below is only meaningful on text the model can
@@ -844,6 +1130,9 @@ def main():
     manifest["prefix_truncated"] = truncated
     manifest["fc_input_reduction"] = witnesses
     manifest["rms_norm_check"] = norm_check
+    manifest["rope_table_check"] = rope_check
+    manifest["synth_config"] = synth_cfg
+    manifest["acceptance_from_vllm_kernels"] = accept_arrays is not None
     manifest["tensor_inventory"] = inventory
     manifest["behaviour"] = behaviour
     manifest["eps_headroom"] = eps_reports
@@ -878,6 +1167,8 @@ def main():
 
     dump("rope_cos", pe[0][0])
     dump("rope_sin", pe[1][0])
+    for name in sorted(synth_arrays):
+        dump(name, synth_arrays[name])
     dump("emb_normed", stages["emb_normed"])
     dump("hidden_normed", stages["hidden_normed"])
     dump("fc_out", stages["fc_out"])

@@ -877,7 +877,36 @@ pub fn load_awq(
         // plausible size and wrong meaning.
         if let Some(t) = w.get(&format!("{prefix}.weight")) {
             let (n, k) = (t.shape[0], t.shape[1]);
-            let halves: Vec<half::f16> = if t.dtype == tuili_safetensors::Dtype::F8E4M3 {
+            if t.dtype == tuili_safetensors::Dtype::F8E4M3 {
+                // Keep the FP8 bytes and carry the scale grid with them, rather
+                // than expanding here. Expanding is correct and was the first
+                // version; it doubles what a decode step has to read, and the
+                // profiler put the resulting f16 GEMM at 75% of a step.
+                //
+                // One buffer: `n * k` quants then the grid as f32, which is the
+                // layout `WeightType::F8E4M3` documents and both FP8 kernels
+                // read. A `Matrix` stays a single allocation, so the offload
+                // blob path and `Matrix::view` need no special case.
+                let scales_t = w
+                    .tensor(&format!("{prefix}.weight_scale_inv"))
+                    .with_context(|| format!("{prefix} is FP8 but has no scale grid"))?;
+                let scales = scales_t.to_f32()?;
+                let want = tuili_kernels::fp8::scale_grid(k, n);
+                anyhow::ensure!(
+                    scales.len() == want,
+                    "{prefix}'s scale grid has {} entries; an [{n}, {k}] matrix \
+                     at block {} wants {want}",
+                    scales.len(),
+                    tuili_kernels::fp8::FP8_BLOCK,
+                );
+                let mut bytes = Vec::with_capacity(tuili_kernels::fp8::fp8_bytes(k, n));
+                bytes.extend_from_slice(t.data);
+                for v in &scales {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                return Ok((bytes, WeightType::F8E4M3, k, n));
+            }
+            let halves: Vec<half::f16> = if false {
                 // Block-scaled FP8. The scale grid is 128x128 and
                 // `dequant_f8_to_f16` validates that the grid matches the
                 // quants, which is the check that catches a transposed or

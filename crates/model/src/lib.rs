@@ -21,7 +21,9 @@
 mod cache;
 pub mod config;
 pub mod gdn_state;
+pub mod mtp;
 pub mod qwen35;
+pub mod spec;
 pub mod qwen35_mtp;
 pub mod qwen35_vision;
 mod sampling;
@@ -370,7 +372,7 @@ pub struct Model {
     use_mmq: bool,
     /// Decode graphs by (tokens, kv bucket). A step issues roughly 700 kernel
     /// launches; replaying one graph removes that cost.
-    graphs: std::collections::HashMap<(u64, usize, usize), GraphSlot>,
+    graphs: std::collections::HashMap<(u64, usize, usize, bool), GraphSlot>,
     /// Cleared by `TUILI_NO_GRAPH`, for measuring what the graphs are worth.
     use_graph: bool,
     max_logit_rows: usize,
@@ -389,6 +391,25 @@ pub struct Model {
     /// bringing one token. `PhaseEvents` averages only those; a prefill costs
     /// about ten times a decode and inflated `gpu_ms` when it did not.
     last_decode_only: bool,
+    /// The multi-token-prediction head, once [`Model::install_mtp_head`] has
+    /// loaded it. Absent on a checkpoint with no head, and on one whose head has
+    /// not been asked for.
+    mtp: Option<mtp::MtpHead>,
+    /// `[max_logit_rows, d_model]` — the rows the last pass took logits from,
+    /// **after** the final norm.
+    ///
+    /// Copied out of `act.xb` because that is the one buffer that holds what the
+    /// MTP head consumes and the next thing to run overwrites it. Which of the
+    /// two hidden states the head wants cannot be settled by the acceptance rate
+    /// — `pre_fc_norm_hidden` renormalizes, so feeding the pre-norm one drafts
+    /// about as well on real text — so it is settled by reading vLLM's runner,
+    /// which passes `Qwen3NextModel.forward`'s return value, whose last statement
+    /// is the final norm. `tests/qwen35_mtp.rs` pins it numerically against the
+    /// capture, which carries both tensors for exactly this reason.
+    mtp_hidden: Option<CudaSlice<f32>>,
+    /// The journal that undoes a rejected candidate's effect on the recurrent
+    /// state. Only allocated for a model that has linear-attention blocks.
+    gdn_rollback: Option<spec::GdnRollback>,
 }
 
 /// Device-side scratch for sampling. Sized once, at the batch and vocabulary
@@ -585,6 +606,30 @@ impl Model {
         Self::from_parts(dev, kern, cfg, w, max_seq, kv_quant, max_logit_rows)
     }
 
+    /// Assemble a model from weights that are already on the device.
+    ///
+    /// The seam a test needs. Qwen3.5's block stack is the only one in this
+    /// engine that carries recurrent state, and the only checkpoint of it is 51
+    /// GiB — which does not fit on the card this is developed on, and did not
+    /// load at all until recently. Speculative decoding's hardest requirement is
+    /// about exactly that state, so the alternative to this constructor is
+    /// testing the rollback on a model that has nothing to roll back.
+    ///
+    /// Nothing else uses it: the loaders build their own weights and call the
+    /// same private assembly.
+    pub fn from_weights(
+        dev: Device,
+        cfg: Config,
+        w: Weights,
+        max_seq: usize,
+        kv_quant: KvQuant,
+        max_logit_rows: usize,
+    ) -> Result<Self> {
+        let kern = Kernels::new(dev.clone());
+        kern.warm_up()?;
+        Self::from_parts(dev, kern, cfg, w, max_seq, kv_quant, max_logit_rows)
+    }
+
     /// Everything after the weights are in VRAM, which is the same whichever
     /// container they came out of.
     fn from_parts(
@@ -698,6 +743,9 @@ impl Model {
             phase_ev: PhaseEvents::new(&dev)?,
             last_decode_only: false,
             logits_host,
+            mtp: None,
+            mtp_hidden: None,
+            gdn_rollback: None,
         })
     }
 
@@ -855,15 +903,51 @@ impl Model {
         items: &[BatchItem<'_>],
         pool: &mut KvPool,
     ) -> Result<usize> {
+        // One logit row per item that asked for one, which is its last token.
+        let tail: Vec<usize> = items
+            .iter()
+            .map(|i| usize::from(i.wants_logits))
+            .collect();
+        self.forward_batch_rows(items, pool, &tail)
+    }
+
+    /// [`Self::forward_batch_device`] with the logits of more than one token per
+    /// sequence.
+    ///
+    /// `tail[i]` is how many of item `i`'s *trailing* tokens want logits, which
+    /// generalizes `wants_logits` (0 or 1) without changing what a caller who
+    /// does not need it writes. Speculative verification is the reason it exists:
+    /// a pass over `k + 1` candidates needs the target's own prediction at every
+    /// one of them, because `logits[j]` is what decides candidate `j`, and taking
+    /// only the last row would leave the acceptance rule with nothing to compare.
+    pub fn forward_batch_rows(
+        &mut self,
+        items: &[BatchItem<'_>],
+        pool: &mut KvPool,
+        tail: &[usize],
+    ) -> Result<usize> {
         let phase = crate::StepPhases::start();
         anyhow::ensure!(!items.is_empty(), "empty batch");
+        anyhow::ensure!(
+            tail.len() == items.len(),
+            "{} logit-row counts for {} items",
+            tail.len(),
+            items.len()
+        );
         let n_tokens: usize = items.iter().map(|i| i.tokens.len()).sum();
         anyhow::ensure!(n_tokens > 0, "batch carries no tokens");
         anyhow::ensure!(
             n_tokens <= MAX_BATCH_TOKENS,
             "batch of {n_tokens} tokens exceeds the {MAX_BATCH_TOKENS} a pass can carry"
         );
-        let n_logit_rows = items.iter().filter(|i| i.wants_logits).count();
+        for (i, (item, want)) in items.iter().zip(tail).enumerate() {
+            anyhow::ensure!(
+                *want <= item.tokens.len(),
+                "item {i} brings {} tokens and {want} of them want logits",
+                item.tokens.len()
+            );
+        }
+        let n_logit_rows: usize = tail.iter().sum();
         self.last_decode_only = n_tokens == n_logit_rows;
         anyhow::ensure!(
             n_logit_rows <= self.max_logit_rows,
@@ -900,7 +984,7 @@ impl Model {
         // long the sequence already was. The recurrence needs the first; the
         // reset decision needs the second.
         let mut starts = vec![(0usize, 0usize); pool.max_seqs()];
-        for item in items {
+        for (item, want) in items.iter().zip(tail) {
             let start = pool.len(item.seq);
             if item.seq.0 < starts.len() {
                 starts[item.seq.0] = (token_ids.len(), start);
@@ -913,8 +997,11 @@ impl Model {
                 slots.push(slot);
             }
             kv_len = kv_len.max(start + item.tokens.len());
-            if item.wants_logits {
-                logit_rows.push((token_ids.len() - 1) as i32);
+            // The last `want` of this item's rows, in order, so that a caller
+            // reading the logits back finds candidate `j` at row `j`.
+            let end = token_ids.len();
+            for row in end - want..end {
+                logit_rows.push(row as i32);
             }
         }
 
@@ -1000,7 +1087,21 @@ impl Model {
         // The pool is part of the key: a graph holds that pool's device
         // pointers, and replaying it against another pool would read the wrong
         // KV cache — which is exactly what a fresh `Session` per sequence does.
-        let key = (pool.id(), n_tokens, kv_len.next_multiple_of(graph_kv_bucket()));
+        // The journal's state is part of the shape. A graph records the copies
+        // that stage a layer's recurrent state and journal its inputs, so a
+        // captured verification pass and a captured ordinary pass of the same
+        // width are *different* graphs — and they collide, because `k + 1` tokens
+        // is also a prefill chunk length. Replaying the wrong one is silent both
+        // ways round: an ordinary pass would advance a working copy and throw its
+        // state update away, and a verification pass would advance the persistent
+        // state and then have its journal replayed on top of it.
+        let armed = self.gdn_rollback.as_ref().is_some_and(|r| r.is_armed());
+        let key = (
+            pool.id(),
+            n_tokens,
+            kv_len.next_multiple_of(graph_kv_bucket()),
+            armed,
+        );
         let graphable = self.use_graph && self.offload.is_none() && key.2 <= self.max_seq;
 
         match self.graphs.get(&key) {
@@ -1084,6 +1185,29 @@ impl Model {
             pe.ev[1].record(self.dev.stream())?;
         }
         phase.mark(1);
+
+        // The MTP head's second input: every token's hidden state, after the
+        // final norm.
+        //
+        // Every token and not just the rows that wanted logits, because the
+        // drafter needs a history. Its slot `p` holds `(h_p, emb(t_{p+1}))`, so a
+        // prompt of `n` tokens gives it `n` slots to attend over — vLLM hands its
+        // drafter the whole `target_hidden_states` array for the same reason. A
+        // head primed only on the rows that were sampled from would attend to a
+        // cache with holes in it, which is not an error and is not the model.
+        //
+        // Before the early return below: a mid-prompt chunk takes no logits and
+        // still has to reach the drafter.
+        if let Some(h) = self.mtp_hidden.as_mut() {
+            self.kern.rms_norm(
+                &mut h.slice_mut(..n_tokens * d),
+                &self.act.x.slice(..n_tokens * d),
+                &self.w.output_norm.as_view(),
+                n_tokens,
+                d,
+                rms_eps,
+            )?;
+        }
         if n_logit_rows == 0 {
             phase.report();
             self.logit_rows = 0;
@@ -1477,6 +1601,9 @@ impl Model {
             .and_then(|g| g.ordinal_of(layer))
             .context("no recurrent state slot for a linear-attention layer")?;
         let n_seqs = pool.max_seqs();
+        // Cloned rather than borrowed: the journal copies below want a device
+        // while `self.act` and `self.gdn_rollback` are borrowed apart.
+        let dev = self.dev.clone();
 
         // Normalize the residual stream. No fused f16 variant here: its point is
         // to hand an f16 activation to an MMQ q/k/v group, and this block has
@@ -1542,6 +1669,17 @@ impl Model {
             total_tokens: n,
         };
 
+        // A speculative verification pass in flight: keep this layer's
+        // convolution taps and take a working copy of its recurrent state, so
+        // that the pass can be undone down to the accepted prefix. Both are
+        // no-ops on an ordinary step. See `crate::spec`.
+        let armed = self.gdn_rollback.as_ref().is_some_and(|r| r.is_armed());
+        if armed {
+            let r = self.gdn_rollback.as_mut().unwrap();
+            r.save_conv(&dev, ordinal, &conv.as_view())?;
+            r.stage_state(&dev, &recurrent.as_view())?;
+        }
+
         // The convolution needs a separate output: it reads three tokens back,
         // so writing in place would consume values it had already overwritten.
         self.kern.gdn_conv(
@@ -1577,9 +1715,38 @@ impl Model {
             1e-6,
         )?;
 
+        // The journal, recorded here and not a line earlier or later. What the
+        // recurrence is about to consume is the packed row *after* the
+        // convolution and *after* `q` and `k` were l2-normalized, and those are
+        // the values a replay has to feed it — journalling `acts.qkv` instead
+        // would replay the recurrence over unfiltered, unnormalized inputs, run
+        // to completion, and leave a state that is wrong by a few percent.
+        if armed {
+            let r = self.gdn_rollback.as_mut().unwrap();
+            r.record(
+                &dev,
+                ordinal,
+                crate::spec::GdnTap {
+                    pre_conv: acts.qkv.slice(..n * width),
+                    post_conv: acts.qkv_conv.slice(..n * width),
+                    g: acts.g.slice(..n * heads),
+                    beta: acts.beta.slice(..n * heads),
+                },
+            )?;
+        }
+        // The recurrence runs on the working copy while a verification pass is
+        // in flight, leaving the persistent state at its pre-step value for the
+        // replay to advance. One 3 MiB copy a layer, which
+        // `GdnRollback::KERNEL_WANTED` would remove entirely.
+        let mut staged = if armed {
+            Some(self.gdn_rollback.as_mut().unwrap().state_scratch_mut())
+        } else {
+            None
+        };
+        let state = staged.as_mut().unwrap_or(&mut recurrent);
         self.kern.gdn_delta_rule(
             &mut acts.core.slice_mut(..n * val_dim),
-            &mut recurrent,
+            state,
             &acts.qkv_conv.slice(..n * width),
             &acts.g.slice(..n * heads),
             &acts.beta.slice(..n * heads),
@@ -1590,6 +1757,10 @@ impl Model {
             la.value_head_dim,
             (width, 0, key_dim, 2 * key_dim),
         )?;
+        // `staged` borrowed the journal for the launch above; letting it fall out
+        // of scope here rather than at the end of the function keeps the journal
+        // available to the rest of the block.
+        let _ = staged;
 
         // Normalize each head's output, then gate it with silu(z). This order
         // matters and the other one runs; `gdn_gated_rmsnorm` says why. `qkv` is
@@ -2793,6 +2964,55 @@ impl Model {
         pre_f16: bool,
     ) -> Result<()> {
         let weights = w.view(stage)?;
+
+        // Block-scaled FP8 has its own pair of paths and neither is the integer
+        // one below: the activation stays f32, because the weights carry a
+        // per-block scale rather than a per-block quantization of the *input*.
+        //
+        // At one token this is the whole point of storing FP8 at all. With the
+        // weights expanded to f16 at load, a batch-1 projection went through
+        // cuBLAS's GEMM with m = 1 — the profiler had `gemm_f16` at 75% of a
+        // step at 86.8 us a launch — so the mat-vec replaces both the byte count
+        // and the wrong kernel shape.
+        if w.ty == tuili_kernels::WeightType::F8E4M3 {
+            if n_tokens == 1 {
+                // `accum` is not offered here. The callers that want the fused
+                // residual add pass it through a separate argument on the
+                // quantized mat-vecs, and `matmul_pre` has no channel for it —
+                // so this path writes and the residual add stays its own
+                // launch. Wiring it through is a later change with its own
+                // measurement, not something to infer from `pre_quantized`.
+                return kern.mmv_f8_block(out, &weights, x, w.k, w.n, false);
+            }
+            // Above one token the answer is a GEMM. Expand the weights into the
+            // f16 staging buffer the float path already uses, and convert the
+            // activation the same way that path does.
+            let n_x = n_tokens * w.k;
+            let elems = w.elements();
+            anyhow::ensure!(
+                scratch.w16.len() >= elems,
+                "the f16 staging buffer holds {} halves, this projection needs {elems}",
+                scratch.w16.len()
+            );
+            if !pre_f16 {
+                kern.to_f16(&mut scratch.x16.slice_mut(..n_x), x, n_x)?;
+            }
+            kern.dequant_f8_block_to_f16(
+                &mut scratch.w16.slice_mut(..elems),
+                &weights,
+                w.k,
+                w.n,
+            )?;
+            return kern.gemm_f16(
+                out,
+                &scratch.x16.slice(..n_x),
+                &scratch.w16.slice(..elems),
+                n_tokens,
+                w.k,
+                w.n,
+            );
+        }
+
         let int_x = use_mmvq && Kernels::has_mmvq(w.ty) && w.k.is_multiple_of(32);
         // Whether *this matrix* gets the tensor-core GEMM, not just its type:
         // Q4_K rows that are not a multiple of 256 have the type but not the

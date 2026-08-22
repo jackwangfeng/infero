@@ -43,9 +43,10 @@ use half::f16;
 
 use crate::{ELEMENTWISE_BLOCK, Kernels, REDUCE_BLOCK, vision_src};
 
-/// Queries one attention block serves. Must match `VIS_BQ` in `cu/vision.cu`:
-/// the host builds the block-to-segment mapping, so the two have to agree.
-pub const VISION_ATTN_BQ: usize = 16;
+/// Queries one attention block serves. Must match `VIS_BQ` in `cu/vision.cu`
+/// (`VIS_WARPS * VIS_QPW`): the host builds the block-to-segment mapping, so the
+/// two have to agree.
+pub const VISION_ATTN_BQ: usize = 32;
 /// Threads in an attention block: `VIS_WARPS * 32`.
 const VISION_ATTN_THREADS: u32 = 256;
 /// Keys per streamed tile; `VIS_BK`.

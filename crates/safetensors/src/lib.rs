@@ -175,7 +175,7 @@ impl Tensor<'_> {
     /// mantissa bits — with two departures: `exp == 0` is subnormal at
     /// `(m/8) · 2⁻⁶`, and there are no infinities, so `0x7F` and `0xFF` are
     /// NaN rather than ±∞.
-    fn e4m3_table() -> &'static [f32; 256] {
+    pub(crate) fn e4m3_table() -> &'static [f32; 256] {
         static T: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
         T.get_or_init(|| {
             let mut t = [0.0f32; 256];
@@ -261,6 +261,15 @@ impl Tensor<'_> {
         anyhow::ensure!(head.is_empty(), "{} is not 4-byte aligned", self.name);
         Ok(&body[..self.n_elements()])
     }
+}
+
+/// What one E4M3 byte means.
+///
+/// Exposed so a test or another crate can name the reference value without
+/// writing a second decoder — a second decoder is how two implementations come
+/// to agree on a reading neither of them confirmed.
+pub fn e4m3_value(byte: u8) -> f32 {
+    Tensor::e4m3_table()[byte as usize]
 }
 
 struct Entry {

@@ -1442,3 +1442,68 @@ fn the_merger_reproduces_the_reference_image_embeddings_stagewise() {
         assert_eq!(emb.len(), grouped.len() / wide * d.out_hidden);
     });
 }
+
+/// `VisionDims::QWEN35_27B` matches the checkpoint, field by field.
+///
+/// Every other test in this file takes its dimensions from the manifest, which
+/// means the hard-coded constant a loader would actually use is the one thing
+/// here that nothing checked. Two of its fields are the kind that cannot be
+/// derived and are silent when wrong:
+///
+/// * `eps`. `Qwen3_5VisionBlock` writes `nn.LayerNorm(hidden, eps=1e-6)` as a
+///   literal and `vision_config` has no field for it, so there is nothing to
+///   read — a port that reaches for `nn.LayerNorm`'s own default gets 1e-5, and
+///   at the variances this tower runs at that is a few tenths of a percent,
+///   which reads as quantization noise. The capture now takes this number off
+///   the instantiated module instead of writing it down, and refuses if the
+///   tower's three LayerNorms disagree.
+/// * `rope_theta`. 1e4 here against 1e7 on the text side of the same
+///   checkpoint, and `Qwen3_5VisionRotaryEmbedding`'s own default is 1e4 — so
+///   the wrong one is only reachable by carrying the text tower's habit across,
+///   which is exactly how it would happen.
+#[test]
+fn the_hard_coded_dimensions_match_the_checkpoint() {
+    with_capture("VisionDims::QWEN35_27B", |c| {
+        let want = c.dims();
+        let got = VisionDims::QWEN35_27B;
+        for (name, a, b) in [
+            ("depth", got.depth, want.depth),
+            ("hidden", got.hidden, want.hidden),
+            ("heads", got.heads, want.heads),
+            ("intermediate", got.intermediate, want.intermediate),
+            ("out_hidden", got.out_hidden, want.out_hidden),
+            ("in_channels", got.in_channels, want.in_channels),
+            ("patch", got.patch, want.patch),
+            ("temporal_patch", got.temporal_patch, want.temporal_patch),
+            ("merge", got.merge, want.merge),
+            (
+                "num_position_embeddings",
+                got.num_position_embeddings,
+                want.num_position_embeddings,
+            ),
+        ] {
+            assert_eq!(a, b, "VisionDims::QWEN35_27B.{name}");
+        }
+        assert_eq!(
+            got.eps, want.eps,
+            "VisionDims::QWEN35_27B.eps is {} but the reference's own vision \
+             LayerNorms use {}. nn.LayerNorm's default is 1e-5 and there is no \
+             config field to read, so this constant is the only place the number \
+             lives.",
+            got.eps, want.eps
+        );
+        assert_eq!(
+            got.rope_theta, want.rope_theta,
+            "VisionDims::QWEN35_27B.rope_theta is {} but the reference's \
+             Qwen3_5VisionRotaryEmbedding uses {}. The text side of this same \
+             checkpoint is 1e7.",
+            got.rope_theta, want.rope_theta
+        );
+        // And the derived quantities, which are the ones a kernel sizes itself
+        // against.
+        assert_eq!(got.head_dim(), c.u("head_dim"));
+        assert_eq!(got.rope_dim(), c.u("vision_rope_dim"));
+        assert_eq!(got.grid_per_side(), c.u("num_grid_per_side"));
+        assert_eq!(got.resize_factor(), c.u("smart_resize_factor"));
+    });
+}

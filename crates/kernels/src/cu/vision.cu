@@ -250,8 +250,34 @@ extern "C" __global__ void vision_qkv_rope_f32(float* __restrict__ q,
 // ------------------------------------------------------------------ attention
 
 // Warps a block, queries a warp, keys a tile. head_dim <= 32 * VIS_ITER.
+//
+// `VIS_QPW` is the reuse factor, and it is the whole performance story of this
+// kernel. Both inner loops read a shared row of K or V and multiply it by
+// something belonging to a query; with the query loop *outside* the head_dim
+// loop, every shared read feeds exactly one FMA. Holding VIS_QPW queries and
+// putting the query loop *innermost* makes one read feed VIS_QPW of them.
+//
+// Measured on an A4000 (sm_86), 4096-patch frame, whole 27-block tower — and this
+// kernel is 89% of it at that size:
+//
+//   QPW 2, query loop outermost   1891 ms   (attention 4492 ms of device time)
+//   QPW 2, loops exchanged        1905 ms
+//   QPW 4, loops exchanged        1038 ms   (attention 1857 ms)
+//   QPW 8, loops exchanged        1013 ms
+//   QPW 4, 16 warps a block       1007 ms
+//
+// So the exchange is worth nothing on its own and 1.8x once VIS_QPW is above 2,
+// which is what "the reads are the same, the reuse is not" predicts. Past 4 it is
+// within noise, and 8 warps of 4 is the cheapest of the three fastest: 28 KB of
+// shared a block leaves three blocks resident per SM, and a block that is 32
+// queries wide wastes less on a short segment than one that is 64 wide.
+//
+// An earlier attempt split the dot product into four independent accumulators
+// while leaving the query loop outermost, on the theory that a 72-long dependent
+// FMA chain was the limit. That made it *worse* (1891 -> 2320 ms). The profiler
+// said which kernel to look at; it did not say why, and guessing cost two builds.
 #define VIS_WARPS 8
-#define VIS_QPW 2
+#define VIS_QPW 4
 #define VIS_BQ (VIS_WARPS * VIS_QPW)
 #define VIS_BK 32
 #define VIS_ITER 4
@@ -336,40 +362,77 @@ extern "C" __global__ void vision_attn_f32(float* __restrict__ out,
         __syncthreads();
         const int nk = min(VIS_BK, seg_b - base);
 
+        // Scores: lane j takes key `base + j` and computes its dot with all
+        // VIS_QPW of this warp's queries at once. The query loop is *inside* the
+        // head_dim loop on purpose — that way `kr[i]` is read from shared once and
+        // feeds VIS_QPW FMAs. See the VIS_QPW comment above for what that is
+        // worth and for what it is not (the accumulators also become independent
+        // chains, and that part measured as worth nothing by itself).
+        //
+        // The q reads are broadcasts (every lane the same address) and the k
+        // reads are conflict-free by the row padding.
+        float dot[VIS_QPW];
+#pragma unroll
+        for (int u = 0; u < VIS_QPW; ++u) dot[u] = 0.0f;
+        if (lane < nk) {
+            const float* kr = ksh + lane * pad;
+            const float* qr = qsh + warp * VIS_QPW * pad;
+            for (int i = 0; i < head_dim; ++i) {
+                const float kv = kr[i];
+#pragma unroll
+                for (int u = 0; u < VIS_QPW; ++u) {
+                    dot[u] += qr[u * pad + i] * kv;
+                }
+            }
+        }
+
+        // Online softmax, per query. `p[u]` is this lane's weight for key
+        // `base + lane`; the correction rescales what is already accumulated.
+        float p[VIS_QPW], corr[VIS_QPW];
+#pragma unroll
         for (int u = 0; u < VIS_QPW; ++u) {
             const int qt = q0 + warp * VIS_QPW + u;
-            const int slot = warp * VIS_QPW + u;
-            // Lane j scores key `base + j`. Both operands come from shared: the
-            // q read is a broadcast, the k read is conflict-free by the padding.
-            float sc = -INFINITY;
-            if (lane < nk && qt < seg_b) {
-                float dot = 0.0f;
-                for (int i = 0; i < head_dim; ++i) {
-                    dot += qsh[slot * pad + i] * ksh[lane * pad + i];
-                }
-                sc = dot * scale;
-            }
+            const float sc =
+                (lane < nk && qt < seg_b) ? dot[u] * scale : -INFINITY;
             const float mnew = fmaxf(mrow[u], warp_reduce_max(sc));
-            // Uniform across the warp: mnew is a warp reduction and mrow starts
-            // uniform. -inf happens when this warp's query is past the segment;
-            // exp(-inf - -inf) would be nan, so the whole update is skipped.
+            // Warp-uniform: mnew is a warp reduction and mrow starts uniform.
+            // -inf means this slot's query is past the segment, and
+            // exp(-inf - -inf) is nan, so the update is skipped entirely.
             if (mnew > -INFINITY) {
-                const float p = (sc > -INFINITY) ? __expf(sc - mnew) : 0.0f;
-                const float corr = __expf(mrow[u] - mnew);
-                lrow[u] = lrow[u] * corr + warp_reduce_sum(p);
+                p[u] = (sc > -INFINITY) ? __expf(sc - mnew) : 0.0f;
+                corr[u] = __expf(mrow[u] - mnew);
+                lrow[u] = lrow[u] * corr[u] + warp_reduce_sum(p[u]);
+                mrow[u] = mnew;
+            } else {
+                p[u] = 0.0f;
+                corr[u] = 1.0f;
+            }
+        }
 #pragma unroll
-                for (int r = 0; r < VIS_ITER; ++r) acc[u][r] *= corr;
-                for (int j = 0; j < nk; ++j) {
-                    const float pj = __shfl_sync(FULL_MASK, p, j);
+        for (int u = 0; u < VIS_QPW; ++u) {
 #pragma unroll
-                    for (int r = 0; r < VIS_ITER; ++r) {
-                        const int i = lane + r * WARP_SIZE;
-                        if (r < iters && i < head_dim) {
-                            acc[u][r] += pj * vsh[j * pad + i];
-                        }
+            for (int r = 0; r < VIS_ITER; ++r) acc[u][r] *= corr[u];
+        }
+
+        // The value accumulation, with the same exchange: one `vr[i]` read feeds
+        // all VIS_QPW accumulators.
+        for (int j = 0; j < nk; ++j) {
+            float pj[VIS_QPW];
+#pragma unroll
+            for (int u = 0; u < VIS_QPW; ++u) {
+                pj[u] = __shfl_sync(FULL_MASK, p[u], j);
+            }
+            const float* vr = vsh + j * pad;
+#pragma unroll
+            for (int r = 0; r < VIS_ITER; ++r) {
+                const int i = lane + r * WARP_SIZE;
+                if (r < iters && i < head_dim) {
+                    const float vv = vr[i];
+#pragma unroll
+                    for (int u = 0; u < VIS_QPW; ++u) {
+                        acc[u][r] += pj[u] * vv;
                     }
                 }
-                mrow[u] = mnew;
             }
         }
     }

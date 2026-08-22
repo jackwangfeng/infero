@@ -98,6 +98,14 @@ pub fn linear(x: &[f32], w: &[f32], t_len: usize, in_dim: usize, out_dim: usize)
 /// `silu` lands on the `gate_proj` branch and not on `up_proj`; the mirror image
 /// runs and gives a different model. The activation is `silu` and not `gelu`
 /// because `hidden_act` says `silu`.
+///
+/// Until `tools/capture_qwen35_mtp.py` grew its `synth.*` arrays nothing in this
+/// repository distinguished those two branches: the real layer's weights are too
+/// large to dump, so the capture could only tap the MLP's endpoints and a test
+/// had nothing to recompute from. The capture now also builds a 40-wide
+/// `Qwen3_5MLP` out of the reference's own class and dumps its weights, and
+/// `the_swiglu_puts_silu_on_the_gate_branch` requires the mirror image to miss
+/// by more than a thousand tolerances.
 pub fn swiglu_mlp(
     x: &[f32],
     gate_w: &[f32],
@@ -408,6 +416,15 @@ pub struct Accepted {
 /// be switched on and off without changing outputs, which in turn means a
 /// regression in the draft head shows up as a throughput change and never as a
 /// quality change.
+///
+/// This is a transcription of a vLLM kernel and it went a long time without a
+/// cross-check, because it is control flow rather than arithmetic and so did not
+/// look like one of the "operations" an audit would enumerate. It is now checked
+/// against the kernel itself: `tools/capture_qwen35_mtp.py` launches
+/// `rejection_greedy_sample_kernel` on a battery that rejects at every position,
+/// accepts everything, and covers each draft length, and dumps what it emitted.
+/// Positions after a rejection hold vLLM's `PLACEHOLDER_TOKEN_ID`, which is what
+/// the truncated `tokens` here corresponds to.
 pub fn accept_greedy(draft: &[u32], target_argmax: &[u32]) -> Accepted {
     assert_eq!(
         target_argmax.len(),
@@ -444,7 +461,9 @@ pub fn accept_greedy(draft: &[u32], target_argmax: &[u32]) -> Accepted {
 ///
 /// A zero draft probability is rejected rather than dividing — vLLM guards the
 /// same way, and the ratio is `+inf` there, which would accept a token the draft
-/// model considers impossible.
+/// model considers impossible. The comparison is `>=`, not `>`; the capture's
+/// battery includes one row with `p_draft == 0` exactly so the guard is not
+/// merely asserted here.
 pub fn accept_stochastic(
     draft: &[u32],
     p_target: &[f32],

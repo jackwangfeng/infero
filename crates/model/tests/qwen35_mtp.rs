@@ -40,6 +40,10 @@ struct Capture {
     cfg: HashMap<String, f64>,
     arrays: HashMap<String, (Vec<usize>, Vec<f32>)>,
     behaviour: HashMap<String, f64>,
+    /// Dimensions of the small `Qwen3_5DecoderLayer` the capture builds out of
+    /// the reference's own class. Absent in captures written before it existed,
+    /// which is why the tests that need it check rather than unwrap.
+    synth: Option<HashMap<String, f64>>,
 }
 
 impl Capture {
@@ -96,10 +100,16 @@ impl Capture {
                 .collect();
             arrays.insert(name.clone(), (shape, vals));
         }
+        let synth = manifest["synth_config"].as_object().map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| v.as_f64().map(|f| (k.clone(), f)))
+                .collect()
+        });
         Some(Self {
             cfg,
             arrays,
             behaviour,
+            synth,
         })
     }
 
@@ -1145,4 +1155,357 @@ fn replaying_the_accepted_prefix_restores_the_state_exactly() {
             );
         }
     }
+}
+
+// ------------------------------- the reference's own layer, at a size that fits
+//
+// The tests above pin every *transition* inside the head's decoder layer against
+// a tap on the real 27B block: the two norms, the q/gate split, the attention
+// output, both residuals. What they cannot pin is the composition, or the MLP at
+// all, because the real layer's weights will not be dumped — `q_proj` alone is
+// 251 MB in f32.
+//
+// So `tools/capture_qwen35_mtp.py` also builds a 40-wide `Qwen3_5DecoderLayer`
+// out of the reference's own class with random weights and dumps the whole thing.
+// These two tests run `full_attention_layer` and `swiglu_mlp` against it. Small
+// matrices are not a numerical stand-in for large ones and are not meant to be —
+// the stagewise tests are what answer to real activations. This is about layout
+// and composition, where the size is irrelevant.
+
+struct Synth {
+    dims: BlockDims,
+    t_len: usize,
+}
+
+fn synth(c: &Capture) -> Option<Synth> {
+    let cfg = c.synth.as_ref()?;
+    let u = |k: &str| cfg[k] as usize;
+    Some(Synth {
+        dims: BlockDims {
+            d_model: u("d_model"),
+            heads: u("heads"),
+            kv_heads: u("kv_heads"),
+            head_dim: u("head_dim"),
+            rotary_dim: u("rotary_dim"),
+            d_ff: u("d_ff"),
+            eps: cfg["eps"] as f32,
+        },
+        t_len: u("tokens"),
+    })
+}
+
+/// `full_attention_layer`, end to end, against `Qwen3_5DecoderLayer` itself.
+///
+/// Everything in the block is under test at once and nothing is decomposed: the
+/// input norm, the per-head q/gate split, the two per-head norms in their offset
+/// form, the partial rope table and its `rotate_half` pairing, the
+/// `1/sqrt(head_dim)` scale, the causal softmax, the GQA key expansion, the
+/// sigmoid output gate before `o_proj`, the first residual, the second norm, the
+/// SwiGLU MLP, and the second residual. If any one of those is read differently
+/// from the library, this fails.
+///
+/// The rope tables come from the capture, which built them the same way
+/// `qwen35::rope_tables` does — so the test also recomputes them here and
+/// requires the two to agree, which is what keeps the table itself in scope.
+#[test]
+fn the_reference_decoder_layer_reproduces_full_attention_layer() {
+    with_capture("synthetic decoder layer", |c| {
+        let Some(s) = synth(c) else {
+            eprintln!(
+                "SKIPPED synthetic decoder layer: this capture predates the \
+                 synth.* arrays; regenerate it"
+            );
+            return;
+        };
+        let d = s.dims;
+
+        // The table first, since everything downstream rides on it.
+        let positions: Vec<u32> = (0..s.t_len as u32).collect();
+        let (cos, sin) = qwen35::rope_tables(
+            c.synth.as_ref().unwrap()["rope_theta"] as f32,
+            d.rotary_dim,
+            &positions,
+        );
+        agree(&cos, c.get("synth.rope_cos"), 1e-6, 1e-7, "synth rope cos");
+        agree(&sin, c.get("synth.rope_sin"), 1e-6, 1e-7, "synth rope sin");
+
+        let w = BlockWeights {
+            input_layernorm: c.get("synth.w.input_layernorm"),
+            q_proj: c.get("synth.w.q_proj"),
+            k_proj: c.get("synth.w.k_proj"),
+            v_proj: c.get("synth.w.v_proj"),
+            o_proj: c.get("synth.w.o_proj"),
+            q_norm: c.get("synth.w.q_norm"),
+            k_norm: c.get("synth.w.k_norm"),
+            post_attention_layernorm: c.get("synth.w.post_attention_layernorm"),
+            gate_proj: c.get("synth.w.gate_proj"),
+            up_proj: c.get("synth.w.up_proj"),
+            down_proj: c.get("synth.w.down_proj"),
+        };
+        let want = c.get("synth.out");
+        let got = full_attention_layer(c.get("synth.x"), &w, &cos, &sin, s.t_len, d);
+        agree(&got, want, 2e-5, 1e-6, "full_attention_layer vs the reference");
+
+        // And two readings that also run, so the agreement above is a statement
+        // about the choices and not only about the arithmetic. Both are the same
+        // block with one decision inverted.
+        //
+        // Dropping the second residual: the MLP replaces the stream instead of
+        // adding to it.
+        let h = rms_norm_offset_rows(c.get("synth.x"), w.input_layernorm, d.d_model, d.eps);
+        let qg = linear(&h, w.q_proj, s.t_len, d.d_model, d.heads * 2 * d.head_dim);
+        let (q, gate) = qwen35::split_q_and_gate(&qg, s.t_len, d.heads, d.head_dim);
+        let k = linear(&h, w.k_proj, s.t_len, d.d_model, d.d_kv());
+        let v = linear(&h, w.v_proj, s.t_len, d.d_model, d.d_kv());
+        let mut q = rms_norm_offset_rows(&q, w.q_norm, d.head_dim, d.eps);
+        let mut k = rms_norm_offset_rows(&k, w.k_norm, d.head_dim, d.eps);
+        qwen35::apply_partial_rope(
+            &mut q,
+            &cos,
+            &sin,
+            s.t_len,
+            d.heads,
+            d.head_dim,
+            d.rotary_dim,
+        );
+        qwen35::apply_partial_rope(
+            &mut k,
+            &cos,
+            &sin,
+            s.t_len,
+            d.kv_heads,
+            d.head_dim,
+            d.rotary_dim,
+        );
+        let ctx = qwen35::causal_attention(
+            &q,
+            &k,
+            &v,
+            s.t_len,
+            s.t_len,
+            d.heads,
+            d.kv_heads,
+            d.head_dim,
+        );
+
+        let mut gated = ctx.clone();
+        for (a, g) in gated.iter_mut().zip(&gate) {
+            *a *= sigmoid(*g);
+        }
+        let attn = linear(&gated, w.o_proj, s.t_len, d.d_attn(), d.d_model);
+        let resid: Vec<f32> = c
+            .get("synth.x")
+            .iter()
+            .zip(&attn)
+            .map(|(a, b)| a + b)
+            .collect();
+        let normed = rms_norm_offset_rows(&resid, w.post_attention_layernorm, d.d_model, d.eps);
+        let mlp = swiglu_mlp(
+            &normed,
+            w.gate_proj,
+            w.up_proj,
+            w.down_proj,
+            s.t_len,
+            d.d_model,
+            d.d_ff,
+        );
+        assert!(
+            margin(&mlp, want, 2e-5, 1e-6) > 1e3,
+            "dropping the second residual lands on the reference output, so this \
+             test does not show the residual is there"
+        );
+
+        // silu on the output gate instead of sigmoid.
+        let mut silu_gated = ctx;
+        for (a, g) in silu_gated.iter_mut().zip(&gate) {
+            *a *= qwen35::silu(*g);
+        }
+        let attn2 = linear(&silu_gated, w.o_proj, s.t_len, d.d_attn(), d.d_model);
+        let mut alt: Vec<f32> = c
+            .get("synth.x")
+            .iter()
+            .zip(&attn2)
+            .map(|(a, b)| a + b)
+            .collect();
+        let n2 = rms_norm_offset_rows(&alt, w.post_attention_layernorm, d.d_model, d.eps);
+        let m2 = swiglu_mlp(
+            &n2,
+            w.gate_proj,
+            w.up_proj,
+            w.down_proj,
+            s.t_len,
+            d.d_model,
+            d.d_ff,
+        );
+        for (r, m) in alt.iter_mut().zip(&m2) {
+            *r += m;
+        }
+        assert!(
+            margin(&alt, want, 2e-5, 1e-6) > 1e3,
+            "a silu output gate reproduces the reference layer, so this test \
+             does not pin the gate's activation"
+        );
+    });
+}
+
+/// `swiglu_mlp` puts `silu` on the `gate_proj` branch, against `Qwen3_5MLP`.
+///
+/// The mirror image — `gate_proj(x) * silu(up_proj(x))` — is the same shape, the
+/// same cost and a different model, and until the capture grew a small MLP there
+/// was nothing anywhere in this repository that distinguished them. The capture
+/// measures the separation on its own input and refuses to write if the two
+/// readings agree, so the margin below is known to be real.
+#[test]
+fn the_swiglu_puts_silu_on_the_gate_branch() {
+    with_capture("synthetic swiglu", |c| {
+        let Some(s) = synth(c) else {
+            eprintln!("SKIPPED synthetic swiglu: this capture predates synth.*");
+            return;
+        };
+        let d = s.dims;
+        let x = c.get("synth.mlp_x");
+        let want = c.get("synth.mlp_y");
+        let got = swiglu_mlp(
+            x,
+            c.get("synth.w.gate_proj"),
+            c.get("synth.w.up_proj"),
+            c.get("synth.w.down_proj"),
+            s.t_len,
+            d.d_model,
+            d.d_ff,
+        );
+        agree(&got, want, 2e-5, 1e-6, "swiglu_mlp vs Qwen3_5MLP");
+
+        // The mirror: silu on up_proj.
+        let mirror = swiglu_mlp(
+            x,
+            c.get("synth.w.up_proj"),
+            c.get("synth.w.gate_proj"),
+            c.get("synth.w.down_proj"),
+            s.t_len,
+            d.d_model,
+            d.d_ff,
+        );
+        let m = margin(&mirror, want, 2e-5, 1e-6);
+        assert!(
+            m > 1e3,
+            "silu on up_proj lands within {m:.1e} tolerances of the reference, \
+             so this test does not pin which branch the activation is on"
+        );
+    });
+}
+
+/// The acceptance rule, against vLLM's own triton kernels.
+///
+/// `accept_greedy` and `accept_stochastic` are transcriptions of
+/// `rejection_greedy_sample_kernel` and `rejection_random_sample_kernel` and
+/// nothing checked them. They are control flow rather than arithmetic, which is
+/// why they were easy to overlook in an audit of "operations", and they are
+/// exactly as silent when wrong: the greedy rule's whole purpose is that
+/// speculation emits bit-identically what unspeculated greedy decoding would
+/// have, and an off-by-one in where the bonus token goes breaks that quietly.
+///
+/// The capture launches both kernels on a battery covering every branch —
+/// rejection at each position, full acceptance, and a zero draft probability —
+/// and dumps what they emitted. Positions after a rejection hold vLLM's
+/// `PLACEHOLDER_TOKEN_ID`, so the comparison is against the row's prefix.
+#[test]
+fn the_acceptance_rule_matches_vllms_kernels() {
+    with_capture("vLLM rejection kernels", |c| {
+        if !c.arrays.contains_key("accept.greedy_out") {
+            eprintln!(
+                "SKIPPED vLLM rejection kernels: the capture ran without a GPU, \
+                 so the triton kernels could not be launched"
+            );
+            return;
+        }
+        let lens: Vec<usize> = c.get("accept.num_draft").iter().map(|v| *v as usize).collect();
+        let ids = |name: &str| -> Vec<u32> {
+            c.get(name).iter().map(|v| *v as i64 as u32).collect()
+        };
+        let draft = ids("accept.draft");
+        let targ = ids("accept.target_argmax");
+        let bonus = ids("accept.bonus");
+        let recovered = ids("accept.recovered");
+        let p_draft = c.get("accept.p_draft");
+        let p_target = c.get("accept.p_target");
+        let uniform = c.get("accept.uniform");
+        let placeholder = c.get("accept.placeholder")[0] as i64;
+        let row = c.shape("accept.greedy_out")[1];
+        let greedy = c.get("accept.greedy_out");
+        let random = c.get("accept.random_out");
+
+        // What the kernel wrote, as a variable-length row: everything before the
+        // first placeholder.
+        let emitted = |out: &[f32], r: usize| -> Vec<u32> {
+            out[r * row..(r + 1) * row]
+                .iter()
+                .take_while(|v| **v as i64 != placeholder)
+                .map(|v| *v as i64 as u32)
+                .collect()
+        };
+
+        let mut off = 0;
+        let mut full = 0;
+        let mut partial = 0;
+        for (r, &n) in lens.iter().enumerate() {
+            let dr = &draft[off..off + n];
+            // `accept_greedy` takes the bonus as the last entry of
+            // `target_argmax`; the kernel takes it in a separate array.
+            let mut tg = targ[off..off + n].to_vec();
+            tg.push(bonus[r]);
+            let got = accept_greedy(dr, &tg);
+            let want = emitted(greedy, r);
+            assert_eq!(
+                got.tokens, want,
+                "greedy request {r}: draft {dr:?}, target {:?}, bonus {}",
+                &targ[off..off + n],
+                bonus[r]
+            );
+            assert_eq!(got.accepted, if want.len() > n { n } else { want.len() - 1 });
+            if got.accepted == n {
+                full += 1;
+            } else {
+                partial += 1;
+            }
+
+            let got = accept_stochastic(
+                dr,
+                &p_target[off..off + n],
+                &p_draft[off..off + n],
+                &uniform[off..off + n],
+                &recovered[off..off + n],
+                bonus[r],
+            );
+            assert_eq!(
+                got.tokens,
+                emitted(random, r),
+                "stochastic request {r}: ratios {:?} against draws {:?}",
+                (0..n)
+                    .map(|j| p_target[off + j] / p_draft[off + j])
+                    .collect::<Vec<_>>(),
+                &uniform[off..off + n]
+            );
+            off += n;
+        }
+        assert_eq!(off, draft.len());
+        assert!(
+            full > 0 && partial > 0,
+            "the battery has {full} full acceptances and {partial} rejections; \
+             it does not exercise both branches"
+        );
+        // A zero draft probability must be rejected rather than divided by: the
+        // ratio would be +inf and would accept a token the draft model calls
+        // impossible. The capture plants exactly one.
+        let zeros = p_draft.iter().filter(|v| **v == 0.0).count();
+        assert!(
+            zeros > 0,
+            "no zero draft probability in the battery, so the guard is untested"
+        );
+        eprintln!(
+            "acceptance: {} requests, {full} fully accepted, {partial} rejected, \
+             {zeros} zero draft probability",
+            lens.len()
+        );
+    });
 }

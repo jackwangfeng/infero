@@ -35,6 +35,16 @@ pub enum WeightType {
     /// lane's whole weight fragment is one aligned 16-byte read. Same total
     /// bytes; see [`crate::awq::transpose_words`].
     Q4G128T,
+    /// FP8 E4M3 with a 128x128 block scale grid, the encoding Qwen3.5 ships.
+    ///
+    /// Laid out as `n * k` quant bytes followed by the scale grid as f32,
+    /// `ceil(n/128) * ceil(k/128)` entries row-major. Unlike every other type
+    /// here a row's bytes are *not* self-describing: a scale is shared across
+    /// 128 rows as well as 128 columns, so the grid is indexed by the output row
+    /// too. `block_size` is 1 because the quants are one byte each; the trailing
+    /// grid is why `n_bytes` must come from the buffer rather than from
+    /// `k * n / block_size * type_size`.
+    F8E4M3,
 }
 
 impl WeightType {
@@ -76,6 +86,7 @@ impl WeightType {
         match self {
             WeightType::F32 => "f32",
             WeightType::F16 => "f16",
+            WeightType::F8E4M3 => "f8_block",
             WeightType::Q4_0 => "q4_0",
             WeightType::Q4_1 => "q4_1",
             WeightType::Q5_0 => "q5_0",
@@ -91,7 +102,7 @@ impl WeightType {
 
     pub const fn block_size(self) -> usize {
         match self {
-            WeightType::F32 | WeightType::F16 => 1,
+            WeightType::F32 | WeightType::F16 | WeightType::F8E4M3 => 1,
             WeightType::Q4_0
             | WeightType::Q4_1
             | WeightType::Q5_0
@@ -107,6 +118,7 @@ impl WeightType {
         match self {
             WeightType::F32 => 4,
             WeightType::F16 => 2,
+            WeightType::F8E4M3 => 1,
             WeightType::Q4_0 => 18,
             WeightType::Q4_1 => 20,
             WeightType::Q5_0 => 22,
@@ -157,6 +169,7 @@ impl std::fmt::Display for WeightType {
         f.write_str(match self {
             WeightType::F32 => "F32",
             WeightType::F16 => "F16",
+            WeightType::F8E4M3 => "F8_E4M3",
             WeightType::Q4_0 => "Q4_0",
             WeightType::Q4_1 => "Q4_1",
             WeightType::Q5_0 => "Q5_0",
@@ -194,6 +207,27 @@ mod tests {
                 assert_eq!(w.block_size() * 4 + 4 * 8, w.type_size() * 8);
                 continue;
             }
+            // FP8 has no ggml counterpart, and — unlike every other type here —
+            // its `type_size` deliberately does not describe the whole layout: a
+            // matrix carries a trailing scale grid whose size depends on both
+            // dimensions, so `k * n * type_size` undercounts it. Assert that
+            // rather than skipping, because a reader who assumed the usual
+            // invariant would size a buffer short.
+            if w == WeightType::F8E4M3 {
+                assert_eq!(w.block_size(), 1, "one quant a byte, no ggml block");
+                assert_eq!(w.type_size(), 1);
+                let (k, n) = (256usize, 256usize);
+                assert!(
+                    crate::fp8::fp8_bytes(k, n) > k * n * w.type_size(),
+                    "the trailing scale grid has to make an FP8 matrix larger \
+                     than its quants"
+                );
+                assert_eq!(
+                    crate::fp8::fp8_bytes(k, n),
+                    k * n + crate::fp8::scale_grid(k, n) * 4
+                );
+                continue;
+            }
             let g = match w {
                 WeightType::F32 => GgmlType::F32,
                 WeightType::F16 => GgmlType::F16,
@@ -204,9 +238,10 @@ mod tests {
                 WeightType::Q8_0 => GgmlType::Q8_0,
                 WeightType::Q4K => GgmlType::Q4K,
                 WeightType::Q6K => GgmlType::Q6K,
-                WeightType::Q4G128 | WeightType::Q4G128T | WeightType::Q8_0S => {
-                    unreachable!("handled above")
-                }
+                WeightType::Q4G128
+                | WeightType::Q4G128T
+                | WeightType::Q8_0S
+                | WeightType::F8E4M3 => unreachable!("handled above"),
             };
             assert_eq!(w.block_size(), g.block_size(), "{w}");
             assert_eq!(w.type_size(), g.type_size(), "{w}");

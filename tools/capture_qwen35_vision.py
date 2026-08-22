@@ -409,6 +409,112 @@ def preprocess(ip, image_hw, seed, longest_edge):
 # -------------------------------------------------------------- cross-checking
 
 
+def check_module_constants(chk, vcfg, model):
+    """What the reference's vision modules actually are, read off the instance.
+
+    Every constant below is hard-coded somewhere — in this file's `layer_norm`
+    default, in the manifest, or in `VisionDims::QWEN35_27B` on the Rust side —
+    and every one of them is silent if wrong:
+
+    * The epsilon. `Qwen3_5VisionBlock` writes `nn.LayerNorm(hidden, eps=1e-6)`
+      as a literal; there is no `layer_norm_eps` in `vision_config` to read, so
+      a port that reaches for `nn.LayerNorm`'s own default gets 1e-5 and a 0.4%
+      error wherever a row's variance is small. That is a rounding-looking bug.
+    * The norm *class*. RMSNorm is what the text tower uses, an RMSNorm-shaped
+      transcription of a LayerNorm runs, and the difference is a mean and a bias.
+    * The merger norm's width. 1152 means `use_postshuffle_norm=False` — the norm
+      runs per patch, before the 2x2 grouping. 4608 would mean the other order.
+      This is the checkpoint's own evidence, in a shape.
+    * Which GELU is where: `nn.GELU()` (exact) in the merger, the tanh form in
+      the 27 blocks. The config names only the latter.
+    * The attention scale, and that it is not causal.
+    * A bias on every projection. The text tower has none anywhere; loading the
+      vision tower with the text loader drops 12 tensors per block.
+
+    Returns the epsilon the tower actually uses, so nothing downstream needs to
+    assume it.
+    """
+    hidden = vcfg.hidden_size
+    heads = vcfg.num_heads
+    head_dim = hidden // heads
+    wide = hidden * vcfg.spatial_merge_size ** 2
+
+    epsilons = set()
+    for tag, norm, width in (("blocks.0.norm1", model.blocks[0].norm1, hidden),
+                             ("blocks.0.norm2", model.blocks[0].norm2, hidden),
+                             ("merger.norm", model.merger.norm, hidden)):
+        if not isinstance(norm, torch.nn.LayerNorm):
+            raise SystemExit(f"{tag} is a {type(norm).__name__}, not an "
+                             f"nn.LayerNorm; this capture and the Rust "
+                             f"reference both centre and add a bias")
+        if norm.bias is None:
+            raise SystemExit(f"{tag} has no bias")
+        if tuple(norm.normalized_shape) != (width,):
+            raise SystemExit(
+                f"{tag} normalizes over {tuple(norm.normalized_shape)}, not "
+                f"({width},). For merger.norm that is the difference between "
+                f"use_postshuffle_norm False and True — the norm running per "
+                f"patch or over the grouped 2x2 block.")
+        epsilons.add(norm.eps)
+    if len(epsilons) != 1:
+        raise SystemExit(f"the tower's LayerNorms disagree on eps: {epsilons}")
+    eps = epsilons.pop()
+    print(f"  every vision LayerNorm: nn.LayerNorm with a bias, eps={eps:g}, "
+          f"merger.norm over {hidden} (per patch, pre-shuffle)")
+
+    # The last norm of the 27 blocks too, in case the depth-0 block is special.
+    last = model.blocks[-1]
+    if not isinstance(last.norm1, torch.nn.LayerNorm) or last.norm1.eps != eps:
+        raise SystemExit("the last block's norm1 differs from the first's")
+
+    if not isinstance(model.merger.act_fn, torch.nn.GELU):
+        raise SystemExit(f"merger.act_fn is {type(model.merger.act_fn).__name__}, "
+                         f"not nn.GELU")
+    if getattr(model.merger.act_fn, "approximate", "none") != "none":
+        raise SystemExit(f"merger.act_fn is nn.GELU(approximate="
+                         f"{model.merger.act_fn.approximate!r}), i.e. the tanh "
+                         f"form, not the exact one this capture assumes")
+    if vcfg.hidden_act != "gelu_pytorch_tanh":
+        raise SystemExit(f"vision_config.hidden_act is {vcfg.hidden_act!r}, not "
+                         f"gelu_pytorch_tanh")
+
+    attn = model.blocks[0].attn
+    chk("vision attention scaling == head_dim**-0.5",
+        abs(attn.scaling - head_dim ** -0.5), 0)
+    if attn.is_causal:
+        raise SystemExit("Qwen3_5VisionAttention.is_causal is True; this "
+                         "capture's segment_attention applies no causal mask")
+
+    biased = {
+        "patch_embed.proj": model.patch_embed.proj,
+        "blocks.0.attn.qkv": attn.qkv,
+        "blocks.0.attn.proj": attn.proj,
+        "blocks.0.mlp.linear_fc1": model.blocks[0].mlp.linear_fc1,
+        "blocks.0.mlp.linear_fc2": model.blocks[0].mlp.linear_fc2,
+        "merger.linear_fc1": model.merger.linear_fc1,
+        "merger.linear_fc2": model.merger.linear_fc2,
+    }
+    missing = [n for n, mod in biased.items() if mod.bias is None]
+    if missing:
+        raise SystemExit(f"these vision projections have no bias: {missing}. "
+                         f"The whole tower is supposed to be biased; a loader "
+                         f"that drops them reads as fluent nonsense.")
+    print(f"  every vision projection carries a bias ({len(biased)} checked)")
+
+    if (model.merger.linear_fc1.in_features, model.merger.linear_fc1.out_features) \
+            != (wide, wide):
+        raise SystemExit(
+            f"merger.linear_fc1 is {model.merger.linear_fc1.in_features} -> "
+            f"{model.merger.linear_fc1.out_features}, expected {wide} -> {wide}")
+    if model.merger.linear_fc2.out_features != vcfg.out_hidden_size:
+        raise SystemExit(
+            f"merger.linear_fc2 outputs {model.merger.linear_fc2.out_features}, "
+            f"not out_hidden_size={vcfg.out_hidden_size}. The class default is "
+            f"3584 (the 9B); a loader that falls back to it builds a merger "
+            f"whose output does not fit the language model.")
+    return eps
+
+
 def cross_check_against_transformers(model_dir, vcfg, model, ip, hooked):
     """Require every transcription above to agree with the reference.
 
@@ -442,24 +548,90 @@ def cross_check_against_transformers(model_dir, vcfg, model, ip, hooked):
     heads = vcfg.num_heads
     head_dim = vcfg.hidden_size // heads
 
-    # 1. LayerNorm against torch's.
-    x = torch.randn(37, vcfg.hidden_size)
-    ref_ln = torch.nn.LayerNorm(vcfg.hidden_size, eps=1e-6)
+    # 0. What the modules *are*, read off the instantiated reference rather than
+    # assumed from the notes. Every one of these is a constant this file or the
+    # Rust reference hard-codes, and every one of them is silent if wrong: an
+    # eps of 1e-5 instead of 1e-6, an RMSNorm where a LayerNorm was expected, a
+    # merger norm over 4608 instead of 1152, the tanh GELU in the merger, a
+    # missing bias on a projection.
+    eps = check_module_constants(chk, vcfg, model)
+
+    # 1. LayerNorm against torch's — using the tower's *own* norm module, so
+    # this is a check on the reference's configuration and not only on the
+    # formula, and the tower's *own* first-block input, so the mean it subtracts
+    # is a real one. A `randn` row has a mean of ~0 by construction, which makes
+    # the centring look optional: the "biased but not centred" reading below
+    # separates by 2% on noise and by 100% on a real activation.
+    x = hooked["img"]["hidden_in"]
+    ref_ln = model.blocks[0].norm1
     with torch.no_grad():
-        ref_ln.weight.copy_(torch.randn(vcfg.hidden_size))
-        ref_ln.bias.copy_(torch.randn(vcfg.hidden_size))
-    chk("layer_norm vs nn.LayerNorm",
-        (layer_norm(x, ref_ln.weight, ref_ln.bias) - ref_ln(x)).abs().max(), 2e-5)
+        ref_out = ref_ln(x)
+    chk("layer_norm vs the tower's own nn.LayerNorm",
+        (layer_norm(x, ref_ln.weight.detach(), ref_ln.bias.detach(), eps)
+         - ref_out).abs().max(), 2e-5)
+    print(f"  (the norm1 input's row means run "
+          f"[{float(x.mean(-1).min()):+.3f}, {float(x.mean(-1).max()):+.3f}], so "
+          f"the mean subtraction is doing something)")
+
+    # 1b. And the readings that also run. An RMSNorm-shaped transcription of a
+    # LayerNorm — no mean subtraction, no bias — is the text tower's habit
+    # carried across, and it runs.
+    with torch.no_grad():
+        gw, gb = ref_ln.weight.detach(), ref_ln.bias.detach()
+        ctr0 = x - x.mean(-1, keepdim=True)
+        peak_ln = ref_out.abs().max()
+        for name, wrong in (
+            ("no mean subtraction and no bias (RMSNorm-shaped)",
+             x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * gw),
+            ("centred but no bias",
+             ctr0 * torch.rsqrt(ctr0.pow(2).mean(-1, keepdim=True) + eps) * gw),
+            ("biased but not centred",
+             x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * gw + gb),
+        ):
+            sep = (wrong - ref_out).abs().max() / peak_ln
+            print(f"  (the reading `{name}` is off by {float(sep):.3e} of peak)")
+            if float(sep) < 1e-2:
+                raise SystemExit(f"the reading `{name}` reproduces the reference "
+                                 f"LayerNorm; this check does not discriminate")
+
+    # 1c. Where the epsilon goes. At unit variance every placement agrees to
+    # 5e-7, which is inside the tolerance above, so the check so far says
+    # nothing about it. Drive the norm at a variance near eps instead.
+    tiny = torch.randn(9, vcfg.hidden_size) * (eps ** 0.5)
+    with torch.no_grad():
+        ref_tiny = ref_ln(tiny)
+        peak_tiny = ref_tiny.abs().max()
+        chk("layer_norm at variance ~ eps",
+            (layer_norm(tiny, gw, gb, eps) - ref_tiny).abs().max() / peak_tiny, 2e-5)
+        ctr = tiny - tiny.mean(-1, keepdim=True)
+        var = ctr.pow(2).mean(-1, keepdim=True)
+        on_root = ctr / (var.sqrt() + eps) * gw + gb
+        on_sum = ctr * torch.rsqrt(ctr.pow(2).sum(-1, keepdim=True) + eps) * gw + gb
+        for name, wrong in (("eps added to the standard deviation", on_root),
+                            ("eps on the sum of squares", on_sum)):
+            sep = (wrong - ref_tiny).abs().max() / peak_tiny
+            print(f"  (the reading `{name}` is off by {float(sep):.3e} of peak)")
+            if float(sep) < 1e-2:
+                raise SystemExit(f"`{name}` is indistinguishable even at variance "
+                                 f"~ eps; this check is decorative")
 
     # 2/3. Both GELUs.
     y = torch.randn(4096) * 3
     chk("gelu_tanh vs ACT2FN[gelu_pytorch_tanh]",
         (gelu_tanh(y) - ACT2FN[vcfg.hidden_act](y)).abs().max(), 1e-5)
+    chk("gelu_tanh vs the blocks' own act_fn",
+        (gelu_tanh(y) - model.blocks[0].mlp.act_fn(y)).abs().max(), 1e-5)
     chk("gelu_erf vs nn.GELU", (gelu_erf(y) - torch.nn.GELU()(y)).abs().max(), 1e-5)
+    chk("gelu_erf vs the merger's own act_fn",
+        (gelu_erf(y) - model.merger.act_fn(y)).abs().max(), 1e-5)
     # And record that they are *not* the same function, so the doc's claim that
     # the tower uses two different GELUs is a claim with content.
     two_gelus = (gelu_tanh(y) - gelu_erf(y)).abs().max()
     print(f"  (the two GELUs differ by at most {float(two_gelus):.2e} over |x|<~12)")
+    if float(two_gelus) < 1e-5:
+        raise SystemExit("the two GELUs agree to f32 resolution here, so "
+                         "'the merger uses the exact one' is not a claim this "
+                         "capture can support")
 
     # 4. Vision rope table against the reference module.
     pids = torch.randint(0, 60, (23, 2))
@@ -845,7 +1017,12 @@ def main():
             "spatial_merge_size": merge,
             "num_position_embeddings": vcfg.num_position_embeddings,
             "num_grid_per_side": model.num_grid_per_side,
-            "layer_norm_eps": 1e-6,
+            # Read off the module, not written down: `Qwen3_5VisionBlock` spells
+            # `nn.LayerNorm(hidden, eps=1e-6)` as a literal and `vision_config`
+            # has no field for it, so a port that takes nn.LayerNorm's own
+            # default gets 1e-5. check_module_constants refuses if the three
+            # norms disagree.
+            "layer_norm_eps": float(model.blocks[0].norm1.eps),
             "vision_rope_theta": float(model.rotary_pos_emb.theta),
             "vision_rope_dim": int(model.rotary_pos_emb.dim),
             "image_token_id": cfg.image_token_id,

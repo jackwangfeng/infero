@@ -49,7 +49,17 @@ pub struct VisionDims {
     pub merge: usize,
     /// `num_position_embeddings`; the learned grid is `sqrt` of this per side.
     pub num_position_embeddings: usize,
+    /// The LayerNorm epsilon, and the one field here that cannot be read from
+    /// `vision_config` at all: `Qwen3_5VisionBlock` and
+    /// `Qwen3_5VisionPatchMerger` both write `nn.LayerNorm(..., eps=1e-6)` as a
+    /// literal. A port that reaches for `nn.LayerNorm`'s own default gets 1e-5,
+    /// which at this tower's variances is a few tenths of a percent — the sort of
+    /// error that gets blamed on quantization. `capture_qwen35_vision.py` now
+    /// reads it off the instantiated module, refuses if the tower's three norms
+    /// disagree, and `the_hard_coded_dimensions_match_the_checkpoint` requires
+    /// this constant to equal it.
     pub eps: f32,
+    /// 1e4 here against 1e7 on the text side of the same checkpoint.
     pub rope_theta: f32,
 }
 

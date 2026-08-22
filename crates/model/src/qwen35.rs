@@ -129,6 +129,20 @@ pub fn depthwise_causal_conv1d_update(
 
 /// L2-normalize each row of `rows` values, matching the FLA convention the
 /// reference cites: `eps` is added to the sum of squares, not to the norm.
+///
+/// Two things about that `eps`. It is a *literal* `1e-6` in the reference —
+/// `l2norm(query, dim=-1, eps=1e-6)` inside both delta-rule paths — and not
+/// `rms_norm_eps`. The two coincide on this checkpoint, which is exactly how
+/// they would come to be conflated; callers should pass `1e-6`, and
+/// `lib.rs`'s `gdn_qk_l2norm` does.
+///
+/// And the placement is now pinned rather than believed: at unit norm the three
+/// readings (eps on the sum of squares, on the mean, or added to the root) agree
+/// to 3e-8, well inside any tolerance a test would use, so the recurrence check
+/// could not see it. `cross_check_against_transformers` in
+/// `tools/capture_qwen35_layers.py` therefore also compares against
+/// `modeling_qwen3_5.l2norm` at an RMS near `sqrt(eps)`, where the sum-form and
+/// the root-form land 167% and 8% away.
 pub fn l2norm_rows(x: &mut [f32], row_len: usize, eps: f32) {
     for row in x.chunks_mut(row_len) {
         let ss: f32 = row.iter().map(|v| v * v).sum();
@@ -383,6 +397,15 @@ pub fn split_q_and_gate(
 /// Returns `[t_len, heads * head_dim]`. `positions` gives each token's absolute
 /// position so a decode step attends over history it cannot see in `k`; here it
 /// is only used for the causal mask, and `k`/`v` are the full history.
+///
+/// The `1/sqrt(head_dim)` lands on the scores, which is `Qwen3_5Attention`'s
+/// `self.scaling = self.head_dim**-0.5` passed into `eager_attention_forward` as
+/// `matmul(q, kᵀ) * scaling`. Scaling `q` instead is the same function up to
+/// rounding and needs no test; `1/head_dim` or `1/sqrt(d_model)` are not, and
+/// `check_gated_attention_against_reference` in
+/// `tools/capture_qwen35_layers.py` measures the first of those at 22% of peak.
+/// The key expansion is `repeat_kv`, i.e. `repeat_interleave` — head `h` uses kv
+/// head `h / group`, not `h % kv_heads`.
 pub fn causal_attention(
     q: &[f32],
     k: &[f32],

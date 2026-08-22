@@ -1,0 +1,29 @@
+{
+ "pillow": "12.3.0",
+ "cases": [
+  {
+   "name": "pil_bicubic_300x400_to_128x160",
+   "src_h": 300,
+   "src_w": 400,
+   "dst_h": 128,
+   "dst_w": 160,
+   "channels": 3
+  },
+  {
+   "name": "pil_bicubic_60x80_to_128x160",
+   "src_h": 60,
+   "src_w": 80,
+   "dst_h": 128,
+   "dst_w": 160,
+   "channels": 3
+  },
+  {
+   "name": "pil_bicubic_224x224_to_96x96",
+   "src_h": 224,
+   "src_w": 224,
+   "dst_h": 96,
+   "dst_w": 96,
+   "channels": 3
+  }
+ ]
+}

@@ -10,6 +10,7 @@
 //! so `out[t, r] = dot(w[r, :], x[t, :])`.
 
 pub mod awq;
+pub mod fp8;
 pub mod gdn;
 pub mod turboquant;
 pub mod vision;
@@ -49,6 +50,7 @@ const MMA_CUH: &str = include_str!("cu/mma.cuh");
 const MMQ_CU: &str = include_str!("cu/mmq.cu");
 const SAMPLE_CU: &str = include_str!("cu/sample.cu");
 const GDN_CU: &str = include_str!("cu/gdn.cu");
+const FP8_CU: &str = include_str!("cu/fp8.cu");
 const VISION_CU: &str = include_str!("cu/vision.cu");
 
 /// Threads per block for the reduction kernels. 256 keeps eight warps busy
@@ -93,6 +95,12 @@ fn gdn_src() -> &'static str {
 fn vision_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SRC.get_or_init(|| format!("{COMMON_CUH}\n{VISION_CU}"))
+}
+
+/// The block-scaled FP8 unit.
+fn fp8_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| format!("{COMMON_CUH}\n{FP8_CU}"))
 }
 
 fn sample_src() -> &'static str {
@@ -221,6 +229,10 @@ impl Kernels {
             "split_interleaved_f32",
         ] {
             self.dev.kernels().get("tuili_gdn", gdn_src(), name)?;
+        }
+        // The FP8 unit, warmed the same way and for the same reason.
+        for name in ["mmv_f8_block_f32", "dequant_f8_block_f16"] {
+            self.dev.kernels().get("tuili_fp8", fp8_src(), name)?;
         }
         // And the vision tower, which is its own translation unit again. A
         // multimodal request pays for these once at startup instead of stalling
