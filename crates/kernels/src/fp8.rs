@@ -116,14 +116,43 @@ pub fn strip_flags() -> &'static str {
 ///   f16 activations are a couple of percent off on a cancelled element (see the
 ///   error model in `tests/fp8_matvec.rs`) and they bought nothing.
 ///
-/// It is the per-row-per-token reduction at the end of each block, and
-/// `examples/fp8_row_cost.rs` shows it by removing pieces rather than by
-/// reasoning: with `TUILI_FP8_STRIP=reduce` the row curve is *flat* from one
-/// token to eight, 0.025 to 0.027 ms, against 0.064 to 0.162 with it in. The
-/// same run says something more useful about the kernel as a whole — of 0.064 ms
-/// at one token only 0.022 is moving weights, so **this kernel is not
-/// memory-bound**, and the GB/s it reports is where it lands rather than a
-/// ceiling it is pressed against.
+It is the per-token arithmetic, and getting to that answer took two
+/// corrections to the probe that found it. `examples/fp8_row_cost.rs` removes
+/// pieces of the kernel instead of reasoning about them, and its first two
+/// versions were both measuring the wrong thing:
+///
+/// * **The weights were in L2.** One 85 MiB projection reused forty times is
+///   resident in this card's 128 MB L2 after the first rep, so the probe reported
+///   3597 GB/s with the reduction stripped — twice the card's DRAM bandwidth,
+///   which should have been the tell. It now rotates through four copies.
+/// * **`strip=reduce` was deleting the arithmetic too.** Reducing only
+///   `acc[0][0]` leaves fifteen of the sixteen accumulator chains unread, so
+///   ptxas eliminated them; the register count fell from 56 to 33 and said so.
+///   It now consumes every accumulator with plain adds, which removes the
+///   shuffles, the shared memory and the barrier at an *unchanged* register
+///   count.
+///
+/// With both fixed, at three tokens and 56 registers either way:
+///
+/// ```text
+///                        1 tok   3 tok   marginal/row
+///   everything           0.070   0.096         0.013
+///   no reduction         0.069   0.088        0.0095
+///   no multiply-add      0.061   0.066        0.0025
+///   weights only         0.068   0.061             -
+/// ```
+///
+/// So of a 0.013 ms marginal row, the reduction is 27% and the per-token
+/// multiply-accumulate is 81%. **The previous commit had this backwards**, on the
+/// strength of the contaminated switch.
+///
+/// `weights only` is flat at 0.061 ms = 1466 GB/s, 81% of this card's DRAM
+/// bandwidth, so the load floor is real and the kernel at one token is already
+/// within 16% of it. What is left is arithmetic running at a seventh of the f32
+/// FMA bound — 0.0105 ms a row against 0.0015 — because it is a scalar loop
+/// issuing sixteen FMA instructions per chunk per token. One `mma.m16n8k16` does
+/// 2048 MACs in one instruction, and even wasting thirteen of its sixteen rows at
+/// three tokens that is twelve times fewer instructions.
 ///
 /// Two attempts to make the reduction cheaper, both measured, both a wash:
 ///
@@ -154,9 +183,13 @@ pub fn strip_flags() -> &'static str {
 /// combined, and combining them costs what it costs. Getting past it means not
 /// having them — a tiled GEMM keeps its accumulator in registers across the whole
 /// k loop and never reduces across threads at all.
-pub const BATCH_KERNELS: [(usize, &str); 4] = [
+pub const BATCH_KERNELS: [(usize, &str); 8] = [
     (2, "mmv_f8_block_batch2_f32"),
+    (3, "mmv_f8_block_batch3_f32"),
     (4, "mmv_f8_block_batch4_f32"),
+    (5, "mmv_f8_block_batch5_f32"),
+    (6, "mmv_f8_block_batch6_f32"),
+    (7, "mmv_f8_block_batch7_f32"),
     (8, "mmv_f8_block_batch8_f32"),
     (16, "mmv_f8_block_batch16_f32"),
 ];

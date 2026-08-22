@@ -23,6 +23,13 @@
 //! at three tokens against four at one. If neither does, the cost is in the
 //! loads the strip leaves behind, and the next thing to vary is the block shape.
 //!
+//! **The weights have to come from DRAM.** One 85 MiB projection reused forty
+//! times sits in this card's 128 MB L2 after the first rep, and then the kernel
+//! is not reading memory at all — the first version of this probe reported 3597
+//! GB/s with the reduction stripped, which is twice this card's DRAM bandwidth
+//! and should have been the tell. A decode step streams 29.6 GB and caches none
+//! of it, so the probe rotates through enough copies to evict.
+//!
 //!     cargo run --release -p tuili-kernels --example fp8_row_cost
 
 use anyhow::Result;
@@ -35,6 +42,10 @@ use tuili_kernels::fp8::{FP8_BLOCK, fp8_bytes, repack_rows, scale_grid};
 /// short contraction, which is the shape the row-interleave is about.
 const N: usize = 17408;
 const K: usize = 5120;
+
+/// Distinct copies of the matrix to rotate through, so that a rep reads DRAM
+/// rather than L2. 85 MiB each, so four is 340 MB against a 128 MB L2.
+const COPIES: usize = 4;
 
 /// Enough repetitions that a single launch's latency is not the measurement,
 /// and few enough that the whole sweep runs in seconds.
@@ -72,7 +83,15 @@ fn main() -> Result<()> {
         buf.extend_from_slice(&v.to_le_bytes());
     }
     assert_eq!(buf.len(), fp8_bytes(K, N));
-    let d_w = stream.clone_htod(&buf)?;
+    // The same bytes in `COPIES` places. Identical contents keep the answer
+    // comparable across reps; distinct *addresses* are what defeats L2.
+    let weights: Vec<_> = (0..COPIES)
+        .map(|_| stream.clone_htod(&buf))
+        .collect::<Result<Vec<_>, _>>()?;
+    println!(
+        "  {} MiB resident, against a 128 MB L2",
+        (COPIES * buf.len()) >> 20
+    );
 
     let strip = std::env::var("TUILI_FP8_STRIP").unwrap_or_default();
     println!(
@@ -92,11 +111,11 @@ fn main() -> Result<()> {
 
         // One untimed call, then the sweep with a single drain at the end: this
         // is a kernel's throughput, and the harness must not measure a launch.
-        run(&k, &mut d_out, &d_w, &d_x, n_tokens)?;
+        run(&k, &mut d_out, &weights[0], &d_x, n_tokens)?;
         dev.synchronize()?;
         let t0 = std::time::Instant::now();
-        for _ in 0..REPS {
-            run(&k, &mut d_out, &d_w, &d_x, n_tokens)?;
+        for rep in 0..REPS {
+            run(&k, &mut d_out, &weights[rep % COPIES], &d_x, n_tokens)?;
         }
         dev.synchronize()?;
         let ms = t0.elapsed().as_secs_f64() * 1000.0 / REPS as f64;

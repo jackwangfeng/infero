@@ -169,9 +169,13 @@ __device__ __forceinline__ void mmv_f8_group_body(
                 for (int j = 0; j < 4; ++j) xv[j] = xt[i0 + j];
             }
 #if FP8_STRIP_FMA
-            // Keep the loads alive so the compiler cannot delete them, and skip
-            // the multiply-accumulate. One add a token instead of sixteen FMAs.
-            acc[0][t] += xv[0] + wv[0][0];
+            // A quarter of the arithmetic — one add per (row, token) instead of
+            // four FMAs — while every accumulator stays live. Touching only
+            // `acc[0][0]` would let ptxas delete fifteen of the sixteen chains
+            // and drop the register count with them, which is a different
+            // experiment than the one this is for.
+#pragma unroll
+            for (int r = 0; r < FP8_ROW_GROUP; ++r) acc[r][t] += wv[r][0] + xv[0];
 #else
 #pragma unroll
             for (int r = 0; r < FP8_ROW_GROUP; ++r) {
@@ -187,13 +191,18 @@ __device__ __forceinline__ void mmv_f8_group_body(
     // since its static shared result would be overwritten while slower threads
     // still read it.
 #if FP8_STRIP_REDUCE
-    // One reduction for the whole block instead of `rows * n_tokens`, so the
-    // accumulators are still consumed — the loop above stays — and the shuffle
-    // chains go away.
+    // Every accumulator consumed by plain adds, so all `rows * n_tokens` chains
+    // stay live and the register count is unchanged — then one write from one
+    // thread, with no shuffle, no shared memory and no barrier. Reducing only
+    // `acc[0][0]` instead would have let ptxas delete the other chains, which is
+    // how the first version of this switch reported a flat row curve: it was not
+    // measuring a cheaper reduction, it was measuring less arithmetic.
     {
-        float v = acc[0][0];
-        for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
-            v += __shfl_down_sync(FULL_MASK, v, off);
+        float v = 0.0f;
+#pragma unroll
+        for (int r = 0; r < FP8_ROW_GROUP; ++r) {
+#pragma unroll
+            for (int t = 0; t < TOKENS; ++t) v += acc[r][t];
         }
         if (threadIdx.x == 0) out[row0] = v;
     }
@@ -251,6 +260,34 @@ extern "C" __global__ void mmv_f8_block_batch4_f32(
         const float* __restrict__ x, int k, int n, int scale_cols, int n_tokens,
         int accum) {
     mmv_f8_group_body<4>(out, w, x, k, n, scale_cols, n_tokens, accum);
+}
+
+extern "C" __global__ void mmv_f8_block_batch3_f32(
+        float* __restrict__ out, const unsigned char* __restrict__ w,
+        const float* __restrict__ x, int k, int n, int scale_cols, int n_tokens,
+        int accum) {
+    mmv_f8_group_body<3>(out, w, x, k, n, scale_cols, n_tokens, accum);
+}
+
+extern "C" __global__ void mmv_f8_block_batch5_f32(
+        float* __restrict__ out, const unsigned char* __restrict__ w,
+        const float* __restrict__ x, int k, int n, int scale_cols, int n_tokens,
+        int accum) {
+    mmv_f8_group_body<5>(out, w, x, k, n, scale_cols, n_tokens, accum);
+}
+
+extern "C" __global__ void mmv_f8_block_batch6_f32(
+        float* __restrict__ out, const unsigned char* __restrict__ w,
+        const float* __restrict__ x, int k, int n, int scale_cols, int n_tokens,
+        int accum) {
+    mmv_f8_group_body<6>(out, w, x, k, n, scale_cols, n_tokens, accum);
+}
+
+extern "C" __global__ void mmv_f8_block_batch7_f32(
+        float* __restrict__ out, const unsigned char* __restrict__ w,
+        const float* __restrict__ x, int k, int n, int scale_cols, int n_tokens,
+        int accum) {
+    mmv_f8_group_body<7>(out, w, x, k, n, scale_cols, n_tokens, accum);
 }
 
 extern "C" __global__ void mmv_f8_block_batch8_f32(
