@@ -28,6 +28,11 @@ fn qwen38_shaped(text_overrides: serde_json::Value) -> serde_json::Value {
             t.insert(k.clone(), v.clone());
         }
     }
+    // `out_hidden_size` has to track the text side, because the merger's output
+    // is spliced into the embedding rows and `Config::from_hf` refuses a
+    // mismatch. Reading it back off `text` rather than repeating 5120 keeps the
+    // override-driven tests below working when they change the width.
+    let d_model = text["hidden_size"].as_u64().expect("the fixture sets hidden_size");
     serde_json::json!({
         "architectures": ["Qwen3_5ForConditionalGeneration"],
         "model_type": "qwen3_5",
@@ -35,7 +40,23 @@ fn qwen38_shaped(text_overrides: serde_json::Value) -> serde_json::Value {
         "image_token_id": 151655,
         "video_token_id": 151656,
         "text_config": text,
-        "vision_config": { "depth": 27, "hidden_size": 1152 },
+        // A complete tower, not a two-key stub. `hidden_size` here is still the
+        // distractor it always was — 1152 against the text side's 5120, so a
+        // parser reading the outer object picks up the wrong number — and the
+        // rest is what `vision_config` actually carries, so the vision parse is
+        // exercised rather than skipped.
+        "vision_config": {
+            "depth": 27,
+            "hidden_size": 1152,
+            "num_heads": 16,
+            "intermediate_size": 4304,
+            "out_hidden_size": d_model,
+            "in_channels": 3,
+            "patch_size": 16,
+            "temporal_patch_size": 2,
+            "spatial_merge_size": 2,
+            "num_position_embeddings": 2304,
+        },
     })
 }
 
@@ -340,4 +361,78 @@ fn an_odd_head_dim_is_still_refused_when_nested() {
     }));
     let err = Config::from_hf(&j, "m").unwrap_err().to_string();
     assert!(!err.is_empty(), "an odd d_head must be refused");
+}
+
+/// The vision tower's dimensions come from `vision_config`, and the placeholder
+/// ids from the *outer* object.
+///
+/// Two separate traps in one config. `vision_config.hidden_size` is 1152 where
+/// the text side is 5120, so a parser reading the wrong level gets a plausible
+/// number rather than an error. And `image_token_id` is not in `vision_config`
+/// at all — it is language-model vocabulary, which is why it sits outside — so a
+/// parser looking for it beside the tower's dimensions finds nothing and would
+/// have to default, and the only available default is another model's ids.
+///
+/// The fixture deliberately carries Qwen2-VL's 151655 / 151656 rather than this
+/// checkpoint's 248056 / 248057, so that a parser substituting a constant for
+/// the config reads through as correct here and wrong on the real checkpoint —
+/// or, with this test, wrong here and caught.
+#[test]
+fn the_vision_tower_is_read_from_vision_config_and_its_ids_from_the_outer_object() {
+    let j = qwen38_shaped(serde_json::json!({}));
+    let cfg = Config::from_hf(&j, "qwen38").expect("the fixture should parse");
+    let v = cfg.vision.expect("the fixture has a vision_config");
+    assert_eq!(v.depth, 27);
+    assert_eq!(v.hidden, 1152, "the tower's own width, not the text model's");
+    assert_eq!(v.heads, 16);
+    assert_eq!(v.intermediate, 4304);
+    assert_eq!(v.grid_per_side(), 48, "2304 position embeddings is 48 on a side");
+    assert_eq!(
+        v.out_hidden, cfg.d_model,
+        "the merger's output is spliced into the embedding rows, so it has to \
+         match the text model's width"
+    );
+    assert_eq!(v.image_token, 151_655, "read, not assumed");
+    assert_eq!(v.video_token, 151_656);
+    // And the text side is untouched by any of it.
+    assert_eq!(cfg.d_model, 5120);
+}
+
+/// A `vision_config` that names some dimensions and not others is an error.
+///
+/// The alternative is to treat a partial object as "no tower", which would load
+/// a multimodal checkpoint as text-only and answer questions about images it
+/// never looked at.
+#[test]
+fn a_partial_vision_config_is_refused() {
+    let mut j = qwen38_shaped(serde_json::json!({}));
+    j["vision_config"]
+        .as_object_mut()
+        .unwrap()
+        .remove("num_heads");
+    let err = Config::from_hf(&j, "qwen38").expect_err("a tower with no head count");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("num_heads"),
+        "the error should name the missing key, got: {msg}"
+    );
+}
+
+/// The merger's output width is checked against the text model's, not assumed
+/// from it.
+///
+/// `Qwen3_5VisionModel` defaults `out_hidden_size` to 3584 while this
+/// checkpoint's text side is 5120. A loader that trusted the class default would
+/// splice 3584 floats into rows of 5120 — no shape error at the config, and
+/// features landing in two-thirds of each row.
+#[test]
+fn a_merger_that_projects_to_the_wrong_width_is_refused() {
+    let mut j = qwen38_shaped(serde_json::json!({}));
+    j["vision_config"]["out_hidden_size"] = serde_json::json!(3584);
+    let err = Config::from_hf(&j, "qwen38").expect_err("3584 into 5120 rows");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("3584") && msg.contains("5120"),
+        "the error should name both widths, got: {msg}"
+    );
 }

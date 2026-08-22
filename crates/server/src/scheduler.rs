@@ -385,6 +385,9 @@ impl Scheduler {
                         seq: r.seq,
                         tokens: &r.prompt[*from..*from + *len],
                         wants_logits: *last,
+                        // No images through the HTTP layer yet; the model-level
+                        // path is `BatchItem::vision`.
+                        vision: None,
                     },
                     Work::Decode => BatchItem {
                         seq: r.seq,
@@ -392,6 +395,7 @@ impl Scheduler {
                         // scheduled for decode.
                         tokens: std::slice::from_ref(r.next.as_ref().unwrap()),
                         wants_logits: true,
+                        vision: None,
                     },
                 }
             })

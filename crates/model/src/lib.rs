@@ -26,6 +26,12 @@ pub mod qwen35;
 pub mod spec;
 pub mod qwen35_mtp;
 pub mod qwen35_vision;
+/// Image preprocessing: resize, normalize, patchify.
+///
+/// `tests/qwen35_vision_image.rs` reaches this with `#[path]`, which compiled
+/// the file into the test binary and not into the library — so it was checked
+/// against Pillow and unreachable from the forward pass at the same time.
+pub mod qwen35_vision_image;
 mod sampling;
 pub mod weights;
 
@@ -116,6 +122,16 @@ pub struct BatchItem<'a> {
     pub tokens: &'a [u32],
     /// False for a mid-prompt chunk, whose logits nobody will read.
     pub wants_logits: bool,
+    /// Vision features to write over this chunk's placeholder tokens.
+    ///
+    /// Carried on the item rather than held per sequence because a chunked
+    /// prefill splits a prompt at token boundaries that know nothing about where
+    /// an image sits: the caller that cut the chunk is the only one that can say
+    /// which feature rows belong to it. Its length must equal the number of
+    /// placeholder ids in `tokens` — [`Model::forward_batch_device`] refuses
+    /// otherwise rather than splicing a prefix, because a count mismatch means
+    /// the grid the tower ran on is not the grid the prompt was built for.
+    pub vision: Option<&'a VisionFeatures>,
 }
 
 impl<'a> BatchItem<'a> {
@@ -124,6 +140,7 @@ impl<'a> BatchItem<'a> {
             seq,
             tokens,
             wants_logits: true,
+            vision: None,
         }
     }
 
@@ -132,6 +149,7 @@ impl<'a> BatchItem<'a> {
             seq,
             tokens,
             wants_logits: false,
+            vision: None,
         }
     }
 }
@@ -410,6 +428,14 @@ pub struct Model {
     /// The journal that undoes a rejected candidate's effect on the recurrent
     /// state. Only allocated for a model that has linear-attention blocks.
     gdn_rollback: Option<spec::GdnRollback>,
+    /// The vision tower, once [`Model::load_vision_tower`] has run.
+    ///
+    /// Loaded on request rather than with the text weights: it is 921 MiB that
+    /// a text-only deployment should not pay for, and the same reasoning the
+    /// MTP head is loaded under.
+    vision: Option<weights::VisionTower>,
+    /// One vision call's activations, sized by the largest image admitted.
+    vision_scratch: Option<tuili_kernels::vision::VisionScratch>,
 }
 
 /// Device-side scratch for sampling. Sized once, at the batch and vocabulary
@@ -746,6 +772,8 @@ impl Model {
             mtp: None,
             mtp_hidden: None,
             gdn_rollback: None,
+            vision: None,
+            vision_scratch: None,
         })
     }
 
@@ -1082,6 +1110,43 @@ impl Model {
             n_tokens,
             d,
         )?;
+
+        // Vision features go in here, over the rows the placeholder ids just
+        // gathered a real embedding into.
+        //
+        // After the gather and not instead of it: the placeholder's own
+        // embedding is overwritten, so gathering it is wasted work — but it is
+        // one row of one kernel, and skipping it would mean a masked gather,
+        // which is a second code path through the hottest launch in the step for
+        // no measurable gain.
+        //
+        // Row indices are per item and then offset by where that item's tokens
+        // start in the batch, because a batch interleaves sequences and the
+        // placeholder positions in `item.tokens` are relative to the item.
+        if items.iter().any(|i| i.vision.is_some()) {
+            let mut base = 0usize;
+            for item in items {
+                if let Some(f) = item.vision {
+                    anyhow::ensure!(
+                        f.out_hidden == d,
+                        "vision features are {} wide and the embedding is {d}",
+                        f.out_hidden
+                    );
+                    let rows = self.vision_targets(item.tokens, f.tokens)?;
+                    let shifted: Vec<i32> =
+                        rows.iter().map(|r| *r + base as i32).collect();
+                    let dst = self.dev.stream().clone_htod(&shifted)?;
+                    self.kern.vision_splice(
+                        &mut self.act.x.slice_mut(..n_tokens * d),
+                        &f.view(),
+                        &dst.as_view(),
+                        d,
+                        f.tokens,
+                    )?;
+                }
+                base += item.tokens.len();
+            }
+        }
 
         phase.mark(0);
         let dims = AttnDims {
@@ -3286,5 +3351,224 @@ impl Activations {
                 None => None,
             },
         })
+    }
+}
+
+impl Model {
+    /// Load `model.visual.*` and size the scratch for `max_patches`.
+    ///
+    /// Returns false when the checkpoint has no tower, which is not an error.
+    ///
+    /// `max_patches` bounds one call, not one conversation: the scratch is about
+    /// 85 KB a patch, so a 1024x1024 image is 4096 patches and 350 MB. Frames
+    /// are independent attention segments, so a caller with more work than this
+    /// splits on a frame boundary and changes nothing about the result — which is
+    /// why this is a per-call bound rather than a limit on what can be served.
+    pub fn load_vision_tower(
+        &mut self,
+        dir: impl AsRef<std::path::Path>,
+        max_patches: usize,
+    ) -> Result<bool> {
+        let shards = tuili_safetensors::Shards::open_dir(dir.as_ref())?;
+        let Some(tower) = weights::load_vision(&self.dev, &shards, &self.cfg)? else {
+            return Ok(false);
+        };
+        let scratch = tuili_kernels::vision::VisionScratch::new(&self.dev, &tower.shape, max_patches)?;
+        tracing::info!(
+            max_patches,
+            scratch_mib = (max_patches * 85) >> 10,
+            "vision scratch allocated"
+        );
+        self.vision = Some(tower);
+        self.vision_scratch = Some(scratch);
+        Ok(true)
+    }
+
+    pub fn has_vision(&self) -> bool {
+        self.vision.is_some()
+    }
+
+    /// The tower's dimensions, for a caller sizing images to it.
+    pub fn vision_shape(&self) -> Option<&tuili_kernels::vision::VisionShape> {
+        self.vision.as_ref().map(|t| &t.shape)
+    }
+
+    /// The placeholder ids a prompt uses to reserve room for vision output.
+    pub fn vision_tokens(&self) -> Option<(u32, u32)> {
+        self.vision.as_ref().map(|t| (t.cfg.image_token, t.cfg.video_token))
+    }
+}
+
+/// One image's merger output, `[tokens, out_hidden]`, on the device.
+///
+/// Owned and detached from the scratch it was computed in, so that encoding a
+/// second image does not overwrite the first — the scratch is a per-call buffer
+/// and features have to outlive the call to reach the forward pass.
+pub struct VisionFeatures {
+    rows: CudaSlice<f32>,
+    /// How many language-model tokens this image occupies, `patches / 4`.
+    pub tokens: usize,
+    pub out_hidden: usize,
+    /// The patch grid, kept for the caller building the prompt: the placeholder
+    /// run has to be exactly `tokens` long.
+    pub grid_h: usize,
+    pub grid_w: usize,
+}
+
+impl VisionFeatures {
+    pub fn view(&self) -> CudaView<'_, f32> {
+        self.rows.as_view()
+    }
+}
+
+impl Model {
+    /// The resize target this tower wants for a `src_h x src_w` image.
+    ///
+    /// Exposed because the caller has to build the prompt's placeholder run
+    /// before the image is encoded, and the run's length is decided here.
+    pub fn vision_resize(&self, src_h: usize, src_w: usize, max_patches: usize) -> Result<(usize, usize, usize)> {
+        let t = self.vision.as_ref().context("this model has no vision tower")?;
+        let dims = qwen35_vision::VisionDims {
+            depth: t.shape.depth,
+            hidden: t.shape.hidden,
+            heads: t.shape.heads,
+            intermediate: t.shape.intermediate,
+            out_hidden: t.shape.out_hidden,
+            in_channels: t.shape.in_channels,
+            patch: t.shape.patch,
+            temporal_patch: t.shape.temporal_patch,
+            merge: t.shape.merge,
+            num_position_embeddings: t.cfg.position_embeddings,
+            eps: t.shape.eps,
+            rope_theta: t.shape.rope_theta,
+        };
+        // `min_pixels` is one merge block's worth and `max_pixels` is the
+        // caller's patch budget, both in pixels because that is the unit
+        // `smart_resize` compares against. `None` means an aspect ratio past
+        // 200:1, which the reference also refuses.
+        let (h, w) = qwen35_vision::smart_resize(
+            src_h,
+            src_w,
+            dims.resize_factor(),
+            t.shape.patch * t.shape.patch * dims.merge_unit(),
+            max_patches * t.shape.patch * t.shape.patch,
+        )
+        .with_context(|| {
+            format!("a {src_h}x{src_w} image is past the 200:1 aspect ratio the \
+                     processor accepts")
+        })?;
+        let tokens = (h / t.shape.patch) * (w / t.shape.patch) / dims.merge_unit();
+        Ok((h, w, tokens))
+    }
+
+    /// Run the tower over one prepared frame.
+    ///
+    /// The whole of the vision path in one call: patchify, the 27 blocks, the
+    /// merger. What comes back is what the prompt's placeholder tokens will be
+    /// replaced by, and its `tokens` count is what the placeholder run has to be
+    /// as long as — a mismatch is refused at splice time rather than silently
+    /// truncated, because it means the grid the tower ran on is not the grid the
+    /// prompt was built for.
+    pub fn encode_image(
+        &mut self,
+        frame: &qwen35_vision_image::PreparedFrame,
+    ) -> Result<VisionFeatures> {
+        let tower = self.vision.as_ref().context("this model has no vision tower")?;
+        let scratch = self
+            .vision_scratch
+            .as_mut()
+            .context("the vision tower is loaded but its scratch is not")?;
+        let shape = tower.shape;
+        let patches = frame.grid_h * frame.grid_w;
+        let merge_unit = shape.merge * shape.merge;
+        anyhow::ensure!(
+            patches.is_multiple_of(merge_unit),
+            "a {}x{} patch grid does not group into whole {}x{} blocks",
+            frame.grid_h,
+            frame.grid_w,
+            shape.merge,
+            shape.merge
+        );
+
+        // Geometry first, on the host, from the same functions the reference
+        // capture pinned: one segment per frame, two position axes, and the
+        // learned 48x48 grid resampled to this image's grid.
+        let grid = qwen35_vision::Grid {
+            t: 1,
+            h: frame.grid_h,
+            w: frame.grid_w,
+        };
+        let grids = [grid];
+        let cu = qwen35_vision::cu_seqlens(&grids);
+        let pos_ids = qwen35_vision::vision_position_ids(&grids, shape.merge);
+        let (idx, wts) =
+            qwen35_vision::pos_embed_taps(&grids, tower.cfg.grid_per_side(), shape.merge);
+        let geo = tuili_kernels::vision::VisionGeometry::new(
+            &self.kern, &shape, &cu, &pos_ids, &idx, &wts,
+        )?;
+
+        // Patchify on the device: the host holds planar `[C, H, W]` and the
+        // patch embedding wants one row a patch.
+        let planar = self.dev.stream().clone_htod(&frame.planar)?;
+        {
+            let pd = shape.patch_dim();
+            let mut rows = self.dev.stream().alloc_zeros::<f32>(patches * pd)?;
+            let mut rows_h = scratch.pixels_h_mut();
+            self.kern.vision_patchify(
+                &mut rows.as_view_mut(),
+                &mut rows_h,
+                &planar.as_view(),
+                1,
+                frame.height,
+                frame.width,
+                &shape,
+            )?;
+        }
+
+        let w = tower.weights();
+        tuili_kernels::vision::vision_forward(&self.kern, &shape, &w, &geo, scratch)?;
+
+        // Copy the features out of the scratch, which the next image would
+        // overwrite.
+        let tokens = patches / merge_unit;
+        let mut rows = self
+            .dev
+            .stream()
+            .alloc_zeros::<f32>(tokens * shape.out_hidden)?;
+        self.dev.stream().memcpy_dtod(
+            &scratch.features().slice(..tokens * shape.out_hidden),
+            &mut rows.as_view_mut(),
+        )?;
+        Ok(VisionFeatures {
+            rows,
+            tokens,
+            out_hidden: shape.out_hidden,
+            grid_h: frame.grid_h,
+            grid_w: frame.grid_w,
+        })
+    }
+
+    /// Which rows of `tokens` are vision placeholders, using **this**
+    /// checkpoint's ids.
+    ///
+    /// Not `tuili_kernels::vision::splice_targets`, which hardcodes 248056 and
+    /// 248057. Those are right for this checkpoint and the config is what says
+    /// so; a loader that checks the config and then splices on a constant has
+    /// two sources of truth and only tests one.
+    fn vision_targets(&self, tokens: &[u32], n_features: usize) -> Result<Vec<i32>> {
+        let (img, vid) = self.vision_tokens().context("no vision tower")?;
+        let rows: Vec<i32> = tokens
+            .iter()
+            .enumerate()
+            .filter(|&(_, &t)| t == img || t == vid)
+            .map(|(i, _)| i as i32)
+            .collect();
+        anyhow::ensure!(
+            rows.len() == n_features,
+            "{} placeholder tokens in this chunk but {n_features} feature rows; \
+             the grid the tower ran on is not the grid the prompt was built for",
+            rows.len()
+        );
+        Ok(rows)
     }
 }

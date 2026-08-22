@@ -1413,3 +1413,238 @@ fn to_f32(bytes: &[u8], info: &TensorInfo) -> Result<Vec<f32>> {
         other => anyhow::bail!("1-D tensors must be F32, F16 or BF16, got {other}"),
     })
 }
+
+// ----------------------------------------------------------------- the vision tower
+
+/// The vision tower's 333 tensors, owned.
+///
+/// [`tuili_kernels::vision::VisionWeights`] is all borrowed views, so something
+/// has to hold the allocations; this is it. Everything is f16 or f32 with no
+/// quantized path, and that is not an omission: the whole tower sits in the
+/// checkpoint's `modules_to_not_convert`, so there are no `weight_scale_inv`
+/// tensors to read and a block-dequantizing branch here would be dead code
+/// pretending to be generality.
+pub struct VisionTower {
+    pub shape: tuili_kernels::vision::VisionShape,
+    pub cfg: crate::config::VisionConfig,
+    patch_embed_w: CudaSlice<half::f16>,
+    patch_embed_b: Vector,
+    pos_embed: Vector,
+    blocks: Vec<VisionBlock>,
+    merger_norm_w: Vector,
+    merger_norm_b: Vector,
+    merger_fc1_w: CudaSlice<half::f16>,
+    merger_fc1_b: Vector,
+    merger_fc2_w: CudaSlice<half::f16>,
+    merger_fc2_b: Vector,
+    pub device_bytes: usize,
+}
+
+struct VisionBlock {
+    norm1_w: Vector,
+    norm1_b: Vector,
+    norm2_w: Vector,
+    norm2_b: Vector,
+    qkv_w: CudaSlice<half::f16>,
+    qkv_b: Vector,
+    proj_w: CudaSlice<half::f16>,
+    proj_b: Vector,
+    fc1_w: CudaSlice<half::f16>,
+    fc1_b: Vector,
+    fc2_w: CudaSlice<half::f16>,
+    fc2_b: Vector,
+}
+
+impl VisionTower {
+    /// Borrowed views in the shape the kernels take.
+    pub fn weights(&self) -> tuili_kernels::vision::VisionWeights<'_> {
+        tuili_kernels::vision::VisionWeights {
+            patch_embed_w: self.patch_embed_w.as_view(),
+            patch_embed_b: self.patch_embed_b.as_view(),
+            pos_embed: self.pos_embed.as_view(),
+            blocks: self
+                .blocks
+                .iter()
+                .map(|b| tuili_kernels::vision::VisionBlockWeights {
+                    norm1_w: b.norm1_w.as_view(),
+                    norm1_b: b.norm1_b.as_view(),
+                    norm2_w: b.norm2_w.as_view(),
+                    norm2_b: b.norm2_b.as_view(),
+                    qkv_w: b.qkv_w.as_view(),
+                    qkv_b: b.qkv_b.as_view(),
+                    proj_w: b.proj_w.as_view(),
+                    proj_b: b.proj_b.as_view(),
+                    fc1_w: b.fc1_w.as_view(),
+                    fc1_b: b.fc1_b.as_view(),
+                    fc2_w: b.fc2_w.as_view(),
+                    fc2_b: b.fc2_b.as_view(),
+                })
+                .collect(),
+            merger_norm_w: self.merger_norm_w.as_view(),
+            merger_norm_b: self.merger_norm_b.as_view(),
+            merger_fc1_w: self.merger_fc1_w.as_view(),
+            merger_fc1_b: self.merger_fc1_b.as_view(),
+            merger_fc2_w: self.merger_fc2_w.as_view(),
+            merger_fc2_b: self.merger_fc2_b.as_view(),
+        }
+    }
+}
+
+/// Load `model.visual.*`, or `None` when the checkpoint has no tower.
+///
+/// The two claims worth stating, because both were settled by reading the
+/// checkpoint rather than the class:
+///
+/// * **`patch_embed.proj.weight` is `[1152, 3, 2, 16, 16]` and wants to be
+///   `[1152, 1536]`.** It is a `Conv3d` whose kernel equals its stride over an
+///   input already cut into patches, so the flatten is a free view and the
+///   patch embedding is a GEMM. Treating it as a convolution is wasted work,
+///   not a different answer.
+/// * **Every bias is real.** The text tower has none at all — `attention_bias:
+///   false`, bias-free MLPs — so a loader written from that habit drops twelve
+///   tensors a block. Dropping only `patch_embed.proj.bias` already moves the
+///   patch embedding by 3.05 out of a peak of 3.15. This is the AWQ loader
+///   dropping Qwen's QKV bias again, and it reads as fluent nonsense.
+///
+/// The deepstack mergers are deliberately not loaded: `deepstack_visual_indexes`
+/// is empty and the tensors do not exist, whatever `modules_to_not_convert`
+/// lists.
+pub fn load_vision(
+    dev: &Device,
+    w: &tuili_safetensors::Shards,
+    cfg: &Config,
+) -> Result<Option<VisionTower>> {
+    let present = w.get("model.visual.patch_embed.proj.weight").is_some();
+    let Some(vc) = cfg.vision else {
+        anyhow::ensure!(
+            !present,
+            "this checkpoint ships `model.visual.*` tensors but its config has \
+             no `vision_config`; the tower's depth and hidden size decide 333 \
+             tensors' shapes and guessing them is not safe"
+        );
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        present,
+        "config describes a vision tower of depth {} but there is no \
+         `model.visual.patch_embed.proj.weight`",
+        vc.depth
+    );
+    // `deepstack_visual_indexes` is empty on this checkpoint. If it were not,
+    // the tower would emit extra feature streams that the text side has to
+    // consume at named layers, and loading only the trunk would quietly drop
+    // them.
+    anyhow::ensure!(
+        w.get("model.visual.deepstack_merger_list.0.norm.weight").is_none(),
+        "this checkpoint carries deepstack mergers; the tower here emits one \
+         feature stream and splicing only that would drop the rest"
+    );
+
+    let started = std::time::Instant::now();
+    let mut bytes = 0usize;
+    let vector = |name: &str, want: usize, total: &mut usize| -> Result<Vector> {
+        let t = w.tensor(name)?;
+        let v = t.to_f32()?;
+        anyhow::ensure!(
+            v.len() == want,
+            "{name} holds {} floats, expected {want}",
+            v.len()
+        );
+        *total += v.len() * 4;
+        Ok(dev.stream().clone_htod(&v)?)
+    };
+    // `[rows, cols]` after flattening every trailing dimension, which is what
+    // makes `proj.weight`'s five dimensions a two-dimensional GEMM operand
+    // without a copy.
+    let matrix =
+        |name: &str, rows: usize, cols: usize, total: &mut usize| -> Result<CudaSlice<half::f16>> {
+            let t = w.tensor(name)?;
+            let elems: usize = t.shape.iter().product();
+            anyhow::ensure!(
+                t.shape[0] == rows && elems == rows * cols,
+                "{name} has shape {:?}, which is not [{rows}, {cols}] however it \
+                 is flattened",
+                t.shape
+            );
+            let halves = t.to_f16()?;
+            anyhow::ensure!(halves.len() == rows * cols, "{name}: {} halves", halves.len());
+            *total += halves.len() * 2;
+            Ok(dev.stream().clone_htod(halves.as_ref())?)
+        };
+
+    let (d, h4) = (vc.hidden, 4 * vc.hidden);
+    let patch_dim = vc.in_channels * vc.temporal_patch * vc.patch * vc.patch;
+    let mut blocks = Vec::with_capacity(vc.depth);
+    for i in 0..vc.depth {
+        let p = format!("model.visual.blocks.{i}");
+        blocks.push(VisionBlock {
+            norm1_w: vector(&format!("{p}.norm1.weight"), d, &mut bytes)?,
+            norm1_b: vector(&format!("{p}.norm1.bias"), d, &mut bytes)?,
+            norm2_w: vector(&format!("{p}.norm2.weight"), d, &mut bytes)?,
+            norm2_b: vector(&format!("{p}.norm2.bias"), d, &mut bytes)?,
+            // `[3 * hidden, hidden]`, whole-q-then-whole-k-then-whole-v rows —
+            // not the text side's per-head interleaving.
+            qkv_w: matrix(&format!("{p}.attn.qkv.weight"), 3 * d, d, &mut bytes)?,
+            qkv_b: vector(&format!("{p}.attn.qkv.bias"), 3 * d, &mut bytes)?,
+            proj_w: matrix(&format!("{p}.attn.proj.weight"), d, d, &mut bytes)?,
+            proj_b: vector(&format!("{p}.attn.proj.bias"), d, &mut bytes)?,
+            fc1_w: matrix(&format!("{p}.mlp.linear_fc1.weight"), vc.intermediate, d, &mut bytes)?,
+            fc1_b: vector(&format!("{p}.mlp.linear_fc1.bias"), vc.intermediate, &mut bytes)?,
+            fc2_w: matrix(&format!("{p}.mlp.linear_fc2.weight"), d, vc.intermediate, &mut bytes)?,
+            fc2_b: vector(&format!("{p}.mlp.linear_fc2.bias"), d, &mut bytes)?,
+        });
+    }
+
+    let tower = VisionTower {
+        shape: tuili_kernels::vision::VisionShape {
+            depth: vc.depth,
+            hidden: vc.hidden,
+            heads: vc.heads,
+            intermediate: vc.intermediate,
+            out_hidden: vc.out_hidden,
+            in_channels: vc.in_channels,
+            patch: vc.patch,
+            temporal_patch: vc.temporal_patch,
+            merge: vc.merge,
+            eps: crate::config::VisionConfig::EPS,
+            rope_theta: crate::config::VisionConfig::ROPE_THETA,
+        },
+        cfg: vc,
+        patch_embed_w: matrix(
+            "model.visual.patch_embed.proj.weight",
+            vc.hidden,
+            patch_dim,
+            &mut bytes,
+        )?,
+        patch_embed_b: vector("model.visual.patch_embed.proj.bias", d, &mut bytes)?,
+        pos_embed: vector(
+            "model.visual.pos_embed.weight",
+            vc.position_embeddings * d,
+            &mut bytes,
+        )?,
+        blocks,
+        // `[hidden]`, not `[4 * hidden]`: the merger normalizes each patch
+        // before it groups them. A post-shuffle norm would make this 4608 wide
+        // and the shape check here is what settles it.
+        merger_norm_w: vector("model.visual.merger.norm.weight", d, &mut bytes)?,
+        merger_norm_b: vector("model.visual.merger.norm.bias", d, &mut bytes)?,
+        merger_fc1_w: matrix("model.visual.merger.linear_fc1.weight", h4, h4, &mut bytes)?,
+        merger_fc1_b: vector("model.visual.merger.linear_fc1.bias", h4, &mut bytes)?,
+        merger_fc2_w: matrix(
+            "model.visual.merger.linear_fc2.weight",
+            vc.out_hidden,
+            h4,
+            &mut bytes,
+        )?,
+        merger_fc2_b: vector("model.visual.merger.linear_fc2.bias", vc.out_hidden, &mut bytes)?,
+        device_bytes: 0,
+    };
+    let tower = VisionTower { device_bytes: bytes, ..tower };
+    tracing::info!(
+        tensors = 3 + 6 + 12 * vc.depth,
+        vram_mib = bytes >> 20,
+        ms = started.elapsed().as_millis(),
+        "vision tower loaded"
+    );
+    Ok(Some(tower))
+}

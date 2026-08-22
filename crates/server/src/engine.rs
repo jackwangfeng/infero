@@ -167,14 +167,35 @@ impl Engine {
         let served = Arc::new(AtomicU64::new(0));
 
         let mut scheduler = Scheduler::new(model, pool, tokenizer.clone());
-        // Speculation, when the checkpoint has a head and the operator asks.
-        // Off by default: it is a per-sequence latency win and this build only
-        // runs it for a lone sequence, so a server under load gains nothing and
-        // would pay the drafter's cost for it.
+        // Speculation, when the checkpoint has a head.
+        //
+        // On by default at k = 1, which is measured rather than chosen: it is
+        // the *fastest* setting, and deeper drafts lose. The 27B, four prompts,
+        // 120 tokens each, one request at a time:
+        //
+        // ```text
+        //   k      tok/s   mean acceptance
+        //   off     30.2                 —
+        //   1       38.5              1.72
+        //   2       36.1              2.08
+        //   3       34.7              2.46
+        // ```
+        //
+        // Acceptance climbs monotonically while throughput falls, which is the
+        // signature of a verification pass that costs more per row than the row
+        // buys. Two things charge per drafted token: the pass itself is `k + 1`
+        // rows wide and the batched FP8 mat-vec charges about 7.2 ms a row (the
+        // sweep is in `fp8.rs`), and each draft step costs 9-10 ms against a
+        // memory bound of 3.2 — the head runs a dozen kernels at one row each,
+        // so it is launch-bound. A marginal row buys 0.37 tokens; at 28 ms a
+        // token it needs to buy 0.6 to pay for itself.
+        //
+        // Both are fixable and neither is fixed here, so the default is the
+        // shallowest draft that still wins. `TUILI_SPEC_K=0` turns it off.
         let spec_k: usize = std::env::var("TUILI_SPEC_K")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+            .unwrap_or(1);
         if spec_k > 0 && std::path::Path::new(path).is_dir() {
             match scheduler.enable_speculation(path, spec_k) {
                 Ok(true) => {}

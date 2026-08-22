@@ -84,6 +84,58 @@ pub struct Config {
     /// text model's embedding and scores with the text model's `lm_head`. The
     /// loader checks the two agree rather than trusting either alone.
     pub mtp_dedicated_embeddings: bool,
+    /// The vision tower, when the checkpoint carries one.
+    pub vision: Option<VisionConfig>,
+}
+
+/// The vision tower's dimensions, and the ids that reserve room for its output.
+///
+/// Read from `vision_config` rather than taken from
+/// [`tuili_kernels::vision::VisionShape::QWEN35_27B`]: that constant is this
+/// checkpoint's numbers, and a loader that reached for it would give a different
+/// tower the 27B's depth and hidden size and produce a shape error deep inside
+/// the tensor loop instead of at the config.
+#[derive(Debug, Clone, Copy)]
+pub struct VisionConfig {
+    pub depth: usize,
+    pub hidden: usize,
+    pub heads: usize,
+    pub intermediate: usize,
+    /// The width the merger projects to — the *text* model's `d_model`, and not
+    /// derivable from it: `Qwen3_5VisionModel` defaults this to 3584 while this
+    /// checkpoint's text side is 5120, so it has to be read and then checked.
+    pub out_hidden: usize,
+    pub in_channels: usize,
+    pub patch: usize,
+    pub temporal_patch: usize,
+    pub merge: usize,
+    /// `num_position_embeddings`, 2304 here — the learned grid is its square
+    /// root on a side, so it has to be a perfect square.
+    pub position_embeddings: usize,
+    /// The placeholder ids a prompt uses to reserve one slot per vision token.
+    /// 248056 and 248057 on this checkpoint, and emphatically not Qwen2-VL's
+    /// 151655/151656.
+    pub image_token: u32,
+    pub video_token: u32,
+}
+
+impl VisionConfig {
+    /// LayerNorm epsilon.
+    ///
+    /// `vision_config` does not carry it, so this cannot be checked against the
+    /// checkpoint the way every dimension above is. It is the value the tower's
+    /// kernels were validated at against a capture of the reference — see
+    /// `crates/kernels/tests/vision.rs`.
+    pub const EPS: f32 = 1e-6;
+
+    /// The vision RoPE base, which `vision_config` also does not carry. 1e4,
+    /// where the text side's is 1e7.
+    pub const ROPE_THETA: f32 = 10_000.0;
+
+    /// The side of the learned position grid, 48 here.
+    pub fn grid_per_side(&self) -> usize {
+        (self.position_embeddings as f64).sqrt() as usize
+    }
 }
 
 /// The GatedDeltaNet dimensions, when a model has such blocks.
@@ -224,6 +276,10 @@ impl Config {
             // guessing a depth would build a drafter out of tensors that are
             // not there.
             mtp_layers: 0,
+            // No GGUF in the wild carries a Qwen3.5 vision tower, and if one
+            // did its dimensions would need names in the GGUF metadata
+            // vocabulary rather than a `vision_config` object.
+            vision: None,
             mtp_dedicated_embeddings: false,
         })
     }
@@ -412,7 +468,97 @@ impl Config {
                      to size the recurrence"
                 ),
             },
+            vision: Self::vision_from_json(j, d_model)?,
         })
+    }
+
+    /// `vision_config`, when there is one.
+    ///
+    /// Every field is required once the object exists. A vision tower with a
+    /// guessed depth or hidden size is not a degraded tower, it is 333 tensors
+    /// that will not fit the buffers — and the failure would surface as a shape
+    /// mismatch on some block in the middle rather than as the missing config
+    /// key it is.
+    fn vision_from_json(j: &serde_json::Value, d_model: usize) -> Result<Option<VisionConfig>> {
+        let v = &j["vision_config"];
+        if !v.is_object() {
+            return Ok(None);
+        }
+        let u = |k: &str| -> Result<usize> {
+            v[k].as_u64()
+                .map(|n| n as usize)
+                .with_context(|| format!("vision_config is missing {k}"))
+        };
+        // The placeholder ids live on the *outer* config, not in
+        // `vision_config`: they are language-model vocabulary, and the tower
+        // never sees them. Required, because a prompt cannot reserve room for
+        // vision output without them and defaulting to another model's ids would
+        // splice features over ordinary text.
+        let tok = |k: &str| -> Result<u32> {
+            j[k].as_u64()
+                .map(|n| n as u32)
+                .with_context(|| format!("this config has a vision tower but no {k}"))
+        };
+        let cfg = VisionConfig {
+            depth: u("depth")?,
+            hidden: u("hidden_size")?,
+            heads: u("num_heads")?,
+            intermediate: u("intermediate_size")?,
+            out_hidden: u("out_hidden_size")?,
+            in_channels: u("in_channels")?,
+            patch: u("patch_size")?,
+            temporal_patch: u("temporal_patch_size")?,
+            merge: u("spatial_merge_size")?,
+            position_embeddings: u("num_position_embeddings")?,
+            image_token: tok("image_token_id")?,
+            video_token: tok("video_token_id")?,
+        };
+        anyhow::ensure!(
+            cfg.hidden.is_multiple_of(cfg.heads) && cfg.heads > 0,
+            "{} vision heads do not divide a hidden size of {}",
+            cfg.heads,
+            cfg.hidden
+        );
+        let side = cfg.grid_per_side();
+        anyhow::ensure!(
+            side * side == cfg.position_embeddings,
+            "num_position_embeddings {} is not a square, so the learned grid has \
+             no side length and the resampling has nothing to interpolate over",
+            cfg.position_embeddings
+        );
+        // The one cross-tower constraint, and the reason `out_hidden_size` is
+        // read rather than assumed: the merger's output is spliced into the
+        // text model's embedding rows, so a mismatch is not a shape error
+        // somewhere later, it is features written into a row of the wrong width.
+        anyhow::ensure!(
+            cfg.out_hidden == d_model,
+            "the vision merger projects to {} and the text model is {d_model} \
+             wide; its output is spliced directly into the embedding rows",
+            cfg.out_hidden
+        );
+        anyhow::ensure!(
+            cfg.merge >= 1 && cfg.patch >= 1 && cfg.temporal_patch >= 1,
+            "vision patch geometry has a zero dimension: patch {}, temporal {}, \
+             merge {}",
+            cfg.patch,
+            cfg.temporal_patch,
+            cfg.merge
+        );
+        anyhow::ensure!(
+            cfg.image_token != cfg.video_token,
+            "image_token_id and video_token_id are both {}; the splice could not \
+             tell a frame from a still",
+            cfg.image_token
+        );
+        tracing::info!(
+            depth = cfg.depth,
+            hidden = cfg.hidden,
+            out_hidden = cfg.out_hidden,
+            grid = side,
+            image_token = cfg.image_token,
+            "vision tower in the config"
+        );
+        Ok(Some(cfg))
     }
 
     /// The per-dimension RoPE frequency divisors a Hugging Face config implies.
