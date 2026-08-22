@@ -126,13 +126,18 @@ __device__ __forceinline__ void mmv_f8_group_body(
         // straddles two, because 128 is a multiple of four.
         const float s = srow[i0 >> 7];
 
-        // Sixteen bytes: four rows at four positions, one request.
-        const uint4 wq = *(const uint4*)(const void*)(wg + (size_t)c * 16);
+        // `FP8_ROW_GROUP * 4` bytes: every row of the group at four positions,
+        // in `uint4`s. One request per four rows.
         float wv[FP8_ROW_GROUP][4];
-        fp8_unpack4(wq.x, s, wv[0]);
-        fp8_unpack4(wq.y, s, wv[1]);
-        fp8_unpack4(wq.z, s, wv[2]);
-        fp8_unpack4(wq.w, s, wv[3]);
+#pragma unroll
+        for (int q = 0; q < FP8_ROW_GROUP / 4; ++q) {
+            const uint4 wq = *(const uint4*)(const void*)(
+                wg + (size_t)c * (FP8_ROW_GROUP * 4) + (size_t)q * 16);
+            fp8_unpack4(wq.x, s, wv[q * 4 + 0]);
+            fp8_unpack4(wq.y, s, wv[q * 4 + 1]);
+            fp8_unpack4(wq.z, s, wv[q * 4 + 2]);
+            fp8_unpack4(wq.w, s, wv[q * 4 + 3]);
+        }
 
         // The activation group, once, for all four rows to reuse.
 #pragma unroll
@@ -258,8 +263,16 @@ extern "C" __global__ void dequant_f8_block_f16(__half* __restrict__ out,
     const int c0 = kb * 32;
     const int chunks = k / 4;
     for (int c = c0 + threadIdx.x; c < c0 + 32 && c < chunks; c += blockDim.x) {
-        const uint4 wq = *(const uint4*)(const void*)(wg + (size_t)c * 16);
-        const unsigned int words[FP8_ROW_GROUP] = {wq.x, wq.y, wq.z, wq.w};
+        unsigned int words[FP8_ROW_GROUP];
+#pragma unroll
+        for (int q = 0; q < FP8_ROW_GROUP / 4; ++q) {
+            const uint4 wq = *(const uint4*)(const void*)(
+                wg + (size_t)c * (FP8_ROW_GROUP * 4) + (size_t)q * 16);
+            words[q * 4 + 0] = wq.x;
+            words[q * 4 + 1] = wq.y;
+            words[q * 4 + 2] = wq.z;
+            words[q * 4 + 3] = wq.w;
+        }
 #pragma unroll
         for (int r = 0; r < FP8_ROW_GROUP; ++r) {
             if (r >= rows) break;
@@ -296,5 +309,6 @@ extern "C" __global__ void fp8_repack_rows(unsigned char* __restrict__ dst,
     const int r = row % FP8_ROW_GROUP;
     // One aligned four-byte read, one aligned four-byte write.
     const unsigned int w = *(const unsigned int*)(const void*)(src + (size_t)row * k + (size_t)c * 4);
-    *(unsigned int*)(void*)(dst + (size_t)g * FP8_ROW_GROUP * k + (size_t)c * 16 + (size_t)r * 4) = w;
+    *(unsigned int*)(void*)(dst + (size_t)g * FP8_ROW_GROUP * k
+                            + (size_t)c * (FP8_ROW_GROUP * 4) + (size_t)r * 4) = w;
 }

@@ -143,7 +143,20 @@ fn main() -> Result<()> {
         t
     };
 
-    println!("\n  plain decode, 1 row       {plain:7.2} ms");
+    let base_len2 = pool.len(seq);
+    let plain_serial = time_serial(
+        REPS,
+        |m: &mut Model| {
+            let it = BatchItem::new(seq, std::slice::from_ref(&pending));
+            m.forward_batch_device(std::slice::from_ref(&it), &mut pool)?;
+            pool.truncate(seq, base_len2);
+            Ok(())
+        },
+        &mut model,
+    )?;
+
+    println!("\n  plain decode, 1 row       {plain:7.2} ms  pipelined");
+    println!("  plain decode, 1 row       {plain_serial:7.2} ms  drained each rep");
     println!("  draft {k} token(s)          {draft_ms:7.2} ms   bytes want ~{:.1}",
              2.0 * k as f64);
     match wide {
@@ -166,6 +179,13 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Average over `reps`, with one synchronise at the end.
+///
+/// This measures *throughput*: consecutive reps overlap, so whatever the host
+/// does between launches is hidden behind the previous rep's execution. The
+/// served engine cannot do that — it has to read each step's logits before it
+/// knows what to feed next — so `time_serial` is the number to compare against
+/// a served step, and the difference between the two is what pipelining buys.
 fn time(
     reps: usize,
     mut f: impl FnMut(&mut Model) -> Result<()>,
@@ -179,6 +199,26 @@ fn time(
         f(model)?;
     }
     model.device().synchronize()?;
+    Ok(t0.elapsed().as_secs_f64() * 1000.0 / reps as f64)
+}
+
+/// The same, with a synchronise after *every* rep.
+///
+/// A served step ends in a drain whether it wants to or not, so this is the
+/// honest comparison. If the two numbers differ, the gap is host work the
+/// pipelined loop was hiding rather than anything the GPU is doing.
+fn time_serial(
+    reps: usize,
+    mut f: impl FnMut(&mut Model) -> Result<()>,
+    model: &mut Model,
+) -> Result<f64> {
+    f(model)?;
+    model.device().synchronize()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..reps {
+        f(model)?;
+        model.device().synchronize()?;
+    }
     Ok(t0.elapsed().as_secs_f64() * 1000.0 / reps as f64)
 }
 

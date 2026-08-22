@@ -139,8 +139,19 @@ pub fn batched_matvec_limit() -> usize {
 
 /// Output rows interleaved into one group by [`repack_rows`].
 ///
-/// Four, so that a thread's four rows at four positions along k are one
-/// 16-byte load. Must divide 128, or a group would straddle a scale-grid row.
+/// Four: one 16-byte load a thread, covering four rows at four positions along
+/// k, so one activation `float4` feeds sixteen products.
+///
+/// Eight was tried after the repack landed, on the theory that the repack had
+/// removed what made wide groups lose. It had not: a three-row pass went 28.06
+/// to 36.57 ms and even one row got slower, 23.59 to 24.30. The repack makes the
+/// *loads* contiguous, but the unpacked values still need `ROW_GROUP * 4`
+/// registers alongside `ROW_GROUP * TOKENS` accumulators, and at eight that is
+/// 64 registers of weights — the same wall the pre-repack attempts hit for a
+/// different reason.
+///
+/// Must divide 128, or a group would straddle a scale-grid row, and must be a
+/// multiple of four, since the kernels read it in `uint4`s.
 pub const ROW_GROUP: usize = 4;
 
 /// How many bytes an `[n, k]` FP8 matrix occupies, quants plus scale grid.
