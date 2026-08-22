@@ -6,7 +6,18 @@ use tuili_gguf::Gguf;
 
 /// Architectures whose block structure matches the one in `Model::forward`:
 /// pre-norm RMSNorm, GQA attention, SwiGLU MLP.
-const SUPPORTED: &[&str] = &["qwen2", "qwen3", "llama", "baichuan", "minicpm"];
+const SUPPORTED: &[&str] = &[
+    "qwen2",
+    "qwen3",
+    // Qwen3.5/3.8: the full-attention blocks are this same layout, but only
+    // every fourth block is one — the rest are GatedDeltaNet. Listed so the
+    // untested-architecture warning does not fire for a layout that is
+    // recognised; the interleaving is enforced where the blocks are built.
+    "qwen3_5",
+    "llama",
+    "baichuan",
+    "minicpm",
+];
 
 /// Architectures whose GGUF conversion permutes Q and K so that the
 /// interleaved rotary pairing reproduces Hugging Face's rotate-half.
@@ -119,11 +130,25 @@ impl Config {
     /// checkpoint directly means not needing it, but it does mean the flag is
     /// the opposite of what the architecture name implies.
     pub fn from_hf(j: &serde_json::Value, name: &str) -> Result<Self> {
+        // A multimodal config describes two models. The outer object names the
+        // wrapper and carries the vision tower and the placeholder token ids;
+        // the language model's own dimensions sit in `text_config`. Reading the
+        // outer object for them finds nothing, so prefer the inner one where it
+        // exists and fall back for the single-model configs that have no such
+        // nesting.
+        let dims = if j["text_config"].is_object() {
+            &j["text_config"]
+        } else {
+            j
+        };
         let u = |k: &str| -> Result<usize> {
-            j[k].as_u64()
+            dims[k]
+                .as_u64()
                 .map(|v| v as usize)
                 .with_context(|| format!("config.json has no integer `{k}`"))
         };
+        // `model_type` stays on the outer object: it identifies the whole model,
+        // and for a multimodal one the inner type names only the text half.
         let arch = j["model_type"].as_str().unwrap_or("llama").to_string();
         if !SUPPORTED.contains(&arch.as_str()) {
             tracing::warn!(
@@ -132,7 +157,7 @@ impl Config {
             );
         }
         let (n_heads, d_model) = (u("num_attention_heads")?, u("hidden_size")?);
-        let n_kv_heads = j["num_key_value_heads"]
+        let n_kv_heads = dims["num_key_value_heads"]
             .as_u64()
             .map_or(n_heads, |v| v as usize);
         anyhow::ensure!(n_heads > 0 && n_kv_heads > 0, "head counts must be non-zero");
@@ -140,13 +165,22 @@ impl Config {
             n_heads.is_multiple_of(n_kv_heads),
             "{n_heads} query heads do not divide into {n_kv_heads} kv heads"
         );
-        let d_head = j["head_dim"]
+        let d_head = dims["head_dim"]
             .as_u64()
             .map_or(d_model / n_heads, |v| v as usize);
+        // `d_head * n_heads` used to have to equal `d_model`, and for every
+        // model tuili had loaded it did. Qwen3.8 breaks it: 24 heads of 256 is
+        // 6144 against a 5120-wide residual, so the attention block widens on
+        // the way in and narrows on the way out. The forward pass still assumes
+        // the two are the same in ~45 places, so refuse for now — but refuse by
+        // naming the real constraint rather than calling the layout
+        // unsupported, because it is the engine that is behind, not the
+        // checkpoint that is odd.
         anyhow::ensure!(
             d_head * n_heads == d_model,
-            "d_head {d_head} * n_heads {n_heads} != d_model {d_model}; \
-             this layout is not supported"
+            "d_head {d_head} * n_heads {n_heads} = {} but d_model is {d_model}; \
+             the attention path does not yet carry a width of its own",
+            d_head * n_heads,
         );
         anyhow::ensure!(
             d_head.is_multiple_of(2),
@@ -164,13 +198,20 @@ impl Config {
             d_ff: u("intermediate_size")?,
             vocab_size: u("vocab_size")?,
             context_length: u("max_position_embeddings").unwrap_or(4096),
-            rms_eps: j["rms_norm_eps"].as_f64().unwrap_or(1e-5) as f32,
-            rope_theta: j["rope_theta"].as_f64().unwrap_or(10_000.0) as f32,
+            rms_eps: dims["rms_norm_eps"].as_f64().unwrap_or(1e-5) as f32,
+            rope_theta: dims["rope_theta"].as_f64().unwrap_or(10_000.0) as f32,
             // Llama 3's scaling is per-dimension rather than a single factor;
             // it arrives through `rope_freq_factors` instead. A plain linear
             // `factor` would go here.
             rope_freq_scale: 1.0,
-            tied_embeddings: j["tie_word_embeddings"].as_bool().unwrap_or(false),
+            // Tying is a property of the whole model, so a multimodal config
+            // states it once on the outer object; a single-model config has only
+            // that level anyway. Fall back to the inner one so a checkpoint that
+            // repeats it there is still read correctly.
+            tied_embeddings: j["tie_word_embeddings"]
+                .as_bool()
+                .or_else(|| dims["tie_word_embeddings"].as_bool())
+                .unwrap_or(false),
             interleaved_rope: false,
         })
     }
@@ -186,7 +227,13 @@ impl Config {
     /// fine and drifts.
     pub fn rope_freq_factors(&self, j: &serde_json::Value) -> Vec<f32> {
         let half = self.d_head / 2;
-        let s = &j["rope_scaling"];
+        // Same nesting as `from_hf`: a multimodal config puts the language
+        // model's rope settings in `text_config`.
+        let s = if j["text_config"].is_object() {
+            &j["text_config"]["rope_scaling"]
+        } else {
+            &j["rope_scaling"]
+        };
         let ty = s["rope_type"].as_str().or_else(|| s["type"].as_str());
         if ty != Some("llama3") {
             return vec![1.0; half];
