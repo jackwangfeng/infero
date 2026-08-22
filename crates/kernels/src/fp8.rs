@@ -27,62 +27,57 @@ use crate::{Kernels, fp8_src};
 /// The scale grid's block size, in both directions.
 pub const FP8_BLOCK: usize = 128;
 
-/// `(token bound, kernel, rows per block)`, tightest bound first.
-///
-/// The third field must equal `FP8_MMV_ROWS*` in `fp8.cu`. The kernel decides
-/// which rows it owns from `blockIdx.x * ROWS`; the launcher decides how many
-/// blocks there are. If the two disagree downward, the output's tail is never
-/// written — and that wrong answer is a plausible one, a projection whose last
-/// rows are stale, which reads as slightly-off text rather than as an error.
-/// `a_row_count_that_does_not_divide_the_row_tile_still_writes_every_row` in
-/// `tests/fp8_matvec.rs` is the check.
+/// `(token bound, kernel)`, tightest bound first.
 ///
 /// The token count has to be the tightest available compile-time bound and not
 /// just an upper one: `#pragma unroll` with a runtime `break` still allocates
 /// every slot, so running two tokens through a sixteen-token kernel pays for
 /// sixteen accumulators. That is why there are four instantiations.
 ///
-/// **Rows per block is 1, and that is a measured result rather than the obvious
-/// starting point.** A verification pass over `k + 1` rows costs 6.9 ms a row on
-/// the 27B for zero extra weight bytes, and the arithmetic says why: with one
-/// output row to a block, every block reads the whole activation, so activation
-/// traffic is four bytes per *weight element* — 118 GB a token against 29.6 GB
-/// of weights. It is L2 rather than DRAM, which is why it never showed up in a
-/// bandwidth argument, and 118 GB at this card's L2 rate is the right size for
-/// 6.9 ms. Neither the arithmetic (0.5 ms) nor the load count (16 us) is within
-/// two orders of magnitude.
+/// Every one of them reads four output rows a block, because the layout
+/// interleaves four rows — see [`repack_rows`]. The road to that, in numbers,
+/// because two intermediate answers were wrong in instructive ways.
 ///
-/// So handling several output rows a block should divide that traffic. Measured,
-/// on the 27B, a two-row pass:
+/// A verification pass over `k + 1` rows used to cost 6.9 ms a row on the 27B
+/// for zero extra weight bytes. The arithmetic ruled out the obvious suspects:
+/// at two tokens a thread does eight FMAs per four weight bytes, four FLOP a
+/// byte against this card's 64, which is 0.5 ms a step; the extra scalar loads
+/// were 16 us. Both two orders of magnitude too small.
+///
+/// Handling several rows a block in the *row-major* layout should have divided
+/// the activation traffic and instead made it worse — 95.7 ms at eight rows and
+/// 47.3 at sixteen, against 34.8 at one. Sixteen rules out register spilling as
+/// the explanation (32 accumulators, no spill, still 36% slower). What it does
+/// is turn the weight stream into R runs 5120 bytes apart, and the weight stream
+/// is the part that is genuinely DRAM-bound.
+///
+/// Reading the activation as one `float4` instead of four scalars then bought
+/// 9.6% at two rows without touching a byte of traffic — which is the clue: the
+/// limit is memory *requests*, not bytes. L1 serves a bounded number a cycle
+/// whatever their width.
+///
+/// So: permute the weights at load so four rows are contiguous, and read all
+/// four in one request. Milliseconds a decode pass, 27B shape:
 ///
 /// ```text
-///   rows/block   accumulators        ms
-///            1              2     34.77   <- shipped
-///            8             64     95.65
-///           16             32     47.29
+///   rows      row-major   +float4    repacked
+///      1          27.88     25.28       23.57
+///      2          34.77     31.43       26.05
+///      3          41.56     41.91       28.08
+///      4          48.78     47.64       30.29
+///   per row        ~6.9      ~6.2        ~2.2
 /// ```
 ///
-/// Both are worse, and the second rules out the first explanation. 64
-/// accumulators plainly spilled; 32 does not, and 16 rows a block is still 36%
-/// slower than one. What changes with the row count is the *weight* stream: a
-/// block reading R rows at the same position along k has R concurrent streams
-/// 5120 bytes apart instead of one contiguous run. The weight stream is the part
-/// that is genuinely DRAM-bound — 29.6 GB at 1.8 TB/s is 16.4 ms of a 25.3 ms
-/// step, so the step is already at 65% of the weight-read ceiling — and scattering
-/// it costs more than the activation traffic saved.
-///
-/// Which leaves the structure that pays for the reuse without scattering the
-/// loads: stage weight and activation tiles in shared memory with `cp.async`,
-/// double-buffered, the way `mmq.cu` does for AWQ. That is the identified next
-/// step, and `mmq.cu`'s own notes set the expectation — it lands at about 63% of
-/// the weight-read ceiling and is then limited by its shared-memory footprint,
-/// which for this shape would be ~26 ms flat in the row count against 34.8 and
-/// climbing.
-pub const BATCH_KERNELS: [(usize, &str, usize); 4] = [
-    (2, "mmv_f8_block_batch2_f32", 1),
-    (4, "mmv_f8_block_batch4_f32", 1),
-    (8, "mmv_f8_block_batch8_f32", 1),
-    (16, "mmv_f8_block_batch16_f32", 1),
+/// A three-row pass went from 41.6 ms to 28.1, and the marginal row from 6.9 ms
+/// to 2.2. The remaining 2.2 is close to what the extra `lm_head` row actually
+/// costs in bytes (1.29 GB at this step's 1049 GB/s is 1.2 ms), so the row is
+/// nearly byte-limited now, which is what makes speculation's acceptance length
+/// convert into throughput.
+pub const BATCH_KERNELS: [(usize, &str); 4] = [
+    (2, "mmv_f8_block_batch2_f32"),
+    (4, "mmv_f8_block_batch4_f32"),
+    (8, "mmv_f8_block_batch8_f32"),
+    (16, "mmv_f8_block_batch16_f32"),
 ];
 
 /// Above this many tokens, expand and call a GEMM instead of the batched
@@ -142,9 +137,96 @@ pub fn batched_matvec_limit() -> usize {
     })
 }
 
+/// Output rows interleaved into one group by [`repack_rows`].
+///
+/// Four, so that a thread's four rows at four positions along k are one
+/// 16-byte load. Must divide 128, or a group would straddle a scale-grid row.
+pub const ROW_GROUP: usize = 4;
+
 /// How many bytes an `[n, k]` FP8 matrix occupies, quants plus scale grid.
+///
+/// Rows are padded up to a whole [`ROW_GROUP`]. The padding is read by the
+/// kernels and discarded by their per-row bounds check; leaving it out would
+/// mean the last group's loads run off the end of the allocation.
 pub fn fp8_bytes(k: usize, n: usize) -> usize {
-    n * k + scale_grid(k, n) * std::mem::size_of::<f32>()
+    n.next_multiple_of(ROW_GROUP) * k + scale_grid(k, n) * std::mem::size_of::<f32>()
+}
+
+/// Interleave every [`ROW_GROUP`] rows so that a thread reads four rows at four
+/// positions along k as one 16-byte load.
+///
+/// **This is the one definition of the quant layout.** The loader packs with it
+/// and `tests/fp8_matvec.rs` packs with it, so a kernel that disagrees shows up
+/// as wrong numbers against the host dequantizer rather than as a silent
+/// mismatch between two hand-written copies of the same permutation.
+///
+/// Why at all: the mat-vec's cost above one token turned out to be *requests*
+/// rather than bytes or arithmetic. Row-major, a thread reads one 4-byte weight
+/// word and then one activation load a token — three requests a group at two
+/// tokens — and L1 is limited by requests a cycle, not bytes. Reading four rows
+/// at once makes it 0.25 weight requests and 0.25 activation requests a token
+/// per group of four bytes, a quarter of the traffic in requests, and the FMAs
+/// per request go from 8 to 32.
+///
+/// Two earlier attempts to get this reuse without repacking both failed, and
+/// their numbers are on [`BATCH_KERNELS`]: handling several rows a block in
+/// row-major order scatters the weight stream into R runs 5120 bytes apart, and
+/// that costs more than the reuse saves. The permutation is what makes the four
+/// rows contiguous.
+///
+/// Layout, for group `g` and k-chunk `c` of four:
+///
+/// ```text
+///   new[g * ROW_GROUP * k + c * 16 + r * 4 + j]
+///       = old[(g * ROW_GROUP + r) * k + c * 4 + j]
+/// ```
+///
+/// `k` must be a multiple of four, which every projection in this checkpoint is
+/// and which the mat-vec launchers already require.
+pub fn repack_rows(quants: &[u8], k: usize, n: usize) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        k.is_multiple_of(4),
+        "the repack moves four bytes at a time; k is {k}"
+    );
+    anyhow::ensure!(
+        quants.len() == n * k,
+        "{} quant bytes for an [{n}, {k}] matrix",
+        quants.len()
+    );
+    let padded = n.next_multiple_of(ROW_GROUP);
+    let mut out = vec![0u8; padded * k];
+    let chunks = k / 4;
+    // Four bytes at a time as `u32`, and the group's whole output window at
+    // once. 29.6 GB of weights is 7.4e9 of these moves, so the inner loop has to
+    // be a word copy and not a `copy_from_slice` call: this runs on every load,
+    // and a load that takes minutes instead of seconds is a change nobody wants
+    // even for a faster decode.
+    //
+    // A group's window is `ROW_GROUP * k` bytes — 20 to 70 KB for this
+    // checkpoint's projections — so the strided writes stay inside L2 while a
+    // row is read sequentially.
+    for g in 0..padded / ROW_GROUP {
+        let base = g * ROW_GROUP * k;
+        let window = &mut out[base..base + ROW_GROUP * k];
+        for r in 0..ROW_GROUP {
+            let row = g * ROW_GROUP + r;
+            if row >= n {
+                break; // padding stays zero
+            }
+            let src = &quants[row * k..(row + 1) * k];
+            for c in 0..chunks {
+                let w = u32::from_ne_bytes([
+                    src[c * 4],
+                    src[c * 4 + 1],
+                    src[c * 4 + 2],
+                    src[c * 4 + 3],
+                ]);
+                let dst = c * (ROW_GROUP * 4) + r * 4;
+                window[dst..dst + 4].copy_from_slice(&w.to_ne_bytes());
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// How many scales an `[n, k]` matrix's grid holds.
@@ -185,11 +267,12 @@ impl Kernels {
             .dev
             .kernels()
             .get("tuili_fp8", fp8_src(), "mmv_f8_block_f32")?;
-        // Eight warps, so eight of the row's 128-wide slices are in flight and
-        // each finishes with a shuffle rather than a barrier.
+        // Eight warps, so eight of the group's 128-wide slices are in flight and
+        // each finishes with a shuffle rather than a barrier. One block per
+        // *group* of `ROW_GROUP` rows, which is the unit the layout interleaves.
         const BLOCK: u32 = 256;
         let cfg = LaunchConfig {
-            grid_dim: (n as u32, 1, 1),
+            grid_dim: (n.div_ceil(ROW_GROUP) as u32, 1, 1),
             block_dim: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -250,9 +333,9 @@ impl Kernels {
         // Two instantiations rather than one at 32: the accumulators are
         // registers, so a block that only needs eight of them should not pay for
         // thirty-two. Which one runs is decided here, not by the kernel.
-        let &(_, name, rows_per_block) = BATCH_KERNELS
+        let &(_, name) = BATCH_KERNELS
             .iter()
-            .find(|(max, _, _)| n_tokens <= *max)
+            .find(|(max, _)| n_tokens <= *max)
             .with_context(|| {
                 format!(
                     "{n_tokens} tokens is past the widest batched mat-vec, {}",
@@ -262,11 +345,11 @@ impl Kernels {
         let f = self.dev.kernels().get("tuili_fp8", fp8_src(), name)?;
         const BLOCK: u32 = 256;
         // One block per *group* of output rows, not per row. This has to track
-        // `FP8_MMV_ROWS8` / `FP8_MMV_ROWS32` in the kernel: too few blocks and
-        // the tail of the output is never written, which is a wrong answer that
-        // looks like a plausible one.
+        // `FP8_ROW_GROUP` in the kernel: too few blocks and the tail of the
+        // output is never written, which is a wrong answer that looks like a
+        // plausible one.
         let cfg = LaunchConfig {
-            grid_dim: (n.div_ceil(rows_per_block) as u32, 1, 1),
+            grid_dim: (n.div_ceil(ROW_GROUP) as u32, 1, 1),
             block_dim: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -311,7 +394,11 @@ impl Kernels {
             .kernels()
             .get("tuili_fp8", fp8_src(), "dequant_f8_block_f16")?;
         let cfg = LaunchConfig {
-            grid_dim: (k.div_ceil(FP8_BLOCK) as u32, n as u32, 1),
+            grid_dim: (
+                k.div_ceil(FP8_BLOCK) as u32,
+                n.div_ceil(ROW_GROUP) as u32,
+                1,
+            ),
             block_dim: (FP8_BLOCK as u32, 1, 1),
             shared_mem_bytes: 0,
         };

@@ -900,10 +900,16 @@ pub fn load_awq(
                     tuili_kernels::fp8::FP8_BLOCK,
                 );
                 let mut bytes = Vec::with_capacity(tuili_kernels::fp8::fp8_bytes(k, n));
-                bytes.extend_from_slice(t.data);
+                // Permuted, not copied: every FP8 kernel reads four interleaved
+                // rows as one 16-byte load, which is what took the batched
+                // mat-vec off a request-per-row-per-token. The permutation lives
+                // in `fp8::repack_rows` so that this and `tests/fp8_matvec.rs`
+                // cannot drift apart.
+                bytes.extend_from_slice(&tuili_kernels::fp8::repack_rows(t.data, k, n)?);
                 for v in &scales {
                     bytes.extend_from_slice(&v.to_le_bytes());
                 }
+                debug_assert_eq!(bytes.len(), tuili_kernels::fp8::fp8_bytes(k, n));
                 return Ok((bytes, WeightType::F8E4M3, k, n));
             }
             let halves: Vec<half::f16> = if false {

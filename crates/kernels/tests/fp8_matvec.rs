@@ -38,12 +38,20 @@ fn quant_bytes(n: usize, seed: u64) -> Vec<u8> {
         .collect()
 }
 
-/// The device buffer: quants then the scale grid as f32.
+/// The device buffer: permuted quants then the scale grid as f32.
+///
+/// Goes through `fp8::repack_rows` rather than repeating the permutation, so a
+/// test cannot pass by making the same layout mistake the loader makes.
 fn packed(quants: &[u8], scales: &[f32]) -> Vec<u8> {
-    let mut v = quants.to_vec();
+    packed_dims(quants, scales, K, N)
+}
+
+fn packed_dims(quants: &[u8], scales: &[f32], k: usize, n: usize) -> Vec<u8> {
+    let mut v = tuili_kernels::fp8::repack_rows(quants, k, n).expect("repack");
     for s in scales {
         v.extend_from_slice(&s.to_le_bytes());
     }
+    assert_eq!(v.len(), tuili_kernels::fp8::fp8_bytes(k, n));
     v
 }
 
@@ -481,9 +489,7 @@ fn a_row_count_that_does_not_divide_the_row_tile_still_writes_every_row() -> Res
     let quants = quant_bytes(NN * KK, 0x51ee);
     let grid = NN.div_ceil(FP8_BLOCK) * KK.div_ceil(FP8_BLOCK);
     let scales: Vec<f32> = (0..grid).map(|i| 0.3 + 0.5 * (i % 5) as f32).collect();
-    let sbytes: Vec<u8> = scales.iter().flat_map(|s| s.to_le_bytes()).collect();
-    let mut buf: Vec<u8> = quants.clone();
-    buf.extend_from_slice(&sbytes);
+    let buf = packed_dims(&quants, &scales, KK, NN);
     let d_w = stream.clone_htod(&buf)?;
 
     // The oracle is the *single-token* kernel, not a dequantized reference

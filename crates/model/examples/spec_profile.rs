@@ -90,7 +90,62 @@ fn main() -> Result<()> {
         Ok(())
     }, &mut model);
 
+    // ---- the draft side of a round ---------------------------------------
+    //
+    // A round costs more than a verification pass, and the difference has to be
+    // attributed rather than guessed at. The host-side distribution build is
+    // 0.376 ms a call at this vocabulary, measured separately, so it is not the
+    // answer; the draft's own bytes are 810 MiB of head plus a 1.29 GB `lm_head`,
+    // which at this step's 1049 GB/s is 2.0 ms.
+    //
+    // The head has to be primed before a one-row draft can be timed, because a
+    // draft at position P against a cache that reaches nowhere near P is refused
+    // — see `MtpHead::prime`. So: prime over the whole prompt once, untimed,
+    // which is what the first round of a real request does.
+    let mut sampler = tuili_model::Sampler::new(tuili_model::SamplingParams {
+        temperature: 0.7,
+        seed: Some(7),
+        ..Default::default()
+    });
+    let mut history: Vec<u32> = prompt.clone();
+    let draft_ms = {
+        // `mtp_hidden` holds the rows of the *last* pass, so priming over the
+        // prompt has to happen while the prefill's rows are still there. Redo
+        // the prefill for that, on a fresh sequence.
+        let mut p2 = model.new_pool(8192, 1)?;
+        let s2 = p2.alloc().context("no kv slot")?;
+        let it = BatchItem::new(s2, &prompt);
+        model.forward_batch_device(std::slice::from_ref(&it), &mut p2)?;
+        let first = argmax(model.logits_host()?);
+        let feed = tuili_model::spec::DraftFeed::after_prefill(&prompt, first);
+        model.draft_with_head_sampled(k, &feed, &mut sampler, &history)?;
+
+        // One decode step, so `mtp_hidden` holds one row at a known position,
+        // and that row is what a steady-state round drafts from.
+        let it = BatchItem::new(s2, std::slice::from_ref(&first));
+        model.forward_batch_device(std::slice::from_ref(&it), &mut p2)?;
+        let second = argmax(model.logits_host()?);
+        history.push(first);
+        let pos = p2.len(s2) - 1;
+        let feed = tuili_model::spec::DraftFeed {
+            rows: 0..1,
+            positions: vec![pos],
+            shifted: vec![second],
+        };
+        let t = time(
+            REPS,
+            |m: &mut Model| {
+                m.draft_with_head_sampled(k, &feed, &mut sampler, &history)?;
+                Ok(())
+            },
+            &mut model,
+        )?;
+        t
+    };
+
     println!("\n  plain decode, 1 row       {plain:7.2} ms");
+    println!("  draft {k} token(s)          {draft_ms:7.2} ms   bytes want ~{:.1}",
+             2.0 * k as f64);
     match wide {
         Ok(t) => println!(
             "  forward at {} rows        {t:7.2} ms   {:+.1}% a row",
