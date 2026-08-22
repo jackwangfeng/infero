@@ -1079,6 +1079,29 @@ fn matmul(
         x.len()
     );
     let weights = w.view(None)?;
+    // Block-scaled FP8, which is what the head's seven projections are in this
+    // checkpoint. Same two paths `Model::matmul_pre` takes and for the same
+    // reasons: at one token a mat-vec is the right kernel shape, and at a few
+    // tokens reading each weight once beats expanding the matrix.
+    if w.ty == tuili_kernels::WeightType::F8E4M3 {
+        if n_tokens == 1 {
+            return kern.mmv_f8_block(out, &weights, x, w.k, w.n, false);
+        }
+        if kern.mmv_f8_block_batch(out, &weights, x, w.k, w.n, n_tokens, false)? {
+            return Ok(());
+        }
+        // Wider than the batched mat-vec goes: expand and use the GEMM, which
+        // is what a prime over a whole prompt does.
+        let n_x = n_tokens * w.k;
+        kern.to_f16(&mut x16.slice_mut(..n_x), x, n_x)?;
+        let mut w16 = kern
+            .device()
+            .stream()
+            .alloc_zeros::<f16>(w.elements())
+            .context("staging the head's FP8 matrix as f16")?;
+        kern.dequant_f8_block_to_f16(&mut w16.as_view_mut(), &weights, w.k, w.n)?;
+        return kern.gemm_f16(out, &x16.slice(..n_x), &w16.as_view(), n_tokens, w.k, w.n);
+    }
     if n_tokens <= 4 {
         return kern.gemv(out, &weights, w.ty, x, w.k, w.n, n_tokens);
     }

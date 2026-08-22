@@ -758,8 +758,13 @@ fn the_loader_adds_one_to_exactly_the_norms_that_are_stored_as_deltas() -> Resul
     };
 
     // Shapes chosen so that every one is different and none is a multiple of
-    // another: 2 heads of 4 against a 6-wide residual, 3 kv... one kv head.
-    let (d, heads, kv_heads, d_head, d_ff) = (6usize, 2usize, 1usize, 4usize, 5usize);
+    // another, and so that every contraction width is a multiple of four —
+    // which block-scaled FP8 requires, because a thread reads four positions
+    // along k as one word. The head's projections are FP8 now (they used to be
+    // dequantized to f16 at load, which is what let a `k` of 6 through here),
+    // so the fixture has to be a shape the format admits: 3 heads of 4 against
+    // a 8-wide residual, one kv head, and a 12-wide feed-forward.
+    let (d, heads, kv_heads, d_head, d_ff) = (8usize, 3usize, 1usize, 4usize, 12usize);
     let d_attn = heads * d_head;
     let vals: &[f32] = &[1.0, -0.5, 2.0, 0.25, -1.5, 0.5, -2.0, 1.5];
     let pattern = |n: usize, seed: usize| -> Vec<f32> {
@@ -904,18 +909,35 @@ fn the_loader_adds_one_to_exactly_the_norms_that_are_stored_as_deltas() -> Resul
     );
     assert!(head.layer.gdn.is_none(), "the head's layer is full attention");
 
-    // And the values survived the FP8 round trip: the fixture's numbers are
-    // exact in E4M3 and the scales are one, so anything but equality means a
-    // transposed read.
+    // The head's projections stay FP8, like the text model's. They used to be
+    // dequantized to f16 here, which doubled the head's bytes — 405 MiB to 810 —
+    // and a draft step reads the head once, so its bytes are its cost.
+    assert_eq!(
+        l.wk.ty,
+        tuili_kernels::WeightType::F8E4M3,
+        "the head's projections should reach the device as FP8"
+    );
+
+    // And they arrive in the layout the kernels read: quants permuted by
+    // `repack_rows`, then the scale grid. Compared against the shared
+    // permutation rather than against a copy of it here, so this cannot pass by
+    // making the same mistake the loader makes — and because the bytes are
+    // checked rather than the decoded values, a transposed read shows up as a
+    // byte mismatch instead of hiding behind a symmetric fixture.
     let view = l.wk.view(None)?;
-    let bytes = dev.stream().clone_dtoh(&view)?;
+    let got = dev.stream().clone_dtoh(&view)?;
     dev.synchronize()?;
-    let got: Vec<f32> = bytes
-        .chunks_exact(2)
-        .map(|c| f32::from(f16::from_le_bytes([c[0], c[1]])))
-        .collect();
-    let want = pattern(kv_heads * d_head * d, 2);
-    assert_eq!(got, want, "k_proj came back different from what was written");
+    let (kn, kk) = (kv_heads * d_head, d);
+    let mut want = tuili_kernels::fp8::repack_rows(&fp8(kn, kk, 2), kk, kn)?;
+    for _ in 0..tuili_kernels::fp8::scale_grid(kk, kn) {
+        want.extend_from_slice(&1.0f32.to_le_bytes());
+    }
+    assert_eq!(
+        got.len(),
+        tuili_kernels::fp8::fp8_bytes(kk, kn),
+        "the buffer is not the size the layout implies"
+    );
+    assert_eq!(got, want, "k_proj's bytes are not the repacked layout");
     Ok(())
 }
 

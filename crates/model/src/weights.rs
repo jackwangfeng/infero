@@ -667,22 +667,43 @@ pub fn load_mtp(
         // f16 GEMM and the mat-vec both want: `k` is the contraction dimension
         // and one row of the weight is contiguous.
         let (n, k) = (t.shape[0], t.shape[1]);
-        let halves = match t.dtype {
-            tuili_safetensors::Dtype::F8E4M3 => {
-                let scales = w
-                    .tensor(&format!("{name}.weight_scale_inv"))
-                    .with_context(|| {
-                        format!(
-                            "{name}.weight is FP8, which is meaningless without \
-                             its block scales"
-                        )
-                    })?;
-                std::borrow::Cow::Owned(t.dequant_f8_to_f16(&scales, FP8_BLOCK)?)
+        if t.dtype == tuili_safetensors::Dtype::F8E4M3 {
+            // Kept as FP8, like the text model's projections, and for the same
+            // two reasons. This used to dequantize to f16 here — the strategy
+            // the text side abandoned — which doubled the head's bytes from
+            // 405 MiB to 810 and sent it through `gemv_f16` instead of the FP8
+            // mat-vec. A draft step reads the head once, so its bytes are its
+            // cost: 5.12 ms measured against a 2.0 ms byte bound, and half of
+            // those bytes did not need to exist.
+            let scales_t = w
+                .tensor(&format!("{name}.weight_scale_inv"))
+                .with_context(|| {
+                    format!("{name}.weight is FP8, which is meaningless without its block scales")
+                })?;
+            let scales = scales_t.to_f32()?;
+            let want = tuili_kernels::fp8::scale_grid(k, n);
+            anyhow::ensure!(
+                scales.len() == want,
+                "{name}'s scale grid has {} entries; an [{n}, {k}] matrix wants {want}",
+                scales.len()
+            );
+            let mut bytes = Vec::with_capacity(tuili_kernels::fp8::fp8_bytes(k, n));
+            bytes.extend_from_slice(&tuili_kernels::fp8::repack_rows(t.data, k, n)?);
+            for v in &scales {
+                bytes.extend_from_slice(&v.to_le_bytes());
             }
-            // `mtp.fc` lands here. Not a special case in the code, only in the
-            // checkpoint.
-            _ => t.to_f16()?,
-        };
+            *total += bytes.len();
+            return Ok(Matrix {
+                ty: WeightType::F8E4M3,
+                k,
+                n,
+                n_bytes: bytes.len(),
+                storage: Storage::Device(dev.stream().clone_htod(&bytes)?),
+            });
+        }
+        // `mtp.fc` lands here — BF16 in this checkpoint. Not a special case in
+        // the code, only in the checkpoint.
+        let halves = t.to_f16()?;
         anyhow::ensure!(halves.len() == k * n, "{name}: {} halves for {k}x{n}", halves.len());
         // Safety: f16 is a transparent u16, so these are already the
         // little-endian halves the device expects, and the view does not outlive
