@@ -196,36 +196,46 @@ pub fn repack_rows(quants: &[u8], k: usize, n: usize) -> Result<Vec<u8>> {
     let padded = n.next_multiple_of(ROW_GROUP);
     let mut out = vec![0u8; padded * k];
     let chunks = k / 4;
-    // Four bytes at a time as `u32`, and the group's whole output window at
-    // once. 29.6 GB of weights is 7.4e9 of these moves, so the inner loop has to
-    // be a word copy and not a `copy_from_slice` call: this runs on every load,
-    // and a load that takes minutes instead of seconds is a change nobody wants
-    // even for a faster decode.
+    // Groups are independent — each writes one `ROW_GROUP * k` window and reads
+    // four source rows — so this runs across threads. On one core it is 28
+    // seconds of a 63-second load on the 27B: 7.4e9 four-byte moves with writes
+    // striding by sixteen, which no amount of loop tuning fixes because the work
+    // really is that many moves.
     //
-    // A group's window is `ROW_GROUP * k` bytes — 20 to 70 KB for this
-    // checkpoint's projections — so the strided writes stay inside L2 while a
-    // row is read sequentially.
-    for g in 0..padded / ROW_GROUP {
-        let base = g * ROW_GROUP * k;
-        let window = &mut out[base..base + ROW_GROUP * k];
-        for r in 0..ROW_GROUP {
-            let row = g * ROW_GROUP + r;
-            if row >= n {
-                break; // padding stays zero
-            }
-            let src = &quants[row * k..(row + 1) * k];
-            for c in 0..chunks {
-                let w = u32::from_ne_bytes([
-                    src[c * 4],
-                    src[c * 4 + 1],
-                    src[c * 4 + 2],
-                    src[c * 4 + 3],
-                ]);
-                let dst = c * (ROW_GROUP * 4) + r * 4;
-                window[dst..dst + 4].copy_from_slice(&w.to_ne_bytes());
-            }
+    // `Kernels::fp8_repack_rows` does the same thing on the device and is the
+    // right answer for a loader that can upload row-major first; this stays
+    // because the loader assembles a host buffer before it uploads, and because
+    // the tests want a definition that needs no GPU.
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(16))
+        .unwrap_or(1);
+    let per_group = ROW_GROUP * k;
+    std::thread::scope(|scope| {
+        // One chunk of consecutive groups per thread, so each thread's writes
+        // stay in its own region and its reads walk forward through `quants`.
+        let groups = padded / ROW_GROUP;
+        let per_thread = groups.div_ceil(threads);
+        for (t, window) in out.chunks_mut(per_thread * per_group).enumerate() {
+            let quants = &quants;
+            scope.spawn(move || {
+                let g0 = t * per_thread;
+                for (gi, group) in window.chunks_mut(per_group).enumerate() {
+                    let g = g0 + gi;
+                    for r in 0..ROW_GROUP {
+                        let row = g * ROW_GROUP + r;
+                        if row >= n {
+                            break; // padding stays zero
+                        }
+                        let src = &quants[row * k..(row + 1) * k];
+                        for c in 0..chunks {
+                            let dst = c * (ROW_GROUP * 4) + r * 4;
+                            group[dst..dst + 4].copy_from_slice(&src[c * 4..c * 4 + 4]);
+                        }
+                    }
+                }
+            });
         }
-    }
+    });
     Ok(out)
 }
 
@@ -235,6 +245,49 @@ pub fn scale_grid(k: usize, n: usize) -> usize {
 }
 
 impl Kernels {
+    /// [`repack_rows`], on the device.
+    ///
+    /// Same permutation, and it exists because doing it on the host costs 28
+    /// seconds of a 63-second load on the 27B — 7.4e9 four-byte moves on one
+    /// core, with writes striding by sixteen. `src` holds `n * k` row-major
+    /// quants; `dst` must be `n.next_multiple_of(ROW_GROUP) * k` bytes and is
+    /// left zero in the padding.
+    pub fn fp8_repack_rows(
+        &self,
+        dst: &mut CudaViewMut<'_, u8>,
+        src: &CudaView<'_, u8>,
+        k: usize,
+        n: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            k.is_multiple_of(4),
+            "the repack moves four bytes at a time; k is {k}"
+        );
+        debug_assert!(src.len() >= n * k);
+        debug_assert!(dst.len() >= n.next_multiple_of(ROW_GROUP) * k);
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_fp8", fp8_src(), "fp8_repack_rows")?;
+        let chunks = n * (k / 4);
+        const BLOCK: u32 = 256;
+        let cfg = LaunchConfig {
+            grid_dim: (chunks.div_ceil(BLOCK as usize) as u32, 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (ki, ni) = (k as i32, n as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(dst).arg(src).arg(&ki).arg(&ni);
+        self.dev
+            .profile()
+            .time("fp8_repack_rows", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("fp8_repack_rows")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     /// `out = W x`, with `W` in FP8 and its block scales, at one token.
     ///
     /// `w` is the whole buffer: quants then grid. `accum` adds into `out`

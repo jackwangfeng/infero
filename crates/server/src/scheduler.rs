@@ -109,6 +109,11 @@ pub struct Scheduler {
     spec_k: usize,
     spec_steps: u64,
     spec_tokens: u64,
+    /// A round's three parts, summed over a window; see `speculative_step`.
+    spec_draft_ms: f64,
+    spec_verify_ms: f64,
+    spec_after_ms: f64,
+    spec_window: u64,
     last_end: Option<std::time::Instant>,
     window: u64,
 }
@@ -141,6 +146,10 @@ impl Scheduler {
             spec_k: 0,
             spec_steps: 0,
             spec_tokens: 0,
+            spec_draft_ms: 0.0,
+            spec_verify_ms: 0.0,
+            spec_after_ms: 0.0,
+            spec_window: 0,
         }
     }
 
@@ -314,11 +323,18 @@ impl Scheduler {
             cached = self.model.mtp_head().map(|h| h.cached()),
             "speculative round"
         );
+        // A round's three parts, timed separately under `TUILI_STEP_TIMING`.
+        // The whole is measurable end to end and the verification pass is
+        // measurable on its own, so what this adds is the *difference* — the
+        // drafting and the bookkeeping — which at k=3 was 9.7 ms of a 50.8 ms
+        // round and had no attribution at all.
+        let t0 = self.profile.then(std::time::Instant::now);
         let draft = {
             let r = &mut self.running[idx];
             self.model
                 .draft_with_head_sampled(k, &feed, &mut r.sampler, &history)?
         };
+        let t1 = self.profile.then(std::time::Instant::now);
         let outcome = {
             let r = &mut self.running[idx];
             self.model.verify_draft_sampled(
@@ -331,6 +347,7 @@ impl Scheduler {
             )?
         };
 
+        let t2 = self.profile.then(std::time::Instant::now);
         self.steps += 1;
         self.spec_steps += 1;
         self.spec_tokens += outcome.tokens.len() as u64;
@@ -346,6 +363,28 @@ impl Scheduler {
             if self.advance_token(idx, t)? {
                 finished = true;
                 break;
+            }
+        }
+        if let (Some(t0), Some(t1), Some(t2)) = (t0, t1, t2) {
+            let t3 = std::time::Instant::now();
+            self.spec_draft_ms += (t1 - t0).as_secs_f64() * 1e3;
+            self.spec_verify_ms += (t2 - t1).as_secs_f64() * 1e3;
+            self.spec_after_ms += (t3 - t2).as_secs_f64() * 1e3;
+            self.spec_window += 1;
+            if self.spec_window >= 100 {
+                let w = self.spec_window as f64;
+                tracing::warn!(
+                    draft_ms = format!("{:.2}", self.spec_draft_ms / w),
+                    verify_ms = format!("{:.2}", self.spec_verify_ms / w),
+                    after_ms = format!("{:.2}", self.spec_after_ms / w),
+                    k = self.spec_k,
+                    accept = format!("{:.2}", self.spec_tokens as f64 / self.spec_steps as f64),
+                    "per-round timing"
+                );
+                self.spec_draft_ms = 0.0;
+                self.spec_verify_ms = 0.0;
+                self.spec_after_ms = 0.0;
+                self.spec_window = 0;
             }
         }
         if finished {

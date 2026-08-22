@@ -272,3 +272,29 @@ extern "C" __global__ void dequant_f8_block_f16(__half* __restrict__ out,
         }
     }
 }
+
+// The row interleave, on the device.
+//
+// `fp8::repack_rows` does the same permutation on the host, and doing it there
+// costs 28 seconds of a 63-second load on the 27B: 7.4e9 four-byte moves, one
+// core, no help from the memory system because the writes stride by sixteen. The
+// device does the same permutation at DRAM speed.
+//
+// `src` is `[n, k]` row-major quants, `dst` is the interleaved form and must be
+// `padded * k` bytes, where `padded` rounds `n` up to a whole group. One thread
+// per four-byte chunk of the source.
+extern "C" __global__ void fp8_repack_rows(unsigned char* __restrict__ dst,
+                                          const unsigned char* __restrict__ src,
+                                          int k, int n) {
+    const int chunks = k / 4;
+    const long long total = (long long)n * chunks;
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int row = (int)(i / chunks);
+    const int c = (int)(i % chunks);
+    const int g = row / FP8_ROW_GROUP;
+    const int r = row % FP8_ROW_GROUP;
+    // One aligned four-byte read, one aligned four-byte write.
+    const unsigned int w = *(const unsigned int*)(const void*)(src + (size_t)row * k + (size_t)c * 4);
+    *(unsigned int*)(void*)(dst + (size_t)g * FP8_ROW_GROUP * k + (size_t)c * 16 + (size_t)r * 4) = w;
+}

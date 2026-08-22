@@ -142,6 +142,8 @@ pub struct MtpHead {
     kc: CudaSlice<f16>,
     vc: CudaSlice<f16>,
     slot_table: CudaSlice<i32>,
+    /// One row quantized to q8_1, for the integer vocabulary mat-vec.
+    q8_1: CudaSlice<u8>,
     /// How far the drafter's cache reaches, in positions.
     len: usize,
     /// Rows the last [`MtpHead::step`] produced.
@@ -201,6 +203,9 @@ impl MtpHead {
             kc: stream.alloc_zeros::<f16>(dims.kv_heads * max_seq * dims.d_head)?,
             vc: stream.alloc_zeros::<f16>(dims.kv_heads * max_seq * dims.d_head)?,
             slot_table: stream.alloc_zeros::<i32>(max_seq)?,
+            // The vocabulary projection's activation, quantized. Sized for the
+            // widest row the head has, which is `d_model`.
+            q8_1: stream.alloc_zeros::<u8>(Kernels::q8_1_bytes(d))?,
             len: 0,
             rows: 0,
             w,
@@ -778,7 +783,27 @@ impl MtpHead {
         {
             let src = self.out.slice(row * d..(row + 1) * d);
             let mut out = self.logits.slice_mut(..n);
-            matmul(kern, &mut out, head, &mut self.x16, &src, 1)?;
+            // The same kernel the text model's own vocabulary projection takes,
+            // not `matmul`'s `gemv`. This is the largest matrix a draft touches
+            // — 1288 MiB on the 27B against the head's own 476 — so which
+            // mat-vec runs on it decides the draft's cost, and the integer one
+            // is what `Model::forward_batch_rows` picks at one row for exactly
+            // this reason. Going through `gemv` here left the draft at 4.65 ms
+            // against a 1.68 ms byte bound.
+            if Kernels::has_mmvq(head.ty) && d.is_multiple_of(32) {
+                let bytes = Kernels::q8_1_bytes(d);
+                kern.quantize_q8_1(&mut self.q8_1.slice_mut(..bytes), &src, d)?;
+                kern.mmvq(
+                    &mut out,
+                    &head.view(None)?,
+                    head.ty,
+                    &self.q8_1.slice(..bytes),
+                    d,
+                    n,
+                )?;
+            } else {
+                matmul(kern, &mut out, head, &mut self.x16, &src, 1)?;
+            }
         }
         let stream = self.dev.stream().clone();
         stream.memcpy_dtoh(&self.logits.slice(..n), &mut self.logits_host[..n])?;
