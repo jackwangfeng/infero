@@ -452,3 +452,114 @@ fn the_batched_matvec_declines_a_batch_it_cannot_hold() -> Result<()> {
     assert!(!ran, "it should decline rather than silently truncate");
     Ok(())
 }
+
+/// A row count that is not a multiple of the block's row tile.
+///
+/// The batched mat-vec handles `ROWS_PER_BLOCK_8` output rows to a block, which
+/// is what stops every block from re-reading the whole activation — 118 GB a
+/// token on the 27B against 29.6 GB of weights, and the reason a second row in a
+/// verification pass cost 6.9 ms of a 27.9 ms step. The last block of a matrix
+/// whose `n` does not divide by the tile is short, and every other test here uses
+/// `N = 256`, which divides by 8 and by 2. So the short-block branch had no
+/// coverage the moment it was written.
+///
+/// A wrong tail is the worst kind of wrong available here: the last few rows of a
+/// projection are stale or zero and everything else is right, which reads as
+/// slightly-off text rather than as an error.
+///
+/// Both instantiations, and `n` chosen to leave a different remainder in each:
+/// 261 is 32 blocks of 8 plus 5, and 130 blocks of 2 plus 1.
+#[test]
+fn a_row_count_that_does_not_divide_the_row_tile_still_writes_every_row() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    // Past one scale row-block, so the tail sits in a different scale row than
+    // the head and a single shared `srow` pointer would be caught.
+    const NN: usize = 2 * FP8_BLOCK + 5;
+    const KK: usize = 2 * FP8_BLOCK;
+
+    let quants = quant_bytes(NN * KK, 0x51ee);
+    let grid = NN.div_ceil(FP8_BLOCK) * KK.div_ceil(FP8_BLOCK);
+    let scales: Vec<f32> = (0..grid).map(|i| 0.3 + 0.5 * (i % 5) as f32).collect();
+    let sbytes: Vec<u8> = scales.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let mut buf: Vec<u8> = quants.clone();
+    buf.extend_from_slice(&sbytes);
+    let d_w = stream.clone_htod(&buf)?;
+
+    // The oracle is the *single-token* kernel, not a dequantized reference
+    // matrix. This test asks one question — does the short final block write
+    // every row — and a f16 reference cannot answer it cleanly: a row's dot
+    // product here sums 256 products of magnitude ~15 to a result of ~20, so
+    // the cancellation amplifies the reference's own f16 rounding well past any
+    // tolerance the tiling would need to violate. `mmv_f8_block` runs one row to
+    // a block with no tiling at all and the same f32 arithmetic, so a
+    // disagreement is the tiling's.
+    for n_tokens in [2usize, 3, 9] {
+        // Distinct rows, so a token's result landing in another token's slot
+        // shows up rather than cancelling.
+        let x: Vec<f32> = (0..n_tokens)
+            .flat_map(|t| {
+                (0..KK).map(move |i| ((i * 7 + t * 13) % 23) as f32 * 0.05 - 0.5)
+            })
+            .collect();
+        let d_x = stream.clone_htod(&x)?;
+        // Poison the output, so a row nobody wrote is a wrong number rather than
+        // a zero that might have been the right answer.
+        let poison = vec![-9.75e30f32; n_tokens * NN];
+        let mut d_out = stream.clone_htod(&poison)?;
+        assert!(
+            k.mmv_f8_block_batch(
+                &mut d_out.as_view_mut(),
+                &d_w.as_view(),
+                &d_x.as_view(),
+                KK,
+                NN,
+                n_tokens,
+                false,
+            )?,
+            "the kernel should accept {n_tokens} tokens"
+        );
+        let got = stream.clone_dtoh(&d_out)?;
+        k.device().synchronize()?;
+
+        // One token at a time through the untiled kernel.
+        let mut want = vec![0.0f32; n_tokens * NN];
+        for t in 0..n_tokens {
+            let d_xt = stream.clone_htod(&x[t * KK..(t + 1) * KK])?;
+            let mut d_one = stream.alloc_zeros::<f32>(NN)?;
+            k.mmv_f8_block(
+                &mut d_one.as_view_mut(),
+                &d_w.as_view(),
+                &d_xt.as_view(),
+                KK,
+                NN,
+                false,
+            )?;
+            let one = stream.clone_dtoh(&d_one)?;
+            k.device().synchronize()?;
+            want[t * NN..(t + 1) * NN].copy_from_slice(&one);
+        }
+        // Same kernel arithmetic on both sides, so only the reduction order
+        // differs and the agreement should be near-exact.
+        let (worst, at) = worst_ratio(&got, &want, 1e-5, 1e-6);
+        assert!(
+            worst < 1.0,
+            "at {n_tokens} tokens, element {at} (token {}, row {}) is {worst:.1}x \
+             the tolerance: got {}, want {}",
+            at / NN,
+            at % NN,
+            got[at],
+            want[at]
+        );
+        // And explicitly: the last row exists and is not the poison.
+        for t in 0..n_tokens {
+            let last = got[t * NN + NN - 1];
+            assert!(
+                last > -1e30,
+                "token {t}'s last row was never written ({last:e}), so the short \
+                 final block dropped it"
+            );
+        }
+    }
+    Ok(())
+}

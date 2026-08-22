@@ -27,14 +27,74 @@ use crate::{Kernels, fp8_src};
 /// The scale grid's block size, in both directions.
 pub const FP8_BLOCK: usize = 128;
 
+/// `(token bound, kernel, rows per block)`, tightest bound first.
+///
+/// The third field must equal `FP8_MMV_ROWS*` in `fp8.cu`. The kernel decides
+/// which rows it owns from `blockIdx.x * ROWS`; the launcher decides how many
+/// blocks there are. If the two disagree downward, the output's tail is never
+/// written — and that wrong answer is a plausible one, a projection whose last
+/// rows are stale, which reads as slightly-off text rather than as an error.
+/// `a_row_count_that_does_not_divide_the_row_tile_still_writes_every_row` in
+/// `tests/fp8_matvec.rs` is the check.
+///
+/// The token count has to be the tightest available compile-time bound and not
+/// just an upper one: `#pragma unroll` with a runtime `break` still allocates
+/// every slot, so running two tokens through a sixteen-token kernel pays for
+/// sixteen accumulators. That is why there are four instantiations.
+///
+/// **Rows per block is 1, and that is a measured result rather than the obvious
+/// starting point.** A verification pass over `k + 1` rows costs 6.9 ms a row on
+/// the 27B for zero extra weight bytes, and the arithmetic says why: with one
+/// output row to a block, every block reads the whole activation, so activation
+/// traffic is four bytes per *weight element* — 118 GB a token against 29.6 GB
+/// of weights. It is L2 rather than DRAM, which is why it never showed up in a
+/// bandwidth argument, and 118 GB at this card's L2 rate is the right size for
+/// 6.9 ms. Neither the arithmetic (0.5 ms) nor the load count (16 us) is within
+/// two orders of magnitude.
+///
+/// So handling several output rows a block should divide that traffic. Measured,
+/// on the 27B, a two-row pass:
+///
+/// ```text
+///   rows/block   accumulators        ms
+///            1              2     34.77   <- shipped
+///            8             64     95.65
+///           16             32     47.29
+/// ```
+///
+/// Both are worse, and the second rules out the first explanation. 64
+/// accumulators plainly spilled; 32 does not, and 16 rows a block is still 36%
+/// slower than one. What changes with the row count is the *weight* stream: a
+/// block reading R rows at the same position along k has R concurrent streams
+/// 5120 bytes apart instead of one contiguous run. The weight stream is the part
+/// that is genuinely DRAM-bound — 29.6 GB at 1.8 TB/s is 16.4 ms of a 25.3 ms
+/// step, so the step is already at 65% of the weight-read ceiling — and scattering
+/// it costs more than the activation traffic saved.
+///
+/// Which leaves the structure that pays for the reuse without scattering the
+/// loads: stage weight and activation tiles in shared memory with `cp.async`,
+/// double-buffered, the way `mmq.cu` does for AWQ. That is the identified next
+/// step, and `mmq.cu`'s own notes set the expectation — it lands at about 63% of
+/// the weight-read ceiling and is then limited by its shared-memory footprint,
+/// which for this shape would be ~26 ms flat in the row count against 34.8 and
+/// climbing.
+pub const BATCH_KERNELS: [(usize, &str, usize); 4] = [
+    (2, "mmv_f8_block_batch2_f32", 1),
+    (4, "mmv_f8_block_batch4_f32", 1),
+    (8, "mmv_f8_block_batch8_f32", 1),
+    (16, "mmv_f8_block_batch16_f32", 1),
+];
+
 /// Above this many tokens, expand and call a GEMM instead of the batched
 /// mat-vec.
 ///
-/// The mat-vec holds one accumulator a token in registers, so its cost in
-/// occupancy grows with the batch while a GEMM's does not. 32 is where the
-/// second instantiation tops out; the crossover is measured rather than
-/// assumed, and `TUILI_FP8_BATCH_MAX` moves it for an A/B.
-pub const MAX_BATCH_TOKENS_FP8: usize = 32;
+/// The mat-vec holds `ROWS * TOKENS` accumulators in registers, so its cost in
+/// occupancy grows with the batch while a GEMM's does not. This is the widest
+/// instantiation there is, derived from [`BATCH_KERNELS`] rather than repeated,
+/// so that adding a kernel cannot leave the dispatch reaching for one that does
+/// not exist. `TUILI_FP8_BATCH_MAX` moves the *crossover* for an A/B and is
+/// clamped to this.
+pub const MAX_BATCH_TOKENS_FP8: usize = BATCH_KERNELS[BATCH_KERNELS.len() - 1].0;
 
 /// Where the batched mat-vec stops winning, measured.
 ///
@@ -190,15 +250,23 @@ impl Kernels {
         // Two instantiations rather than one at 32: the accumulators are
         // registers, so a block that only needs eight of them should not pay for
         // thirty-two. Which one runs is decided here, not by the kernel.
-        let name = if n_tokens <= 8 {
-            "mmv_f8_block_batch8_f32"
-        } else {
-            "mmv_f8_block_batch32_f32"
-        };
+        let &(_, name, rows_per_block) = BATCH_KERNELS
+            .iter()
+            .find(|(max, _, _)| n_tokens <= *max)
+            .with_context(|| {
+                format!(
+                    "{n_tokens} tokens is past the widest batched mat-vec, {}",
+                    BATCH_KERNELS.last().unwrap().0
+                )
+            })?;
         let f = self.dev.kernels().get("tuili_fp8", fp8_src(), name)?;
         const BLOCK: u32 = 256;
+        // One block per *group* of output rows, not per row. This has to track
+        // `FP8_MMV_ROWS8` / `FP8_MMV_ROWS32` in the kernel: too few blocks and
+        // the tail of the output is never written, which is a wrong answer that
+        // looks like a plausible one.
         let cfg = LaunchConfig {
-            grid_dim: (n as u32, 1, 1),
+            grid_dim: (n.div_ceil(rows_per_block) as u32, 1, 1),
             block_dim: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };

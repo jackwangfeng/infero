@@ -233,8 +233,14 @@ impl Kernels {
         // The FP8 unit, warmed the same way and for the same reason.
         for name in [
             "mmv_f8_block_f32",
+            // One per token width; see `fp8::BATCH_KERNELS`, which is what
+            // dispatches, and which this list has to stay in step with — a name
+            // missing here is a first-request NVRTC stall rather than an error,
+            // so nothing would report it.
+            "mmv_f8_block_batch2_f32",
+            "mmv_f8_block_batch4_f32",
             "mmv_f8_block_batch8_f32",
-            "mmv_f8_block_batch32_f32",
+            "mmv_f8_block_batch16_f32",
             "dequant_f8_block_f16",
         ] {
             self.dev.kernels().get("tuili_fp8", fp8_src(), name)?;

@@ -69,18 +69,23 @@ extern "C" __global__ void mmv_f8_block_f32(float* __restrict__ out,
     const float* srow = scales + (size_t)(row / 128) * scale_cols;
     const unsigned char* wrow = w + (size_t)row * k;
 
+    const bool xvec = ((size_t)(const void*)x % 16 == 0);
+
     float acc = 0.0f;
     // Each thread walks the row in 4-element strides. `i0 / 128` is the slice it
     // is in, and a 4-element group never straddles two slices because 128 is a
     // multiple of 4 — which is what makes one scale per group correct.
     for (int i0 = threadIdx.x * 4; i0 < k; i0 += blockDim.x * 4) {
         const float s = srow[i0 >> 7];
-        if (i0 + 3 < k) {
+        if (i0 + 3 < k && xvec) {
             const unsigned int packed = *(const unsigned int*)(wrow + i0);
-            acc += s * (e4m3_to_f32(packed & 0xFFu) * x[i0]
-                      + e4m3_to_f32((packed >> 8) & 0xFFu) * x[i0 + 1]
-                      + e4m3_to_f32((packed >> 16) & 0xFFu) * x[i0 + 2]
-                      + e4m3_to_f32((packed >> 24) & 0xFFu) * x[i0 + 3]);
+            // One 16-byte activation load beside the one 4-byte weight load.
+            // Same reasoning as the batched kernel below, where it matters more.
+            const float4 xv = *(const float4*)(const void*)(x + i0);
+            acc += s * (e4m3_to_f32(packed & 0xFFu) * xv.x
+                      + e4m3_to_f32((packed >> 8) & 0xFFu) * xv.y
+                      + e4m3_to_f32((packed >> 16) & 0xFFu) * xv.z
+                      + e4m3_to_f32((packed >> 24) & 0xFFu) * xv.w);
         } else {
             for (int j = 0; j < 4 && i0 + j < k; ++j) {
                 acc += s * e4m3_to_f32(wrow[i0 + j]) * x[i0 + j];
@@ -109,87 +114,206 @@ extern "C" __global__ void mmv_f8_block_f32(float* __restrict__ out,
 //
 // `x` is `[n_tokens, k]` and `out` is `[n_tokens, n]`, both row-major, matching
 // what the rest of the engine passes around.
-template <int TOKENS>
+// Output rows a block handles, per instantiation.
+//
+// `ROWS * TOKENS` is held constant at 32, because that product is the
+// accumulator count and the accumulators are what the register file has to fit.
+// The first attempt used ROWS 8 with TOKENS 8 — 64 accumulators plus 32
+// activation registers — and it was 2.75x *slower* than no tiling at all: 95.7 ms
+// against 34.8 for a two-row pass. Spilling in this inner loop costs far more
+// than the L2 traffic the tiling saves.
+//
+// `#pragma unroll` over `TOKENS` with a runtime `break` does not shrink that:
+// the compiler still allocates every slot. So the token count has to be a tight
+// compile-time bound, which is why there are four instantiations rather than one
+// wide one, and why the launcher dispatches on the actual count.
+//
+// Every ROWS must divide 128, or a block's rows straddle a scale-grid row and
+// one `srow` pointer stops being enough.
+// One. Two tilings were measured and both were worse; the reasoning and the
+// numbers are on `BATCH_KERNELS` in `fp8.rs`. The machinery stays because it is
+// the shape a shared-memory-staged version needs, and because `ROWS = 1` is the
+// same arithmetic the untiled kernel did.
+#define FP8_MMV_ROWS2 1
+#define FP8_MMV_ROWS4 1
+#define FP8_MMV_ROWS8 1
+#define FP8_MMV_ROWS16 1
+
+// The same, for a handful of tokens at once, ROWS output rows to a block.
+//
+// Two things happen here that did not before, and the second is the one that
+// mattered.
+//
+// **Each weight is read once and spent on every token.** This is the case the
+// expansion path was getting badly wrong: expanding a matrix to f16 and handing
+// it to cuBLAS costs one byte read, two written and two read back — five bytes a
+// weight against the two that resident f16 cost — so it made batched decode 2.5x
+// more memory traffic than before FP8. The profiler put `dequant_f8_block` at
+// 67% of a batch-32 step and batch scaling fell from 36.9x to 8.6x.
+//
+// **Each activation is read once and spent on every row.** With one output row
+// to a block, every block reads the whole activation, so activation traffic is
+// four bytes per *weight element* — 118 GB a token on the 27B against 29.6 GB of
+// weights. It comes out of L2 rather than DRAM, which is why it was invisible in
+// a DRAM-traffic argument, and at a few TB/s of L2 it is exactly the size of the
+// measured cost: a second row cost 6.9 ms of a 27.9 ms step, and a third and a
+// fourth cost 6.9 each, flat, for zero extra weight bytes.
+//
+// It is not the arithmetic and it is not the load count. At two tokens a thread
+// does eight FMAs per four weight bytes — four FLOP a byte against this card's
+// 64 — which is 0.5 ms a step; the extra scalar loads are 16 us. Both are two
+// orders of magnitude too small. Only the bytes are the right size, and `ROWS`
+// divides them.
+//
+// `ROWS` must divide 128 so that a block's rows never straddle a scale-grid
+// boundary: the grid is 128 rows by 128 columns, so one `srow` pointer serves a
+// whole block only if the block's rows share `row / 128`.
+//
+// `x` is `[n_tokens, k]` and `out` is `[n_tokens, n]`, both row-major, matching
+// what the rest of the engine passes around.
+template <int TOKENS, int ROWS>
 __device__ __forceinline__ void mmv_f8_block_batch_body(
         float* __restrict__ out, const unsigned char* __restrict__ w,
         const float* __restrict__ x, int k, int n, int scale_cols, int n_tokens,
         int accum) {
-    const int row = blockIdx.x;
-    if (row >= n) return;
+    static_assert(128 % ROWS == 0, "a block's rows must share one scale row");
+    const int row0 = blockIdx.x * ROWS;
+    if (row0 >= n) return;
+    const int rows = (n - row0 < ROWS) ? (n - row0) : ROWS;
 
     const float* scales = (const float*)(w + (size_t)n * k);
-    const float* srow = scales + (size_t)(row / 128) * scale_cols;
-    const unsigned char* wrow = w + (size_t)row * k;
+    const float* srow = scales + (size_t)(row0 / 128) * scale_cols;
 
-    float acc[TOKENS];
+    float acc[ROWS][TOKENS];
 #pragma unroll
-    for (int t = 0; t < TOKENS; ++t) acc[t] = 0.0f;
+    for (int r = 0; r < ROWS; ++r) {
+#pragma unroll
+        for (int t = 0; t < TOKENS; ++t) acc[r][t] = 0.0f;
+    }
+
+    // Whether the activation can be read 16 bytes at a time. `x` is a *view*
+    // here — the caller may hand over a slice of a larger buffer — so the base
+    // pointer is checked rather than assumed. Row `t` starts at `x + t * k` and
+    // `k` is a multiple of four (the launcher checks), so 16-byte alignment of
+    // the base carries to every row. Same guard as `f32_to_f16_vec` in `ops.cu`,
+    // and for the same reason: a misaligned `float4` is a fault, not a slow load.
+    const bool xvec = ((size_t)(const void*)x % 16 == 0);
 
     for (int i0 = threadIdx.x * 4; i0 < k; i0 += blockDim.x * 4) {
         const float s = srow[i0 >> 7];
-        float wv[4];
-        if (i0 + 3 < k) {
-            const unsigned int packed = *(const unsigned int*)(wrow + i0);
-            wv[0] = s * e4m3_to_f32(packed & 0xFFu);
-            wv[1] = s * e4m3_to_f32((packed >> 8) & 0xFFu);
-            wv[2] = s * e4m3_to_f32((packed >> 16) & 0xFFu);
-            wv[3] = s * e4m3_to_f32((packed >> 24) & 0xFFu);
-        } else {
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                wv[j] = (i0 + j < k) ? s * e4m3_to_f32(wrow[i0 + j]) : 0.0f;
-            }
-        }
-        // The weight is in registers now; every token reuses it.
+        const bool whole = (i0 + 3 < k);
+
+        // The activation group, once, for every row below to reuse. This is the
+        // reordering: activations in the outer position, weights in the inner.
+        float xv[TOKENS][4];
 #pragma unroll
         for (int t = 0; t < TOKENS; ++t) {
             if (t >= n_tokens) break;
             const float* xt = x + (size_t)t * k;
+            if (whole && xvec) {
+                const float4 v = *(const float4*)(const void*)(xt + i0);
+                xv[t][0] = v.x;
+                xv[t][1] = v.y;
+                xv[t][2] = v.z;
+                xv[t][3] = v.w;
+            } else {
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                if (i0 + j < k) acc[t] += wv[j] * xt[i0 + j];
+                for (int j = 0; j < 4; ++j) {
+                    xv[t][j] = (i0 + j < k) ? xt[i0 + j] : 0.0f;
+                }
+            }
+        }
+
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            if (r >= rows) break;
+            const unsigned char* wrow = w + (size_t)(row0 + r) * k;
+            float wv[4];
+            if (whole) {
+                const unsigned int packed = *(const unsigned int*)(wrow + i0);
+                wv[0] = s * e4m3_to_f32(packed & 0xFFu);
+                wv[1] = s * e4m3_to_f32((packed >> 8) & 0xFFu);
+                wv[2] = s * e4m3_to_f32((packed >> 16) & 0xFFu);
+                wv[3] = s * e4m3_to_f32((packed >> 24) & 0xFFu);
+            } else {
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    wv[j] = (i0 + j < k) ? s * e4m3_to_f32(wrow[i0 + j]) : 0.0f;
+                }
+            }
+#pragma unroll
+            for (int t = 0; t < TOKENS; ++t) {
+                if (t >= n_tokens) break;
+                acc[r][t] += wv[0] * xv[t][0] + wv[1] * xv[t][1]
+                           + wv[2] * xv[t][2] + wv[3] * xv[t][3];
             }
         }
     }
 
-    // One reduction a token. Warp-level first, then across warps through shared
-    // memory — `block_reduce_sum` cannot be called in a loop, since its static
-    // shared result would be overwritten while slower threads still read it.
-    __shared__ float partial[32][TOKENS];
+    // One reduction per row per token. Warp-level first, then across warps
+    // through shared memory — `block_reduce_sum` cannot be called in a loop,
+    // since its static shared result would be overwritten while slower threads
+    // still read it.
+    __shared__ float partial[32][ROWS][TOKENS];
     const int lane = threadIdx.x % WARP_SIZE;
     const int warp = threadIdx.x / WARP_SIZE;
     const int warps = blockDim.x / WARP_SIZE;
 #pragma unroll
-    for (int t = 0; t < TOKENS; ++t) {
-        if (t >= n_tokens) break;
-        float v = acc[t];
-        for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
-            v += __shfl_down_sync(FULL_MASK, v, off);
+    for (int r = 0; r < ROWS; ++r) {
+        if (r >= rows) break;
+#pragma unroll
+        for (int t = 0; t < TOKENS; ++t) {
+            if (t >= n_tokens) break;
+            float v = acc[r][t];
+            for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+                v += __shfl_down_sync(FULL_MASK, v, off);
+            }
+            if (lane == 0) partial[warp][r][t] = v;
         }
-        if (lane == 0) partial[warp][t] = v;
     }
     __syncthreads();
-    if (threadIdx.x < TOKENS && threadIdx.x < n_tokens) {
-        const int t = threadIdx.x;
+    // One thread per (row, token) pair finishes the cross-warp sum. `rows *
+    // n_tokens` is at most `ROWS * TOKENS`, which is under any block size here.
+    for (int i = threadIdx.x; i < rows * n_tokens; i += blockDim.x) {
+        const int r = i / n_tokens;
+        const int t = i % n_tokens;
         float sum = 0.0f;
-        for (int wi = 0; wi < warps; ++wi) sum += partial[wi][t];
-        float* o = out + (size_t)t * n + row;
+        for (int wi = 0; wi < warps; ++wi) sum += partial[wi][r][t];
+        float* o = out + (size_t)t * n + row0 + r;
         *o = accum ? *o + sum : sum;
     }
+}
+
+extern "C" __global__ void mmv_f8_block_batch2_f32(
+        float* __restrict__ out, const unsigned char* __restrict__ w,
+        const float* __restrict__ x, int k, int n, int scale_cols, int n_tokens,
+        int accum) {
+    mmv_f8_block_batch_body<2, FP8_MMV_ROWS2>(out, w, x, k, n, scale_cols,
+                                                  n_tokens, accum);
+}
+
+extern "C" __global__ void mmv_f8_block_batch4_f32(
+        float* __restrict__ out, const unsigned char* __restrict__ w,
+        const float* __restrict__ x, int k, int n, int scale_cols, int n_tokens,
+        int accum) {
+    mmv_f8_block_batch_body<4, FP8_MMV_ROWS4>(out, w, x, k, n, scale_cols,
+                                                  n_tokens, accum);
 }
 
 extern "C" __global__ void mmv_f8_block_batch8_f32(
         float* __restrict__ out, const unsigned char* __restrict__ w,
         const float* __restrict__ x, int k, int n, int scale_cols, int n_tokens,
         int accum) {
-    mmv_f8_block_batch_body<8>(out, w, x, k, n, scale_cols, n_tokens, accum);
+    mmv_f8_block_batch_body<8, FP8_MMV_ROWS8>(out, w, x, k, n, scale_cols,
+                                                  n_tokens, accum);
 }
 
-extern "C" __global__ void mmv_f8_block_batch32_f32(
+extern "C" __global__ void mmv_f8_block_batch16_f32(
         float* __restrict__ out, const unsigned char* __restrict__ w,
         const float* __restrict__ x, int k, int n, int scale_cols, int n_tokens,
         int accum) {
-    mmv_f8_block_batch_body<32>(out, w, x, k, n, scale_cols, n_tokens, accum);
+    mmv_f8_block_batch_body<16, FP8_MMV_ROWS16>(out, w, x, k, n, scale_cols,
+                                                  n_tokens, accum);
 }
 
 // The same weights, dequantized to f16 for the batched path.
