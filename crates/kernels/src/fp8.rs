@@ -27,6 +27,35 @@ use crate::{Kernels, fp8_src};
 /// The scale grid's block size, in both directions.
 pub const FP8_BLOCK: usize = 128;
 
+/// `#define`s that take pieces out of the mat-vec, for
+/// `examples/fp8_row_cost.rs`.
+///
+/// A marginal row costs 2.25 ms where its DRAM bytes are zero, and three
+/// end-to-end explanations were all wrong — so the move left is to remove one
+/// piece at a time and see which one the cost follows. `TUILI_FP8_STRIP` takes
+/// `fma`, `reduce`, or `both`; anything else, including unset, is the real
+/// kernel. These produce wrong answers by construction.
+pub fn strip_flags() -> &'static str {
+    static F: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    F.get_or_init(|| {
+        let want = std::env::var("TUILI_FP8_STRIP").unwrap_or_default();
+        let fma = want == "fma" || want == "both";
+        let reduce = want == "reduce" || want == "both";
+        if fma || reduce {
+            tracing::warn!(
+                strip = %want,
+                "TUILI_FP8_STRIP is set: the FP8 mat-vec is computing the wrong answer \
+                 on purpose"
+            );
+        }
+        format!(
+            "#define FP8_STRIP_FMA {}\n#define FP8_STRIP_REDUCE {}",
+            i32::from(fma),
+            i32::from(reduce)
+        )
+    })
+}
+
 /// `(token bound, kernel)`, tightest bound first.
 ///
 /// The token count has to be the tightest available compile-time bound and not

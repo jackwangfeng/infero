@@ -100,7 +100,11 @@ fn vision_src() -> &'static str {
 /// The block-scaled FP8 unit.
 fn fp8_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    SRC.get_or_init(|| format!("{COMMON_CUH}\n{FP8_CU}"))
+    // `TUILI_FP8_STRIP` prepends `#define`s that take pieces out of the mat-vec,
+    // for `examples/fp8_row_cost.rs` to attribute the marginal row's cost. The
+    // defines change the source, so they change the NVRTC cache key — a stripped
+    // build cannot be confused with a serving one.
+    SRC.get_or_init(|| format!("{COMMON_CUH}\n{}\n{FP8_CU}", crate::fp8::strip_flags()))
 }
 
 fn sample_src() -> &'static str {

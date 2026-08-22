@@ -63,6 +63,19 @@ __device__ __forceinline__ float e4m3_to_f32(unsigned int b) {
 // stop being enough.
 #define FP8_ROW_GROUP 4
 
+// Attribution switches for `examples/fp8_row_cost.rs`, compiled in by
+// `fp8::strip_flags()` when `TUILI_FP8_STRIP` asks. A marginal row costs 2.25 ms
+// where its DRAM bytes are zero, and three end-to-end guesses at why were all
+// wrong — so the remaining move is to take pieces out and see which one the cost
+// follows. These produce wrong answers by construction and are never on in a
+// serving build.
+#ifndef FP8_STRIP_FMA
+#define FP8_STRIP_FMA 0
+#endif
+#ifndef FP8_STRIP_REDUCE
+#define FP8_STRIP_REDUCE 0
+#endif
+
 // One packed word into four scaled floats.
 __device__ __forceinline__ void fp8_unpack4(unsigned int packed, float s,
                                             float out[4]) {
@@ -155,11 +168,17 @@ __device__ __forceinline__ void mmv_f8_group_body(
 #pragma unroll
                 for (int j = 0; j < 4; ++j) xv[j] = xt[i0 + j];
             }
+#if FP8_STRIP_FMA
+            // Keep the loads alive so the compiler cannot delete them, and skip
+            // the multiply-accumulate. One add a token instead of sixteen FMAs.
+            acc[0][t] += xv[0] + wv[0][0];
+#else
 #pragma unroll
             for (int r = 0; r < FP8_ROW_GROUP; ++r) {
                 acc[r][t] += wv[r][0] * xv[0] + wv[r][1] * xv[1]
                            + wv[r][2] * xv[2] + wv[r][3] * xv[3];
             }
+#endif
         }
     }
 
@@ -167,6 +186,19 @@ __device__ __forceinline__ void mmv_f8_group_body(
     // through shared memory — `block_reduce_sum` cannot be called in a loop,
     // since its static shared result would be overwritten while slower threads
     // still read it.
+#if FP8_STRIP_REDUCE
+    // One reduction for the whole block instead of `rows * n_tokens`, so the
+    // accumulators are still consumed — the loop above stays — and the shuffle
+    // chains go away.
+    {
+        float v = acc[0][0];
+        for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+            v += __shfl_down_sync(FULL_MASK, v, off);
+        }
+        if (threadIdx.x == 0) out[row0] = v;
+    }
+    return;
+#endif
     __shared__ float partial[32][FP8_ROW_GROUP][TOKENS];
     const int lane = threadIdx.x % WARP_SIZE;
     const int warp = threadIdx.x / WARP_SIZE;
