@@ -50,6 +50,23 @@ pub struct Config {
 }
 
 impl Config {
+    /// How wide the attention block is inside, `n_heads · d_head`.
+    ///
+    /// Equal to `d_model` for every model up to Qwen3.8, which is why the two
+    /// were the same variable for so long. Qwen3.8-27B runs 24 heads of 256
+    /// against a 5120-wide residual, so `q` is 6144 columns and the output
+    /// projection narrows back down — the residual stream and the attention
+    /// interior are separate widths, and conflating them sizes half the
+    /// attention buffers wrong.
+    pub fn d_attn(&self) -> usize {
+        self.n_heads * self.d_head
+    }
+
+    /// How wide `k` and `v` are, `n_kv_heads · d_head`.
+    pub fn d_kv(&self) -> usize {
+        self.n_kv_heads * self.d_head
+    }
+
     pub fn from_gguf(f: &Gguf) -> Result<Self> {
         let arch = f.arch()?.to_string();
         if !SUPPORTED.contains(&arch.as_str()) {
@@ -169,19 +186,13 @@ impl Config {
             .as_u64()
             .map_or(d_model / n_heads, |v| v as usize);
         // `d_head * n_heads` used to have to equal `d_model`, and for every
-        // model tuili had loaded it did. Qwen3.8 breaks it: 24 heads of 256 is
-        // 6144 against a 5120-wide residual, so the attention block widens on
-        // the way in and narrows on the way out. The forward pass still assumes
-        // the two are the same in ~45 places, so refuse for now — but refuse by
-        // naming the real constraint rather than calling the layout
-        // unsupported, because it is the engine that is behind, not the
-        // checkpoint that is odd.
-        anyhow::ensure!(
-            d_head * n_heads == d_model,
-            "d_head {d_head} * n_heads {n_heads} = {} but d_model is {d_model}; \
-             the attention path does not yet carry a width of its own",
-            d_head * n_heads,
-        );
+        // model tuili had loaded before Qwen3.8 it did. Qwen3.8 breaks it: 24
+        // heads of 256 is 6144 against a 5120-wide residual, so the attention
+        // block widens on the way in and narrows on the way out. The forward
+        // pass now carries `d_attn()` separately from `d_model`, so there is
+        // nothing left to check here — but note that the two are still equal on
+        // every other model, which means the width separation has no regression
+        // test of its own beyond "the old models still speak".
         anyhow::ensure!(
             d_head.is_multiple_of(2),
             "d_head {d_head} must be even for rotary embeddings"

@@ -574,7 +574,13 @@ impl Model {
                 .alloc_zeros::<f16>(cfg.max_layer_weight_elements())?,
             x16: dev
                 .stream()
-                .alloc_zeros::<f16>(MAX_BATCH_TOKENS * cfg.d_ff.max(cfg.d_model))?,
+                // Holds an f16 copy of whichever activation feeds the next
+                // matmul: the FFN hidden, the residual, or the attention
+                // output — and that last one is `d_attn` wide, which stopped
+                // being covered by `d_model` on Qwen3.8.
+                .alloc_zeros::<f16>(
+                    MAX_BATCH_TOKENS * cfg.d_ff.max(cfg.d_model).max(cfg.d_attn()),
+                )?,
             q8_1: dev.stream().alloc_zeros::<u8>(
                 MAX_BATCH_TOKENS * Kernels::q8_1_bytes(cfg.d_ff.max(cfg.d_model)),
             )?,
@@ -582,14 +588,17 @@ impl Model {
 
         let tq = if kv_quant.is_quantized() {
             let chunk = MAX_BATCH_TOKENS;
-            let kv_dim = cfg.n_kv_heads * cfg.d_head;
+            let kv_dim = cfg.d_kv();
+            // These three hold rotated queries and the attention accumulator,
+            // so they are `d_attn` wide, not `d_model`.
+            let d_attn = cfg.d_attn();
             Some(TqBuffers {
                 tables: TqTables::new(&dev, cfg.d_head, kv_quant)?,
                 k_rot: dev.stream().alloc_zeros::<f32>(chunk * kv_dim)?,
                 v_rot: dev.stream().alloc_zeros::<f32>(chunk * kv_dim)?,
-                q_rot: dev.stream().alloc_zeros::<f32>(chunk * cfg.d_model)?,
-                q_qjl: dev.stream().alloc_zeros::<f32>(chunk * cfg.d_model)?,
-                acc_rot: dev.stream().alloc_zeros::<f32>(chunk * cfg.d_model)?,
+                q_rot: dev.stream().alloc_zeros::<f32>(chunk * d_attn)?,
+                q_qjl: dev.stream().alloc_zeros::<f32>(chunk * d_attn)?,
+                acc_rot: dev.stream().alloc_zeros::<f32>(chunk * d_attn)?,
             })
         } else {
             None
@@ -1341,7 +1350,14 @@ impl Model {
         let stage = slot.map(|s| &self.offload.as_ref().unwrap().stage[s]);
         let cfg = &self.cfg;
         let d = cfg.d_model;
-        let kv_dim = cfg.n_kv_heads * cfg.d_head;
+        // The attention interior's width. Equal to `d` on every model before
+        // Qwen3.8, which ran 24 heads of 256 against a 5120 residual — so
+        // reading `d` for a query row is right by accident there and wrong
+        // here. `d` stays the residual stream and the projections' input; `da`
+        // is q, the packed row, the attention output, and anything strided by a
+        // query row.
+        let da = cfg.d_attn();
+        let kv_dim = cfg.d_kv();
         let l = &self.w.layers[layer];
         let table_stride = pool.table_stride();
         // Set below, where the decode combine either writes the output
@@ -1419,7 +1435,7 @@ impl Model {
                 [l.wq.n, l.wk.n, l.wv.n],
             )?;
             for (bias, out, cols) in [
-                (&l.bq, &mut self.act.q, d),
+                (&l.bq, &mut self.act.q, da),
                 (&l.bk, &mut self.act.k, kv_dim),
                 (&l.bv, &mut self.act.v, kv_dim),
             ] {
@@ -1438,7 +1454,7 @@ impl Model {
             // `act.gate` is the staging buffer: it is the FFN's, already wide
             // enough, and nothing in this block will read it before the FFN
             // writes it again.
-            let fused_w = d + 2 * kv_dim;
+            let fused_w = da + 2 * kv_dim;
             Self::matmul_pre(
                 &self.kern,
                 &mut self.scratch,
@@ -1463,7 +1479,7 @@ impl Model {
                 && self.tq.is_none();
             if !packed_qkv {
                 self.kern.split_qkv(
-                    &mut self.act.q.slice_mut(..n * d),
+                    &mut self.act.q.slice_mut(..n * da),
                     &mut self.act.k.slice_mut(..n * kv_dim),
                     &mut self.act.v.slice_mut(..n * kv_dim),
                     &self.act.gate.slice(..n * fused_w),
@@ -1473,7 +1489,7 @@ impl Model {
                 )?;
             }
             for (bias, out, cols) in [
-                (&l.bq, &mut self.act.q, d),
+                (&l.bq, &mut self.act.q, da),
                 (&l.bk, &mut self.act.k, kv_dim),
                 (&l.bv, &mut self.act.v, kv_dim),
             ] {
@@ -1484,7 +1500,7 @@ impl Model {
             }
         } else {
         for (w, bias, out, cols) in [
-            (&l.wq, &l.bq, &mut self.act.q, d),
+            (&l.wq, &l.bq, &mut self.act.q, da),
             (&l.wk, &l.bk, &mut self.act.k, kv_dim),
             (&l.wv, &l.bv, &mut self.act.v, kv_dim),
         ] {
@@ -1508,7 +1524,7 @@ impl Model {
         }
         }
 
-        let fused_w = d + 2 * kv_dim;
+        let fused_w = da + 2 * kv_dim;
 
         // Qwen3 normalizes every head of q and k before the rotary. The order
         // matters: rotating first and normalizing after is a different
@@ -1538,7 +1554,7 @@ impl Model {
             let (buf, stride, len) = if packed_qkv {
                 (&mut self.act.gate, fused_w, n * fused_w)
             } else {
-                (&mut self.act.q, d, n * d)
+                (&mut self.act.q, da, n * da)
             };
             self.kern.qk_norm(
                 &mut buf.slice_mut(..len),
@@ -1562,7 +1578,7 @@ impl Model {
             && let Some(qn) = l.q_norm.as_ref()
         {
             let stream = self.kern.device().stream();
-            let width = if packed_qkv { fused_w } else { d };
+            let width = if packed_qkv { fused_w } else { da };
             let row = stream.clone_dtoh(&self.act.gate.slice(..width.max(d)))?;
             let w = stream.clone_dtoh(&qn.as_view())?;
             self.kern.device().synchronize()?;
@@ -1585,7 +1601,7 @@ impl Model {
 
         if let Some(kn) = l.k_norm.as_ref().filter(|_| !skip_qk_norm) {
             let (buf, stride, offset, len) = if packed_qkv {
-                (&mut self.act.gate, fused_w, d, n * fused_w)
+                (&mut self.act.gate, fused_w, da, n * fused_w)
             } else {
                 (&mut self.act.k, kv_dim, 0, n * kv_dim)
             };
@@ -1613,7 +1629,7 @@ impl Model {
             && let Some(kn) = l.k_norm.as_ref()
         {
             let stream = self.kern.device().stream();
-            let (base, span) = if packed_qkv { (d, fused_w) } else { (0, kv_dim) };
+            let (base, span) = if packed_qkv { (da, fused_w) } else { (0, kv_dim) };
             let row = stream.clone_dtoh(&self.act.gate.slice(..span))?;
             let w = stream.clone_dtoh(&kn.as_view())?;
             self.kern.device().synchronize()?;
@@ -1638,7 +1654,7 @@ impl Model {
         if packed_qkv {
             let (q, packed) = (&mut self.act.q, &mut self.act.gate);
             self.kern.rope_qk_packed(
-                &mut q.slice_mut(..n * d),
+                &mut q.slice_mut(..n * da),
                 &mut packed.slice_mut(..n * fused_w),
                 fused_w,
                 0,
@@ -1656,7 +1672,7 @@ impl Model {
         } else {
             let (q, k) = (&mut self.act.q, &mut self.act.k);
             self.kern.rope_qk(
-                &mut q.slice_mut(..n * d),
+                &mut q.slice_mut(..n * da),
                 &mut k.slice_mut(..n * kv_dim),
                 &self.act.positions.slice(..n),
                 &self.w.rope_freqs.as_view(),
@@ -1754,11 +1770,11 @@ impl Model {
                 if !std::env::var("TUILI_DECODE_ATTN").is_ok_and(|v| v == "0")
                     && self.kern.decode_attention(&dims)
                 {
-                    let mut h16 = self.scratch.x16.slice_mut(..n * d);
+                    let mut h16 = self.scratch.x16.slice_mut(..n * da);
                     attn_f16 = self.kern.attn_decode(
-                        &mut attn_out.slice_mut(..n * d),
+                        &mut attn_out.slice_mut(..n * da),
                         wo_f16.then_some(&mut h16),
-                        &self.act.q.slice(..n * d),
+                        &self.act.q.slice(..n * da),
                         &pool.dense(layer).0.as_view(),
                         &pool.dense(layer).1.as_view(),
                         batch,
@@ -1769,8 +1785,8 @@ impl Model {
                     )?;
                 } else if self.kern.flash_attention(&dims, kv_len) {
                     self.kern.attn_flash(
-                        &mut attn_out.slice_mut(..n * d),
-                        &self.act.q.slice(..n * d),
+                        &mut attn_out.slice_mut(..n * da),
+                        &self.act.q.slice(..n * da),
                         &pool.dense(layer).0.as_view(),
                         &pool.dense(layer).1.as_view(),
                         batch,
@@ -1782,7 +1798,7 @@ impl Model {
                 } else {
                     self.kern.attn_scores(
                         &mut self.act.scores.slice_mut(..score_len),
-                        &self.act.q.slice(..n * d),
+                        &self.act.q.slice(..n * da),
                         &pool.dense(layer).0.as_view(),
                         batch,
                         dims,
@@ -1796,7 +1812,7 @@ impl Model {
                         kv_len,
                     )?;
                     self.kern.attn_output(
-                        &mut attn_out.slice_mut(..n * d),
+                        &mut attn_out.slice_mut(..n * da),
                         &self.act.scores.slice(..score_len),
                         &pool.dense(layer).1.as_view(),
                         batch,
@@ -1828,15 +1844,15 @@ impl Model {
                     n_kv_vecs,
                 )?;
                 self.kern.tq_matvec(
-                    &mut tq.q_rot.slice_mut(..n * d),
-                    &self.act.q.slice(..n * d),
+                    &mut tq.q_rot.slice_mut(..n * da),
+                    &self.act.q.slice(..n * da),
                     &tq.tables.rotation.as_view(),
                     d_head,
                     n_q_vecs,
                 )?;
                 self.kern.tq_matvec(
-                    &mut tq.q_qjl.slice_mut(..n * d),
-                    &tq.q_rot.slice(..n * d),
+                    &mut tq.q_qjl.slice_mut(..n * da),
+                    &tq.q_rot.slice(..n * da),
                     &tq.tables.qjl.as_view(),
                     d_head,
                     n_q_vecs,
@@ -1887,8 +1903,8 @@ impl Model {
                     let (codes, signs, scale, gamma) = pool.tq_key(layer);
                     self.kern.tq_attn_scores(
                         &mut self.act.scores.slice_mut(..score_len),
-                        &tq.q_rot.slice(..n * d),
-                        &tq.q_qjl.slice(..n * d),
+                        &tq.q_rot.slice(..n * da),
+                        &tq.q_qjl.slice(..n * da),
                         &codes.as_view(),
                         &signs.as_view(),
                         &scale.as_view(),
@@ -1911,7 +1927,7 @@ impl Model {
                 {
                     let (codes, scale) = pool.tq_value(layer);
                     self.kern.tq_attn_output(
-                        &mut tq.acc_rot.slice_mut(..n * d),
+                        &mut tq.acc_rot.slice_mut(..n * da),
                         &self.act.scores.slice(..score_len),
                         &codes.as_view(),
                         &scale.as_view(),
@@ -1924,8 +1940,8 @@ impl Model {
                 }
                 // Back out of the rotated basis, once, on the output.
                 self.kern.tq_matvec(
-                    &mut self.act.attn.slice_mut(..n * d),
-                    &tq.acc_rot.slice(..n * d),
+                    &mut self.act.attn.slice_mut(..n * da),
+                    &tq.acc_rot.slice(..n * da),
                     &tq.tables.rotation_t.as_view(),
                     d_head,
                     n_q_vecs,
@@ -1959,7 +1975,7 @@ impl Model {
             &mut self.act.proj.slice_mut(..n * d),
             &l.wo,
             stage,
-            &self.act.attn.slice(..n * d),
+            &self.act.attn.slice(..n * da),
             n,
             self.use_mmvq,
             self.use_mmq,
@@ -2594,7 +2610,12 @@ impl Activations {
         let stream = dev.stream();
         let chunk = MAX_BATCH_TOKENS;
         let d = cfg.d_model;
-        let kv_dim = cfg.n_kv_heads * cfg.d_head;
+        // The attention interior can be wider than the residual stream — 24
+        // heads of 256 against 5120 on Qwen3.8 — so `q` and the attention
+        // output are sized by it rather than by `d_model`. They were the same
+        // number for every model before that one.
+        let d_attn = cfg.d_attn();
+        let kv_dim = cfg.d_kv();
 
         let alloc_f32 = |n: usize, what: &str| -> Result<CudaSlice<f32>> {
             stream
@@ -2605,15 +2626,24 @@ impl Activations {
         Ok(Self {
             x: alloc_f32(chunk * d, "residual")?,
             xb: alloc_f32(chunk * d, "normalized")?,
-            q: alloc_f32(chunk * d, "queries")?,
+            q: alloc_f32(chunk * d_attn, "queries")?,
             k: alloc_f32(chunk * kv_dim, "keys")?,
             v: alloc_f32(chunk * kv_dim, "values")?,
-            attn: alloc_f32(chunk * d, "attention output")?,
+            attn: alloc_f32(chunk * d_attn, "attention output")?,
             proj: alloc_f32(chunk * d.max(1), "projection")?,
             // Twice `d_ff`: under `TUILI_FUSE_FFN` one matmul writes `gate` and
             // `up` into a single row of this, and `silu_mul_split` reads the
             // two halves. The unfused path uses the first half only.
-            gate: alloc_f32(chunk * cfg.d_ff * 2, "ffn gate")?,
+            //
+            // It doubles as the packed `[q | k | v]` staging row, which is
+            // `d_attn + 2·d_kv` wide. That has always been the smaller of the
+            // two and still is on every model here, but it stopped being
+            // obviously so once `d_attn` came loose from `d_model` — so take
+            // the max rather than relying on it.
+            gate: alloc_f32(
+                chunk * (cfg.d_ff * 2).max(d_attn + 2 * kv_dim),
+                "ffn gate / packed qkv",
+            )?,
             up: alloc_f32(chunk * cfg.d_ff, "ffn up")?,
             ffn: alloc_f32(chunk * cfg.d_ff, "ffn hidden")?,
             scores: alloc_f32(cfg.n_heads * chunk * max_seq, "attention scores")?,

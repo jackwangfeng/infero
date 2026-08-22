@@ -113,22 +113,27 @@ fn a_flat_config_still_reads_from_the_top_level() {
 }
 
 /// The real Qwen3.8-27B widths — 24 heads of 256 against a 5120 residual — are
-/// refused, and the message says which constraint is missing rather than
-/// calling the checkpoint unsupported. This is the state of the engine, so the
-/// test is here to be deleted along with the assertion when the attention path
-/// carries a width of its own.
+/// accepted, and the attention width is the head product rather than d_model.
+/// This test replaces the assertion that used to refuse this shape; it is worth
+/// keeping because on every other model the two widths coincide, so a
+/// regression to `d_attn == d_model` would be invisible everywhere else.
 #[test]
-fn an_attention_width_wider_than_d_model_is_refused_by_name() {
+fn the_attention_width_is_the_head_product_not_d_model() {
     let j = qwen38_shaped(serde_json::json!({ "num_attention_heads": 24 }));
-    let err = Config::from_hf(&j, "qwen38").unwrap_err().to_string();
-    assert!(
-        err.contains("6144") && err.contains("5120"),
-        "the message should state both widths: {err}"
-    );
-    assert!(
-        err.contains("width of its own"),
-        "the message should name the missing capability: {err}"
-    );
+    let cfg = Config::from_hf(&j, "qwen38").expect("a wider attention block should load");
+    assert_eq!(cfg.d_model, 5120, "the residual keeps its own width");
+    assert_eq!(cfg.d_attn(), 6144, "24 heads of 256");
+    assert_eq!(cfg.d_kv(), 1024, "4 kv heads of 256");
+    assert_ne!(cfg.d_attn(), cfg.d_model, "the point of the test");
+}
+
+/// And where the two widths do coincide — every model tuili loaded before this
+/// one — `d_attn` must agree with `d_model` rather than drifting.
+#[test]
+fn the_two_widths_still_agree_on_a_conventional_model() {
+    let j = qwen38_shaped(serde_json::json!({}));
+    let cfg = Config::from_hf(&j, "qwen38").unwrap();
+    assert_eq!(cfg.d_attn(), cfg.d_model, "20 heads of 256 is 5120");
 }
 
 /// An odd head dimension cannot be rotated in pairs, and that check has to

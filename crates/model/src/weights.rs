@@ -275,7 +275,12 @@ impl Weights {
     /// several kernels later.
     fn check_shapes(&self, cfg: &Config) -> Result<()> {
         let d = cfg.d_model;
-        let kv_dim = cfg.n_kv_heads * cfg.d_head;
+        // The attention block is not square once `n_heads * d_head` stops
+        // equalling `d_model`: q widens the residual to `d_attn` and o narrows
+        // it back. This check is the only place a width mistake is caught
+        // against the actual tensor, so it has to know the difference.
+        let da = cfg.d_attn();
+        let kv_dim = cfg.d_kv();
 
         anyhow::ensure!(
             self.token_embd.k == d && self.token_embd.n == cfg.vocab_size,
@@ -295,10 +300,10 @@ impl Weights {
                 );
                 Ok(())
             };
-            expect(&l.wq, d, d, "attn_q")?;
+            expect(&l.wq, d, da, "attn_q")?;
             expect(&l.wk, d, kv_dim, "attn_k")?;
             expect(&l.wv, d, kv_dim, "attn_v")?;
-            expect(&l.wo, d, d, "attn_output")?;
+            expect(&l.wo, da, d, "attn_output")?;
             expect(&l.w_gate, d, cfg.d_ff, "ffn_gate")?;
             expect(&l.w_up, d, cfg.d_ff, "ffn_up")?;
             expect(&l.w_down, cfg.d_ff, d, "ffn_down")?;
