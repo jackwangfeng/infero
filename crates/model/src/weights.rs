@@ -77,6 +77,33 @@ impl Matrix {
 /// A 1-D parameter — norm gains and biases — always held as f32 on the device.
 pub type Vector = CudaSlice<f32>;
 
+impl Matrix {
+    /// Upload `[n, k]` f16 values, row-major, as a resident matrix.
+    ///
+    /// For a caller that has the numbers rather than a checkpoint: the reference
+    /// weights a capture carries, chiefly. The loaders build their matrices
+    /// through the private paths above and do not go through this.
+    pub fn upload_f16(dev: &Device, halves: &[half::f16], k: usize, n: usize) -> Result<Self> {
+        anyhow::ensure!(
+            halves.len() == k * n,
+            "{} halves for a [{n}, {k}] matrix",
+            halves.len()
+        );
+        // Safety: f16 is a transparent u16, so these are already the
+        // little-endian halves the device expects, and the view does not outlive
+        // `halves`.
+        let raw =
+            unsafe { std::slice::from_raw_parts(halves.as_ptr() as *const u8, halves.len() * 2) };
+        Ok(Self {
+            ty: WeightType::F16,
+            k,
+            n,
+            n_bytes: raw.len(),
+            storage: Storage::Device(dev.stream().clone_htod(raw)?),
+        })
+    }
+}
+
 /// One offloaded layer's matrices, packed contiguously in page-locked memory.
 ///
 /// One blob per layer means one DMA per layer: the transfer the prefetch has to
@@ -187,6 +214,37 @@ impl Layer {
     pub fn is_linear(&self) -> bool {
         self.gdn.is_some()
     }
+}
+
+/// The multi-token-prediction head, when a checkpoint carries one.
+///
+/// Shaped like a [`Layer`] plus four tensors of glue, which is what it is: one
+/// full-attention decoder block, the same kind as the text model's layers 3, 7,
+/// …, 63, wrapped in `fc` and three norms. See `crates/model/src/qwen35_mtp.rs`
+/// for the host reference this is the device counterpart of, and
+/// `notes/qwen3.5-mtp.md` for why each of these is the tensor it is.
+///
+/// Deliberately *not* holding an embedding or a vocabulary projection: the head
+/// borrows the text model's. That is what `mtp_use_dedicated_embeddings = false`
+/// means, and it is what the checkpoint shows by shipping no `mtp.embed_tokens`
+/// and no `mtp.lm_head`. [`load_mtp`] checks both statements and refuses when
+/// they disagree, rather than trusting the config over the tensors or the other
+/// way round.
+pub struct MtpWeights {
+    /// `[2 * d_model, d_model]` — `k = 2 * d_model`, so the low half of every
+    /// row multiplies the **embedding** and the high half the hidden state.
+    pub fc: Matrix,
+    /// Applies to the token embedding.
+    pub pre_fc_norm_embedding: Vector,
+    /// Applies to the text model's final hidden state.
+    pub pre_fc_norm_hidden: Vector,
+    /// The head's own final norm — a different tensor from the text model's
+    /// `model.language_model.norm`.
+    pub norm: Vector,
+    /// The one decoder layer, in the same shape the text model's blocks use so
+    /// that the forward pass can be read against `Model::attention`.
+    pub layer: Layer,
+    pub device_bytes: usize,
 }
 
 pub struct Weights {
@@ -370,10 +428,44 @@ impl Weights {
                 );
                 Ok(())
             };
-            expect(&l.attn().wq, d, da, "attn_q")?;
-            expect(&l.attn().wk, d, kv_dim, "attn_k")?;
-            expect(&l.attn().wv, d, kv_dim, "attn_v")?;
-            expect(&l.attn().wo, da, d, "attn_output")?;
+            if let Some(g) = &l.gdn {
+                // A GatedDeltaNet block. Its widths come from the linear
+                // dimensions, not from the attention ones, and checking it
+                // against `d_attn` would pass on some of them by coincidence.
+                let la = cfg.linear_attn.context(
+                    "a block has GatedDeltaNet weights but the config gives no \
+                     linear-attention dimensions to check them against",
+                )?;
+                let (key_dim, val_dim) = (la.key_dim(), la.value_dim());
+                expect(&g.in_proj_qkv, d, la.conv_channels(), "in_proj_qkv")?;
+                expect(&g.in_proj_z, d, val_dim, "in_proj_z")?;
+                expect(&g.in_proj_a, d, la.value_heads, "in_proj_a")?;
+                expect(&g.in_proj_b, d, la.value_heads, "in_proj_b")?;
+                expect(&g.out_proj, val_dim, d, "out_proj")?;
+                // The 1-D parameters, whose lengths encode the head counts.
+                for (v, want, what) in [
+                    (&g.conv1d, la.conv_channels() * la.conv_kernel, "conv1d"),
+                    (&g.a_log, la.value_heads, "A_log"),
+                    (&g.dt_bias, la.value_heads, "dt_bias"),
+                    (&g.norm, la.value_head_dim, "norm"),
+                ] {
+                    anyhow::ensure!(
+                        v.len() == want,
+                        "layer {i} {what} has {} elements, expected {want}",
+                        v.len()
+                    );
+                }
+                let _ = key_dim;
+            } else {
+                let a = l.attn();
+                // A gated q projection is twice as wide: a query and its gate
+                // interleaved per head.
+                let q_cols = if a.output_gate { 2 * da } else { da };
+                expect(&a.wq, d, q_cols, "attn_q")?;
+                expect(&a.wk, d, kv_dim, "attn_k")?;
+                expect(&a.wv, d, kv_dim, "attn_v")?;
+                expect(&a.wo, da, d, "attn_output")?;
+            }
             expect(&l.w_gate, d, cfg.d_ff, "ffn_gate")?;
             expect(&l.w_up, d, cfg.d_ff, "ffn_up")?;
             expect(&l.w_down, cfg.d_ff, d, "ffn_down")?;
@@ -385,7 +477,24 @@ impl Weights {
     pub fn dominant_type(&self) -> WeightType {
         let mut totals: std::collections::HashMap<WeightType, usize> = Default::default();
         for l in &self.layers {
-            for m in [&l.attn().wq, &l.attn().wk, &l.attn().wv, &l.attn().wo, &l.w_gate, &l.w_up, &l.w_down] {
+            // A block's matrices depend on which mixer it has. Reaching for the
+            // attention ones unconditionally is what the `attn()` accessor
+            // panics about, and this loop runs over every layer.
+            let mixer: Vec<&Matrix> = match (&l.attn, &l.gdn) {
+                (Some(a), _) => vec![&a.wq, &a.wk, &a.wv, &a.wo],
+                (_, Some(g)) => vec![
+                    &g.in_proj_qkv,
+                    &g.in_proj_z,
+                    &g.in_proj_a,
+                    &g.in_proj_b,
+                    &g.out_proj,
+                ],
+                _ => vec![],
+            };
+            for m in mixer
+                .into_iter()
+                .chain([&l.w_gate, &l.w_up, &l.w_down])
+            {
                 *totals.entry(m.ty).or_default() += m.n_bytes;
             }
         }
@@ -396,6 +505,270 @@ impl Weights {
             .unwrap_or(self.token_embd.ty)
     }
 }
+
+/// One if this norm weight is stored as a delta from one, zero if it is a gain.
+///
+/// Qwen3.5 stores most of its norm weights as a *delta from one*:
+/// `Qwen3_5RMSNorm` initializes to zeros and computes
+/// `normalized * (1 + weight)`, where every other model tuili loads initializes
+/// to ones and computes `weight * normalized`. Adding the one here, at load,
+/// means every norm kernel stays as it is — the alternative was a variant of
+/// `rms_norm` and `qk_norm` each.
+///
+/// The exception is `linear_attn.norm`, which is `Qwen3_5RMSNormGated` and does
+/// use the plain form. Two conventions in one checkpoint.
+///
+/// Which form a tensor wants follows from the class that consumes it, not from
+/// the tensor: the two populations overlap. An `input_layernorm` centred at
+/// 0.036 would be annihilated by the plain form, but some trained `q_norm`
+/// deltas exceed 0.5 and some gated gains fall below 1.5, so a mean-based guess
+/// gets those wrong. Hence a name rule, not a data rule.
+///
+/// A whitelist, not a blacklist. This same loader path reads the attention
+/// biases and the GatedDeltaNet's `A_log`, `dt_bias` and `conv1d.weight`, none
+/// of which are norms; a blacklist that forgot one of those would add one to a
+/// bias or to a decay exponent. A whitelist that forgets a norm leaves that
+/// norm on the old convention, which is bad but confined.
+///
+/// The MTP head adds three names and no new rule. Its `input_layernorm`,
+/// `post_attention_layernorm`, `q_norm` and `k_norm` are already matched by the
+/// suffixes above — they are the same classes in the same decoder block — and
+/// `notes/qwen3.5-mtp.md` measures all four of the head's own norms as the
+/// offset form, so `pre_fc_norm_embedding`, `pre_fc_norm_hidden` and `mtp.norm`
+/// are listed here by their exact names. `mtp.norm.weight` cannot be matched by
+/// the `norm.weight` suffix for the same reason `model.norm.weight` is not:
+/// `linear_attn.norm.weight` ends in it too and is the one gain in the model.
+fn norm_offset(arch: &str, name: &str) -> f32 {
+    const OFFSET_FORM: &[&str] = &[
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+        "self_attn.q_norm.weight",
+        "self_attn.k_norm.weight",
+    ];
+    const OFFSET_FORM_EXACT: &[&str] = &[
+        // The final norm before the vocabulary projection.
+        "model.norm.weight",
+        "model.language_model.norm.weight",
+        // The MTP head's three. Its fourth and fifth — the decoder layer's two
+        // — are covered by the suffixes; see the note above.
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+        "mtp.norm.weight",
+    ];
+    let is_offset_form = OFFSET_FORM.iter().any(|suffix| name.ends_with(suffix))
+        || OFFSET_FORM_EXACT.contains(&name);
+    if arch == "qwen3_5" && is_offset_form {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// Load the multi-token-prediction head, if the checkpoint has one.
+///
+/// Returns `None` when neither the config nor the tensors mention a head, and
+/// an error when only one of them does — a checkpoint that names
+/// `mtp_num_hidden_layers` and ships no `mtp.*` would otherwise build a drafter
+/// out of nothing, and one that ships the tensors under a config that does not
+/// mention them means this loader is reading a layout it has not been shown.
+///
+/// The head's tensors live under **`mtp.`**, not `model.mtp.`; vLLM rewrites the
+/// prefix to `model.` at load time, which is where a reader looking for
+/// `model.mtp.layers.0` gets the idea. Everything else about the block is the
+/// text model's full-attention layout, so it goes through the same code.
+///
+/// One thing in here is not uniform: `mtp.fc` is BF16 while the rest of the head
+/// is FP8. The dispatch is on the tensor's own dtype rather than on a list of
+/// exceptions, which agrees with the checkpoint's
+/// `quantization_config.modules_to_not_convert` (it names `mtp.fc`) and with
+/// vLLM's special case, and keeps working if a future export quantizes it.
+pub fn load_mtp(
+    dev: &Device,
+    w: &tuili_safetensors::Shards,
+    cfg: &Config,
+) -> Result<Option<MtpWeights>> {
+    let present = w.get("mtp.fc.weight").is_some();
+    match (cfg.mtp_layers, present) {
+        (0, false) => return Ok(None),
+        (0, true) => anyhow::bail!(
+            "this checkpoint ships `mtp.*` tensors but its config does not say \
+             `mtp_num_hidden_layers`; the head's depth decides how the draft \
+             loop indexes its layers and guessing it is not safe"
+        ),
+        (n, false) => anyhow::bail!(
+            "config says mtp_num_hidden_layers = {n} but there is no \
+             `mtp.fc.weight`; there is nothing to build the drafter out of"
+        ),
+        (n, true) => anyhow::ensure!(
+            n == 1,
+            "this loader builds a one-layer MTP head, the config says {n}. The \
+             draft loop indexes `spec_step_idx % mtp_num_hidden_layers`, which \
+             is only the identity at one layer"
+        ),
+    }
+    anyhow::ensure!(
+        !cfg.mtp_dedicated_embeddings,
+        "config says the MTP head has dedicated embeddings; this loader has the \
+         head share the text model's `embed_tokens` and `lm_head`, which is what \
+         `mtp_use_dedicated_embeddings = false` means"
+    );
+    // The other half of the sharing claim, from the tensors rather than the
+    // config. Absence is part of the spec here: a checkpoint that shipped these
+    // would want them used, and using the text model's instead would be a
+    // silently different drafter.
+    for name in ["mtp.embed_tokens.weight", "mtp.lm_head.weight"] {
+        anyhow::ensure!(
+            w.get(name).is_none(),
+            "the checkpoint carries {name}, so the head does not share the text \
+             model's — but the config says it does. One of the two is being \
+             misread"
+        );
+    }
+    // And the head's layer is a full-attention block, which the checkpoint
+    // settles without interpretation: it has q/k/v/o and no recurrence. This is
+    // the single most consequential fact for scheduling — a drafter that ran a
+    // GatedDeltaNet layer would advance recurrent state on every speculative
+    // token — so it is checked here as well as in the tests.
+    for absent in [
+        "mtp.layers.0.linear_attn.in_proj_qkv.weight",
+        "mtp.layers.0.linear_attn.conv1d.weight",
+        "mtp.layers.0.linear_attn.A_log",
+        "mtp.layers.0.linear_attn.dt_bias",
+    ] {
+        anyhow::ensure!(
+            w.get(absent).is_none(),
+            "the MTP head carries {absent}: its layer is not the full-attention \
+             block this drafter assumes, and drafting would touch recurrent state"
+        );
+    }
+
+    let started = std::time::Instant::now();
+    let mut bytes = 0usize;
+    let vector = |name: &str, total: &mut usize| -> Result<Vector> {
+        let t = w.tensor(name)?;
+        let mut v = t.to_f32()?;
+        let off = norm_offset(&cfg.arch, name);
+        if off != 0.0 {
+            for x in v.iter_mut() {
+                *x += off;
+            }
+        }
+        *total += v.len() * 4;
+        Ok(dev.stream().clone_htod(&v)?)
+    };
+    let projection = |name: &str, total: &mut usize| -> Result<Matrix> {
+        let t = w.tensor(&format!("{name}.weight"))?;
+        anyhow::ensure!(
+            t.shape.len() == 2,
+            "{name}.weight has shape {:?}, expected a matrix",
+            t.shape
+        );
+        // Row-major `[out, in]`, as torch writes it, which is the layout the
+        // f16 GEMM and the mat-vec both want: `k` is the contraction dimension
+        // and one row of the weight is contiguous.
+        let (n, k) = (t.shape[0], t.shape[1]);
+        let halves = match t.dtype {
+            tuili_safetensors::Dtype::F8E4M3 => {
+                let scales = w
+                    .tensor(&format!("{name}.weight_scale_inv"))
+                    .with_context(|| {
+                        format!(
+                            "{name}.weight is FP8, which is meaningless without \
+                             its block scales"
+                        )
+                    })?;
+                std::borrow::Cow::Owned(t.dequant_f8_to_f16(&scales, FP8_BLOCK)?)
+            }
+            // `mtp.fc` lands here. Not a special case in the code, only in the
+            // checkpoint.
+            _ => t.to_f16()?,
+        };
+        anyhow::ensure!(halves.len() == k * n, "{name}: {} halves for {k}x{n}", halves.len());
+        // Safety: f16 is a transparent u16, so these are already the
+        // little-endian halves the device expects, and the view does not outlive
+        // `halves`.
+        let raw = unsafe {
+            std::slice::from_raw_parts(halves.as_ptr() as *const u8, halves.len() * 2)
+        };
+        *total += raw.len();
+        Ok(Matrix {
+            ty: WeightType::F16,
+            k,
+            n,
+            n_bytes: raw.len(),
+            storage: Storage::Device(dev.stream().clone_htod(raw)?),
+        })
+    };
+
+    let l = "mtp.layers.0";
+    let wq = projection(&format!("{l}.self_attn.q_proj"), &mut bytes)?;
+    // Twice the attention width means q_proj carries a gate interleaved with
+    // the query, per head. Read off the shape, like the text model's blocks,
+    // because the shape is what the rest of the code has to agree with.
+    let output_gate = wq.n == 2 * cfg.d_attn();
+    anyhow::ensure!(
+        wq.n == cfg.d_attn() || output_gate,
+        "the MTP head's q_proj has {} columns; expected {} for a plain query or \
+         {} for a query and its gate",
+        wq.n,
+        cfg.d_attn(),
+        2 * cfg.d_attn()
+    );
+    let layer = Layer {
+        attn_norm: vector(&format!("{l}.input_layernorm.weight"), &mut bytes)?,
+        attn: Some(AttnWeights {
+            wq,
+            wk: projection(&format!("{l}.self_attn.k_proj"), &mut bytes)?,
+            wv: projection(&format!("{l}.self_attn.v_proj"), &mut bytes)?,
+            wo: projection(&format!("{l}.self_attn.o_proj"), &mut bytes)?,
+            bq: None,
+            bk: None,
+            bv: None,
+            bo: None,
+            q_norm: Some(vector(&format!("{l}.self_attn.q_norm.weight"), &mut bytes)?),
+            k_norm: Some(vector(&format!("{l}.self_attn.k_norm.weight"), &mut bytes)?),
+            w_qkv: None,
+            output_gate,
+        }),
+        gdn: None,
+        ffn_norm: vector(&format!("{l}.post_attention_layernorm.weight"), &mut bytes)?,
+        w_gate: projection(&format!("{l}.mlp.gate_proj"), &mut bytes)?,
+        w_up: projection(&format!("{l}.mlp.up_proj"), &mut bytes)?,
+        w_down: projection(&format!("{l}.mlp.down_proj"), &mut bytes)?,
+        w_gate_up: None,
+        blob: None,
+    };
+
+    let fc = projection("mtp.fc", &mut bytes)?;
+    anyhow::ensure!(
+        fc.k == 2 * cfg.d_model && fc.n == cfg.d_model,
+        "mtp.fc is [{}, {}], expected [{}, {}] — it consumes the embedding and \
+         the hidden state concatenated and produces one residual row",
+        fc.n,
+        fc.k,
+        cfg.d_model,
+        2 * cfg.d_model
+    );
+    let head = MtpWeights {
+        fc,
+        pre_fc_norm_embedding: vector("mtp.pre_fc_norm_embedding.weight", &mut bytes)?,
+        pre_fc_norm_hidden: vector("mtp.pre_fc_norm_hidden.weight", &mut bytes)?,
+        norm: vector("mtp.norm.weight", &mut bytes)?,
+        layer,
+        device_bytes: bytes,
+    };
+    tracing::info!(
+        vram_mib = bytes >> 20,
+        gated = output_gate,
+        ms = started.elapsed().as_millis(),
+        "mtp head loaded"
+    );
+    Ok(Some(head))
+}
+
+/// The tile an FP8 checkpoint's `weight_scale_inv` covers, from
+/// `quantization_config.weight_block_size`.
+const FP8_BLOCK: usize = 128;
 
 /// Describe a tensor without moving its bytes anywhere.
 fn describe(f: &Gguf, name: &str) -> Result<(WeightType, usize, usize, usize)> {
@@ -450,43 +823,8 @@ pub fn load_awq(
             storage: Storage::Device(dev.stream().clone_htod(bytes)?),
         })
     };
-    // Qwen3.5 stores most of its norm weights as a *delta from one*:
-    // `Qwen3_5RMSNorm` initializes to zeros and computes
-    // `normalized * (1 + weight)`, where every other model tuili loads
-    // initializes to ones and computes `weight * normalized`. Adding the one
-    // here, at load, means every norm kernel stays as it is — the alternative
-    // was a variant of `rms_norm` and `qk_norm` each.
-    //
-    // The exception is `linear_attn.norm`, which is `Qwen3_5RMSNormGated` and
-    // does use the plain form. Two conventions in one checkpoint.
-    //
-    // Which form a tensor wants follows from the class that consumes it, not
-    // from the tensor: the two populations overlap. An `input_layernorm`
-    // centred at 0.036 would be annihilated by the plain form, but some trained
-    // `q_norm` deltas exceed 0.5 and some gated gains fall below 1.5, so a
-    // mean-based guess gets those wrong. Hence a name rule, not a data rule.
-    // A whitelist, not a blacklist. This same loader path reads the attention
-    // biases and the GatedDeltaNet's `A_log`, `dt_bias` and `conv1d.weight`,
-    // none of which are norms; a blacklist that forgot one of those would add
-    // one to a bias or to a decay exponent. A whitelist that forgets a norm
-    // leaves that norm on the old convention, which is bad but confined.
-    let offset_norms = cfg.arch == "qwen3_5";
-    let norm_offset = move |name: &str| -> f32 {
-        const OFFSET_FORM: &[&str] = &[
-            "input_layernorm.weight",
-            "post_attention_layernorm.weight",
-            "self_attn.q_norm.weight",
-            "self_attn.k_norm.weight",
-        ];
-        let is_offset_form = OFFSET_FORM.iter().any(|suffix| name.ends_with(suffix))
-            // The final norm before the vocabulary projection. Matched exactly
-            // rather than by suffix, because `linear_attn.norm.weight` and
-            // `visual.merger.norm.weight` also end in `norm.weight` and neither
-            // is this one.
-            || name == "model.norm.weight"
-            || name == "model.language_model.norm.weight";
-        if offset_norms && is_offset_form { 1.0 } else { 0.0 }
-    };
+    let arch = cfg.arch.clone();
+    let norm_offset = move |name: &str| -> f32 { norm_offset(&arch, name) };
     let vector = |name: &str, total: &mut usize| -> Result<Vector> {
         let t = w.tensor(name)?;
         // `to_f32` rather than `as_f16`: Qwen3's AWQ export stores the norm
@@ -528,6 +866,41 @@ pub fn load_awq(
     // projections which are stacked into one matrix — see `fuse_ffn` below —
     // can be concatenated in the layout they will be read in.
     let projection_bytes = |prefix: &str| -> Result<(Vec<u8>, WeightType, usize, usize)> {
+        // FP8 and plain-float exports name the matrix `{prefix}.weight`; AWQ
+        // splits it into qweight/qzeros/scales. Check for the single tensor
+        // first, because its absence is the cheap question.
+        //
+        // Note the transposed convention between the two. AWQ stores
+        // `[in_features, out_features / 8]`, so `k` is dimension 0. Everything
+        // else stores output-major `[out_features, in_features]`, so `k` is
+        // dimension 1. Reading one with the other's convention gives a matrix of
+        // plausible size and wrong meaning.
+        if let Some(t) = w.get(&format!("{prefix}.weight")) {
+            let (n, k) = (t.shape[0], t.shape[1]);
+            let halves: Vec<half::f16> = if t.dtype == tuili_safetensors::Dtype::F8E4M3 {
+                // Block-scaled FP8. The scale grid is 128x128 and
+                // `dequant_f8_to_f16` validates that the grid matches the
+                // quants, which is the check that catches a transposed or
+                // row-only index — neither of which fails on its own, they just
+                // mis-scale every tile past the first.
+                let scales = w
+                    .tensor(&format!("{prefix}.weight_scale_inv"))
+                    .with_context(|| format!("{prefix} is FP8 but has no scale grid"))?;
+                t.dequant_f8_to_f16(&scales, 128)
+                    .with_context(|| format!("dequantizing {prefix}"))?
+            } else {
+                t.to_f16()
+                    .with_context(|| format!("converting {prefix} to f16"))?
+                    .into_owned()
+            };
+            // Safety: f16 is a transparent u16, so these are already the
+            // little-endian halves the device wants.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(halves.as_ptr() as *const u8, halves.len() * 2)
+            }
+            .to_vec();
+            return Ok((bytes, WeightType::F16, k, n));
+        }
         let qw = w.tensor(&format!("{prefix}.qweight"))?;
         let (k, n) = (qw.shape[0], qw.shape[1] * 8);
         // The scales are BF16 in Qwen3's AWQ export, not F16 — bound to a local
@@ -649,7 +1022,27 @@ pub fn load_awq(
         Ok(Some(upload(&abc, ty, k, n_a + n_b + n_c, total)?))
     };
 
-    let embd = w.tensor("model.embed_tokens.weight")?;
+    // Where the text model sits. A multimodal export nests it under
+    // `language_model`, so the same tensor is
+    // `model.language_model.embed_tokens.weight` there and
+    // `model.embed_tokens.weight` everywhere else. Probed rather than derived
+    // from the architecture name: the nesting is a property of how the
+    // checkpoint was written.
+    //
+    // The layer prefix below is derived from this rather than probed separately.
+    // Probing them independently is how the first attempt at the 27B got the
+    // layers right and the embedding wrong, and failed one tensor into the load.
+    let stem = ["model.language_model", "model"]
+        .into_iter()
+        .find(|s| w.get(&format!("{s}.embed_tokens.weight")).is_some())
+        .context(
+            "found no embedding under `model.embed_tokens.weight` or \
+             `model.language_model.embed_tokens.weight`; the checkpoint's tensor \
+             names are not ones this loader recognises",
+        )?;
+    tracing::info!(stem, "text model tensors");
+
+    let embd = w.tensor(&format!("{stem}.embed_tokens.weight"))?;
     // `to_f16` rather than `embd.data`: this uploaded the mapping's bytes and
     // labelled them `F16`, which reinterprets bf16 bit patterns as halves when
     // the checkpoint stores BF16 — no error, just a wrong number for every
@@ -676,7 +1069,7 @@ pub fn load_awq(
         embd.shape[0],
         &mut device_bytes,
     )?;
-    let output_norm = vector("model.norm.weight", &mut device_bytes)?;
+    let output_norm = vector(&format!("{stem}.norm.weight"), &mut device_bytes)?;
     let output = if cfg.tied_embeddings {
         None
     } else {
@@ -757,21 +1150,19 @@ pub fn load_awq(
     // `model.language_model.layers.0` there and `model.layers.0` everywhere
     // else. Probe rather than branch on the architecture name: the prefix is a
     // property of how the checkpoint was exported, not of the model.
-    let layer_prefix = ["model.layers", "model.language_model.layers"]
-        .into_iter()
-        .find(|pre| {
-            [
-                "input_layernorm.weight",
-                "self_attn.q_proj.weight",
-                "linear_attn.in_proj_qkv.weight",
-            ]
-            .iter()
-            .any(|leaf| w.get(&format!("{pre}.0.{leaf}")).is_some())
-        })
-        .context(
-            "found no layer 0 under `model.layers` or `model.language_model.layers`; \
-             the checkpoint's tensor names are not one this loader recognises",
-        )?;
+    let layer_prefix = format!("{stem}.layers");
+    anyhow::ensure!(
+        [
+            "input_layernorm.weight",
+            "self_attn.q_proj.weight",
+            "linear_attn.in_proj_qkv.weight",
+        ]
+        .iter()
+        .any(|leaf| w.get(&format!("{layer_prefix}.0.{leaf}")).is_some()),
+        "the embedding is under `{stem}` but there is no layer 0 under \
+         `{layer_prefix}`; this checkpoint splits the text model across two \
+         prefixes and the loader assumes one"
+    );
     tracing::info!(prefix = layer_prefix, "decoder layers");
 
     let mut layers = Vec::with_capacity(cfg.n_layers);

@@ -68,6 +68,22 @@ pub struct Config {
     /// the loader refuses a checkpoint where the two disagree — the config
     /// cannot silently change the arithmetic.
     pub attn_output_gate: bool,
+    /// How many decoder layers the multi-token-prediction head has; `0` when
+    /// the checkpoint has no head.
+    ///
+    /// One on Qwen3.5, and that does *not* bound the number of speculative
+    /// tokens: the drafter loops `spec_step_idx % mtp_num_hidden_layers`, which
+    /// is always zero here, so every draft step re-enters the same layer with
+    /// the head's own previous output fed back in as the hidden state. See
+    /// `notes/qwen3.5-mtp.md`.
+    pub mtp_layers: usize,
+    /// Whether the head owns an embedding table of its own.
+    ///
+    /// False on Qwen3.5, which is the config's way of saying what the
+    /// checkpoint shows by shipping no `mtp.embed_tokens`: the head reads the
+    /// text model's embedding and scores with the text model's `lm_head`. The
+    /// loader checks the two agree rather than trusting either alone.
+    pub mtp_dedicated_embeddings: bool,
 }
 
 /// The GatedDeltaNet dimensions, when a model has such blocks.
@@ -204,6 +220,11 @@ impl Config {
             // does it will need its own metadata keys rather than a guess.
             linear_attn: None,
             attn_output_gate: false,
+            // Likewise for the MTP head: no GGUF conversion carries one, and
+            // guessing a depth would build a drafter out of tensors that are
+            // not there.
+            mtp_layers: 0,
+            mtp_dedicated_embeddings: false,
         })
     }
 
@@ -337,6 +358,18 @@ impl Config {
                 .or_else(|| dims["tie_word_embeddings"].as_bool())
                 .unwrap_or(false),
             interleaved_rope: false,
+            // The MTP head's depth and whether it has its own embedding.
+            // `text_config` on this checkpoint, but read either level: these
+            // describe the text model, and an exporter that flattened the
+            // config would put them where every other dimension went.
+            mtp_layers: dims["mtp_num_hidden_layers"]
+                .as_u64()
+                .or_else(|| j["mtp_num_hidden_layers"].as_u64())
+                .unwrap_or(0) as usize,
+            mtp_dedicated_embeddings: dims["mtp_use_dedicated_embeddings"]
+                .as_bool()
+                .or_else(|| j["mtp_use_dedicated_embeddings"].as_bool())
+                .unwrap_or(false),
             // Present only when the checkpoint says some layers are linear. All
             // five dimensions come from one place or none of them do: a
             // partially-specified linear-attention config would produce a
