@@ -59,8 +59,14 @@ pub const MAX_BATCH_TOKENS_FP8: usize = 32;
 /// The expansion path is nearly flat in the batch size, because its cost is one
 /// whole-matrix expansion per projection whichever way the tokens fall — which
 /// is also why it is catastrophic at two tokens, 4.6x slower than one token. The
-/// mat-vec grows about 7.2 ms a token. They cross at 16, so 8 is the last size
-/// where the mat-vec clearly wins.
+/// mat-vec grows about 7.2 ms a token.
+///
+/// They cross at 16, and 16 is where this sits rather than 8. On time the two
+/// are level there, so the tie is broken on what else the expansion path costs:
+/// it needs `scratch.w16` to hold an entire projection — 17408 x 5120 halves,
+/// 170 MiB for the widest one — and it writes those halves before reading them
+/// back. The mat-vec needs neither. Level on time and cheaper in memory and
+/// traffic is not a tie.
 ///
 /// `TUILI_FP8_BATCH_MAX` moves it, which is how the table above was produced.
 /// The real fix for the large-batch end is an FP8 GEMM that feeds tensor cores
@@ -71,7 +77,7 @@ pub fn batched_matvec_limit() -> usize {
         std::env::var("TUILI_FP8_BATCH_MAX")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(8)
+            .unwrap_or(16)
             .min(MAX_BATCH_TOKENS_FP8)
     })
 }
