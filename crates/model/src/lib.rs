@@ -924,6 +924,23 @@ impl Model {
                         self.attention(layer, n_tokens, kv, dims, pool, s)?;
                         self.feed_forward(layer, n_tokens, s)?;
                         self.release_layer(s)?;
+                        // `TUILI_LAYER_RMS=1` reports the residual stream's
+                        // magnitude after every block. Nine single-suspect A/Bs
+                        // came back negative, so the question stops being
+                        // "which component" and becomes "which layer": a stream
+                        // that grows smoothly and then jumps names the block to
+                        // read, where a component-by-component search does not.
+                        // Only meaningful with TUILI_NO_GRAPH=1 — a device copy
+                        // cannot happen inside a capture region.
+                        if std::env::var_os("TUILI_LAYER_RMS").is_some() {
+                            let stream = self.kern.device().stream();
+                            let row = stream.clone_dtoh(&self.act.x.slice(..d))?;
+                            self.kern.device().synchronize()?;
+                            let rms =
+                                (row.iter().map(|v| v * v).sum::<f32>() / d as f32).sqrt();
+                            let bad = row.iter().filter(|v| !v.is_finite()).count();
+                            tracing::info!(layer, rms, non_finite = bad, "layer rms");
+                        }
                     }
                     Ok(())
                 })();
@@ -1059,6 +1076,27 @@ impl Model {
                 vocab_size,
                 n_logit_rows,
             )?;
+        }
+
+        // `TUILI_LOGIT_PROBE=1` reports the last row's top-5 ids and values.
+        // The residual stream is healthy all the way to layer 35 (RMS climbs
+        // 0.98 → 62 with no non-finite value), so whatever is wrong sits after
+        // the blocks. This splits the two remaining candidates: a sane argmax
+        // whose text is wrong means detokenization, and a nonsense argmax means
+        // the final norm or the vocab projection.
+        if std::env::var_os("TUILI_LOGIT_PROBE").is_some() {
+            let row = n_logit_rows - 1;
+            let start = row * vocab_size;
+            let v = self
+                .dev
+                .stream()
+                .clone_dtoh(&self.act.logits.slice(start..start + vocab_size))?;
+            self.dev.synchronize()?;
+            let mut idx: Vec<usize> = (0..v.len()).collect();
+            idx.sort_unstable_by(|a, b| v[*b].total_cmp(&v[*a]));
+            let top: Vec<(usize, f32)> = idx.iter().take(5).map(|i| (*i, v[*i])).collect();
+            let bad = v.iter().filter(|x| !x.is_finite()).count();
+            tracing::info!(?top, non_finite = bad, vocab_size, "logit probe");
         }
 
         if let Some(pe) = &self.phase_ev {
@@ -1471,6 +1509,132 @@ impl Model {
         }
 
         let fused_w = d + 2 * kv_dim;
+
+        // Qwen3 normalizes every head of q and k before the rotary. The order
+        // matters: rotating first and normalizing after is a different
+        // function, and a model that wants this and does not get it produces
+        // fluent nonsense rather than an error.
+        //
+        // In the packed path both q and k are still inside the `[q | k | v]`
+        // row and are normalized in place there, q at offset 0 and k at
+        // `offset = d`.
+        //
+        // q is the trap. `rope_qk_packed` takes it as `q_dst` — an *output*: it
+        // reads q out of the packed row and writes the rotated result into
+        // `act.q`. Normalizing `act.q` here instead would touch a buffer that
+        // still holds the previous layer's values and is about to be
+        // overwritten, so the q normalization becomes a silent no-op while k's
+        // works, and the model generates degenerate repetition ("的博客 的博客
+        // …") rather than failing. The unit tests cannot see this: they check
+        // the kernel against a CPU reference, and the kernel was never wrong.
+        // `TUILI_NO_QK_NORM=1` skips both, which is how a bad answer is
+        // attributed: a checkpoint that needs QK-norm is degenerate without it,
+        // so if the output is *equally* degenerate either way the fault is
+        // somewhere else and this path is only taking the blame.
+        static NO_QK_NORM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let skip_qk_norm = *NO_QK_NORM.get_or_init(|| std::env::var_os("TUILI_NO_QK_NORM").is_some());
+
+        if let Some(qn) = l.q_norm.as_ref().filter(|_| !skip_qk_norm) {
+            let (buf, stride, len) = if packed_qkv {
+                (&mut self.act.gate, fused_w, n * fused_w)
+            } else {
+                (&mut self.act.q, d, n * d)
+            };
+            self.kern.qk_norm(
+                &mut buf.slice_mut(..len),
+                &qn.as_view(),
+                n,
+                cfg.n_heads,
+                cfg.d_head,
+                stride,
+                0,
+                cfg.rms_eps,
+            )?;
+        }
+        // `TUILI_QK_NORM_PROBE=1` checks the invariant at the real call site
+        // rather than against a reference implementation. RMS-normalizing head
+        // h and scaling by `w` leaves `RMS(out_h / w) == 1`, so if the offsets
+        // and stride are right every head reads 1.0 here. The unit tests cannot
+        // establish this: they compare the kernel to a CPU reference built from
+        // the same assumed layout, so a wrong assumption is wrong in both.
+        if std::env::var_os("TUILI_QK_NORM_PROBE").is_some()
+            && !skip_qk_norm
+            && let Some(qn) = l.q_norm.as_ref()
+        {
+            let stream = self.kern.device().stream();
+            let width = if packed_qkv { fused_w } else { d };
+            let row = stream.clone_dtoh(&self.act.gate.slice(..width.max(d)))?;
+            let w = stream.clone_dtoh(&qn.as_view())?;
+            self.kern.device().synchronize()?;
+            let rms: Vec<f32> = (0..cfg.n_heads.min(4))
+                .map(|h| {
+                    let seg = &row[h * cfg.d_head..(h + 1) * cfg.d_head];
+                    let acc: f32 = seg
+                        .iter()
+                        .zip(&w)
+                        .map(|(o, wi)| {
+                            let v = if wi.abs() > 1e-6 { o / wi } else { 0.0 };
+                            v * v
+                        })
+                        .sum();
+                    (acc / cfg.d_head as f32).sqrt()
+                })
+                .collect();
+            tracing::info!(?rms, packed = packed_qkv, "qk_norm probe: RMS(q/w) per head, want 1.0");
+        }
+
+        if let Some(kn) = l.k_norm.as_ref().filter(|_| !skip_qk_norm) {
+            let (buf, stride, offset, len) = if packed_qkv {
+                (&mut self.act.gate, fused_w, d, n * fused_w)
+            } else {
+                (&mut self.act.k, kv_dim, 0, n * kv_dim)
+            };
+            self.kern.qk_norm(
+                &mut buf.slice_mut(..len),
+                &kn.as_view(),
+                n,
+                cfg.n_kv_heads,
+                cfg.d_head,
+                stride,
+                offset,
+                cfg.rms_eps,
+            )?;
+        }
+
+        // The same invariant for k. Two things went wrong with the first
+        // version of this probe and both produced confident wrong readings:
+        // it read from offset 0, so it measured q rather than k; and it sat
+        // *above* the normalization it was meant to check, so it reported
+        // un-normalized values (0.51, 0.60, 2.67, 0.067) that looked exactly
+        // like a real bug. A probe placed before the thing it measures is not
+        // a weaker check, it is a check of something else.
+        if std::env::var_os("TUILI_QK_NORM_PROBE").is_some()
+            && !skip_qk_norm
+            && let Some(kn) = l.k_norm.as_ref()
+        {
+            let stream = self.kern.device().stream();
+            let (base, span) = if packed_qkv { (d, fused_w) } else { (0, kv_dim) };
+            let row = stream.clone_dtoh(&self.act.gate.slice(..span))?;
+            let w = stream.clone_dtoh(&kn.as_view())?;
+            self.kern.device().synchronize()?;
+            let rms: Vec<f32> = (0..cfg.n_kv_heads.min(4))
+                .map(|h| {
+                    let off = base + h * cfg.d_head;
+                    let seg = &row[off..off + cfg.d_head];
+                    let acc: f32 = seg
+                        .iter()
+                        .zip(&w)
+                        .map(|(o, wi)| {
+                            let v = if wi.abs() > 1e-6 { o / wi } else { 0.0 };
+                            v * v
+                        })
+                        .sum();
+                    (acc / cfg.d_head as f32).sqrt()
+                })
+                .collect();
+            tracing::info!(?rms, "qk_norm probe: RMS(k/w) per kv head, want 1.0");
+        }
+
         if packed_qkv {
             let (q, packed) = (&mut self.act.q, &mut self.act.gate);
             self.kern.rope_qk_packed(
