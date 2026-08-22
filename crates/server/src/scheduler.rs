@@ -46,6 +46,13 @@ struct Running {
     prefill_done: Option<Instant>,
     /// This step's sampled token, filled by the parallel pass below.
     sampled: u32,
+    /// What to hand the drafter next round, when speculation is running.
+    ///
+    /// `None` until the prompt is in — the drafter's first input is the
+    /// prefill's own hidden states — and `None` again after any step that did
+    /// not go through the speculative path, since a plain decode step leaves the
+    /// drafter's cache a token behind.
+    spec_feed: Option<tuili_model::spec::DraftFeed>,
 }
 
 impl Running {
@@ -87,6 +94,10 @@ pub struct Scheduler {
     /// between steps, and only measuring both tells you which.
     t_step: f64,
     t_gap: f64,
+    /// How many tokens a speculative round drafts. Zero when off.
+    spec_k: usize,
+    spec_steps: u64,
+    spec_tokens: u64,
     last_end: Option<std::time::Instant>,
     window: u64,
 }
@@ -113,7 +124,42 @@ impl Scheduler {
             t_gap: 0.0,
             last_end: None,
             window: 0,
+            // Speculation is off unless a head is installed and `TUILI_SPEC_K`
+            // asks for it. Zero means off, which is also what a checkpoint
+            // without an MTP head leaves it at.
+            spec_k: 0,
+            spec_steps: 0,
+            spec_tokens: 0,
         }
+    }
+
+    /// Load the checkpoint's MTP head and turn on speculation.
+    ///
+    /// Returns false when the checkpoint has no head, which is not an error.
+    /// `k` is how many tokens a round drafts; the verification pass is `k + 1`
+    /// rows wide, so the model has to have been built with at least that many
+    /// logit rows.
+    pub fn enable_speculation(&mut self, dir: &str, k: usize) -> Result<bool> {
+        if k == 0 {
+            return Ok(false);
+        }
+        if !self.model.load_mtp_head(dir, k + 1)? {
+            tracing::info!("this checkpoint has no MTP head; speculation stays off");
+            return Ok(false);
+        }
+        self.model.enable_speculation(k, &self.pool)?;
+        self.spec_k = k;
+        tracing::info!(k, "speculative decoding on");
+        Ok(true)
+    }
+
+    /// Mean tokens emitted per verification pass, or `None` if none ran.
+    ///
+    /// The number the speedup is proportional to, and the one to distrust if it
+    /// looks too good: a greedy request drafting against degenerate repetition
+    /// would report a high acceptance while producing text nobody wants.
+    pub fn acceptance_length(&self) -> Option<f64> {
+        (self.spec_steps > 0).then(|| self.spec_tokens as f64 / self.spec_steps as f64)
     }
 
     pub fn enqueue(&mut self, req: Request) {
@@ -147,11 +193,100 @@ impl Scheduler {
     }
 
     /// Admit what fits, run one batched forward, and deliver its output.
+    /// One speculative round, or `Ok(false)` if this step is not one.
+    ///
+    /// Deliberately narrow. It runs only when there is exactly one running
+    /// sequence, past its prompt, with a sampling (not greedy) request, a
+    /// drafter feed from the previous round, and `k + 1` free pool slots.
+    /// Everything else falls through to the ordinary step.
+    ///
+    /// Single-sequence because `verify_draft_sampled` is: batched speculation
+    /// needs the recurrent working copy and the journal indexed per slot, which
+    /// is a separate piece of work. Not greedy because the acceptance rule here
+    /// is a probability ratio — a greedy request has no distribution to take a
+    /// ratio of, and `Sampler::distribution` refuses rather than inventing one.
+    fn speculative_step(&mut self) -> Result<bool> {
+        if self.spec_k == 0 || self.running.len() != 1 {
+            return Ok(false);
+        }
+        let idx = 0usize;
+        let k = self.spec_k;
+        {
+            let r = &self.running[idx];
+            if !r.prompt_complete() || r.next.is_none() || r.sampler.params().is_greedy() {
+                return Ok(false);
+            }
+            if r.spec_feed.is_none() {
+                return Ok(false);
+            }
+        }
+        // The verification pass appends `k + 1` tokens before rolling back to
+        // the accepted prefix, so the slots have to be there for the whole pass.
+        if self.pool.free_slots() < k + 1 || self.pool.headroom(self.running[idx].seq) < k + 1 {
+            return Ok(false);
+        }
+
+        let seq = self.running[idx].seq;
+        let pending = self.running[idx].next.expect("checked above");
+        let feed = self.running[idx].spec_feed.take().expect("checked above");
+        // The window the repetition penalty reads, which both sides have to
+        // score against — see `verify_draft_sampled`.
+        let history: Vec<u32> = {
+            let r = &self.running[idx];
+            let mut h = r.prompt.clone();
+            h.extend_from_slice(&r.generated);
+            r.sampler.window(&h).to_vec()
+        };
+
+        let draft = {
+            let r = &mut self.running[idx];
+            self.model
+                .draft_with_head_sampled(k, &feed, &mut r.sampler, &history)?
+        };
+        let outcome = {
+            let r = &mut self.running[idx];
+            self.model.verify_draft_sampled(
+                seq,
+                &mut self.pool,
+                pending,
+                &draft,
+                &mut r.sampler,
+                &history,
+            )?
+        };
+
+        self.steps += 1;
+        self.spec_steps += 1;
+        self.spec_tokens += outcome.tokens.len() as u64;
+
+        // Every emitted token goes through the same bookkeeping a plain step's
+        // single token does, in order, and the first one that ends the sequence
+        // stops the rest — a stop sequence found at token two must not be
+        // overrun by token three.
+        let mut finished = false;
+        for &t in &outcome.tokens {
+            if self.advance_token(idx, t)? {
+                finished = true;
+                break;
+            }
+        }
+        if finished {
+            let r = self.running.swap_remove(idx);
+            self.pool.free(r.seq);
+            return Ok(true);
+        }
+        self.running[idx].spec_feed = Some(outcome.feed);
+        Ok(true)
+    }
+
     pub fn step(&mut self) -> Result<()> {
         let step_start = self.profile.then(std::time::Instant::now);
         self.admit();
         self.drop_disconnected();
         if self.running.is_empty() {
+            return Ok(());
+        }
+        if self.speculative_step()? {
             return Ok(());
         }
 
@@ -267,8 +402,48 @@ impl Scheduler {
             if !wants {
                 continue;
             }
-            if self.advance(*idx)? {
+            let ended = self.advance(*idx)?;
+            if ended {
                 finished.push(*idx);
+            } else if self.spec_k > 0 {
+                // Hand the drafter what this pass actually covered.
+                //
+                // Not `DraftFeed::after_prefill`, which assumes the whole prompt
+                // went through in one pass: `mtp_hidden` holds only the rows of
+                // the *last* pass, so a chunked prefill would point the drafter
+                // at hidden states that are not there. The general form is the
+                // rows this pass ran, and a decode step is the one-row case.
+                let r = &self.running[*idx];
+                let pending = r.sampled;
+                let (from, len) = match work {
+                    Work::Prefill { from, len, .. } => (*from, *len),
+                    // `prefilled` and `generated` already include this step's
+                    // token, so the row just run sits one before the end.
+                    Work::Decode => (r.prompt.len() + r.generated.len() - 2, 1),
+                };
+                // `shifted[i]` is the embedding that pairs with hidden row `i`:
+                // the token *after* the one at that position. For every row but
+                // the last that is the next token of the sequence; for the last
+                // it is the token this step just sampled.
+                let seq_tokens: Vec<u32> = r
+                    .prompt
+                    .iter()
+                    .chain(r.generated.iter())
+                    .copied()
+                    .collect();
+                let mut shifted: Vec<u32> = Vec::with_capacity(len);
+                for p in from..from + len {
+                    shifted.push(if p + 1 < seq_tokens.len() {
+                        seq_tokens[p + 1]
+                    } else {
+                        pending
+                    });
+                }
+                self.running[*idx].spec_feed = Some(tuili_model::spec::DraftFeed {
+                    rows: 0..len,
+                    positions: (from..from + len).collect(),
+                    shifted,
+                });
             }
         }
 
@@ -368,6 +543,7 @@ impl Scheduler {
                 prefilled: 0,
                 next: None,
                 sampled: 0,
+                spec_feed: None,
                 generated: Vec::new(),
                 sampler: Sampler::new(req.params),
                 partial: Vec::new(),
@@ -437,13 +613,24 @@ impl Scheduler {
 
     /// Sample, emit, and report whether the sequence is done.
     fn advance(&mut self, idx: usize) -> Result<bool> {
+        let next = self.running[idx].sampled;
+        self.advance_token(idx, next)
+    }
+
+    /// One token's worth of bookkeeping: end-of-generation, stop sequences,
+    /// streaming, budget, pool headroom.
+    ///
+    /// Split out from `advance` because a speculative step emits between one and
+    /// `k + 1` tokens and every one of them has to pass through the same checks.
+    /// A speculative path that scanned for stop sequences only on the last token
+    /// of a step would run past a stop string by up to `k` tokens, which is a
+    /// correctness difference the speedup does not justify.
+    fn advance_token(&mut self, idx: usize, next: u32) -> Result<bool> {
         let tokenizer = self.tokenizer.clone();
         let r = &mut self.running[idx];
         if r.prefill_done.is_none() {
             r.prefill_done = Some(Instant::now());
         }
-
-        let next = r.sampled;
         if tokenizer.is_eog(next) {
             return Self::finish(r, &tokenizer, FinishReason::Stop);
         }

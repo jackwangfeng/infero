@@ -166,8 +166,27 @@ impl Engine {
         let in_flight = Arc::new(AtomicU64::new(0));
         let served = Arc::new(AtomicU64::new(0));
 
+        let mut scheduler = Scheduler::new(model, pool, tokenizer.clone());
+        // Speculation, when the checkpoint has a head and the operator asks.
+        // Off by default: it is a per-sequence latency win and this build only
+        // runs it for a lone sequence, so a server under load gains nothing and
+        // would pay the drafter's cost for it.
+        let spec_k: usize = std::env::var("TUILI_SPEC_K")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if spec_k > 0 && std::path::Path::new(path).is_dir() {
+            match scheduler.enable_speculation(path, spec_k) {
+                Ok(true) => {}
+                Ok(false) => {}
+                // A checkpoint that has a head but cannot use it is worth
+                // saying out loud rather than silently serving without.
+                Err(e) => tracing::warn!(error = %e, "speculation stayed off"),
+            }
+        }
+
         let worker = Worker {
-            scheduler: Scheduler::new(model, pool, tokenizer.clone()),
+            scheduler,
             in_flight: in_flight.clone(),
             served: served.clone(),
         };
