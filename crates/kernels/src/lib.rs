@@ -164,26 +164,54 @@ pub struct Kernels {
 pub struct TmaDesc([u8; 128]);
 unsafe impl cudarc::driver::DeviceRepr for TmaDesc {}
 
+/// Launch one of the register-resident norms, with or without the f16 copy.
+///
+/// The kernel's `__half*` is nullable, and a launch says "no second output" with
+/// a zero of pointer width — kernel parameters are untyped bytes at this
+/// boundary, so that is the same eight bytes a slice would have written. It is
+/// worth the small ugliness: the FP8 projections read f32, and producing an f16
+/// copy for them would be 10 KB a row written and never read.
+///
+/// `label` follows the caller rather than the kernel, so a profile still
+/// separates the plain norm from the f16-writing one.
 fn b_args(
     k: &Kernels,
     f: &tuili_cuda::Kernel,
     cfg: LaunchConfig,
     out: &mut CudaViewMut<'_, f32>,
-    h_out: &mut CudaViewMut<'_, f16>,
+    h_out: Option<&mut CudaViewMut<'_, f16>>,
     x: &CudaView<'_, f32>,
     weight: &CudaView<'_, f32>,
     d: i32,
     eps: f32,
+    label: &'static str,
 ) -> Result<()> {
+    let null: u64 = 0;
     let mut b = k.device().stream().launch_builder(f);
-    b.arg(out).arg(h_out).arg(x).arg(weight).arg(&d).arg(&eps);
-    k.device()
-        .profile()
-        .time("rms_norm_f16", k.device().stream(), || {
-            unsafe { b.launch(cfg) }.context("rms_norm_f16")?;
-            Ok(())
-        })?;
+    match h_out {
+        Some(h) => {
+            b.arg(out).arg(h).arg(x).arg(weight).arg(&d).arg(&eps);
+        }
+        None => {
+            b.arg(out).arg(&null).arg(x).arg(weight).arg(&d).arg(&eps);
+        }
+    }
+    k.device().profile().time(label, k.device().stream(), || {
+        unsafe { b.launch(cfg) }.context(label)?;
+        Ok(())
+    })?;
     Ok(())
+}
+
+/// Block size for the register-resident norms: enough threads that
+/// `blockDim * RMS_REGS >= d`, rounded to a warp.
+fn rms_block(d: usize) -> u32 {
+    (d as u32).div_ceil(RMS_REGS).next_multiple_of(32).clamp(32, 1024)
+}
+
+/// Whether a row of `d` fits the register-resident norm at all.
+fn rms_fits(d: usize) -> bool {
+    d <= 1024 * RMS_REGS as usize
 }
 
 impl Kernels {
@@ -399,6 +427,16 @@ impl Kernels {
         eps: f32,
     ) -> Result<()> {
         debug_assert!(out.len() >= n_tokens * d && x.len() >= n_tokens * d);
+        // The register-resident kernel whenever the row fits it, which is every
+        // `d_model` in these models. `rms_norm_f32` reads the row, reduces, then
+        // reads it *again* to scale; this one keeps it in registers across the
+        // reduction and reads once. It was written for the f16-writing path and
+        // the only thing stopping the f32 callers from having it was that its
+        // second output was mandatory. Measured on the 27B: 14.1 us a launch
+        // against 5.4, 140 launches a decode step.
+        if rms_fits(d) {
+            return self.rms_norm_f16(out, None, x, weight, n_tokens, d, eps);
+        }
         let f = self
             .dev
             .kernels()
@@ -2507,7 +2545,7 @@ impl Kernels {
     pub fn add_rms_norm_f16(
         &self,
         out: &mut CudaViewMut<'_, f32>,
-        h_out: &mut CudaViewMut<'_, f16>,
+        h_out: Option<&mut CudaViewMut<'_, f16>>,
         x: &mut CudaViewMut<'_, f32>,
         b: &CudaView<'_, f32>,
         weight: &CudaView<'_, f32>,
@@ -2515,64 +2553,65 @@ impl Kernels {
         d: usize,
         eps: f32,
     ) -> Result<()> {
-        let block = (d as u32).div_ceil(RMS_REGS).next_multiple_of(32).clamp(32, 1024);
         anyhow::ensure!(
-            (block as usize) * (RMS_REGS as usize) >= d,
+            rms_fits(d),
             "fused norm needs d <= 1024 * {RMS_REGS}, got {d}"
         );
+        let label = if h_out.is_some() { "add_rms_norm_f16" } else { "add_rms_norm" };
         let f = self
             .dev
             .kernels()
             .get("tuili_mmvq", mmvq_src(), "add_rms_norm_f16_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (n_tokens as u32, 1, 1),
-            block_dim: (block, 1, 1),
+            block_dim: (rms_block(d), 1, 1),
             shared_mem_bytes: 0,
         };
         let (d_i, eps_f) = (d as i32, eps);
+        let null: u64 = 0;
         let mut bl = self.dev.stream().launch_builder(&f);
-        bl.arg(out)
-            .arg(h_out)
-            .arg(&mut *x)
-            .arg(b)
-            .arg(weight)
-            .arg(&d_i)
-            .arg(&eps_f);
-        self.dev
-            .profile()
-            .time("add_rms_norm_f16", self.dev.stream(), || {
-                unsafe { bl.launch(cfg) }.context("add_rms_norm_f16")?;
-                Ok(())
-            })?;
+        match h_out {
+            Some(h) => {
+                bl.arg(out).arg(h);
+            }
+            None => {
+                bl.arg(out).arg(&null);
+            }
+        }
+        bl.arg(&mut *x).arg(b).arg(weight).arg(&d_i).arg(&eps_f);
+        self.dev.profile().time(label, self.dev.stream(), || {
+            unsafe { bl.launch(cfg) }.context(label)?;
+            Ok(())
+        })?;
         Ok(())
     }
 
     pub fn rms_norm_f16(
         &self,
         out: &mut CudaViewMut<'_, f32>,
-        h_out: &mut CudaViewMut<'_, f16>,
+        h_out: Option<&mut CudaViewMut<'_, f16>>,
         x: &CudaView<'_, f32>,
         weight: &CudaView<'_, f32>,
         n_tokens: usize,
         d: usize,
         eps: f32,
     ) -> Result<()> {
-        let block = (d as u32).div_ceil(RMS_REGS).next_multiple_of(32).clamp(32, 1024);
         anyhow::ensure!(
-            (block as usize) * (RMS_REGS as usize) >= d,
+            rms_fits(d),
             "fused norm needs d <= 1024 * {RMS_REGS}, got {d}"
         );
+        let label = if h_out.is_some() { "rms_norm_f16" } else { "rms_norm" };
         let f = self
             .dev
             .kernels()
             .get("tuili_mmvq", mmvq_src(), "rms_norm_f16_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (n_tokens as u32, 1, 1),
-            block_dim: (block, 1, 1),
+            block_dim: (rms_block(d), 1, 1),
             shared_mem_bytes: 0,
         };
         let (d_i, eps_f) = (d as i32, eps);
-        b_args(self, &f, cfg, out, h_out, x, weight, d_i, eps_f)
+        b_args(self, &f, cfg, out, h_out, x, weight, d_i, eps_f, label)
     }
 
     /// RMS norm that also writes its output's Q8_1 form.

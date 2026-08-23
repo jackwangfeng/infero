@@ -178,7 +178,8 @@ fn the_gate_and_decay_match_the_reference() -> Result<()> {
         &d_dt.as_view(),
         t_len,
         heads,
-    )?;
+    
+    heads,)?;
     k.device().synchronize()?;
 
     let got_beta = stream.clone_dtoh(&d_beta)?;
@@ -1113,6 +1114,75 @@ fn the_register_state_does_not_spill() -> Result<()> {
         "the register-blocked delta rule fits no block an SM at all: {regs} \
          registers over 2 * {DV} threads is past this device's budget, and the \
          launch will fail rather than run slowly"
+    );
+    Ok(())
+}
+
+/// The gate kernel reads `a` and `b` at a stride, so that they can be the two
+/// halves of one stacked projection instead of two buffers.
+///
+/// The stride is what this checks and nothing else: the same numbers laid out
+/// interleaved, a token at a time, must give the same `beta` and `g` as when
+/// they are contiguous. Getting the pitch wrong reads a neighbouring head's
+/// gate — a plausible number in a plausible range, which is why it wants a
+/// test rather than an eyeball.
+#[test]
+fn the_gate_reads_a_and_b_at_a_stride() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    // Not a multiple of the block, so the tail of the grid is exercised.
+    let t_len = 7;
+    let heads = VAL_HEADS;
+
+    let a = pseudo_random(t_len * heads, 0xa11);
+    let b = pseudo_random(t_len * heads, 0xb22);
+    let a_log: Vec<f32> = (0..heads).map(|h| -5.5 + h as f32 * 0.4).collect();
+    // dt_bias reaching +19 is what the softplus branch exists for, so keep it.
+    let dt_bias: Vec<f32> = (0..heads)
+        .map(|h| if h == 0 { 19.25 } else { -5.7 + h as f32 * 1.3 })
+        .collect();
+
+    // `a` then `b`, one token at a time — the layout a stacked `[k, 2 * heads]`
+    // projection writes.
+    let mut ab = Vec::with_capacity(2 * t_len * heads);
+    for t in 0..t_len {
+        ab.extend_from_slice(&a[t * heads..(t + 1) * heads]);
+        ab.extend_from_slice(&b[t * heads..(t + 1) * heads]);
+    }
+
+    let d_al = stream.clone_htod(&a_log)?;
+    let d_dt = stream.clone_htod(&dt_bias)?;
+
+    let run = |a_src: &[f32], b_src: &[f32], a_off: usize, b_off: usize, stride: usize| -> Result<(Vec<f32>, Vec<f32>)> {
+        let d_a = stream.clone_htod(a_src)?;
+        let d_b = stream.clone_htod(b_src)?;
+        let mut d_beta = stream.alloc_zeros::<f32>(t_len * heads)?;
+        let mut d_g = stream.alloc_zeros::<f32>(t_len * heads)?;
+        k.gdn_gate_decay(
+            &mut d_beta.as_view_mut(),
+            &mut d_g.as_view_mut(),
+            &d_a.slice(a_off..a_off + t_len * stride),
+            &d_b.slice(b_off..b_off + t_len * stride - b_off),
+            &d_al.as_view(),
+            &d_dt.as_view(),
+            t_len,
+            heads,
+            stride,
+        )?;
+        k.device().synchronize()?;
+        Ok((stream.clone_dtoh(&d_beta)?, stream.clone_dtoh(&d_g)?))
+    };
+
+    let (beta_sep, g_sep) = run(&a, &b, 0, 0, heads)?;
+    let (beta_int, g_int) = run(&ab, &ab, 0, heads, 2 * heads)?;
+
+    // Same arithmetic on the same values, so this is exact.
+    assert_eq!(beta_sep, beta_int, "beta differs between the two layouts");
+    assert_eq!(g_sep, g_int, "g differs between the two layouts");
+    // And the values have to be non-trivial, or two buffers of zeros would pass.
+    assert!(
+        beta_sep.iter().any(|v| *v > 0.01 && *v < 0.99) && g_sep.iter().any(|v| *v < -0.01),
+        "the gate produced degenerate values, so the comparison proves nothing"
     );
     Ok(())
 }

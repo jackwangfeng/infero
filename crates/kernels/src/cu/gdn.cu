@@ -82,18 +82,27 @@ extern "C" __global__ void gdn_conv_f32(float* __restrict__ out,
 // NaN several layers later rather than here.
 //
 // One thread a (token, head) pair.
+// `stride` is the row pitch of `a` and `b`, which is not always `heads`.
+//
+// `in_proj_a` and `in_proj_b` are 48 rows over a 5120 contraction — bytes that
+// want 0.34 us where a launch costs 14.2, twice a layer and 96 times a decode
+// step. Stacked into one projection they come out interleaved, `a` then `b` per
+// token, so the caller passes one buffer twice with `b` offset by `heads` and a
+// stride of `2 * heads`. Unstacked it passes two buffers and `stride = heads`.
 extern "C" __global__ void gdn_gate_decay_f32(float* __restrict__ beta_out,
                                               float* __restrict__ g_out,
                                               const float* __restrict__ a,
                                               const float* __restrict__ b,
                                               const float* __restrict__ a_log,
                                               const float* __restrict__ dt_bias,
-                                              int n_tokens, int heads) {
+                                              int n_tokens, int heads,
+                                              int stride) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_tokens * heads) return;
     const int h = idx % heads;
-    beta_out[idx] = 1.0f / (1.0f + __expf(-b[idx]));
-    const float z = a[idx] + dt_bias[h];
+    const int src = (idx / heads) * stride + h;
+    beta_out[idx] = 1.0f / (1.0f + __expf(-b[src]));
+    const float z = a[src] + dt_bias[h];
     // log1p(exp(z)) with the large-z branch taken directly: dt_bias reaches +19
     // in this checkpoint, and exp of a large sum overflows before the log can
     // bring it back.

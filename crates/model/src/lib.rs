@@ -288,6 +288,9 @@ struct GdnActs {
     /// `[chunk, value_heads]` each.
     a: CudaSlice<f32>,
     b: CudaSlice<f32>,
+    /// `[chunk, 2 * value_heads]` — `a` and `b` from the stacked projection,
+    /// interleaved a token at a time. Unused when the loader could not stack.
+    ab: CudaSlice<f32>,
     beta: CudaSlice<f32>,
     g: CudaSlice<f32>,
     /// `[chunk, value_dim]` — the recurrence's output, before the gated norm.
@@ -1718,12 +1721,27 @@ impl Model {
         // into a fused mat-vec: `in_proj_a` and `in_proj_b` are `value_heads`
         // columns wide — 48 against 10240 — and the fusion helper wants
         // same-shaped matrices anyway.
+        //
+        // `a` and `b` are the exception the loader stacks: `qkv` and `z` are
+        // FP8 and go to tensor cores, but `a` and `b` are F16 and 48 rows wide,
+        // so each took a `gemv` whose 14.2 us was all launch against 0.34 us of
+        // bytes — 96 of a decode step's 104 `gemv` launches. Stacked they are
+        // one launch, and `ab` holds them interleaved a token at a time.
+        let stacked = gw.in_proj_ba.as_ref();
+        let gate: Vec<(&Matrix, &mut CudaSlice<f32>, usize)> = match stacked {
+            Some(ba) => vec![(ba, &mut acts.ab, 2 * heads)],
+            None => vec![
+                (&gw.in_proj_a, &mut acts.a, heads),
+                (&gw.in_proj_b, &mut acts.b, heads),
+            ],
+        };
         for (m, out, cols) in [
             (&gw.in_proj_qkv, &mut acts.qkv, width),
             (&gw.in_proj_z, &mut acts.z, val_dim),
-            (&gw.in_proj_a, &mut acts.a, heads),
-            (&gw.in_proj_b, &mut acts.b, heads),
-        ] {
+        ]
+        .into_iter()
+        .chain(gate)
+        {
             Self::matmul_pre(
                 &self.kern,
                 &mut self.scratch,
@@ -1770,15 +1788,29 @@ impl Model {
             la.conv_kernel,
         )?;
 
+        // Stacked, `a` is columns `[0, heads)` of each `2 * heads`-wide row and
+        // `b` is the rest, so the same buffer goes in twice with `b` offset and
+        // the stride says how to walk it.
+        let (a_off, b_off, stride) = if stacked.is_some() {
+            (0, heads, 2 * heads)
+        } else {
+            (0, 0, heads)
+        };
+        let a_src = if stacked.is_some() { &acts.ab } else { &acts.a };
+        let b_src = if stacked.is_some() { &acts.ab } else { &acts.b };
+        // The kernel's last read is `(n - 1) * stride + heads - 1` past each
+        // pointer, so `b`'s slice is short by `b_off` and no more.
+        let b_len = n * stride - b_off;
         self.kern.gdn_gate_decay(
             &mut acts.beta.slice_mut(..n * heads),
             &mut acts.g.slice_mut(..n * heads),
-            &acts.a.slice(..n * heads),
-            &acts.b.slice(..n * heads),
+            &a_src.slice(a_off..a_off + n * stride),
+            &b_src.slice(b_off..b_off + b_len),
             &gw.a_log.as_view(),
             &gw.dt_bias.as_view(),
             n,
             heads,
+            stride,
         )?;
 
         // q and k are normalized where they lie, inside the packed row.
@@ -1931,7 +1963,7 @@ impl Model {
             // The previous layer's FFN left its output in `proj` for this.
             self.kern.add_rms_norm_f16(
                 &mut self.act.xb.slice_mut(..n * d),
-                &mut self.scratch.x16.slice_mut(..n * d),
+                Some(&mut self.scratch.x16.slice_mut(..n * d)),
                 &mut self.act.x.slice_mut(..n * d),
                 &self.act.proj.slice(..n * d),
                 &self.w.layers[layer].attn_norm.as_view(),
@@ -2705,7 +2737,7 @@ impl Model {
         let (shared, shared_f16) = if want_h {
             self.kern.add_rms_norm_f16(
                 &mut self.act.xb.slice_mut(..n * d),
-                &mut self.scratch.x16.slice_mut(..n * d),
+                Some(&mut self.scratch.x16.slice_mut(..n * d)),
                 &mut self.act.x.slice_mut(..n * d),
                 &self.act.proj.slice(..n * d),
                 &self.w.layers[layer].ffn_norm.as_view(),
@@ -2902,7 +2934,7 @@ impl Model {
         if want_f16 {
             kern.rms_norm_f16(
                 &mut act_xb.slice_mut(..n_tokens * d),
-                &mut scratch.x16.slice_mut(..n_tokens * d),
+                Some(&mut scratch.x16.slice_mut(..n_tokens * d)),
                 x,
                 weight,
                 n_tokens,
@@ -3383,6 +3415,7 @@ impl Activations {
                     z: alloc_f32(chunk * la.value_dim(), "gdn gate")?,
                     a: alloc_f32(chunk * la.value_heads, "gdn a")?,
                     b: alloc_f32(chunk * la.value_heads, "gdn b")?,
+                    ab: alloc_f32(2 * chunk * la.value_heads, "gdn ab")?,
                     beta: alloc_f32(chunk * la.value_heads, "gdn beta")?,
                     g: alloc_f32(chunk * la.value_heads, "gdn g")?,
                     core: alloc_f32(chunk * la.value_dim(), "gdn core")?,

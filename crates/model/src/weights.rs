@@ -163,6 +163,11 @@ pub struct GdnWeights {
     pub in_proj_a: Matrix,
     /// `[d_model, value_heads]` — the per-head write strength.
     pub in_proj_b: Matrix,
+    /// `in_proj_a` and `in_proj_b` stacked along the output, when they are the
+    /// same dense type. One launch instead of two on matrices whose cost is all
+    /// launch. `a` occupies columns `[0, value_heads)` of each row and `b` the
+    /// rest, which is why the gate kernel takes a stride.
+    pub in_proj_ba: Option<Matrix>,
     /// `[conv_channels, conv_k]`, depthwise, no bias.
     pub conv1d: Vector,
     pub a_log: Vector,
@@ -1078,6 +1083,24 @@ pub fn load_awq(
         Ok(Some(upload(&abc, ty, k, n_a + n_b + n_c, total)?))
     };
 
+    // Two same-shaped projections of one input, stacked along the output.
+    //
+    // `in_proj_a` and `in_proj_b` are `value_heads` rows — 48 against a 5120
+    // contraction — so their bytes want 0.34 us and each launch measured 14.2,
+    // twice a layer and 96 times a decode step for 1.36 ms. Row-major means the
+    // stack is byte concatenation and nothing has to be interleaved. Returns
+    // `None` when the two are not the same dense type over the same `k`, in
+    // which case the caller keeps its two launches.
+    let stacked2 = |a: &str, b: &str, total: &mut usize| -> Result<Option<Matrix>> {
+        let (mut ba, ty, k, n_a) = projection_bytes(a)?;
+        let (bb, ty_b, k_b, n_b) = projection_bytes(b)?;
+        if ty != ty_b || k != k_b || !matches!(ty, WeightType::F16 | WeightType::F32) {
+            return Ok(None);
+        }
+        ba.extend_from_slice(&bb);
+        Ok(Some(upload(&ba, ty, k, n_a + n_b, total)?))
+    };
+
     // Where the text model sits. A multimodal export nests it under
     // `language_model`, so the same tensor is
     // `model.language_model.embed_tokens.weight` there and
@@ -1292,6 +1315,11 @@ pub fn load_awq(
                 in_proj_z: projection(&format!("{l}.in_proj_z"), &mut device_bytes)?,
                 in_proj_a: projection(&format!("{l}.in_proj_a"), &mut device_bytes)?,
                 in_proj_b: projection(&format!("{l}.in_proj_b"), &mut device_bytes)?,
+                in_proj_ba: stacked2(
+                    &format!("{l}.in_proj_a"),
+                    &format!("{l}.in_proj_b"),
+                    &mut device_bytes,
+                )?,
                 conv1d: vector(&format!("{l}.conv1d.weight"), &mut device_bytes)?,
                 a_log: vector(&format!("{l}.A_log"), &mut device_bytes)?,
                 dt_bias: vector(&format!("{l}.dt_bias"), &mut device_bytes)?,

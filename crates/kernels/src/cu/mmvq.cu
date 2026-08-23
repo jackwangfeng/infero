@@ -655,7 +655,10 @@ extern "C" __global__ void add_rms_norm_f16_f32(float* __restrict__ out,
     float* row = x + (size_t)token * d;
     const float* brow = b + (size_t)token * d;
     float* orow = out + (size_t)token * d;
-    __half* hrow = hout + (size_t)token * d;
+    // The offset has to be conditional, not the store: `hout + token * d` is
+    // non-null for every row but the first, so a `hrow` check would pass n=1 and
+    // write out of bounds at n=2. The test caught exactly that.
+    __half* hrow = hout ? hout + (size_t)token * d : nullptr;
     const int tid = threadIdx.x;
 
     float v[RMS_REGS];
@@ -678,7 +681,10 @@ extern "C" __global__ void add_rms_norm_f16_f32(float* __restrict__ out,
         if (i < d) {
             v[k] *= scale * weight[i];
             orow[i] = v[k];
-            hrow[i] = __float2half(v[k]);
+            // `hout` is optional: the FP8 projections read f32 and would only
+            // pay for a copy nothing reads. The branch is uniform across the
+            // block, so it costs a predicate and no divergence.
+            if (hrow) hrow[i] = __float2half(v[k]);
         }
     }
 }
@@ -691,7 +697,10 @@ extern "C" __global__ void rms_norm_f16_f32(float* __restrict__ out,
     const int token = blockIdx.x;
     const float* row = x + (size_t)token * d;
     float* orow = out + (size_t)token * d;
-    __half* hrow = hout + (size_t)token * d;
+    // The offset has to be conditional, not the store: `hout + token * d` is
+    // non-null for every row but the first, so a `hrow` check would pass n=1 and
+    // write out of bounds at n=2. The test caught exactly that.
+    __half* hrow = hout ? hout + (size_t)token * d : nullptr;
     const int tid = threadIdx.x;
 
     float v[RMS_REGS];
@@ -710,7 +719,8 @@ extern "C" __global__ void rms_norm_f16_f32(float* __restrict__ out,
         if (i < d) {
             v[k] *= scale * weight[i];
             orow[i] = v[k];
-            hrow[i] = __float2half(v[k]);
+            // Optional, as in `add_rms_norm_f16_f32` above.
+            if (hrow) hrow[i] = __float2half(v[k]);
         }
     }
 }

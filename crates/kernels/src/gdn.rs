@@ -194,6 +194,10 @@ impl Kernels {
         dt_bias: &CudaView<'_, f32>,
         n_tokens: usize,
         heads: usize,
+        // `stride` is the row pitch of `a` and `b`: `heads` when they are their
+        // own buffers, `2 * heads` when they are halves of one stacked
+        // projection. See the kernel.
+        stride: usize,
     ) -> Result<()> {
         let n = n_tokens * heads;
         debug_assert!(beta.len() >= n && g.len() >= n);
@@ -210,7 +214,7 @@ impl Kernels {
             block_dim: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
-        let (nt, h) = (n_tokens as i32, heads as i32);
+        let (nt, h, st) = (n_tokens as i32, heads as i32, stride as i32);
         let mut bl = self.dev.stream().launch_builder(&f);
         bl.arg(beta)
             .arg(g)
@@ -219,7 +223,8 @@ impl Kernels {
             .arg(a_log)
             .arg(dt_bias)
             .arg(&nt)
-            .arg(&h);
+            .arg(&h)
+            .arg(&st);
         self.dev
             .profile()
             .time("gdn_gate_decay", self.dev.stream(), || {

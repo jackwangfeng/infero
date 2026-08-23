@@ -188,7 +188,8 @@ impl Layer {
             &self.dt_bias.as_view(),
             n,
             heads,
-        )?;
+        
+        heads,)?;
         // Keep the unnormalized copy before the l2norm runs in place.
         self.dev.stream().memcpy_dtod(
             &self.post_conv.slice(..n * width),
@@ -293,7 +294,8 @@ fn verify_then_replay(
             &l.dt_bias.as_view(),
             n,
             heads,
-        )?;
+        
+        heads,)?;
         l.dev.stream().memcpy_dtod(
             &l.post_conv.slice(..n * width),
             &mut l.post_conv_unnormed.slice_mut(..n * width),
