@@ -272,3 +272,70 @@ kernel void gemv_f16(device float* out            [[buffer(0)]],
     const float sum = BLOCK_SUM(acc, tid.x, tgdim.x);
     if (tid.x == 0) out[row] = sum;
 }
+
+// ---- Qwen3.5/3.8 additions ----------------------------------------------
+
+/// Per-head RMSNorm over `d_head`, applied where the head lies inside a row of
+/// `row_stride`. Qwen3 normalizes q and k this way *before* RoPE.
+kernel void qk_norm_f32(device float* buf              [[buffer(0)]],
+                        device const float* weight     [[buffer(1)]],
+                        constant int& n_heads          [[buffer(2)]],
+                        constant int& d_head           [[buffer(3)]],
+                        constant int& row_stride       [[buffer(4)]],
+                        constant int& offset           [[buffer(5)]],
+                        constant float& eps            [[buffer(6)]],
+                        uint3 tgid  [[threadgroup_position_in_grid]],
+                        uint3 tid   [[thread_position_in_threadgroup]],
+                        uint3 tgdim [[threads_per_threadgroup]]) {
+    BLOCK_REDUCE_SCRATCH
+
+    const int token = int(tgid.x) / n_heads;
+    const int head = int(tgid.x) % n_heads;
+    device float* h = buf + size_t(token) * row_stride + offset
+                    + size_t(head) * d_head;
+
+    float acc = 0.0f;
+    for (int i = int(tid.x); i < d_head; i += int(tgdim.x)) {
+        const float v = h[i];
+        acc += v * v;
+    }
+    const float scale = rsqrt(BLOCK_SUM(acc, tid.x, tgdim.x) / float(d_head) + eps);
+    for (int i = int(tid.x); i < d_head; i += int(tgdim.x)) {
+        h[i] = h[i] * scale * weight[i];
+    }
+}
+
+/// Partial rotary: only the first `rotary_dim` of each head rotates, the rest
+/// passes through untouched.
+///
+/// Pairing is `(i, i + rotary_dim/2)` -- the non-interleaved `rotate_half`
+/// convention, not the adjacent-pair one. The tables come from the host in f64
+/// and are already duplicated across both halves, because the two obvious f32
+/// formulations of `theta^(-2i/rot)` differ by an ulp that amplifies to 2.5e-3
+/// in the cosine at position 130000.
+kernel void rope_partial_f32(device float* x                [[buffer(0)]],
+                             device const float* cos_tab    [[buffer(1)]],
+                             device const float* sin_tab    [[buffer(2)]],
+                             constant int& heads            [[buffer(3)]],
+                             constant int& head_dim         [[buffer(4)]],
+                             constant int& rotary_dim       [[buffer(5)]],
+                             uint3 tgid  [[threadgroup_position_in_grid]],
+                             uint3 tid   [[thread_position_in_threadgroup]],
+                             uint3 tgdim [[threads_per_threadgroup]]) {
+    const int half_r = rotary_dim / 2;
+    const int i = int(tgid.x * tgdim.x + tid.x);
+    if (i >= half_r) return;
+    const int head = int(tgid.y);
+    const int token = int(tgid.z);
+
+    device float* row = x + (size_t(token) * heads + head) * head_dim;
+    device const float* c = cos_tab + size_t(token) * rotary_dim;
+    device const float* s = sin_tab + size_t(token) * rotary_dim;
+
+    const float a = row[i];
+    const float b = row[i + half_r];
+    // rotate_half puts -x2 where x1 was, so the first half takes `-b * sin` and
+    // the second takes `+a * sin`.
+    row[i] = a * c[i] - b * s[i];
+    row[i + half_r] = b * c[i + half_r] + a * s[i + half_r];
+}
