@@ -927,6 +927,12 @@ impl MtpHead {
     /// Observable because chunked priming's whole job is to leave this where a
     /// single wide step would have: `rows` describes only the last chunk, so it
     /// cannot answer whether the earlier ones landed.
+    /// Lanes the head's cache was forked for, and so the widest tree level it
+    /// can run.
+    pub fn branch_count(&self) -> usize {
+        self.branches
+    }
+
     pub fn cached(&self) -> usize {
         self.len
     }
@@ -1020,7 +1026,12 @@ impl MtpHead {
     /// 0.7 of the mass, so roughly half the drafts die. Sampling the draft at
     /// the request's temperature is what makes the ratio close to one whenever
     /// the two models agree.
-    pub fn draft_row_sampled(
+    /// The drafter's own distribution for one row, truncated the way the request
+    /// asked for.
+    ///
+    /// Split from the sampling so that a tree node can draw several candidates
+    /// from it. See [`Self::draft_row_candidates`].
+    fn draft_row_dist(
         &mut self,
         kern: &Kernels,
         head: &Matrix,
@@ -1168,12 +1179,106 @@ impl MtpHead {
             .copied()
             .zip(ps[..keep].iter().copied())
             .collect();
+        Ok((token, q))
+    }
+
+    /// One drafted token from a row, with the distribution it came from.
+    pub fn draft_row_sampled(
+        &mut self,
+        kern: &Kernels,
+        head: &Matrix,
+        row: usize,
+        sampler: &mut crate::Sampler,
+        history: &[u32],
+    ) -> Result<(u32, Vec<(u32, f32)>)> {
+        let (token, q) = self.draft_row_dist(kern, head, row, sampler, history)?;
         anyhow::ensure!(
             q.iter().any(|(t, w)| *t == token && *w > 0.0),
             "the draft sampled {token}, which carries no weight in its own \
              distribution"
         );
         Ok((token, q))
+    }
+
+    /// `n` candidates from one row, drawn i.i.d. from the same distribution.
+    ///
+    /// Siblings in a tree are exactly this: one parent, one `q`, several draws.
+    /// Sharing the distribution is not an optimization — the multi-candidate
+    /// acceptance rule is stated for candidates i.i.d. from a single `q`, and
+    /// that is what makes the composition reproduce the target.
+    ///
+    /// Duplicates are allowed and are not a bug: i.i.d. draws from a peaked `q`
+    /// often repeat, and the acceptance rule handles a repeat correctly — the
+    /// second copy is tested against a residual that has already had `q`
+    /// subtracted once, so it is much less likely to pass. Removing them would
+    /// change the proposal and break the guarantee.
+    pub fn draft_row_candidates(
+        &mut self,
+        kern: &Kernels,
+        head: &Matrix,
+        row: usize,
+        n: usize,
+        sampler: &mut crate::Sampler,
+        history: &[u32],
+    ) -> Result<(Vec<u32>, Vec<(u32, f32)>)> {
+        anyhow::ensure!(n > 0, "a node with no candidates");
+        // The device's own draw is the first candidate rather than a discarded
+        // one, so a node of `n` candidates consumes exactly `n` uniforms and a
+        // width of one reproduces the linear draft's stream token for token.
+        let (first, q) = self.draft_row_dist(kern, head, row, sampler, history)?;
+        let mut cands = Vec::with_capacity(n);
+        cands.push(first);
+        for _ in 1..n {
+            cands.push(crate::Sampler::pick(&q, 1.0, sampler.next_draw()));
+        }
+        Ok((cands, q))
+    }
+}
+
+/// A drafted tree: nodes in breadth-first order, with one `q` per internal node.
+///
+/// Siblings share a `q` because they are i.i.d. draws from it, which is both what
+/// the multi-candidate acceptance rule is stated for and why the bookkeeping is
+/// per *parent* rather than per node.
+///
+/// `parent[i]` indexes `nodes`, or `None` for a level-one node whose parent is
+/// the root — the position the target has already reached. `q_of[i]` indexes
+/// `qs`: the distribution node `i` was drawn from, shared with its siblings.
+pub struct TreeDraft {
+    /// Breadth-first: level one first, then level two, and so on.
+    pub nodes: Vec<TreeNode>,
+    /// One per internal node, the root's first.
+    pub qs: Vec<Vec<(u32, f32)>>,
+    /// Candidates a node fans out to.
+    pub branch: usize,
+    /// Levels below the root.
+    pub depth: usize,
+}
+
+pub struct TreeNode {
+    pub token: u32,
+    /// Index into `TreeDraft::nodes`, or `None` for a child of the root.
+    pub parent: Option<usize>,
+    /// Index into `TreeDraft::qs`.
+    pub q_of: usize,
+    /// The drafter row this node's own output landed in, which its children
+    /// continue from.
+    pub row: usize,
+    /// Which forked branch of the drafter's cache this node lives on.
+    pub lane: usize,
+}
+
+impl TreeDraft {
+    /// The path from the root down to `node`, tokens in order.
+    pub fn path(&self, node: usize) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut cur = Some(node);
+        while let Some(i) = cur {
+            out.push(self.nodes[i].token);
+            cur = self.nodes[i].parent;
+        }
+        out.reverse();
+        out
     }
 }
 
@@ -1266,6 +1371,167 @@ impl crate::Model {
     /// [`crate::spec::DraftFeed::after_prefill`] for the first round. Steps after
     /// the first feed the head its own output and add one to the position, which
     /// is what makes `k > 1` possible from a one-layer head.
+    /// A tree of drafts: `branch` candidates a node, `depth` levels deep.
+    ///
+    /// One drafter pass a level, not one a branch. A level of `B^L` rows costs
+    /// what one row costs — the pass reads the head's weights either way and rows
+    /// are nearly free — so a two-wide three-deep tree is the price of a linear
+    /// draft of three, and offers fourteen candidates instead of three.
+    ///
+    /// Siblings are i.i.d. draws from their parent's own distribution, which is
+    /// what [`crate::Model::accept_multi`] is stated for. The `q` is kept once a
+    /// parent rather than once a node for the same reason.
+    ///
+    /// `branch = 1` is the linear draft, and produces the same tokens from the
+    /// same seed as [`Self::draft_with_head_sampled`] does — the head consumes
+    /// one uniform a candidate either way.
+    pub fn draft_tree(
+        &mut self,
+        branch: usize,
+        depth: usize,
+        feed: &crate::spec::DraftFeed,
+        sampler: &mut crate::Sampler,
+        history: &[u32],
+    ) -> anyhow::Result<TreeDraft> {
+        anyhow::ensure!(branch > 0 && depth > 0, "a tree of {branch} by {depth}");
+        let d = self.cfg.d_model;
+        let hidden_rows = feed.rows.clone();
+        let (positions, shifted_ids) = (&feed.positions, &feed.shifted);
+        let rows = hidden_rows.len();
+        anyhow::ensure!(
+            rows == positions.len() && rows == shifted_ids.len(),
+            "{rows} hidden rows against {} positions and {} ids",
+            positions.len(),
+            shifted_ids.len()
+        );
+        // The widest level is what the head had to be forked for.
+        let widest = branch.pow(depth as u32 - 1);
+        let mut head = self
+            .mtp
+            .take()
+            .context("this model has no MTP head; call load_mtp_head first")?;
+        let res = (|| -> anyhow::Result<TreeDraft> {
+            anyhow::ensure!(
+                head.branch_count() >= widest,
+                "a {branch}-by-{depth} tree needs {widest} lanes, the head was \
+                 built with {}",
+                head.branch_count()
+            );
+            let hidden = self
+                .mtp_hidden
+                .as_ref()
+                .context("no captured hidden states")?
+                .slice(hidden_rows.start * d..hidden_rows.end * d);
+            head.truncate(positions[0]);
+            let root_row =
+                head.prime(&self.kern, &self.w.token_embd, shifted_ids, positions, &hidden)?;
+            let lm = self.w.output.as_ref().unwrap_or(&self.w.token_embd);
+            let base = positions[rows - 1] + 1;
+            // Every lane shares the prefix and owns `depth` slots past it, which
+            // is as far as any branch reaches.
+            head.fork(base, depth)?;
+
+            let mut nodes: Vec<TreeNode> = Vec::new();
+            let mut qs: Vec<Vec<(u32, f32)>> = Vec::new();
+
+            // Level one: the root's own row, `branch` draws from one `q`.
+            let (cands, q) = head.draft_row_candidates(
+                &self.kern,
+                lm,
+                root_row,
+                branch,
+                sampler,
+                history,
+            )?;
+            qs.push(q);
+            for (lane, tok) in cands.into_iter().enumerate() {
+                nodes.push(TreeNode {
+                    token: tok,
+                    parent: None,
+                    q_of: 0,
+                    // Filled in when the level runs; the root's children have not
+                    // been through the drafter yet.
+                    row: usize::MAX,
+                    lane,
+                });
+            }
+
+            // Each further level: one `step_tree` for the whole level, then one
+            // `q` a node and `branch` draws from it.
+            let mut level: Vec<usize> = (0..nodes.len()).collect();
+            for l in 1..depth {
+                let tokens: Vec<u32> = level.iter().map(|i| nodes[*i].token).collect();
+                let src_rows: Vec<usize> = level
+                    .iter()
+                    .map(|i| match nodes[*i].parent {
+                        Some(p) => nodes[p].row,
+                        None => root_row,
+                    })
+                    .collect();
+                let lanes: Vec<usize> = level.iter().map(|i| nodes[*i].lane).collect();
+                let pos = vec![base + l - 1; level.len()];
+                head.step_tree(
+                    &self.kern,
+                    &self.w.token_embd,
+                    &tokens,
+                    &pos,
+                    &src_rows,
+                    &lanes,
+                    depth,
+                )?;
+                // `step_tree` lays the level out in the order it was given, so
+                // node `level[j]`'s output is row `j`.
+                for (j, i) in level.iter().enumerate() {
+                    nodes[*i].row = j;
+                }
+
+                let mut next: Vec<usize> = Vec::new();
+                for (j, i) in level.iter().enumerate() {
+                    // The window a node's distribution is penalized against is
+                    // its own path, not the tree's — a sibling's tokens are a
+                    // different continuation entirely.
+                    let mut window = history.to_vec();
+                    let mut path = Vec::new();
+                    let mut cur = Some(*i);
+                    while let Some(c) = cur {
+                        path.push(nodes[c].token);
+                        cur = nodes[c].parent;
+                    }
+                    path.reverse();
+                    window.extend_from_slice(&path);
+
+                    let (cands, q) = head.draft_row_candidates(
+                        &self.kern,
+                        lm,
+                        j,
+                        branch,
+                        sampler,
+                        &window,
+                    )?;
+                    let q_of = qs.len();
+                    qs.push(q);
+                    for (b, tok) in cands.into_iter().enumerate() {
+                        next.push(nodes.len());
+                        nodes.push(TreeNode {
+                            token: tok,
+                            parent: Some(*i),
+                            q_of,
+                            row: usize::MAX,
+                            // A child stays on its parent's lane at width one and
+                            // fans out otherwise, so that every root-to-leaf path
+                            // has a lane to itself at the widest level.
+                            lane: nodes[*i].lane * branch + b,
+                        });
+                    }
+                }
+                level = next;
+            }
+            Ok(TreeDraft { nodes, qs, branch, depth })
+        })();
+        self.mtp = Some(head);
+        res
+    }
+
     /// A draft plus the probability the drafter gave each token.
     ///
     /// The sampled counterpart of [`Model::draft_with_head`]. The history grows

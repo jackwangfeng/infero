@@ -657,3 +657,177 @@ fn priming_the_drafter_across_a_gap_is_an_error() -> Result<()> {
     );
     Ok(())
 }
+
+/// A tree of width one has to draft exactly what the linear path drafts.
+///
+/// This is the reduction that makes the tree machinery trustworthy: the fork, the
+/// per-level `step_tree`, the per-node windows and the candidate loop all sit on
+/// the path a width-one tree takes, so if any of them is wrong the tokens diverge
+/// from the code that has been shipping. Same seed both ways, and the head
+/// consumes one uniform a candidate either way, so the streams line up token for
+/// token.
+#[test]
+fn a_tree_of_width_one_drafts_what_the_linear_path_drafts() -> Result<()> {
+    let _gpu = gpu_lock();
+    const K: usize = 3;
+    let Some((mut model, tok)) = load("qwen2.5-0.5b-instruct-q8_0.gguf", K + 1)? else {
+        return Ok(());
+    };
+    let _ = &tok;
+    let prompt = tok.encode(PROMPT, Some(false), false);
+    let cfg = model.config().clone();
+    // One lane: a width-one tree never forks, which is what makes it the linear
+    // draft.
+    let head = synthetic_head_branched(model.device(), &cfg, prompt.len().max(K + 1), model.max_seq(), 1)?;
+    model.install_mtp_head(head)?;
+
+    let mut pool = model.new_pool(512, 1)?;
+    model.enable_speculation(K, &pool)?;
+    let seq = pool.alloc().unwrap();
+    let pending = prime(&mut model, &mut pool, seq, &prompt)?;
+    let feed = DraftFeed::after_prefill(&prompt, pending);
+
+    let sp = tuili_model::SamplingParams {
+        temperature: 0.8,
+        top_p: 0.95,
+        top_k: 32,
+        seed: Some(4242),
+        ..Default::default()
+    };
+    let linear = {
+        let mut s = tuili_model::Sampler::new(sp.clone());
+        model.draft_with_head_sampled(K, &feed, &mut s, &prompt)?
+    };
+    let tree = {
+        let mut s = tuili_model::Sampler::new(sp.clone());
+        model.draft_tree(1, K, &feed, &mut s, &prompt)?
+    };
+
+    assert_eq!(
+        tree.nodes.len(),
+        K,
+        "a width-one tree of depth {K} should have {K} nodes"
+    );
+    let tree_tokens: Vec<u32> = tree.nodes.iter().map(|n| n.token).collect();
+    let linear_tokens: Vec<u32> = linear.iter().map(|d| d.token).collect();
+    assert_eq!(
+        tree_tokens, linear_tokens,
+        "a width-one tree drafted {tree_tokens:?} where the linear path drafted \
+         {linear_tokens:?}"
+    );
+    // And the distributions have to match too, since the acceptance rule
+    // composes with them.
+    for (i, (n, l)) in tree.nodes.iter().zip(&linear).enumerate() {
+        let q = &tree.qs[n.q_of];
+        assert_eq!(
+            q.len(),
+            l.q.len(),
+            "node {i}'s distribution has {} entries, the linear draft's {}",
+            q.len(),
+            l.q.len()
+        );
+        for (a, b) in q.iter().zip(&l.q) {
+            assert_eq!(a.0, b.0, "node {i}: token order differs");
+            assert!(
+                (a.1 - b.1).abs() < 1e-6,
+                "node {i}: probability {} against {}",
+                a.1,
+                b.1
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A two-wide tree's shape: the node count, the lanes, and which nodes share a
+/// distribution.
+///
+/// Siblings must share a `q` — they are i.i.d. draws from it, which is what the
+/// acceptance rule is stated for — and cousins must not, since their parents saw
+/// different tokens. Every leaf needs a lane to itself, or two paths would write
+/// the same slot in the drafter's cache.
+#[test]
+fn a_two_wide_tree_is_well_formed() -> Result<()> {
+    let _gpu = gpu_lock();
+    const B: usize = 2;
+    const D: usize = 3;
+    let Some((mut model, tok)) = load("qwen2.5-0.5b-instruct-q8_0.gguf", 4)? else {
+        return Ok(());
+    };
+    let prompt = tok.encode(PROMPT, Some(false), false);
+    let cfg = model.config().clone();
+    let widest = B.pow(D as u32 - 1);
+    let head = synthetic_head_branched(
+        model.device(),
+        &cfg,
+        prompt.len().max(widest * B),
+        model.max_seq(),
+        widest,
+    )?;
+    model.install_mtp_head(head)?;
+
+    let mut pool = model.new_pool(512, 1)?;
+    model.enable_speculation(D, &pool)?;
+    let seq = pool.alloc().unwrap();
+    let pending = prime(&mut model, &mut pool, seq, &prompt)?;
+    let feed = DraftFeed::after_prefill(&prompt, pending);
+    let mut s = tuili_model::Sampler::new(tuili_model::SamplingParams {
+        temperature: 0.9,
+        top_p: 0.95,
+        top_k: 32,
+        seed: Some(7),
+        ..Default::default()
+    });
+    let tree = model.draft_tree(B, D, &feed, &mut s, &prompt)?;
+
+    let want: usize = (1..=D).map(|l| B.pow(l as u32)).sum();
+    assert_eq!(tree.nodes.len(), want, "a {B}-by-{D} tree should have {want} nodes");
+    // One distribution a parent, and a parent is any node with children: the
+    // root plus every level but the last. So `1 + B + ... + B^(D-1)`, which is
+    // seven at two by three — not three, which is what this line said until the
+    // test disagreed with the code and the code turned out to be right.
+    let internal: usize = (0..D).map(|l| B.pow(l as u32)).sum();
+    assert_eq!(
+        tree.qs.len(),
+        internal,
+        "a {B}-by-{D} tree should carry {internal} distributions"
+    );
+
+    for (i, n) in tree.nodes.iter().enumerate() {
+        assert!((n.token as usize) < cfg.vocab_size, "node {i} drafted {}", n.token);
+        assert!(n.q_of < tree.qs.len(), "node {i} points at distribution {}", n.q_of);
+        if let Some(p) = n.parent {
+            assert!(p < i, "node {i}'s parent {p} comes after it");
+        }
+    }
+    // Siblings share, cousins do not.
+    for a in 0..tree.nodes.len() {
+        for b in 0..tree.nodes.len() {
+            if a == b {
+                continue;
+            }
+            let same_parent = tree.nodes[a].parent == tree.nodes[b].parent;
+            let same_q = tree.nodes[a].q_of == tree.nodes[b].q_of;
+            assert_eq!(
+                same_parent, same_q,
+                "nodes {a} and {b}: parents {:?}/{:?} but distributions {}/{}",
+                tree.nodes[a].parent, tree.nodes[b].parent,
+                tree.nodes[a].q_of, tree.nodes[b].q_of
+            );
+        }
+    }
+    // Every deepest-level node on its own lane, and every path the right length.
+    let leaves: Vec<usize> = (0..tree.nodes.len())
+        .filter(|i| tree.path(*i).len() == D)
+        .collect();
+    assert_eq!(leaves.len(), B.pow(D as u32), "wrong number of leaves");
+    let mut lanes: Vec<usize> = leaves.iter().map(|i| tree.nodes[*i].lane).collect();
+    lanes.sort_unstable();
+    lanes.dedup();
+    assert_eq!(
+        lanes.len(),
+        leaves.len(),
+        "two leaves share a lane, so two paths write the same cache slot"
+    );
+    Ok(())
+}
