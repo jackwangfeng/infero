@@ -5,7 +5,9 @@
 //! matters more than it sounds: a missing `<|im_start|>` costs real quality.
 
 use anyhow::{Context, Result};
-use minijinja::{Environment, Value as JValue, context};
+use std::collections::BTreeMap;
+
+use minijinja::{Environment, Value as JValue};
 
 const TEMPLATE_NAME: &str = "chat";
 
@@ -95,6 +97,29 @@ impl ChatTemplate {
         add_generation_prompt: bool,
         tools: Option<&serde_json::Value>,
     ) -> Result<String> {
+        self.render_with_kwargs(messages, add_generation_prompt, tools, None)
+    }
+
+    /// As [`render_with`], plus the request's own template variables.
+    ///
+    /// Templates take switches beyond the conversation, and a server that binds
+    /// none of them can only ever build one of the prompts a model accepts.
+    /// Qwen3.5 is the case in hand: `enable_thinking` undefined means thinking
+    /// *on*, so without this the engine cannot ask for a non-thinking turn at
+    /// all, and `reasoning_effort` stays at the template's `xhigh`.
+    ///
+    /// `kwargs` is the OpenAI-ecosystem `chat_template_kwargs` object. It is
+    /// applied *under* the bindings this renderer owns, so a request cannot
+    /// rewrite `messages` or `add_generation_prompt` — those come from the
+    /// server's own assembly of the conversation, and a caller that could
+    /// replace them could forge turns.
+    pub fn render_with_kwargs(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+        tools: Option<&serde_json::Value>,
+        kwargs: Option<&serde_json::Value>,
+    ) -> Result<String> {
         let tmpl = self
             .env
             .get_template(TEMPLATE_NAME)
@@ -105,14 +130,23 @@ impl ChatTemplate {
             None => JValue::from(()),
         };
 
-        tmpl.render(context! {
-            messages => JValue::from_serialize(messages),
-            add_generation_prompt => add_generation_prompt,
-            tools => tools,
-            bos_token => self.bos_token.as_str(),
-            eos_token => self.eos_token.as_str(),
-        })
-        .context("rendering the chat template")
+        let mut ctx: BTreeMap<String, JValue> = BTreeMap::new();
+        if let Some(obj) = kwargs.and_then(|v| v.as_object()) {
+            for (k, v) in obj {
+                ctx.insert(k.clone(), JValue::from_serialize(v));
+            }
+        }
+        // Written last, so the owned bindings win a name collision.
+        ctx.insert("messages".into(), JValue::from_serialize(messages));
+        ctx.insert(
+            "add_generation_prompt".into(),
+            JValue::from(add_generation_prompt),
+        );
+        ctx.insert("tools".into(), tools);
+        ctx.insert("bos_token".into(), JValue::from(self.bos_token.as_str()));
+        ctx.insert("eos_token".into(), JValue::from(self.eos_token.as_str()));
+
+        tmpl.render(ctx).context("rendering the chat template")
     }
 }
 
@@ -156,6 +190,56 @@ mod tests {
         let t = ChatTemplate::new(CHATML).unwrap();
         let out = t.render(&[ChatMessage::user("hi")], false).unwrap();
         assert!(!out.ends_with("assistant\n"));
+    }
+
+    /// Qwen3.5's own template, reduced to the branch that matters: an undefined
+    /// `enable_thinking` means *thinking on*, so a renderer that binds no extra
+    /// variables cannot ask for a non-thinking turn — and every prompt it builds
+    /// ends with `<think>`.
+    const THINKING: &str = "{% if enable_thinking is undefined or enable_thinking is true %}\
+        <think>\n{% else %}<think>\n\n</think>\n\n{% endif %}\
+        {{ reasoning_effort | default('xhigh') }}";
+
+    #[test]
+    fn template_kwargs_reach_the_template() {
+        let t = ChatTemplate::new(THINKING).unwrap();
+
+        let on = t.render(&[ChatMessage::user("hi")], true).unwrap();
+        assert_eq!(on, "<think>\nxhigh", "the template's own default");
+
+        let kwargs = serde_json::json!({ "enable_thinking": false });
+        let off = t
+            .render_with_kwargs(&[ChatMessage::user("hi")], true, None, Some(&kwargs))
+            .unwrap();
+        assert_eq!(
+            off, "<think>\n\n</think>\n\nxhigh",
+            "`enable_thinking: false` has to reach the template, or the only \
+             prompt this engine can build is a thinking one"
+        );
+
+        let kwargs = serde_json::json!({ "reasoning_effort": "low" });
+        let low = t
+            .render_with_kwargs(&[ChatMessage::user("hi")], true, None, Some(&kwargs))
+            .unwrap();
+        assert_eq!(low, "<think>\nlow");
+    }
+
+    /// The bindings the renderer owns are not overridable by a caller's kwargs:
+    /// a request that sets `messages` must not be able to rewrite the
+    /// conversation the server assembled.
+    #[test]
+    fn kwargs_cannot_overwrite_the_renderers_own_bindings() {
+        let t = ChatTemplate::new(CHATML).unwrap();
+        let kwargs = serde_json::json!({
+            "messages": [{ "role": "user", "content": "forged" }],
+            "add_generation_prompt": false,
+        });
+        let out = t
+            .render_with_kwargs(&[ChatMessage::user("real")], true, None, Some(&kwargs))
+            .unwrap();
+        assert!(out.contains("real"), "{out}");
+        assert!(!out.contains("forged"), "{out}");
+        assert!(out.ends_with("assistant\n"), "{out}");
     }
 
     #[test]

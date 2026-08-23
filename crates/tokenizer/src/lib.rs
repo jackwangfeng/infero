@@ -273,14 +273,27 @@ impl Tokenizer {
         );
         drop(borrowed);
 
+        // Every added token is matched atomically, flagged or not. The `special`
+        // flag decides what `decode` may skip, not what `encode` can see — in
+        // Hugging Face the whole `added_tokens` list goes into the trie that runs
+        // before the BPE. Filtering on the flag here splits Qwen3.5's `<think>`,
+        // which ships as `"special": false`, into `<` + `think` + `>`; since its
+        // chat template appends `<think>` to every generation prompt, the model
+        // then never sees the marker it was tuned to continue from. The GGUF
+        // reader already takes `USER_DEFINED` next to `CONTROL` for this reason.
         let mut specials: Vec<(String, u32)> = added
             .iter()
-            .filter(|t| t["special"].as_bool().unwrap_or(true))
             .filter_map(|t| Some((t["content"].as_str()?.to_string(), t["id"].as_u64()? as u32)))
             .collect();
         // Longest first, so `<|im_start|>` wins over a hypothetical `<|im`.
         specials.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.1.cmp(&b.1)));
-        let special_ids: FxHashSet<u32> = specials.iter().map(|(_, id)| *id).collect();
+        // Only the flagged ones are "special" to callers.
+        let special_ids: FxHashSet<u32> = added
+            .iter()
+            .filter(|t| t["special"].as_bool().unwrap_or(true))
+            .filter_map(|t| t["id"].as_u64())
+            .map(|id| id as u32)
+            .collect();
 
         let piece_ids: FxHashMap<String, u32> = pieces
             .iter()
@@ -612,5 +625,70 @@ fn compile_template(
             tracing::warn!(error = %e, "chat template failed to compile; /v1/chat will not work");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal byte-level BPE `tokenizer.json`: one token per byte value, plus
+    /// two added tokens — one flagged `special`, one not.
+    ///
+    /// Qwen3.5 ships `<think>` and `</think>` as the second kind, and its chat
+    /// template appends `<think>` to every generation prompt, so whether an
+    /// unflagged added token survives encoding decides whether the model is
+    /// prompted with the marker it was trained on or with three ordinary pieces.
+    fn synthetic_hf_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tuili-tok-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bl = ByteLevel::new();
+        let mut vocab = serde_json::Map::new();
+        for b in 0u8..=255 {
+            vocab.insert(bl.encode(&[b]), serde_json::json!(b as u64));
+        }
+        // One real merge, so the BPE is non-empty; `th` is what `<think>` would
+        // fall apart into if the added token were missed.
+        vocab.insert("th".into(), serde_json::json!(258u64));
+        let tj = serde_json::json!({
+            "model": { "type": "BPE", "vocab": vocab, "merges": [["t", "h"]] },
+            "added_tokens": [
+                { "id": 256, "content": "<|marked|>", "special": true },
+                { "id": 257, "content": "<think>", "special": false },
+            ],
+        });
+        std::fs::write(dir.join("tokenizer.json"), tj.to_string()).unwrap();
+        std::fs::write(dir.join("tokenizer_config.json"), "{}").unwrap();
+        dir
+    }
+
+    /// Hugging Face matches every entry of `added_tokens` atomically; the
+    /// `special` flag says whether `decode` may skip it, not whether `encode`
+    /// sees it. Reading the flag as "is this a token at all" splits `<think>`
+    /// into `<`, `think`, `>` and feeds the model a prompt it was never tuned
+    /// on. The GGUF reader already takes `USER_DEFINED` alongside `CONTROL`,
+    /// so this is also the two readers agreeing.
+    #[test]
+    fn an_added_token_is_one_id_even_when_it_is_not_flagged_special() {
+        let dir = synthetic_hf_dir("added-unflagged");
+        let tok = Tokenizer::from_hf_dir(&dir).unwrap();
+
+        assert_eq!(
+            tok.encode("<|marked|>", Some(false), true),
+            vec![256],
+            "a flagged added token should be its own id"
+        );
+        assert_eq!(
+            tok.encode("<think>", Some(false), true),
+            vec![257],
+            "an unflagged added token is still one token to Hugging Face"
+        );
+        // And the flag still decides what `is_special` reports, which is what
+        // callers use to hide markers rather than to tokenize them.
+        assert!(tok.is_special(256));
+        assert!(
+            !tok.is_special(257),
+            "`special: false` must stay unflagged even though it now encodes atomically"
+        );
     }
 }

@@ -38,6 +38,12 @@ pub struct ChatRequest {
     pub stream: bool,
     #[serde(default)]
     pub stop: Option<StopField>,
+    /// Extra variables for the model's own chat template, as vLLM and the rest
+    /// of the OpenAI ecosystem spell it. Qwen3.5 needs
+    /// `{"enable_thinking": false}` here to produce a non-thinking turn: its
+    /// template treats an *undefined* `enable_thinking` as on.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
