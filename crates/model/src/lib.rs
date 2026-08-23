@@ -1570,6 +1570,9 @@ impl Model {
                 n,
                 vocab,
                 stride,
+            
+                // The main decode path needs the token, not the distribution.
+                None,
             )?;
         }
         if let Some(pe) = &self.phase_ev {

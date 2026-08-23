@@ -180,6 +180,8 @@ fn the_device_sampler_picks_what_the_host_sampler_picks() -> Result<()> {
             rows,
             VOCAB,
             stride,
+        
+            None,
         )?;
         let got = stream.clone_dtoh(&d_out)?;
         dev.synchronize()?;
@@ -268,6 +270,7 @@ fn the_split_argmax_picks_what_one_block_picks() -> Result<()> {
             rows,
             VOCAB,
             stride,
+            None,
         )?;
 
         let mut split = stream.alloc_zeros::<u32>(rows)?;
@@ -293,6 +296,171 @@ fn the_split_argmax_picks_what_one_block_picks() -> Result<()> {
             "case {case} (penalty {penalty}): split argmax and one-block \
              disagree"
         );
+    }
+    Ok(())
+}
+
+/// Does the distribution the device drew from match the one the host builds?
+///
+/// The token alone is not enough for speculative decoding. The acceptance rule
+/// is `min(1, p(x)/q(x))` and a rejection draws from the normalized `(p - q)+`,
+/// so `q` has to be right as *numbers* over its whole truncated support — an
+/// error there does not crash, it quietly stops reproducing the target's
+/// distribution. That is why the draft now asks the kernel for the survivors
+/// instead of redoing the sampling on the host, and why they need checking.
+#[test]
+fn the_device_survivors_match_the_host_distribution() -> Result<()> {
+    let Ok(dev) = Device::new(0) else {
+        eprintln!("no CUDA device; skipping");
+        return Ok(());
+    };
+    let kern = Kernels::new(dev.clone());
+    let stream = dev.stream().clone();
+
+    // Non-greedy only: the survivors are what a *sampled* draft composes with,
+    // and a greedy request takes the greedy acceptance rule instead.
+    let cases = [
+        SamplingParams {
+            temperature: 0.7,
+            top_p: 1.0,
+            top_k: 20,
+            repetition_penalty: 1.0,
+            repetition_window: 256,
+            seed: Some(11),
+        },
+        // A nucleus tight enough to cut, so `keep < top_k` is exercised.
+        SamplingParams {
+            temperature: 0.7,
+            top_p: 0.6,
+            top_k: 40,
+            repetition_penalty: 1.05,
+            repetition_window: 64,
+            seed: Some(12),
+        },
+        SamplingParams {
+            temperature: 1.2,
+            top_p: 0.95,
+            top_k: 64,
+            repetition_penalty: 1.3,
+            repetition_window: 32,
+            seed: Some(13),
+        },
+    ];
+
+    for (case, params) in cases.iter().enumerate() {
+        let rows = 3usize;
+        let mut all: Vec<f32> = Vec::with_capacity(rows * VOCAB);
+        let mut windows: Vec<Vec<u32>> = Vec::new();
+        for r in 0..rows {
+            all.extend_from_slice(&logits_for(case * 16 + r + 3, VOCAB));
+            let w: Vec<u32> = (0..40u32)
+                .map(|i| ((i * 17 + r as u32 * 5) % 300) * 7)
+                .chain((0..20u32).map(|i| (i % 4) * 7))
+                .collect();
+            windows.push(w);
+        }
+
+        let mut samplers: Vec<Sampler> = (0..rows).map(|_| Sampler::new(params.clone())).collect();
+        let draws: Vec<f64> = samplers.iter_mut().map(|s| s.next_draw()).collect();
+
+        let stride = windows.iter().map(|w| w.len()).max().unwrap().max(1);
+        let effective: Vec<Vec<u32>> = windows
+            .iter()
+            .map(|w| {
+                let n = params.repetition_window.min(w.len());
+                w[w.len() - n..].to_vec()
+            })
+            .collect();
+        let (tok, cnt, len) = window_tables(&effective, stride);
+
+        let mut pv = vec![0f32; rows * 4];
+        for p in 0..rows {
+            pv[p * 4] = params.temperature;
+            pv[p * 4 + 1] = params.top_p;
+            pv[p * 4 + 2] = f32::from_bits(params.top_k as u32);
+            pv[p * 4 + 3] = params.repetition_penalty;
+        }
+
+        let d_logits = stream.clone_htod(&all)?;
+        let d_params = stream.clone_htod(&pv)?;
+        let d_tok = stream.clone_htod(&tok)?;
+        let d_cnt = stream.clone_htod(&cnt)?;
+        let d_len = stream.clone_htod(&len)?;
+        let d_rnd = stream.clone_htod(&draws)?;
+        let mut d_out = stream.alloc_zeros::<u32>(rows)?;
+        // The survivor buffers are `top_k` wide, which is what the draft sizes
+        // them to.
+        let sstride = params.top_k;
+        let mut d_id = stream.alloc_zeros::<u32>(rows * sstride)?;
+        let mut d_p = stream.alloc_zeros::<f32>(rows * sstride)?;
+        let mut d_slen = stream.alloc_zeros::<i32>(rows)?;
+        {
+            let mut out_v = d_out.as_view_mut();
+            let mut id_v = d_id.as_view_mut();
+            let mut p_v = d_p.as_view_mut();
+            let mut l_v = d_slen.as_view_mut();
+            kern.sample_rows(
+                &mut out_v,
+                &d_logits.as_view(),
+                &d_params.as_view(),
+                &d_tok.as_view(),
+                &d_cnt.as_view(),
+                &d_len.as_view(),
+                &d_rnd.as_view(),
+                rows,
+                VOCAB,
+                stride,
+                Some(tuili_kernels::Survivors {
+                    id: &mut id_v,
+                    p: &mut p_v,
+                    len: &mut l_v,
+                    stride: sstride,
+                }),
+            )?;
+        }
+        dev.synchronize()?;
+        let got_id = stream.clone_dtoh(&d_id)?;
+        let got_p = stream.clone_dtoh(&d_p)?;
+        let got_len = stream.clone_dtoh(&d_slen)?;
+
+        for r in 0..rows {
+            let mut s = Sampler::new(params.clone());
+            let _ = s.next_draw();
+            let logits = &all[r * VOCAB..(r + 1) * VOCAB];
+            let (dist, total) = s.distribution(logits, &windows[r]);
+            let want: Vec<(u32, f32)> = dist
+                .iter()
+                .map(|(t, w)| (*t, (*w as f64 / total) as f32))
+                .collect();
+
+            let keep = got_len[r] as usize;
+            assert_eq!(
+                keep,
+                want.len(),
+                "case {case} row {r}: the device kept {keep} survivors, the host {}",
+                want.len()
+            );
+            let mut mass = 0.0f64;
+            for j in 0..keep {
+                let (gi, gp) = (got_id[r * sstride + j], got_p[r * sstride + j]);
+                let (wi, wp) = want[j];
+                assert_eq!(
+                    gi, wi,
+                    "case {case} row {r} rank {j}: device id {gi}, host {wi}"
+                );
+                // Both normalize in f64 over the same survivors, so this is a
+                // rounding difference and nothing else.
+                assert!(
+                    (gp - wp).abs() <= 1e-6 + 1e-5 * wp,
+                    "case {case} row {r} rank {j} (id {gi}): device p {gp}, host {wp}"
+                );
+                mass += gp as f64;
+            }
+            assert!(
+                (mass - 1.0).abs() < 1e-4,
+                "case {case} row {r}: the survivors sum to {mass}, not one"
+            );
+        }
     }
     Ok(())
 }

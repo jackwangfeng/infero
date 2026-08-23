@@ -140,6 +140,43 @@ fn main() -> Result<()> {
             },
             &mut model,
         )?;
+        // Where a draft's time goes, on its own.
+        //
+        // A draft reads one MTP layer and the vocab head — about 2.2 GB, which
+        // at the 1466 GB/s a streaming read reaches here is 1.5 ms. It measures
+        // 2.05, so a third of it is not bytes, and at k=2 that slack is 1.7 ms a
+        // round — the same size as the whole remaining gap to vLLM, with nothing
+        // traded for it.
+        if model.device().profile().enabled() {
+            model.device().profile().reset();
+            // Wall clock and kernel sum from the *same* run. Comparing a
+            // profiled kernel total against an unprofiled wall time is how a
+            // difference gets attributed to the host when it was the profiler's
+            // own serialization; taking both here removes the question.
+            let wall = time_serial(
+                REPS,
+                |m: &mut Model| {
+                    m.draft_with_head_sampled(k, &feed, &mut sampler, &history)?;
+                    Ok(())
+                },
+                &mut model,
+            )?;
+            let mut rows = model.device().profile().snapshot();
+            let gpu: f64 = rows.iter().map(|(_, e)| e.millis).sum::<f64>() / REPS as f64;
+            println!(
+                "\n  draft: {wall:.3} ms wall, {gpu:.3} in kernels, {:.3} on the host",
+                wall - gpu
+            );
+            rows.sort_by(|a, b| b.1.millis.total_cmp(&a.1.millis));
+            println!("\n  one draft of {k}, per call");
+            println!("  {:<22} {:>9} {:>9} {:>9}", "kernel", "ms", "launches", "us each");
+            for (n, e) in rows.iter().take(10) {
+                let ms = e.millis / REPS as f64;
+                let l = e.launches / REPS as u64;
+                let us = if l > 0 { ms * 1000.0 / l as f64 } else { 0.0 };
+                println!("  {n:<22} {ms:>9.3} {l:>9} {us:>9.1}");
+            }
+        }
         t
     };
 

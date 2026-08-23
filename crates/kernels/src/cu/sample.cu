@@ -192,11 +192,25 @@ extern "C" __global__ void argmax_combine_f32(unsigned int* __restrict__ out,
 /// counts, `pen_len` how many; `rnd` is that row's uniform draw. `out` takes
 /// the sampled id. Dynamic shared memory is the vocabulary bitset followed by
 /// the reduction scratch and the top-k survivors.
+//
+// `surv_id` / `surv_p` / `surv_len` are optional and, when given, take the
+// surviving distribution the draw was made from: the ids the nucleus kept, in
+// descending order, with their normalized probabilities. Nothing extra is
+// computed for them — the kernel already has all three at the end.
+//
+// Speculative decoding is why. The acceptance test needs `q(x)` for the token
+// the drafter sampled, and a rejection needs the whole of `q` to subtract from
+// `p`; both are over the truncated support, a few dozen entries. Reading them
+// back is a kilobyte, where having the host redo the sampling means copying
+// 248320 logits — 993 KB and a full-vocabulary pass — which measured 0.709 ms of
+// a 2.249 ms draft, a third of it, and 1.42 ms of a round at k = 2.
 extern "C" __global__ void sample_rows_f32(
     unsigned int* __restrict__ out, const float* __restrict__ logits,
     const SampleParams* __restrict__ params, const int* __restrict__ pen_tok,
     const int* __restrict__ pen_cnt, const int* __restrict__ pen_len,
-    const double* __restrict__ rnd, int vocab, int pen_stride) {
+    const double* __restrict__ rnd, int vocab, int pen_stride,
+    unsigned int* __restrict__ surv_id, float* __restrict__ surv_p,
+    int* __restrict__ surv_len, int surv_stride) {
     extern __shared__ __align__(16) unsigned int smem[];
 
     const int row = blockIdx.x;
@@ -330,5 +344,16 @@ extern "C" __global__ void sample_rows_f32(
             }
         }
         out[row] = pick;
+        // The distribution the draw came from, for a caller that has to compose
+        // with it. Normalized here rather than on the host so that `q` sums to
+        // one in the same arithmetic that picked from it.
+        if (surv_len) {
+            surv_len[row] = keep;
+            const double inv = total > 0.0 ? 1.0 / total : 0.0;
+            for (int j = 0; j < keep && j < surv_stride; ++j) {
+                surv_id[(size_t)row * surv_stride + j] = (unsigned int)ki[j];
+                surv_p[(size_t)row * surv_stride + j] = (float)((double)kv[j] * inv);
+            }
+        }
     }
 }

@@ -203,6 +203,22 @@ fn b_args(
     Ok(())
 }
 
+/// Device buffers for the surviving distribution a sampled row drew from.
+///
+/// Speculative decoding needs `q` as numbers, not just the token: the acceptance
+/// test is `min(1, p(x)/q(x))` and a rejection draws from the normalized
+/// `(p - q)+`. The support is the nucleus, a few dozen entries, so reading it
+/// back is a kilobyte — against the 993 KB of logits the host would need to
+/// reconstruct it, which measured a third of a draft's time.
+pub struct Survivors<'a> {
+    pub id: &'a mut CudaViewMut<'a, u32>,
+    pub p: &'a mut CudaViewMut<'a, f32>,
+    pub len: &'a mut CudaViewMut<'a, i32>,
+    /// Entries a row. The kernel reports the true `keep` in `len` even when it
+    /// exceeds this, so truncation is visible rather than silent.
+    pub stride: usize,
+}
+
 /// Block size for the register-resident norms: enough threads that
 /// `blockDim * RMS_REGS >= d`, rounded to a warp.
 fn rms_block(d: usize) -> u32 {
@@ -762,6 +778,11 @@ impl Kernels {
     /// uniform draw per row, taken from that sequence's own generator on the
     /// host so that seeding stays reproducible.
     #[allow(clippy::too_many_arguments)]
+    /// Where [`Self::sample_rows`] writes the distribution it drew from.
+    ///
+    /// `stride` bounds one row's entries; the kernel writes `min(keep, stride)`
+    /// and reports `keep`, so a caller that sized `stride` below its `top_k`
+    /// will see the truncation in `len` rather than silently losing mass.
     pub fn sample_rows(
         &self,
         out: &mut CudaViewMut<'_, u32>,
@@ -774,6 +795,9 @@ impl Kernels {
         n_rows: usize,
         vocab: usize,
         pen_stride: usize,
+        // Optional: the surviving distribution each draw was made from — see
+        // `Survivors` and the kernel.
+        survivors: Option<Survivors<'_>>,
     ) -> Result<()> {
         let f = self
             .dev
@@ -787,6 +811,8 @@ impl Kernels {
         let v = vocab as i32;
         let ps = pen_stride as i32;
         let mut b = self.dev.stream().launch_builder(&f);
+        let sstride = survivors.as_ref().map_or(0, |v| v.stride) as i32;
+        let null: u64 = 0;
         b.arg(out)
             .arg(logits)
             .arg(params)
@@ -796,6 +822,15 @@ impl Kernels {
             .arg(rnd)
             .arg(&v)
             .arg(&ps);
+        match survivors {
+            Some(v) => {
+                b.arg(v.id).arg(v.p).arg(v.len);
+            }
+            None => {
+                b.arg(&null).arg(&null).arg(&null);
+            }
+        }
+        b.arg(&sstride);
         self.dev
             .profile()
             .time("sample_rows", self.dev.stream(), || {
