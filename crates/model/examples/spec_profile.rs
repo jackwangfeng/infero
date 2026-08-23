@@ -161,7 +161,46 @@ fn main() -> Result<()> {
         &mut model,
     )?;
 
-    println!("\n  plain decode, 1 row       {plain:7.2} ms  pipelined");
+    // ---- prefill ---------------------------------------------------------
+    //
+    // 121 ms of a 1780 ms request on the 27B, 6.8%, and per request rather than
+    // per round — so it is worth as much as two milliseconds off the round. The
+    // weights want 40 ms at 66 tokens (two passes of 29.6 GB, since the
+    // tensor-core path covers 64 tokens a pass), so most of it is something
+    // else. Timed on its own sequence so it is a real cold prefill and not a
+    // cache hit.
+    let prefill = {
+        let mut p3 = model.new_pool(8192, 2)?;
+        let s3 = p3.alloc().context("no kv slot")?;
+        let it = BatchItem::new(s3, &prompt);
+        // One untimed pass so the graph for this width is captured.
+        model.forward_batch_device(std::slice::from_ref(&it), &mut p3)?;
+        p3.truncate(s3, 0);
+        model.device().profile().reset();
+        let t = time_serial(
+            4,
+            |m: &mut Model| {
+                let it = BatchItem::new(s3, &prompt);
+                m.forward_batch_device(std::slice::from_ref(&it), &mut p3)?;
+                p3.truncate(s3, 0);
+                Ok(())
+            },
+            &mut model,
+        )?;
+        if model.device().profile().enabled() {
+            let mut rows = model.device().profile().snapshot();
+            rows.sort_by(|a, b| b.1.millis.total_cmp(&a.1.millis));
+            println!("\n  prefill of {} tokens, per pass", prompt.len());
+            println!("  {:<22} {:>9} {:>9}", "kernel", "ms", "launches");
+            for (n, e) in rows.iter().take(9) {
+                println!("  {n:<22} {:>9.3} {:>9}", e.millis / 4.0, e.launches / 4);
+            }
+        }
+        t
+    };
+
+    println!("\n  prefill, {} tokens       {prefill:7.2} ms   bytes want ~40", prompt.len());
+    println!("  plain decode, 1 row       {plain:7.2} ms  pipelined");
     println!("  plain decode, 1 row       {plain_serial:7.2} ms  drained each rep");
     println!("  draft {k} token(s)          {draft_ms:7.2} ms   bytes want ~{:.1}",
              2.0 * k as f64);

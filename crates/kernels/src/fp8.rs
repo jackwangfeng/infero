@@ -192,6 +192,22 @@ pub const MMA_ROWS: usize = 16;
 /// number of MMAs.
 pub const MMA_TOKENS: usize = 8;
 
+/// Staging the *activation* tile beside the weights was tried and reverted.
+///
+/// The reasoning looked sound: an unstaged `B` is read once a warp a group, and a
+/// lane's eight bytes come from a different token than its neighbour's, so one
+/// fragment is eight 32-byte sectors instead of two. That is `14.8 GB * GROUPS`
+/// of L1 traffic for the 27B's forward, and prefill measured 451 GB/s at four
+/// groups against a decode step's 1420.
+///
+/// Staged — `[token][k]` in shared with the same `+8` row padding, read once a
+/// block and perfectly coalesced — prefill got 13% *slower*: the server's
+/// `queued_ms` went 121 ms to 137, and the decode round did not move at all
+/// (correctly: at one group there is nothing to stage). So the extra pass through
+/// shared memory and its barrier cost more than the L1 requests they saved, and
+/// the traffic was not what prefill was waiting on. Whatever prefill's 121 ms is,
+/// it is not this.
+///
 /// Fragment columns off one staged weight tile, and so the token counts covered
 /// in a single pass over the weights: 8, 16, 32, 64.
 ///
