@@ -218,6 +218,7 @@ fn head_from_capture_width(
     c: &Capture,
     reading: Reading,
     width: usize,
+    branches: usize,
 ) -> Result<MtpHead> {
     let dims = c.dims();
     let d = dims.d_model;
@@ -278,12 +279,12 @@ fn head_from_capture_width(
         },
         device_bytes: 0,
     };
-    MtpHead::new(dev, w, dims, width, 128)
+    MtpHead::new(dev, w, dims, width, 128, branches)
 }
 
 /// The head sized for the capture's whole token run in one step.
 fn head_from_capture(dev: &Device, c: &Capture, reading: Reading) -> Result<MtpHead> {
-    head_from_capture_width(dev, c, reading, c.shape("output")[0])
+    head_from_capture_width(dev, c, reading, c.shape("output")[0], 1)
 }
 
 /// A stand-in embedding matrix whose row `i` is the capture's `inputs_embeds[i]`.
@@ -987,7 +988,7 @@ fn chunked_priming_agrees_with_one_wide_step() -> Result<()> {
         };
 
         // The same feed, five chunks, into a head that cannot hold it whole.
-        let mut head = head_from_capture_width(&dev, c, Reading::Reference, WIDTH)?;
+        let mut head = head_from_capture_width(&dev, c, Reading::Reference, WIDTH, 1)?;
         let (embed, ids) = stub_embedding(&dev, c)?;
         let last = head.prime(&kern, &embed, &ids, &positions, &hidden.as_view())?;
         let chunked = dev.stream().clone_dtoh(&head.output())?;

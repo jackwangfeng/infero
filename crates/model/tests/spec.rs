@@ -435,11 +435,12 @@ fn the_mtp_head_drives_the_loop_without_changing_the_output() -> Result<()> {
 /// Small on purpose: the head is twenty-seven f16 operations deep and the point
 /// is to exercise the plumbing, not to survive an overflow. The values are
 /// deterministic so a failure is reproducible.
-fn synthetic_head(
+fn synthetic_head_branched(
     dev: &tuili_cuda::Device,
     cfg: &tuili_model::Config,
     max_rows: usize,
     max_seq: usize,
+    branches: usize,
 ) -> Result<MtpHead> {
     let dims = HeadDims::from_config(cfg);
     let (d, d_attn, d_kv) = (dims.d_model, dims.d_attn(), dims.d_kv());
@@ -487,7 +488,17 @@ fn synthetic_head(
         },
         device_bytes: 0,
     };
-    MtpHead::new(dev, w, dims, max_rows, max_seq)
+    MtpHead::new(dev, w, dims, max_rows, max_seq, branches)
+}
+
+/// The same, one branch, which is what the linear draft wants.
+fn synthetic_head(
+    dev: &tuili_cuda::Device,
+    cfg: &tuili_model::Config,
+    max_rows: usize,
+    max_seq: usize,
+) -> Result<MtpHead> {
+    synthetic_head_branched(dev, cfg, max_rows, max_seq, 1)
 }
 
 /// A mean acceptance length, measured end to end with a drafter that is a real

@@ -141,7 +141,18 @@ pub struct MtpHead {
     /// The drafter's own single-sequence KV cache, `[kv_heads, max_seq, d_head]`.
     kc: CudaSlice<f16>,
     vc: CudaSlice<f16>,
+    /// `[branches, max_seq]` — position to slot, one row a branch.
+    ///
+    /// One branch is the linear draft and the table is the identity. A tree
+    /// draft forks: every branch shares the prefix's slots and owns the slots
+    /// past it, which is what lets siblings sit at the same position without
+    /// overwriting each other's keys. See [`Self::fork`].
     slot_table: CudaSlice<i32>,
+    /// Branches the table holds, and so the widest tree level this head can run.
+    branches: usize,
+    /// Slots the shared prefix occupies. Positions below it map to themselves in
+    /// every branch; above it each branch has its own.
+    fork_at: usize,
     /// One row quantized to q8_1, for the integer vocabulary mat-vec.
     q8_1: CudaSlice<u8>,
     /// How far the drafter's cache reaches, in positions.
@@ -162,8 +173,12 @@ impl MtpHead {
         dims: HeadDims,
         max_tokens: usize,
         max_seq: usize,
+        // Widest tree level this head will be asked for. One is the linear
+        // draft; the slot table and the cache grow with it.
+        branches: usize,
     ) -> Result<Self> {
         anyhow::ensure!(max_tokens > 0 && max_seq > 0, "an empty MTP head");
+        anyhow::ensure!(branches > 0, "a head with no branches");
         let stream = dev.stream();
         let (d, da, dkv) = (dims.d_model, dims.d_attn(), dims.d_kv());
         let t = max_tokens;
@@ -205,7 +220,9 @@ impl MtpHead {
             freqs: stream.clone_htod(&vec![1.0f32; dims.rotary_dim / 2])?,
             kc: stream.alloc_zeros::<f16>(dims.kv_heads * max_seq * dims.d_head)?,
             vc: stream.alloc_zeros::<f16>(dims.kv_heads * max_seq * dims.d_head)?,
-            slot_table: stream.alloc_zeros::<i32>(max_seq)?,
+            slot_table: stream.alloc_zeros::<i32>(branches * max_seq)?,
+            branches,
+            fork_at: 0,
             // The vocabulary projection's activation, quantized. Sized for the
             // widest row the head has, which is `d_model`.
             q8_1: stream.alloc_zeros::<u8>(Kernels::q8_1_bytes(d))?,
@@ -300,7 +317,8 @@ impl MtpHead {
         self.dev
             .stream()
             .memcpy_dtod(hidden, &mut self.hidden_in.slice_mut(..n * self.dims.d_model))?;
-        self.run(kern, embed, shifted_ids, positions)
+        // One branch: `step` is the linear draft's own entry point.
+        self.run(kern, embed, shifted_ids, positions, &vec![0; shifted_ids.len()], 0)
     }
 
     /// [`MtpHead::step`] over a feed of any width, in chunks.
@@ -386,7 +404,7 @@ impl MtpHead {
         // so reading it as an input would alias.
         let mut dst = self.hidden_in.slice_mut(..d);
         self.dev.stream().memcpy_dtod(&src, &mut dst)?;
-        self.run(kern, embed, &[drafted], &[position])
+        self.run(kern, embed, &[drafted], &[position], &[0], 0)
     }
 
     /// One draft step's kernels: four small uploads, then eighteen launches.
@@ -400,12 +418,132 @@ impl MtpHead {
     /// of its byte bound since the vocabulary projection moved to `mmvq`. The
     /// 120 GB/s I thought this ran at came from subtracting an assumed
     /// `lm_head` time from the total, and the assumption was wrong.
+    /// One tree level: several rows, each continuing its own branch from its own
+    /// parent's output.
+    ///
+    /// `src_rows[i]` is the row of the previous level whose output feeds row `i`
+    /// — siblings share a parent and so share a source row. `positions[i]` is
+    /// where row `i` sits in its branch's sequence, and `branch_of[i]` which
+    /// branch that is, which together pick the slot its key goes to.
+    ///
+    /// The whole level in one call is the point: a draft pass costs what its
+    /// weights cost and rows are nearly free, so a level of `B^L` branches is the
+    /// same price as one. Calling this once a branch instead would multiply the
+    /// draft's cost by the tree's width and give the whole scheme back.
+    pub fn step_tree(
+        &mut self,
+        kern: &Kernels,
+        embed: &Matrix,
+        tokens: &[u32],
+        positions: &[usize],
+        src_rows: &[usize],
+        branch_of: &[usize],
+        tail: usize,
+    ) -> Result<()> {
+        let n = tokens.len();
+        anyhow::ensure!(
+            n == positions.len() && n == src_rows.len() && n == branch_of.len(),
+            "{n} tokens against {} positions, {} source rows and {} branches",
+            positions.len(),
+            src_rows.len(),
+            branch_of.len()
+        );
+        anyhow::ensure!(n > 0 && n <= self.max_tokens, "a level of {n} rows");
+        for (i, r) in src_rows.iter().enumerate() {
+            anyhow::ensure!(
+                *r < self.rows,
+                "row {i} continues from row {r}, past the {} the last level \
+                 produced",
+                self.rows
+            );
+        }
+        for b in branch_of {
+            anyhow::ensure!(
+                *b < self.branches,
+                "branch {b} of a head forked {} ways",
+                self.branches
+            );
+        }
+        let d = self.dims.d_model;
+        // Gather the parents' outputs into consecutive rows. A copy rather than a
+        // view because `run` writes `out`, so reading it as an input would alias
+        // — the same reason `step_from_own_output` copies.
+        for (i, r) in src_rows.iter().enumerate() {
+            let src = self.out.slice(r * d..(r + 1) * d);
+            let mut dst = self.hidden_in.slice_mut(i * d..(i + 1) * d);
+            self.dev.stream().memcpy_dtod(&src, &mut dst)?;
+        }
+        self.run(kern, embed, tokens, positions, branch_of, tail)
+    }
+
+    /// Point every branch at the same prefix and its own slots past it.
+    ///
+    /// Branch `b`, position `p` maps to `p` while `p < base` and to
+    /// `base + b * tail + (p - base)` above it. So siblings can sit at the same
+    /// position without overwriting each other's keys, which is the whole
+    /// mechanism a tree draft needs — the drafter's attention already reads its
+    /// cache through this table and through `seq_of`, because it shares
+    /// `BatchLayout` with the text model's batched path. Only the sequence count
+    /// was pinned at one.
+    ///
+    /// `tail` is how far past the prefix a branch may reach, so `depth - 1` for a
+    /// tree of that depth. The table is filled to `base + branches * tail` and no
+    /// further: the attention never reads past `kv_len`.
+    ///
+    /// Uploaded once a draft rather than once a level — at a 200-token prefix and
+    /// eight branches that is 6.5 KB, which is why this is a host-side build and
+    /// not a kernel.
+    pub fn fork(&mut self, base: usize, tail: usize) -> Result<()> {
+        anyhow::ensure!(
+            base + self.branches * tail <= self.max_seq,
+            "a prefix of {base} and {} branches of {tail} want {} slots, the \
+             drafter's cache holds {}",
+            self.branches,
+            base + self.branches * tail,
+            self.max_seq
+        );
+        let width = base + tail;
+        let mut table = vec![0i32; self.branches * self.max_seq];
+        for b in 0..self.branches {
+            for p in 0..width {
+                table[b * self.max_seq + p] = if p < base {
+                    p as i32
+                } else {
+                    (base + b * tail + (p - base)) as i32
+                };
+            }
+        }
+        self.dev
+            .stream()
+            .memcpy_htod(&table, &mut self.slot_table.slice_mut(..))?;
+        self.fork_at = base;
+        Ok(())
+    }
+
+    /// Which slot branch `b` writes for `position`, matching [`Self::fork`].
+    ///
+    /// The host needs this to tell `run` where a row's key goes; the table tells
+    /// the *kernel* where to read it. Both have to agree, so they are one
+    /// formula in one place.
+    fn slot_of(&self, branch: usize, position: usize, tail: usize) -> usize {
+        if position < self.fork_at {
+            position
+        } else {
+            self.fork_at + branch * tail + (position - self.fork_at)
+        }
+    }
+
+    /// `branch_of` names the tree branch each row belongs to, and `tail` how far
+    /// past the fork point a branch may reach. All zeros and any `tail` is the
+    /// linear draft, where a slot equals its position.
     fn run(
         &mut self,
         kern: &Kernels,
         embed: &Matrix,
         shifted_ids: &[u32],
         positions: &[usize],
+        branch_of: &[usize],
+        tail: usize,
     ) -> Result<()> {
         let n = shifted_ids.len();
         let dims = self.dims;
@@ -421,10 +559,18 @@ impl MtpHead {
             "position {last} is past the {} slots the drafter's cache holds",
             self.max_seq
         );
-        for w in positions.windows(2) {
+        // Consecutive *within a branch*. A tree level puts one row per branch at
+        // the same position, which is the point of forking; what would still be
+        // wrong is a gap along one branch, since the slot mapping and the cache
+        // length both assume a branch is contiguous.
+        for (i, w) in positions.windows(2).enumerate() {
+            if branch_of[i] != branch_of[i + 1] {
+                continue;
+            }
             anyhow::ensure!(
                 w[1] == w[0] + 1,
-                "the drafter's rows must be consecutive positions, got {w:?}"
+                "branch {}'s rows must be consecutive positions, got {w:?}",
+                branch_of[i]
             );
         }
         anyhow::ensure!(
@@ -446,10 +592,18 @@ impl MtpHead {
         // Slot equals position: the drafter is one sequence with a cache of its
         // own, so there is no pool to share and no indirection to get wrong.
         let pos: Vec<i32> = positions.iter().map(|p| *p as i32).collect();
+        // The slot a row's key goes to has to match what `fork` told the kernel
+        // to read, so both come from `slot_of`.
+        let slots: Vec<i32> = positions
+            .iter()
+            .zip(branch_of)
+            .map(|(p, b)| self.slot_of(*b, *p, tail) as i32)
+            .collect();
+        let seqs: Vec<i32> = branch_of.iter().map(|b| *b as i32).collect();
         stream.memcpy_htod(&ids, &mut self.ids.slice_mut(..n))?;
         stream.memcpy_htod(&pos, &mut self.positions.slice_mut(..n))?;
-        stream.memcpy_htod(&pos, &mut self.slots.slice_mut(..n))?;
-        stream.memcpy_htod(&vec![0i32; n], &mut self.seq_of.slice_mut(..n))?;
+        stream.memcpy_htod(&slots, &mut self.slots.slice_mut(..n))?;
+        stream.memcpy_htod(&seqs, &mut self.seq_of.slice_mut(..n))?;
         kern.write_slot_table(
             &mut self.slot_table.as_view_mut(),
             &self.seq_of.slice(..n),
@@ -1063,7 +1217,9 @@ impl crate::Model {
             HeadDims::from_config(&self.cfg),
             max_draft_rows.max(1),
             self.max_seq,
-
+            // One branch for now: the tree draft sets this from its widest
+            // level once `draft_tree` exists. See `MtpHead::fork`.
+            1,
         )?;
         self.install_mtp_head(head)?;
         Ok(true)
