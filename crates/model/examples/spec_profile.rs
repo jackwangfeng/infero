@@ -33,8 +33,12 @@ fn main() -> Result<()> {
     let dev = tuili_cuda::Device::new(device)?;
     let tok = tuili_tokenizer::Tokenizer::from_hf_dir(&dir)?;
     // `k + 1` logit rows for the verification pass, and the drafter wants at
-    // least that many rows of its own.
-    let mut model = Model::load_awq(dev, &dir, 8192, KvCacheQuant::F16, (k + 1).max(8))?;
+    // least that many rows of its own. Wider than that so the width sweep below
+    // can price a tree draft's verification: a `B`-by-`D` tree costs
+    // `B^(D-1) * D` rows, 24 at two by three, because the GatedDeltaNet
+    // recurrence cannot fork and every root-to-leaf path has to be its own
+    // linear sequence.
+    let mut model = Model::load_awq(dev, &dir, 8192, KvCacheQuant::F16, (k + 1).max(32))?;
     anyhow::ensure!(model.load_mtp_head(&dir, 64)?, "this checkpoint has no MTP head");
 
     let prompt = tok.encode(
@@ -89,6 +93,41 @@ fn main() -> Result<()> {
         pool.truncate(seq, base_len);
         Ok(())
     }, &mut model);
+
+    // ---- what a wider verification pass costs ----------------------------
+    //
+    // A tree draft's verification is one pass over many rows, and how many
+    // depends on the shape: the GatedDeltaNet recurrence cannot fork, so every
+    // root-to-leaf path has to be its own linear sequence and a `B`-by-`D` tree
+    // costs `B^(D-1) * D` rows rather than its node count — 8 at two by two, 24
+    // at two by three. Whether that is worth having turns entirely on whether
+    // the marginal row stays flat out there, so measure it instead of
+    // extrapolating from two points.
+    //
+    // The rows are one sequence here, not the several a real tree would use.
+    // What is being priced is the pass's width; the state copies a fork adds are
+    // counted separately.
+    let mut row_costs: Vec<(usize, f64)> = Vec::new();
+    for n in [1usize, 2, 3, 4, 6, 8, 12, 16, 24] {
+        if n > model.max_logit_rows() {
+            continue;
+        }
+        let many: Vec<u32> = std::iter::repeat_n(pending, n).collect();
+        let t = [n];
+        match time(
+            REPS,
+            |m: &mut Model| {
+                let it = BatchItem::new(seq, &many);
+                m.forward_batch_rows(std::slice::from_ref(&it), &mut pool, &t)?;
+                pool.truncate(seq, base_len);
+                Ok(())
+            },
+            &mut model,
+        ) {
+            Ok(ms) => row_costs.push((n, ms)),
+            Err(_) => break,
+        }
+    }
 
     // ---- the draft side of a round ---------------------------------------
     //
@@ -326,6 +365,20 @@ fn main() -> Result<()> {
         );
         for (_, l) in &lines {
             println!("{l}");
+        }
+    }
+
+    if !row_costs.is_empty() {
+        println!("\n  a verification pass by width");
+        println!("  {:>5}  {:>9}  {:>11}", "rows", "ms", "marginal");
+        let base = row_costs[0].1;
+        for (i, (n, ms)) in row_costs.iter().enumerate() {
+            let marg = if i == 0 {
+                String::from("-")
+            } else {
+                format!("{:+.3} ms", (ms - base) / (*n - 1) as f64)
+            };
+            println!("  {n:>5}  {ms:>9.2}  {marg:>11}");
         }
     }
 

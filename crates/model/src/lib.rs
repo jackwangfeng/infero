@@ -798,6 +798,12 @@ impl Model {
         &self.dev
     }
 
+    /// Logit rows one pass may ask for, which bounds how wide a
+    /// verification pass can be — and so which tree shapes are possible.
+    pub fn max_logit_rows(&self) -> usize {
+        self.max_logit_rows
+    }
+
     pub fn max_seq(&self) -> usize {
         self.max_seq
     }
