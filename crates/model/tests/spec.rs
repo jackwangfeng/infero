@@ -700,7 +700,7 @@ fn a_tree_of_width_one_drafts_what_the_linear_path_drafts() -> Result<()> {
     };
     let tree = {
         let mut s = tuili_model::Sampler::new(sp.clone());
-        model.draft_tree(1, K, &feed, &mut s, &prompt)?
+        model.draft_tree(&[1; K], &feed, &mut s, &prompt)?
     };
 
     assert_eq!(
@@ -778,7 +778,7 @@ fn a_two_wide_tree_is_well_formed() -> Result<()> {
         seed: Some(7),
         ..Default::default()
     });
-    let tree = model.draft_tree(B, D, &feed, &mut s, &prompt)?;
+    let tree = model.draft_tree(&[B; D], &feed, &mut s, &prompt)?;
 
     let want: usize = (1..=D).map(|l| B.pow(l as u32)).sum();
     assert_eq!(tree.nodes.len(), want, "a {B}-by-{D} tree should have {want} nodes");

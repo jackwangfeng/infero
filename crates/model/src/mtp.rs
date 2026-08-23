@@ -1249,10 +1249,13 @@ pub struct TreeDraft {
     pub nodes: Vec<TreeNode>,
     /// One per internal node, the root's first.
     pub qs: Vec<Vec<(u32, f32)>>,
-    /// Candidates a node fans out to.
-    pub branch: usize,
-    /// Levels below the root.
-    pub depth: usize,
+    /// Candidates a node fans out to, one entry a level. `[2, 1]` is two
+    /// candidates for the next token and one after that, which is the shape a
+    /// verification pass can afford: two root-to-leaf paths of three rows each,
+    /// six in all, against the eight where the FP8 kernel's cost steps up.
+    pub widths: Vec<usize>,
+    /// Root-to-leaf paths, and so sequences a verification pass needs.
+    pub leaves: usize,
 }
 
 pub struct TreeNode {
@@ -1387,13 +1390,14 @@ impl crate::Model {
     /// one uniform a candidate either way.
     pub fn draft_tree(
         &mut self,
-        branch: usize,
-        depth: usize,
+        widths: &[usize],
         feed: &crate::spec::DraftFeed,
         sampler: &mut crate::Sampler,
         history: &[u32],
     ) -> anyhow::Result<TreeDraft> {
-        anyhow::ensure!(branch > 0 && depth > 0, "a tree of {branch} by {depth}");
+        let depth = widths.len();
+        anyhow::ensure!(depth > 0, "a tree of no levels");
+        anyhow::ensure!(widths.iter().all(|w| *w > 0), "a level of no candidates");
         let d = self.cfg.d_model;
         let hidden_rows = feed.rows.clone();
         let (positions, shifted_ids) = (&feed.positions, &feed.shifted);
@@ -1404,8 +1408,13 @@ impl crate::Model {
             positions.len(),
             shifted_ids.len()
         );
-        // The widest level is what the head had to be forked for.
-        let widest = branch.pow(depth as u32 - 1);
+        // Leaves, and so the lanes the head had to be forked for. Also the
+        // sequences a verification pass will need, since every root-to-leaf path
+        // is its own — the recurrence cannot fork.
+        let leaves: usize = widths.iter().product();
+        // The lanes in flight at the deepest level the drafter runs, which is one
+        // level short of the leaves.
+        let widest: usize = widths[..depth - 1].iter().product::<usize>().max(1);
         let mut head = self
             .mtp
             .take()
@@ -1413,8 +1422,8 @@ impl crate::Model {
         let res = (|| -> anyhow::Result<TreeDraft> {
             anyhow::ensure!(
                 head.branch_count() >= widest,
-                "a {branch}-by-{depth} tree needs {widest} lanes, the head was \
-                 built with {}",
+                "a tree of {widths:?} needs {widest} lanes, the head was built \
+                 with {}",
                 head.branch_count()
             );
             let hidden = self
@@ -1439,7 +1448,7 @@ impl crate::Model {
                 &self.kern,
                 lm,
                 root_row,
-                branch,
+                widths[0],
                 sampler,
                 history,
             )?;
@@ -1504,7 +1513,7 @@ impl crate::Model {
                         &self.kern,
                         lm,
                         j,
-                        branch,
+                        widths[l],
                         sampler,
                         &window,
                     )?;
@@ -1520,13 +1529,13 @@ impl crate::Model {
                             // A child stays on its parent's lane at width one and
                             // fans out otherwise, so that every root-to-leaf path
                             // has a lane to itself at the widest level.
-                            lane: nodes[*i].lane * branch + b,
+                            lane: nodes[*i].lane * widths[l] + b,
                         });
                     }
                 }
                 level = next;
             }
-            Ok(TreeDraft { nodes, qs, branch, depth })
+            Ok(TreeDraft { nodes, qs, widths: widths.to_vec(), leaves })
         })();
         self.mtp = Some(head);
         res

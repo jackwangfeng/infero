@@ -118,7 +118,11 @@ fn main() -> Result<()> {
 
     let mut prev = 0.0f64;
     let mut prev_mma = 0.0f64;
-    for n_tokens in [1usize, 2, 3, 4, 8] {
+    // Past eight the tensor-core path leaves `GROUPS = 1`, and a verification
+    // pass over 12 rows measured 32.57 ms against 23.92 at 8 — a cliff that caps
+    // how deep a tree draft can go. Whether that is the kernel or something else
+    // in the pass is what these last widths are for.
+    for n_tokens in [1usize, 2, 3, 4, 8, 9, 12, 16, 24] {
         let x: Vec<f32> = (0..n_tokens * K)
             .map(|i| ((i * 37 % 101) as f32 - 50.0) / 97.0)
             .collect();

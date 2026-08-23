@@ -390,6 +390,58 @@ impl KvPool {
         Ok(())
     }
 
+    /// Move `keep` of `src`'s own tokens onto `dst`, which forked from it.
+    ///
+    /// How a tree's winning path becomes the sequence's future. The path forked
+    /// `dst`'s prefix and then wrote its own tokens past it; accepting the path
+    /// means those tokens are now the sequence's, so their slots change owner
+    /// rather than being copied.
+    ///
+    /// `src` must be a fork of `dst` — its borrowed prefix has to be exactly
+    /// `dst`'s current tokens, or the tokens would land after a gap. Whatever
+    /// `src` owned past `keep` goes back to the pool, since a rejected suffix is
+    /// nobody's.
+    ///
+    /// The device table needs no copy: `dst`'s new positions are `src`'s old
+    /// ones, and the entries there already name the slots being transferred.
+    pub fn adopt(&mut self, dst: SeqId, src: SeqId, keep: usize) -> Result<()> {
+        anyhow::ensure!(src.0 != dst.0, "sequence {} adopting from itself", src.0);
+        let (owned, borrowed) = {
+            let s = self.seqs[src.0]
+                .as_ref()
+                .with_context(|| format!("sequence {} is not allocated", src.0))?;
+            (s.slots[s.borrowed..].to_vec(), s.borrowed)
+        };
+        anyhow::ensure!(
+            borrowed == self.len(dst),
+            "sequence {} forked at {borrowed} but {} now holds {}; adopting \
+             would leave a gap",
+            src.0,
+            dst.0,
+            self.len(dst)
+        );
+        anyhow::ensure!(
+            keep <= owned.len(),
+            "adopting {keep} tokens from a fork that wrote {}",
+            owned.len()
+        );
+        {
+            let d = self.seqs[dst.0]
+                .as_mut()
+                .with_context(|| format!("sequence {} is not allocated", dst.0))?;
+            d.slots.extend_from_slice(&owned[..keep]);
+            d.len += keep;
+        }
+        {
+            let s = self.seqs[src.0].as_mut().unwrap();
+            s.slots.truncate(s.borrowed);
+            s.len = s.borrowed;
+        }
+        // The suffix nobody accepted.
+        self.free.extend(owned[keep..].iter().rev().copied());
+        Ok(())
+    }
+
     /// Give up a forked prefix, so the sequence owns nothing and can be freed or
     /// truncated like any other.
     ///
