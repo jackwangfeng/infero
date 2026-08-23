@@ -1,0 +1,28 @@
+[package]
+name = "tuili-metal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The Apple-GPU half of the device layer. Deliberately shaped like the subset of
+# `cudarc` that `tuili-kernels` uses -- same method names, same argument order,
+# same `LaunchConfig` field names -- so that the 160 launch sites in that crate
+# compile against either backend without a line of change. See
+# `docs/superpowers/specs/2026-08-23-tuili-metal-port-design.md`.
+
+[dependencies]
+anyhow.workspace = true
+half.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+objc2 = "0.6"
+objc2-metal = "0.3"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSString",
+] }
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
