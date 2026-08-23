@@ -690,6 +690,10 @@ impl Kernels {
     /// at every batch width this engine serves.
     pub const ARGMAX_SPLITS: usize = 32;
 
+    /// Vocabulary slices [`Self::sample_rows_split`] fans out over. Has to match
+    /// `SAMPLE_SPLITS` in the kernel, which lays out the candidate buffer.
+    pub const SAMPLE_SPLITS: usize = 64;
+
     /// [`Self::sample_rows`] when every row is greedy: the vocabulary scan split
     /// across the device and the winners reduced by a second kernel.
     ///
@@ -783,6 +787,110 @@ impl Kernels {
     /// `stride` bounds one row's entries; the kernel writes `min(keep, stride)`
     /// and reports `keep`, so a caller that sized `stride` below its `top_k`
     /// will see the truncation in `len` rather than silently losing mass.
+    /// Splits a row's vocabulary across blocks, so the top-k is one pass.
+    ///
+    /// [`Self::sample_rows`] scans the vocabulary once per survivor. At a 248320
+    /// -token vocabulary and `top_k = 40` that is forty passes in one block, and
+    /// it measured 5.99 ms against 0.71 for the host doing the same work — which
+    /// is why a speculative draft still copies its logits back. This is the same
+    /// answer `sample_rows_greedy` uses for `k = 1`: each of `SAMPLE_SPLITS`
+    /// blocks emits its slice's top-k, then one block merges. A token in the
+    /// global top-k is in its own slice's top-k, so nothing is lost.
+    ///
+    /// `cand_v`/`cand_i` need `n_rows * SAMPLE_SPLITS * top_k` entries.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_rows_split(
+        &self,
+        out: &mut CudaViewMut<'_, u32>,
+        cand_v: &mut CudaViewMut<'_, f32>,
+        cand_i: &mut CudaViewMut<'_, i32>,
+        logits: &CudaView<'_, f32>,
+        params: &CudaView<'_, f32>,
+        pen_tok: &CudaView<'_, i32>,
+        pen_cnt: &CudaView<'_, i32>,
+        pen_len: &CudaView<'_, i32>,
+        rnd: &CudaView<'_, f64>,
+        n_rows: usize,
+        vocab: usize,
+        pen_stride: usize,
+        top_k: usize,
+        survivors: Option<Survivors<'_>>,
+    ) -> Result<()> {
+        let cand_k = top_k.max(1);
+        debug_assert!(cand_v.len() >= n_rows * Self::SAMPLE_SPLITS * cand_k);
+        let (v, ps, ck) = (vocab as i32, pen_stride as i32, cand_k as i32);
+        // Stage one: the penalty bitset covers a slice, not the vocabulary.
+        let per = vocab.div_ceil(Self::SAMPLE_SPLITS);
+        let words = per.div_ceil(32);
+        let sh1 = (words * 4 + 256 * 4 * 2) as u32;
+        let f1 = self
+            .dev
+            .kernels()
+            .get("tuili_sample", sample_src(), "sample_topk_partial_f32")?;
+        let cfg1 = LaunchConfig {
+            grid_dim: (n_rows as u32, Self::SAMPLE_SPLITS as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: sh1,
+        };
+        let mut b1 = self.dev.stream().launch_builder(&f1);
+        b1.arg(&mut *cand_v)
+            .arg(&mut *cand_i)
+            .arg(logits)
+            .arg(params)
+            .arg(pen_tok)
+            .arg(pen_cnt)
+            .arg(pen_len)
+            .arg(&v)
+            .arg(&ps)
+            .arg(&ck);
+        self.dev
+            .profile()
+            .time("sample_topk_partial", self.dev.stream(), || {
+                unsafe { b1.launch(cfg1) }.context("sample_topk_partial")?;
+                Ok(())
+            })?;
+
+        // Stage two: merge, then the same tail `sample_rows` runs.
+        let f2 = self
+            .dev
+            .kernels()
+            .get("tuili_sample", sample_src(), "sample_rows_topk_f32")?;
+        let cfg2 = LaunchConfig {
+            grid_dim: (n_rows as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: (256 * 4 * 4) as u32,
+        };
+        let sstride = survivors.as_ref().map_or(0, |x| x.stride) as i32;
+        let null: u64 = 0;
+        let mut b2 = self.dev.stream().launch_builder(&f2);
+        // The candidates are read-only here; the mutable views were stage one's.
+        let cv = cand_v.as_view();
+        let ci = cand_i.as_view();
+        b2.arg(out)
+            .arg(&cv)
+            .arg(&ci)
+            .arg(params)
+            .arg(rnd)
+            .arg(&v)
+            .arg(&ck);
+        match survivors {
+            Some(x) => {
+                b2.arg(x.id).arg(x.p).arg(x.len);
+            }
+            None => {
+                b2.arg(&null).arg(&null).arg(&null);
+            }
+        }
+        b2.arg(&sstride);
+        self.dev
+            .profile()
+            .time("sample_rows_topk", self.dev.stream(), || {
+                unsafe { b2.launch(cfg2) }.context("sample_rows_topk")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     pub fn sample_rows(
         &self,
         out: &mut CudaViewMut<'_, u32>,

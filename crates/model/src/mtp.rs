@@ -149,6 +149,9 @@ pub struct MtpHead {
     /// Rows the last [`MtpHead::step`] produced.
     rows: usize,
     logits_host: Vec<f32>,
+    /// Device-sampler state for a sampled draft, one row wide. Allocated on
+    /// first use; a greedy draft never touches it.
+    samp: Option<DraftSampleBufs>,
 }
 
 impl MtpHead {
@@ -210,6 +213,7 @@ impl MtpHead {
             rows: 0,
             w,
             logits_host: vec![0.0; dims.vocab],
+            samp: None,
         })
     }
 
@@ -778,7 +782,18 @@ impl MtpHead {
     /// `head` is the text model's `lm_head`. The head has none of its own —
     /// `tie_word_embeddings` is false on this checkpoint, so `lm_head` and the
     /// embedding are different tensors and the drafter wants the former.
-    pub fn logits_row(&mut self, kern: &Kernels, head: &Matrix, row: usize) -> Result<&[f32]> {
+    /// The vocabulary projection for one row, left on the device.
+    ///
+    /// A sampled draft does not need the logits on the host: the device sampler
+    /// returns the token and the truncated distribution the acceptance rule
+    /// composes with, which is a kilobyte where these are 993 KB. Returns the
+    /// row width.
+    pub fn logits_row_device(
+        &mut self,
+        kern: &Kernels,
+        head: &Matrix,
+        row: usize,
+    ) -> Result<usize> {
         let d = self.dims.d_model;
         anyhow::ensure!(row < self.rows, "row {row} of {}", self.rows);
         anyhow::ensure!(
@@ -816,6 +831,13 @@ impl MtpHead {
                 matmul(kern, &mut out, head, &mut self.x16, &src, 1)?;
             }
         }
+        Ok(n)
+    }
+
+    /// The same, copied to the host. Callers that need only a token or a
+    /// truncated distribution should take the device path.
+    pub fn logits_row(&mut self, kern: &Kernels, head: &Matrix, row: usize) -> Result<&[f32]> {
+        let n = self.logits_row_device(kern, head, row)?;
         let stream = self.dev.stream().clone();
         stream.memcpy_dtoh(&self.logits.slice(..n), &mut self.logits_host[..n])?;
         self.dev.synchronize()?;
@@ -852,15 +874,129 @@ impl MtpHead {
         sampler: &mut crate::Sampler,
         history: &[u32],
     ) -> Result<(u32, Vec<(u32, f32)>)> {
-        let logits = self.logits_row(kern, head, row)?;
         anyhow::ensure!(
             !sampler.params().is_greedy(),
             "draft_row_sampled needs a sampling distribution; a greedy request \
              takes the greedy acceptance rule"
         );
+        let n = self.logits_row_device(kern, head, row)?;
+        let sp = sampler.params().clone();
         let draw = sampler.next_draw();
-        let (dist, total) = sampler.distribution(logits, history);
-        let token = crate::Sampler::pick(dist, total, draw);
+
+        // The penalty window, run-length encoded the way the kernel wants it:
+        // sorted unique ids with counts. Tens of tokens, so it stays on the host
+        // and rides along in the same transfer as the parameters.
+        let win = sp.repetition_window.min(history.len());
+        let mut w: Vec<u32> = history[history.len() - win..].to_vec();
+        w.sort_unstable();
+        let mut ptok: Vec<i32> = Vec::with_capacity(w.len());
+        let mut pcnt: Vec<i32> = Vec::with_capacity(w.len());
+        let mut i = 0usize;
+        while i < w.len() {
+            let t = w[i];
+            let mut c = 0i32;
+            while i < w.len() && w[i] == t {
+                c += 1;
+                i += 1;
+            }
+            if (t as usize) < n {
+                ptok.push(t as i32);
+                pcnt.push(c);
+            }
+        }
+
+        let top_k = sp.top_k.max(1);
+        let stride = top_k.max(ptok.len()).max(1);
+        let fits = matches!(&self.samp, Some(b) if b.stride >= stride);
+        if !fits {
+            let st = self.dev.stream().clone();
+            let cand = Kernels::SAMPLE_SPLITS * stride;
+            self.samp = Some(DraftSampleBufs {
+                params: st.alloc_zeros::<f32>(4)?,
+                pen_tok: st.alloc_zeros::<i32>(stride)?,
+                pen_cnt: st.alloc_zeros::<i32>(stride)?,
+                pen_len: st.alloc_zeros::<i32>(1)?,
+                rnd: st.alloc_zeros::<f64>(1)?,
+                out: st.alloc_zeros::<u32>(1)?,
+                cand_v: st.alloc_zeros::<f32>(cand)?,
+                cand_i: st.alloc_zeros::<i32>(cand)?,
+                surv_id: st.alloc_zeros::<u32>(stride)?,
+                surv_p: st.alloc_zeros::<f32>(stride)?,
+                surv_len: st.alloc_zeros::<i32>(1)?,
+                stride,
+            });
+        }
+        let b = self.samp.as_mut().unwrap();
+        let stride = b.stride;
+        let stream = self.dev.stream().clone();
+        let params = [
+            sp.temperature,
+            sp.top_p,
+            f32::from_bits(top_k as u32),
+            sp.repetition_penalty,
+        ];
+        let plen = [ptok.len() as i32];
+        ptok.resize(stride, 0);
+        pcnt.resize(stride, 0);
+        stream.memcpy_htod(&params, &mut b.params.slice_mut(..4))?;
+        stream.memcpy_htod(&ptok, &mut b.pen_tok.slice_mut(..stride))?;
+        stream.memcpy_htod(&pcnt, &mut b.pen_cnt.slice_mut(..stride))?;
+        stream.memcpy_htod(&plen, &mut b.pen_len.slice_mut(..1))?;
+        stream.memcpy_htod(&[draw], &mut b.rnd.slice_mut(..1))?;
+
+        {
+            let (pv, tv, cv2, lv, rv) = (
+                b.params.slice(..4),
+                b.pen_tok.slice(..stride),
+                b.pen_cnt.slice(..stride),
+                b.pen_len.slice(..1),
+                b.rnd.slice(..1),
+            );
+            let mut out_v = b.out.slice_mut(..1);
+            let mut cav = b.cand_v.slice_mut(..Kernels::SAMPLE_SPLITS * top_k);
+            let mut cai = b.cand_i.slice_mut(..Kernels::SAMPLE_SPLITS * top_k);
+            let mut id_v = b.surv_id.slice_mut(..stride);
+            let mut p_v = b.surv_p.slice_mut(..stride);
+            let mut len_v = b.surv_len.slice_mut(..1);
+            kern.sample_rows_split(
+                &mut out_v,
+                &mut cav,
+                &mut cai,
+                &self.logits.slice(..n),
+                &pv,
+                &tv,
+                &cv2,
+                &lv,
+                &rv,
+                1,
+                n,
+                stride,
+                top_k,
+                Some(tuili_kernels::Survivors {
+                    id: &mut id_v,
+                    p: &mut p_v,
+                    len: &mut len_v,
+                    stride,
+                }),
+            )?;
+        }
+
+        let mut tok_out = [0u32; 1];
+        let mut len_out = [0i32; 1];
+        let mut ids = vec![0u32; stride];
+        let mut ps = vec![0f32; stride];
+        stream.memcpy_dtoh(&b.out.slice(..1), &mut tok_out)?;
+        stream.memcpy_dtoh(&b.surv_len.slice(..1), &mut len_out)?;
+        stream.memcpy_dtoh(&b.surv_id.slice(..stride), &mut ids)?;
+        stream.memcpy_dtoh(&b.surv_p.slice(..stride), &mut ps)?;
+        self.dev.synchronize()?;
+        let token = tok_out[0];
+        let keep = (len_out[0].max(0) as usize).min(stride);
+        anyhow::ensure!(
+            keep > 0,
+            "the device sampler kept no survivors, so there is no `q` to accept \
+             against"
+        );
         // The *whole* distribution, normalized, not just the sampled token's
         // probability.
         //
@@ -873,9 +1009,10 @@ impl MtpHead {
         //
         // The cost is the truncated support, so top_k pairs — 40 for a typical
         // request, against a 248320-entry vocabulary.
-        let q: Vec<(u32, f32)> = dist
+        let q: Vec<(u32, f32)> = ids[..keep]
             .iter()
-            .map(|(t, w)| (*t, (*w as f64 / total) as f32))
+            .copied()
+            .zip(ps[..keep].iter().copied())
             .collect();
         anyhow::ensure!(
             q.iter().any(|(t, w)| *t == token && *w > 0.0),
@@ -1171,4 +1308,32 @@ pub fn argmax(v: &[f32]) -> u32 {
         }
     }
     best as u32
+}
+
+/// One row's device-sampler state for a draft.
+///
+/// The draft used to sample on the host: 993 KB of logits copied back per draft
+/// token and a walk over the whole vocabulary in Rust, measured at 0.709 ms of a
+/// 2.249 ms draft with the wall clock and the kernel sum taken in the same run.
+/// At `k = 2` that is 1.42 ms a round.
+///
+/// Doing it on the device needed two things. `sample_rows_f32` already had the
+/// token and the nucleus it drew from, so it now writes them out; and its top-k
+/// scanned the vocabulary once per survivor, which is forty passes over 248320
+/// tokens and measured 5.99 ms — hence `sample_rows_split`, whose candidate
+/// buffers are what `cand_v`/`cand_i` are.
+struct DraftSampleBufs {
+    params: CudaSlice<f32>,
+    pen_tok: CudaSlice<i32>,
+    pen_cnt: CudaSlice<i32>,
+    pen_len: CudaSlice<i32>,
+    rnd: CudaSlice<f64>,
+    out: CudaSlice<u32>,
+    cand_v: CudaSlice<f32>,
+    cand_i: CudaSlice<i32>,
+    surv_id: CudaSlice<u32>,
+    surv_p: CudaSlice<f32>,
+    surv_len: CudaSlice<i32>,
+    /// Survivor entries and the penalty window's pitch.
+    stride: usize,
 }

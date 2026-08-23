@@ -464,3 +464,199 @@ fn the_device_survivors_match_the_host_distribution() -> Result<()> {
     }
     Ok(())
 }
+
+/// Does the split top-k pick and normalize what the single-block scan does?
+///
+/// The split version exists because the single-block one scans the vocabulary
+/// once per survivor — forty passes over 248320 tokens at a typical `top_k`. The
+/// claim it rests on is that a token in the global top-k is in its own slice's
+/// top-k, so `top_k` candidates a slice loses nothing. If that were wrong the
+/// symptom would be a survivor missing from deep in the tail, which changes the
+/// distribution slightly and nothing else — so the two are compared entry for
+/// entry rather than by their sampled token alone.
+#[test]
+fn the_split_sampler_agrees_with_the_single_block_one() -> Result<()> {
+    let Ok(dev) = Device::new(0) else {
+        eprintln!("no CUDA device; skipping");
+        return Ok(());
+    };
+    let kern = Kernels::new(dev.clone());
+    let stream = dev.stream().clone();
+
+    let cases = [
+        SamplingParams {
+            temperature: 0.7,
+            top_p: 1.0,
+            top_k: 40,
+            repetition_penalty: 1.0,
+            repetition_window: 256,
+            seed: Some(21),
+        },
+        // A penalty heavy enough to reorder the head of the distribution, which
+        // is where a slice-local bitset could go wrong.
+        SamplingParams {
+            temperature: 0.7,
+            top_p: 0.9,
+            top_k: 40,
+            repetition_penalty: 1.4,
+            repetition_window: 256,
+            seed: Some(22),
+        },
+        // `top_k` above what any one slice holds is the padding path.
+        SamplingParams {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 200,
+            repetition_penalty: 1.05,
+            repetition_window: 64,
+            seed: Some(23),
+        },
+    ];
+
+    for (case, params) in cases.iter().enumerate() {
+        let rows = 3usize;
+        let mut all: Vec<f32> = Vec::with_capacity(rows * VOCAB);
+        let mut windows: Vec<Vec<u32>> = Vec::new();
+        for r in 0..rows {
+            all.extend_from_slice(&logits_for(case * 32 + r + 7, VOCAB));
+            // A window that includes some of the very top logits, so the
+            // penalty actually moves the ranking.
+            let w: Vec<u32> = (0..60u32)
+                .map(|i| ((i * 7 + r as u32 * 3) % 400) * 5)
+                .chain((0..30u32).map(|i| (i % 6) * 5))
+                .collect();
+            windows.push(w);
+        }
+        let mut samplers: Vec<Sampler> = (0..rows).map(|_| Sampler::new(params.clone())).collect();
+        let draws: Vec<f64> = samplers.iter_mut().map(|s| s.next_draw()).collect();
+
+        let stride = windows.iter().map(|w| w.len()).max().unwrap().max(1);
+        let effective: Vec<Vec<u32>> = windows
+            .iter()
+            .map(|w| {
+                let n = params.repetition_window.min(w.len());
+                w[w.len() - n..].to_vec()
+            })
+            .collect();
+        let (tok, cnt, len) = window_tables(&effective, stride);
+        let mut pv = vec![0f32; rows * 4];
+        for p in 0..rows {
+            pv[p * 4] = params.temperature;
+            pv[p * 4 + 1] = params.top_p;
+            pv[p * 4 + 2] = f32::from_bits(params.top_k as u32);
+            pv[p * 4 + 3] = params.repetition_penalty;
+        }
+
+        let d_logits = stream.clone_htod(&all)?;
+        let d_params = stream.clone_htod(&pv)?;
+        let d_tok = stream.clone_htod(&tok)?;
+        let d_cnt = stream.clone_htod(&cnt)?;
+        let d_len = stream.clone_htod(&len)?;
+        let d_rnd = stream.clone_htod(&draws)?;
+        let ss = params.top_k;
+
+        // Both paths, same inputs, same draws.
+        let mut want_tok = stream.alloc_zeros::<u32>(rows)?;
+        let mut want_id = stream.alloc_zeros::<u32>(rows * ss)?;
+        let mut want_p = stream.alloc_zeros::<f32>(rows * ss)?;
+        let mut want_len = stream.alloc_zeros::<i32>(rows)?;
+        {
+            let (mut o, mut i, mut p, mut l) = (
+                want_tok.as_view_mut(),
+                want_id.as_view_mut(),
+                want_p.as_view_mut(),
+                want_len.as_view_mut(),
+            );
+            kern.sample_rows(
+                &mut o,
+                &d_logits.as_view(),
+                &d_params.as_view(),
+                &d_tok.as_view(),
+                &d_cnt.as_view(),
+                &d_len.as_view(),
+                &d_rnd.as_view(),
+                rows,
+                VOCAB,
+                stride,
+                Some(tuili_kernels::Survivors {
+                    id: &mut i,
+                    p: &mut p,
+                    len: &mut l,
+                    stride: ss,
+                }),
+            )?;
+        }
+
+        let mut got_tok = stream.alloc_zeros::<u32>(rows)?;
+        let mut got_id = stream.alloc_zeros::<u32>(rows * ss)?;
+        let mut got_p = stream.alloc_zeros::<f32>(rows * ss)?;
+        let mut got_len = stream.alloc_zeros::<i32>(rows)?;
+        let ck = params.top_k.max(1);
+        let mut cv = stream.alloc_zeros::<f32>(rows * Kernels::SAMPLE_SPLITS * ck)?;
+        let mut ci = stream.alloc_zeros::<i32>(rows * Kernels::SAMPLE_SPLITS * ck)?;
+        {
+            let (mut o, mut i, mut p, mut l) = (
+                got_tok.as_view_mut(),
+                got_id.as_view_mut(),
+                got_p.as_view_mut(),
+                got_len.as_view_mut(),
+            );
+            let (mut a, mut b) = (cv.as_view_mut(), ci.as_view_mut());
+            kern.sample_rows_split(
+                &mut o,
+                &mut a,
+                &mut b,
+                &d_logits.as_view(),
+                &d_params.as_view(),
+                &d_tok.as_view(),
+                &d_cnt.as_view(),
+                &d_len.as_view(),
+                &d_rnd.as_view(),
+                rows,
+                VOCAB,
+                stride,
+                params.top_k,
+                Some(tuili_kernels::Survivors {
+                    id: &mut i,
+                    p: &mut p,
+                    len: &mut l,
+                    stride: ss,
+                }),
+            )?;
+        }
+        dev.synchronize()?;
+
+        let (wt, gt) = (stream.clone_dtoh(&want_tok)?, stream.clone_dtoh(&got_tok)?);
+        let (wi, gi) = (stream.clone_dtoh(&want_id)?, stream.clone_dtoh(&got_id)?);
+        let (wp, gp) = (stream.clone_dtoh(&want_p)?, stream.clone_dtoh(&got_p)?);
+        let (wl, gl) = (stream.clone_dtoh(&want_len)?, stream.clone_dtoh(&got_len)?);
+        for r in 0..rows {
+            assert_eq!(
+                gl[r], wl[r],
+                "case {case} row {r}: split kept {}, single block kept {}",
+                gl[r], wl[r]
+            );
+            let keep = wl[r] as usize;
+            for j in 0..keep {
+                assert_eq!(
+                    gi[r * ss + j],
+                    wi[r * ss + j],
+                    "case {case} row {r} rank {j}: split id {}, single block {}",
+                    gi[r * ss + j],
+                    wi[r * ss + j]
+                );
+                let (a, b) = (gp[r * ss + j], wp[r * ss + j]);
+                assert!(
+                    (a - b).abs() <= 1e-6 + 1e-5 * b,
+                    "case {case} row {r} rank {j}: split p {a}, single block {b}"
+                );
+            }
+            assert_eq!(
+                gt[r], wt[r],
+                "case {case} row {r}: split sampled {}, single block {}",
+                gt[r], wt[r]
+            );
+        }
+    }
+    Ok(())
+}

@@ -357,3 +357,221 @@ extern "C" __global__ void sample_rows_f32(
         }
     }
 }
+
+// ---- top-k in one pass over the vocabulary -----------------------------------
+//
+// `sample_rows_f32` above finds its survivors by scanning the vocabulary once
+// per survivor: pass `j` takes the best entry strictly below pass `j-1`. That is
+// fine at the vocabularies it was written for and quadratic in the wrong place
+// at 248320 tokens — at `top_k = 40` it is forty passes and ten million reads,
+// all in one block, and it measured 5.99 ms against the host's 0.71 for a
+// speculative draft.
+//
+// So: split the vocabulary across blocks, have each emit its own slice's top-k,
+// and merge. A token in the global top-k is in its own slice's top-k — at most
+// `k-1` tokens beat it anywhere, so at most that many beat it in its slice — so
+// `k` candidates a slice is exactly enough and nothing is lost.
+//
+// This is the shape `argmax_partial_f32` / `argmax_combine_f32` already use for
+// `k = 1`, generalized. The penalties are applied in the first stage and the
+// penalized value travels with the candidate, so the second stage and the tail
+// see exactly what a single-block scan would have.
+#define SAMPLE_SPLITS 64
+
+/// One block per (row, slice). Emits the slice's top-`k` as (value, id) pairs.
+///
+/// The penalty bitset covers the slice only — 122 words at this vocabulary and
+/// this split count, against 7760 for the whole of it — which is what lets many
+/// of these blocks be resident at once.
+extern "C" __global__ void sample_topk_partial_f32(
+    float* __restrict__ cand_v, int* __restrict__ cand_i,
+    const float* __restrict__ logits, const SampleParams* __restrict__ params,
+    const int* __restrict__ pen_tok, const int* __restrict__ pen_cnt,
+    const int* __restrict__ pen_len, int vocab, int pen_stride, int cand_k) {
+    extern __shared__ __align__(16) unsigned int smem[];
+
+    const int row = blockIdx.x;
+    const int split = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    const int per = (vocab + SAMPLE_SPLITS - 1) / SAMPLE_SPLITS;
+    const int lo = split * per;
+    const int hi = min(lo + per, vocab);
+
+    const int words = (per + 31) / 32;
+    unsigned int* bits = smem;
+    float* rv = (float*)(void*)(smem + words);
+    int* ri = (int*)(void*)(rv + SAMPLE_BLOCK);
+
+    const SampleParams p = params[row];
+    const float* row_logits = logits + (size_t)row * vocab;
+    const int plen = pen_len[row];
+    const int* ptok = pen_tok + (size_t)row * pen_stride;
+    const int* pcnt = pen_cnt + (size_t)row * pen_stride;
+    const bool greedy = p.temperature <= 0.0f || p.top_k == 1;
+    const int k = min(max(p.top_k, 1), vocab);
+
+    float* out_v = cand_v + ((size_t)row * SAMPLE_SPLITS + split) * cand_k;
+    int* out_i = cand_i + ((size_t)row * SAMPLE_SPLITS + split) * cand_k;
+
+    // Slice-local bitset: only the window entries that land in [lo, hi).
+    for (int i = tid; i < words; i += SAMPLE_BLOCK) bits[i] = 0u;
+    __syncthreads();
+    for (int i = tid; i < plen; i += SAMPLE_BLOCK) {
+        const int t = ptok[i];
+        if (t >= lo && t < hi) {
+            const int r = t - lo;
+            atomicOr(&bits[r >> 5], 1u << (r & 31));
+        }
+    }
+    __syncthreads();
+
+    // The slice's own top-`k`, by the same rule the single-block version uses,
+    // over `per` entries instead of `vocab`.
+    float lastv = INFINITY;
+    int lasti = -1;
+    for (int j = 0; j < k; ++j) {
+        float bv = -INFINITY;
+        int bi = 0;
+        bool have = false;
+        for (int i = lo + tid; i < hi; i += SAMPLE_BLOCK) {
+            float v = row_logits[i];
+            const int r = i - lo;
+            if (bits[r >> 5] & (1u << (r & 31))) {
+                v = samp_penalize(v, samp_count(ptok, pcnt, plen, i),
+                                  p.rep_penalty, greedy);
+            }
+            if (j > 0 && !samp_better(lastv, lasti, v, i)) continue;
+            if (!have || samp_better(v, i, bv, bi)) {
+                bv = v;
+                bi = i;
+                have = true;
+            }
+        }
+        rv[tid] = have ? bv : -INFINITY;
+        ri[tid] = have ? bi : 0x7fffffff;
+        samp_reduce(rv, ri, tid);
+        __syncthreads();
+        lastv = rv[0];
+        lasti = ri[0];
+        if (tid == 0) {
+            // A slice narrower than `k` runs out; `-INFINITY` with an
+            // unreachable id makes the merge ignore the padding.
+            out_v[j] = lastv;
+            out_i[j] = (lasti == 0x7fffffff) ? vocab : lasti;
+        }
+        __syncthreads();
+        if (lasti == 0x7fffffff) {
+            // Nothing left in this slice: pad the rest and stop.
+            for (int t2 = j + 1 + tid; t2 < k; t2 += SAMPLE_BLOCK) {
+                out_v[t2] = -INFINITY;
+                out_i[t2] = vocab;
+            }
+            break;
+        }
+    }
+}
+
+/// One block per row. Merges the slice candidates, then samples exactly as
+/// `sample_rows_f32` does from that point on.
+///
+/// The candidates are read from global rather than staged: `SAMPLE_SPLITS * k`
+/// is a few thousand entries, they are L2-hot, and staging them would want 32 KB
+/// of shared memory that the survivors and the reduction also need.
+extern "C" __global__ void sample_rows_topk_f32(
+    unsigned int* __restrict__ out, const float* __restrict__ cand_v,
+    const int* __restrict__ cand_i, const SampleParams* __restrict__ params,
+    const double* __restrict__ rnd, int vocab, int cand_k,
+    unsigned int* __restrict__ surv_id, float* __restrict__ surv_p,
+    int* __restrict__ surv_len, int surv_stride) {
+    extern __shared__ __align__(16) unsigned int smem[];
+
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    float* rv = (float*)(void*)smem;
+    int* ri = (int*)(void*)(rv + SAMPLE_BLOCK);
+    float* kv = (float*)(void*)(ri + SAMPLE_BLOCK);
+    int* ki = (int*)(void*)(kv + SAMPLE_BLOCK);
+
+    const SampleParams p = params[row];
+    const int k = min(max(p.top_k, 1), vocab);
+    const int total_cand = SAMPLE_SPLITS * cand_k;
+    const float* cv = cand_v + (size_t)row * total_cand;
+    const int* ci = cand_i + (size_t)row * total_cand;
+
+    float lastv = INFINITY;
+    int lasti = -1;
+    for (int j = 0; j < k; ++j) {
+        float bv = -INFINITY;
+        int bi = 0;
+        bool have = false;
+        for (int i = tid; i < total_cand; i += SAMPLE_BLOCK) {
+            const float v = cv[i];
+            const int id = ci[i];
+            if (id >= vocab) continue;  // padding from a short slice
+            if (j > 0 && !samp_better(lastv, lasti, v, id)) continue;
+            if (!have || samp_better(v, id, bv, bi)) {
+                bv = v;
+                bi = id;
+                have = true;
+            }
+        }
+        rv[tid] = have ? bv : -INFINITY;
+        ri[tid] = have ? bi : 0x7fffffff;
+        samp_reduce(rv, ri, tid);
+        __syncthreads();
+        lastv = rv[0];
+        lasti = ri[0];
+        if (tid == 0) {
+            kv[j] = lastv;
+            ki[j] = lasti;
+        }
+        __syncthreads();
+    }
+
+    // Identical to the tail of `sample_rows_f32`, in the same order and the same
+    // precision — the survivors are the same values a single-block scan would
+    // have put there.
+    if (tid == 0) {
+        const float inv_t = 1.0f / fmaxf(p.temperature, 1e-5f);
+        const float mx = kv[0];
+        double total = 0.0;
+        for (int j = 0; j < k; ++j) {
+            const double q = exp((double)((kv[j] - mx) * inv_t));
+            kv[j] = (float)q;
+            total += q;
+        }
+        int keep = k;
+        if (p.top_p < 1.0f) {
+            const double target = total * (double)fminf(fmaxf(p.top_p, 1e-4f), 1.0f);
+            double acc = 0.0;
+            keep = 0;
+            for (int j = 0; j < k; ++j) {
+                acc += (double)kv[j];
+                ++keep;
+                if (acc >= target) break;
+            }
+            if (keep < 1) keep = 1;
+            total = 0.0;
+            for (int j = 0; j < keep; ++j) total += (double)kv[j];
+        }
+        double r = rnd[row] * total;
+        unsigned int pick = (unsigned int)ki[keep - 1];
+        for (int j = 0; j < keep; ++j) {
+            r -= (double)kv[j];
+            if (r <= 0.0) {
+                pick = (unsigned int)ki[j];
+                break;
+            }
+        }
+        out[row] = pick;
+        if (surv_len) {
+            surv_len[row] = keep;
+            const double inv = total > 0.0 ? 1.0 / total : 0.0;
+            for (int j = 0; j < keep && j < surv_stride; ++j) {
+                surv_id[(size_t)row * surv_stride + j] = (unsigned int)ki[j];
+                surv_p[(size_t)row * surv_stride + j] = (float)((double)kv[j] * inv);
+            }
+        }
+    }
+}
