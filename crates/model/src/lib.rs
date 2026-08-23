@@ -454,7 +454,17 @@ struct SampleBufs {
     pen_len: cudarc::driver::CudaSlice<i32>,
     rnd: cudarc::driver::CudaSlice<f64>,
     out: cudarc::driver::CudaSlice<u32>,
+    /// Per-slice top-k candidates for `Kernels::sample_rows_split`.
+    cand_v: cudarc::driver::CudaSlice<f32>,
+    cand_i: cudarc::driver::CudaSlice<i32>,
+    /// The surviving distribution each row drew from, which is what the
+    /// speculative acceptance rule composes with.
+    surv_id: cudarc::driver::CudaSlice<u32>,
+    surv_p: cudarc::driver::CudaSlice<f32>,
+    surv_len: cudarc::driver::CudaSlice<i32>,
     stride: usize,
+    /// Entries the candidate and survivor buffers hold a row.
+    top_k: usize,
 }
 
 /// Where a step's *GPU* time goes, under `TUILI_PHASE_EVENTS`.
@@ -1428,22 +1438,20 @@ impl Model {
     /// Returns `None` when the batch is outside what the device sampler
     /// covers, which leaves the caller on the host path rather than silently
     /// sampling differently.
-    pub fn sample_on_device(
+    /// Lay out the device sampler's inputs for these rows: the penalty windows
+    /// as sorted unique ids with counts, the four parameters a row, and the
+    /// uniform draws. Grows the buffers when a wider `top_k` or window arrives.
+    ///
+    /// Shared by [`Self::sample_on_device`] and [`Self::survivors_on_device`],
+    /// which differ only in what they ask the kernel to return.
+    fn prepare_sample_bufs(
         &mut self,
         rows: &[RowSample],
         windows: &[&[u32]],
-    ) -> Result<Option<Vec<u32>>> {
+        max_k: usize,
+    ) -> Result<()> {
         let vocab = self.cfg.vocab_size;
         let n = rows.len();
-        anyhow::ensure!(n == windows.len(), "{n} rows against {} windows", windows.len());
-        if n == 0 || n != self.logit_rows {
-            return Ok(None);
-        }
-        let max_k = rows.iter().map(|r| r.top_k as usize).max().unwrap_or(1);
-        if !Kernels::can_sample_on_device(vocab, max_k.max(1)) {
-            return Ok(None);
-        }
-
         // Each window as sorted unique ids with counts. The kernel binary
         // searches this on a bitset hit, and the counts are what let it
         // reproduce the host's non-greedy path, which penalizes a token once
@@ -1485,14 +1493,11 @@ impl Model {
             rnd[i] = r.rnd;
         }
 
-        // Every row greedy means the whole batch can take the split argmax,
-        // which fills the device instead of giving each row one block. The test
-        // is the kernel's own `is_greedy()`: zero temperature, or a top-k of one.
-        let all_greedy = rows
-            .iter()
-            .all(|r| r.temperature <= 0.0 || r.top_k == 1);
         let stream = self.dev.stream().clone();
-        let fits = matches!(&self.samp, Some(b) if b.stride >= stride && b.pen_len.len() >= n);
+        let fits = matches!(
+            &self.samp,
+            Some(b) if b.stride >= stride && b.pen_len.len() >= n && b.top_k >= max_k
+        );
         if !fits {
             self.samp = Some(SampleBufs {
                 params: stream.alloc_zeros::<f32>(self.max_logit_rows * 4)?,
@@ -1507,7 +1512,17 @@ impl Model {
                 pen_len: stream.alloc_zeros::<i32>(self.max_logit_rows)?,
                 rnd: stream.alloc_zeros::<f64>(self.max_logit_rows)?,
                 out: stream.alloc_zeros::<u32>(self.max_logit_rows)?,
+                cand_v: stream.alloc_zeros::<f32>(
+                    self.max_logit_rows * Kernels::SAMPLE_SPLITS * max_k,
+                )?,
+                cand_i: stream.alloc_zeros::<i32>(
+                    self.max_logit_rows * Kernels::SAMPLE_SPLITS * max_k,
+                )?,
+                surv_id: stream.alloc_zeros::<u32>(self.max_logit_rows * max_k)?,
+                surv_p: stream.alloc_zeros::<f32>(self.max_logit_rows * max_k)?,
+                surv_len: stream.alloc_zeros::<i32>(self.max_logit_rows)?,
                 stride,
+                top_k: max_k,
             });
         }
         let b = self.samp.as_mut().unwrap();
@@ -1531,6 +1546,122 @@ impl Model {
         stream.memcpy_htod(&cnt, &mut b.pen_cnt.slice_mut(..n * stride))?;
         stream.memcpy_htod(&len, &mut b.pen_len.slice_mut(..n))?;
         stream.memcpy_htod(&rnd, &mut b.rnd.slice_mut(..n))?;
+        Ok(())
+    }
+
+    /// The truncated distribution each logit row would be sampled from, on the
+    /// device.
+    ///
+    /// Speculative verification needs `p` as numbers over its support: the
+    /// acceptance test is `min(1, p(x)/q(x))` and a rejection draws from
+    /// `(p - q)+`. Both are over the nucleus, tens of entries. Reconstructing it
+    /// on the host means copying `n * vocab` floats — 2.98 MB at three rows on
+    /// the 27B — and walking the whole vocabulary once a row, which measured
+    /// about 1.7 ms of a 29.6 ms round.
+    ///
+    /// Returns `None` when the shape is one the device sampler declines, so the
+    /// caller keeps its host path.
+    ///
+    /// The distributions come back normalized, which is what
+    /// `Sampler::pick` and `Self::draw_residual` want with `total = 1.0`. They
+    /// take unnormalized weights and a normalizer, and `w / 1.0` is `w`.
+    pub fn survivors_on_device(
+        &mut self,
+        rows: &[RowSample],
+        windows: &[&[u32]],
+    ) -> Result<Option<Vec<Vec<(u32, f32)>>>> {
+        let vocab = self.cfg.vocab_size;
+        let n = rows.len();
+        anyhow::ensure!(n == windows.len(), "{n} rows against {} windows", windows.len());
+        if n == 0 || n != self.logit_rows {
+            return Ok(None);
+        }
+        let max_k = rows.iter().map(|r| r.top_k as usize).max().unwrap_or(1).max(1);
+        self.prepare_sample_bufs(rows, windows, max_k)?;
+        let b = self.samp.as_mut().unwrap();
+        let stride = b.stride;
+        let top_k = b.top_k;
+        {
+            let (pv, tv, cv, lv, rv) = (
+                b.params.slice(..n * 4),
+                b.pen_tok.slice(..n * stride),
+                b.pen_cnt.slice(..n * stride),
+                b.pen_len.slice(..n),
+                b.rnd.slice(..n),
+            );
+            let mut out_v = b.out.slice_mut(..n);
+            let mut cav = b.cand_v.slice_mut(..n * Kernels::SAMPLE_SPLITS * max_k);
+            let mut cai = b.cand_i.slice_mut(..n * Kernels::SAMPLE_SPLITS * max_k);
+            let mut id_v = b.surv_id.slice_mut(..n * top_k);
+            let mut p_v = b.surv_p.slice_mut(..n * top_k);
+            let mut len_v = b.surv_len.slice_mut(..n);
+            self.kern.sample_rows_split(
+                &mut out_v,
+                &mut cav,
+                &mut cai,
+                &self.act.logits.slice(..n * vocab),
+                &pv,
+                &tv,
+                &cv,
+                &lv,
+                &rv,
+                n,
+                vocab,
+                stride,
+                max_k,
+                Some(tuili_kernels::Survivors {
+                    id: &mut id_v,
+                    p: &mut p_v,
+                    len: &mut len_v,
+                    stride: top_k,
+                }),
+            )?;
+        }
+        let stream = self.dev.stream().clone();
+        let mut lens = vec![0i32; n];
+        let mut ids = vec![0u32; n * top_k];
+        let mut ps = vec![0f32; n * top_k];
+        stream.memcpy_dtoh(&b.surv_len.slice(..n), &mut lens)?;
+        stream.memcpy_dtoh(&b.surv_id.slice(..n * top_k), &mut ids)?;
+        stream.memcpy_dtoh(&b.surv_p.slice(..n * top_k), &mut ps)?;
+        self.dev.synchronize()?;
+        let out = (0..n)
+            .map(|r| {
+                let keep = (lens[r].max(0) as usize).min(top_k);
+                ids[r * top_k..r * top_k + keep]
+                    .iter()
+                    .copied()
+                    .zip(ps[r * top_k..r * top_k + keep].iter().copied())
+                    .collect()
+            })
+            .collect();
+        Ok(Some(out))
+    }
+
+    pub fn sample_on_device(
+        &mut self,
+        rows: &[RowSample],
+        windows: &[&[u32]],
+    ) -> Result<Option<Vec<u32>>> {
+        let vocab = self.cfg.vocab_size;
+        let n = rows.len();
+        anyhow::ensure!(n == windows.len(), "{n} rows against {} windows", windows.len());
+        if n == 0 || n != self.logit_rows {
+            return Ok(None);
+        }
+        let max_k = rows.iter().map(|r| r.top_k as usize).max().unwrap_or(1);
+        if !Kernels::can_sample_on_device(vocab, max_k.max(1)) {
+            return Ok(None);
+        }
+
+        // Every row greedy means the whole batch can take the split argmax,
+        // which fills the device instead of giving each row one block. The test
+        // is the kernel's own `is_greedy()`: zero temperature, or a top-k of one.
+        let all_greedy = rows.iter().all(|r| r.temperature <= 0.0 || r.top_k == 1);
+        self.prepare_sample_bufs(rows, windows, max_k.max(1))?;
+        let b = self.samp.as_mut().unwrap();
+        let stride = b.stride;
+        let stream = self.dev.stream().clone();
 
         let (params_v, tok_v, cnt_v, len_v, rnd_v) = (
             b.params.slice(..n * 4),

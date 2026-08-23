@@ -652,23 +652,70 @@ impl Model {
         let vocab = self.cfg.vocab_size;
         // Copied out because building each row's distribution borrows the
         // sampler mutably while the logits live in `self`.
-        let logits: Vec<f32> = self.logits_host()?.to_vec();
-
         // Walk the draft, extending the window as tokens are accepted.
         let mut window: Vec<u32> = history.to_vec();
         window.push(pending);
+
+        // Every row's penalty window is known before the loop runs, because row
+        // `j`'s distribution is only ever consulted when rows `0..j` were all
+        // accepted — so its window is the history plus the first `j` drafted
+        // tokens, whatever the acceptance test decides. That is what lets all
+        // `n` distributions come from one device call.
+        let mut win_owned: Vec<Vec<u32>> = Vec::with_capacity(n);
+        {
+            let mut w = window.clone();
+            for j in 0..n {
+                win_owned.push(w.clone());
+                if let Some(d) = draft.get(j) {
+                    w.push(d.token);
+                }
+            }
+        }
+        let sp = sampler.params().clone();
+        let row_specs: Vec<crate::RowSample> = (0..n)
+            .map(|_| crate::RowSample {
+                temperature: sp.temperature,
+                top_p: sp.top_p,
+                top_k: sp.top_k as u32,
+                rep_penalty: sp.repetition_penalty,
+                // Unused: every draw this function needs comes from `sampler`,
+                // in the order the host path took them, so a seed reproduces the
+                // same stream. The device only supplies the distributions.
+                rnd: 0.0,
+            })
+            .collect();
+        let win_refs: Vec<&[u32]> = win_owned.iter().map(|w| w.as_slice()).collect();
+        let device_dists = self.survivors_on_device(&row_specs, &win_refs)?;
+
+        // The host fallback keeps the whole vocabulary; the device path returns
+        // the nucleus, which is what both the acceptance test and the residual
+        // are over. 2.98 MB and three full-vocabulary passes against a kilobyte.
+        let logits: Vec<f32> = if device_dists.is_some() {
+            Vec::new()
+        } else {
+            self.logits_host()?.to_vec()
+        };
         let mut tokens: Vec<u32> = Vec::with_capacity(n);
         let mut accepted = 0usize;
         for (j, d) in draft.iter().enumerate() {
             let token = d.token;
-            let row = &logits[j * vocab..(j + 1) * vocab];
             // Both draws come out before the distribution borrows the sampler.
             // Taking them unconditionally also keeps the generator's sequence
             // independent of which branch runs, so a seed reproduces the same
             // stream whether a draft was accepted or not.
             let draw = sampler.next_draw();
             let residual_draw = sampler.next_draw();
-            let (dist, total) = sampler.distribution(row, &window);
+            // Normalized already on the device path, so the normalizer is one —
+            // `pick` and `draw_residual` both take weights and a total, and
+            // `w / 1.0` is `w`.
+            let (dist, total): (&[(u32, f32)], f64) = match &device_dists {
+                Some(d) => (&d[j], 1.0),
+                None => {
+                    let row = &logits[j * vocab..(j + 1) * vocab];
+                    let (dd, tt) = sampler.distribution(row, &window);
+                    (dd, tt)
+                }
+            };
             let p_target = dist
                 .iter()
                 .find(|(t, _)| *t == token)
@@ -701,9 +748,15 @@ impl Model {
         if accepted == draft.len() {
             // Every draft survived, so the target's own extra row is a free
             // token — the bonus that makes k accepted drafts worth k + 1.
-            let row = &logits[draft.len() * vocab..(draft.len() + 1) * vocab];
             let draw = sampler.next_draw();
-            let (dist, total) = sampler.distribution(row, &window);
+            let (dist, total): (&[(u32, f32)], f64) = match &device_dists {
+                Some(d) => (&d[draft.len()], 1.0),
+                None => {
+                    let row = &logits[draft.len() * vocab..(draft.len() + 1) * vocab];
+                    let (dd, tt) = sampler.distribution(row, &window);
+                    (dd, tt)
+                }
+            };
             tokens.push(crate::Sampler::pick(dist, total, draw));
         }
         debug_assert!(!tokens.is_empty(), "a step has to emit something");
