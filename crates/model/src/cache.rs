@@ -43,7 +43,17 @@ enum Storage {
 }
 
 struct SeqState {
-    len: usize,
+len: usize,
+    /// Leading slots this sequence borrows from another rather than owning.
+    ///
+    /// A tree draft's verification runs every root-to-leaf path as its own
+    /// sequence over the same prefix, and copying the prefix's keys per path
+    /// would cost more than the pass. So a forked sequence points at the
+    /// original's slots and must not return them: `free` and `truncate` stop
+    /// here. Getting that wrong hands another request's cache to the allocator,
+    /// which is why it is a field and not a convention.
+    borrowed: usize,
+    
     /// Physical slots this sequence holds, in logical order.
     slots: Vec<i32>,
 }
@@ -300,6 +310,7 @@ impl KvPool {
         self.seqs[idx] = Some(SeqState {
             len: 0,
             slots: Vec::new(),
+            borrowed: 0,
         });
         Some(SeqId(idx))
     }
@@ -307,7 +318,96 @@ impl KvPool {
     /// Release a sequence and return its slots to the pool.
     pub fn free(&mut self, id: SeqId) {
         if let Some(state) = self.seqs.get_mut(id.0).and_then(Option::take) {
-            self.free.extend(state.slots.into_iter().rev());
+            // Only what this sequence owns. A forked prefix belongs to the
+            // sequence it was forked from, and returning it here would hand the
+            // allocator slots another sequence is still reading.
+            self.free
+                .extend(state.slots.into_iter().skip(state.borrowed).rev());
+        }
+    }
+
+    /// Point `dst` at `src`'s tokens, sharing the slots rather than copying them.
+    ///
+    /// A tree draft's verification runs every root-to-leaf path as its own
+    /// sequence over the same prefix. Copying the prefix's keys per path would
+    /// cost more than the pass it is for — the whole point of the tree is that
+    /// the pass is nearly free at these widths — so `dst` borrows them and may
+    /// not return them. [`Self::free`] and [`Self::truncate`] both stop at the
+    /// fork point.
+    ///
+    /// The device table has to be copied even though the slots are not: it is
+    /// persistent and written a token at a time, so `dst`'s prefix entries have
+    /// never been filled in. That is `len` ints, under a kilobyte at these
+    /// lengths.
+    ///
+    /// `dst` must be empty. Forking onto a sequence with tokens of its own would
+    /// leave two owners for one slot, which is the failure this method's whole
+    /// shape exists to prevent.
+    pub fn fork(&mut self, dev: &Device, src: SeqId, dst: SeqId) -> Result<()> {
+        anyhow::ensure!(src.0 != dst.0, "forking sequence {} onto itself", src.0);
+        anyhow::ensure!(
+            self.len(dst) == 0,
+            "sequence {} holds {} tokens; a fork wants an empty destination",
+            dst.0,
+            self.len(dst)
+        );
+        let (slots, len) = {
+            let s = self.seqs[src.0]
+                .as_ref()
+                .with_context(|| format!("sequence {} is not allocated", src.0))?;
+            (s.slots.clone(), s.len)
+        };
+        {
+            let d = self.seqs[dst.0]
+                .as_mut()
+                .with_context(|| format!("sequence {} is not allocated", dst.0))?;
+            d.slots = slots;
+            d.len = len;
+            d.borrowed = len;
+        }
+        // The persistent table's prefix, `src`'s row into `dst`'s.
+        let stride = self.max_seq;
+        let (a, b) = (src.0 * stride, dst.0 * stride);
+        let n = len;
+        if n > 0 {
+            let table = &mut self.slot_table;
+            if a < b {
+                let (lo, mut hi) = table.split_at_mut(b);
+                let from = lo.slice(a..a + n);
+                let mut to = hi.slice_mut(..n);
+                dev.stream().memcpy_dtod(&from, &mut to)?;
+            } else {
+                let (mut lo, hi) = table.split_at_mut(a);
+                let mut to = lo.slice_mut(b..b + n);
+                let from = hi.slice(..n);
+                dev.stream().memcpy_dtod(&from, &mut to)?;
+            }
+        }
+        // The recurrence cannot fork, so its state is copied outright.
+        if let Some(g) = self.gdn.as_mut() {
+            g.fork(dev, src, dst)?;
+        }
+        Ok(())
+    }
+
+    /// Give up a forked prefix, so the sequence owns nothing and can be freed or
+    /// truncated like any other.
+    ///
+    /// Separate from `free` because a tree's paths are forked and dropped every
+    /// round, and a caller that forgets this leaks nothing — it is the *opposite*
+    /// mistake, freeing a borrowed slot, that this design makes impossible.
+    pub fn drop_fork(&mut self, id: SeqId) {
+        if let Some(s) = self.seqs[id.0].as_mut() {
+            // What it owns goes back; what it borrowed is simply forgotten. The
+            // first version of this cleared the whole vector, which dropped the
+            // owned slots on the floor — a leak that only shows as a pool
+            // slowly running out under load.
+            let at = s.borrowed.min(s.slots.len());
+            let own: Vec<i32> = s.slots.split_off(at);
+            s.slots.clear();
+            s.len = 0;
+            s.borrowed = 0;
+            self.free.extend(own.into_iter().rev());
         }
     }
 
@@ -420,12 +520,26 @@ impl KvPool {
     /// Drop the tail of a sequence back to `len` tokens, returning its slots.
     pub fn truncate(&mut self, id: SeqId, len: usize) {
         if let Some(state) = self.seqs[id.0].as_mut() {
-            while state.len > len {
+            while state.len > len && state.len > state.borrowed {
                 if let Some(slot) = state.slots.pop() {
                     self.free.push(slot);
                 }
                 state.len -= 1;
             }
+            // Below the fork point is not expressible, and the loop above has
+            // already stopped there. Letting `len` fall under `borrowed` would
+            // leave the sequence claiming to be shorter than the slots it holds,
+            // and the next reservation would append past the borrowed prefix and
+            // leave a hole in the middle. So the length clamps, the same stance
+            // `GdnState::truncate` takes for a partial rollback: say what
+            // happened rather than fake it.
+            debug_assert!(
+                len >= state.borrowed || state.borrowed == 0,
+                "truncating forked sequence {} to {len}, below its borrowed \
+                 prefix of {}; drop the fork first",
+                id.0,
+                state.borrowed
+            );
         }
     }
 

@@ -831,3 +831,92 @@ fn a_two_wide_tree_is_well_formed() -> Result<()> {
     );
     Ok(())
 }
+
+/// A forked sequence shares its prefix's slots and computes from them.
+///
+/// Two claims, and the second is the one that matters. The bookkeeping claim is
+/// that a fork consumes no slots and gives back only what it owns — get that
+/// wrong and the allocator hands one sequence's cache to the next request, which
+/// reads as another user's text bleeding into this one rather than as a crash.
+/// The computational claim is that a forward pass on the fork sees the prefix:
+/// the same token after the same history has to give the same logits, or the
+/// shared table is pointing somewhere else.
+#[test]
+fn a_forked_sequence_shares_its_prefix_and_computes_from_it() -> Result<()> {
+    let _gpu = gpu_lock();
+    let Some((mut model, tok)) = load("qwen2.5-0.5b-instruct-q8_0.gguf", 2)? else {
+        return Ok(());
+    };
+    let prompt = tok.encode(PROMPT, Some(false), false);
+    let mut pool = model.new_pool(512, 4)?;
+    let free0 = pool.free_slots();
+
+    let src = pool.alloc().expect("no slot");
+    let pending = prime(&mut model, &mut pool, src, &prompt)?;
+    let src_len = pool.len(src);
+    let after_prime = pool.free_slots();
+    assert_eq!(after_prime, free0 - src_len, "priming should cost its tokens");
+    let src_table = pool.read_slot_table(model.device(), src)?;
+
+    // What the source would produce for the next token, for comparison.
+    let want = {
+        let it = BatchItem::new(src, std::slice::from_ref(&pending));
+        model.forward_batch_device(std::slice::from_ref(&it), &mut pool)?;
+        let v = model.logits_host()?.to_vec();
+        pool.truncate(src, src_len);
+        v
+    };
+
+    let dst = pool.alloc().expect("no second slot");
+    pool.fork(model.device(), src, dst)?;
+    assert_eq!(
+        pool.free_slots(),
+        after_prime,
+        "a fork must not consume slots of its own"
+    );
+    assert_eq!(pool.len(dst), src_len, "a fork inherits the length");
+    let dst_table = pool.read_slot_table(model.device(), dst)?;
+    assert_eq!(
+        &dst_table[..src_len],
+        &src_table[..src_len],
+        "the fork's prefix must map to the same slots, not to copies"
+    );
+
+    // The same token on the fork, which owns this one slot.
+    let got = {
+        let it = BatchItem::new(dst, std::slice::from_ref(&pending));
+        model.forward_batch_device(std::slice::from_ref(&it), &mut pool)?;
+        model.logits_host()?.to_vec()
+    };
+    assert_eq!(
+        pool.free_slots(),
+        after_prime - 1,
+        "the fork's own token should cost one slot"
+    );
+    let num: f32 = got.iter().zip(&want).map(|(a, b)| (a - b) * (a - b)).sum();
+    let den: f32 = want.iter().map(|b| b * b).sum::<f32>().max(1e-12);
+    let rel = (num / den).sqrt();
+    assert!(
+        rel < 1e-5,
+        "the fork's logits differ from the source's by {rel:.2e}; it is not \
+         reading the shared prefix"
+    );
+
+    // Giving the fork up returns its own slot and none of the prefix's, and
+    // freeing both ends where the pool started.
+    pool.drop_fork(dst);
+    assert_eq!(
+        pool.free_slots(),
+        after_prime,
+        "dropping a fork should return its own slots and none of the prefix's"
+    );
+    assert_eq!(pool.len(src), src_len, "the source's length changed");
+    pool.free(dst);
+    pool.free(src);
+    assert_eq!(
+        pool.free_slots(),
+        free0,
+        "the pool leaked or double-freed across a fork"
+    );
+    Ok(())
+}

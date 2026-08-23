@@ -197,6 +197,60 @@ impl GdnState {
         Ok(())
     }
 
+    /// Copy one sequence's recurrent and convolution state onto another.
+    ///
+    /// A tree draft's verification runs every root-to-leaf path as its own
+    /// sequence, and each starts from the state the shared prefix left behind.
+    /// The recurrence cannot fork — a state is advanced along a sequence, not
+    /// branched — so the fork is a copy, and this is it.
+    ///
+    /// 3 MiB a layer on the 27B, so 151 MiB for a whole state. A four-path tree
+    /// copies three of them: 906 MiB moved, about 0.6 ms, which is the price of
+    /// admission for a shape the recurrence will not otherwise allow.
+    pub fn fork(&mut self, dev: &Device, src: SeqId, dst: SeqId) -> Result<()> {
+        anyhow::ensure!(
+            src.0 < self.max_seqs && dst.0 < self.max_seqs,
+            "sequences {} and {} against a pool of {}",
+            src.0,
+            dst.0,
+            self.max_seqs
+        );
+        anyhow::ensure!(src.0 != dst.0, "forking sequence {} onto itself", src.0);
+        // Both spans live in one buffer, so the borrow checker will not hand out
+        // a read and a write at once — correctly, since it cannot know they are
+        // disjoint. `split_at_mut` at the later span's start proves it: two
+        // halves, the source wholly in one and the destination wholly in the
+        // other, whichever way round they fall.
+        let copy = |dev: &Device,
+                    buf: &mut cudarc::driver::CudaSlice<f32>,
+                    from: std::ops::Range<usize>,
+                    to: std::ops::Range<usize>|
+         -> Result<()> {
+            debug_assert_eq!(from.end - from.start, to.end - to.start);
+            debug_assert!(from.end <= to.start || to.end <= from.start, "overlapping spans");
+            let n = from.end - from.start;
+            if from.start < to.start {
+                let (lo, mut hi) = buf.split_at_mut(to.start);
+                let a = lo.slice(from.start..from.start + n);
+                let mut b = hi.slice_mut(..n);
+                dev.stream().memcpy_dtod(&a, &mut b)?;
+            } else {
+                let (mut lo, hi) = buf.split_at_mut(from.start);
+                let mut b = lo.slice_mut(to.start..to.start + n);
+                let a = hi.slice(..n);
+                dev.stream().memcpy_dtod(&a, &mut b)?;
+            }
+            Ok(())
+        };
+        for ordinal in 0..self.n_linear {
+            let (a, b) = (self.recurrent_span(src, ordinal), self.recurrent_span(dst, ordinal));
+            copy(dev, &mut self.recurrent, a, b)?;
+            let (a, b) = (self.conv_span(src, ordinal), self.conv_span(dst, ordinal));
+            copy(dev, &mut self.conv, a, b)?;
+        }
+        Ok(())
+    }
+
     /// What a truncation means for a sequence with recurrent state.
     ///
     /// Returns whether the caller must re-prefill from scratch. Truncating to
