@@ -794,6 +794,29 @@ impl Model {
         q: &[(u32, f32)],
         draw: f64,
     ) -> u32 {
+        match Self::residual(dist, total, q) {
+            Some((residual, sum)) => crate::Sampler::pick(&residual, sum, draw),
+            // The target's support is entirely covered by the draft's, which can
+            // only happen when the two agree completely. Any token of that
+            // shared support is a correct draw; the first is the most likely.
+            None => dist.first().map(|(t, _)| *t).unwrap_or(0),
+        }
+    }
+
+    /// `(p - q)+` over the target's support, unnormalized, with its own total.
+    ///
+    /// `None` when nothing is left, which needs `p`'s support to sit entirely
+    /// inside `q`'s with no more mass anywhere — only reachable when the two
+    /// distributions agree.
+    ///
+    /// Split out from [`Self::draw_residual`] because multi-candidate acceptance
+    /// needs the residual as a *distribution* to test the next candidate
+    /// against, not a draw from it.
+    pub fn residual(
+        dist: &[(u32, f32)],
+        total: f64,
+        q: &[(u32, f32)],
+    ) -> Option<(Vec<(u32, f32)>, f64)> {
         let q_of = |tok: u32| {
             q.iter()
                 .find(|(t, _)| *t == tok)
@@ -812,12 +835,76 @@ impl Model {
             }
         }
         if residual.is_empty() || sum <= 0.0 {
-            // The target's support is entirely covered by the draft's, which can
-            // only happen when the two agree completely. Any token of that
-            // shared support is a correct draw; the first is the most likely.
-            return dist.first().map(|(t, _)| *t).unwrap_or(0);
+            return None;
         }
-        crate::Sampler::pick(&residual, sum, draw)
+        Some((residual, sum))
+    }
+
+    /// Accept one of several candidates for the same position, or draw from what
+    /// is left of the target.
+    ///
+    /// The one-candidate rule with the residual carried forward. Reject `x_i` and
+    /// the target becomes `norm((p - q)+)`; the next candidate is tested against
+    /// *that*, not against the original `p`. With the candidates drawn i.i.d.
+    /// from `q`, the composition is exactly `p` — the same argument the
+    /// one-candidate case rests on, applied down the list.
+    ///
+    /// This is what a tree draft needs and what "take whichever branch accepted"
+    /// is not: picking the best of several branches conditions on the outcome and
+    /// biases what comes out, however natural it looks.
+    ///
+    /// `draws` supplies one uniform per candidate and `final_draw` the fallback.
+    /// Taking them all up front keeps the generator's sequence independent of how
+    /// many candidates were tested, so a seed reproduces the same stream.
+    ///
+    /// Returns which candidate was accepted, if any, and the token to emit.
+    pub fn accept_multi(
+        p: &[(u32, f32)],
+        p_total: f64,
+        q: &[(u32, f32)],
+        candidates: &[u32],
+        draws: &[f64],
+        final_draw: f64,
+    ) -> (Option<usize>, u32) {
+        debug_assert!(draws.len() >= candidates.len());
+        // Normalized once, so the loop below can keep replacing it with a
+        // residual that is also normalized-with-a-total.
+        let mut cur: Vec<(u32, f32)> = p
+            .iter()
+            .map(|(t, w)| (*t, (*w as f64 / p_total) as f32))
+            .collect();
+        let mut cur_total = 1.0f64;
+        for (i, &x) in candidates.iter().enumerate() {
+            let q_x = q
+                .iter()
+                .find(|(t, _)| *t == x)
+                .map(|(_, w)| *w as f64)
+                .unwrap_or(0.0);
+            let p_x = cur
+                .iter()
+                .find(|(t, _)| *t == x)
+                .map(|(_, w)| *w as f64 / cur_total)
+                .unwrap_or(0.0);
+            // A candidate outside the target's remaining support has probability
+            // zero there and is always rejected, which is how top-k and top-p
+            // keep speculation from smuggling in tokens the request excluded.
+            if q_x > 0.0 && p_x / q_x >= draws[i] {
+                return (Some(i), x);
+            }
+            match Self::residual(&cur, cur_total, q) {
+                Some((r, t)) => {
+                    cur = r;
+                    cur_total = t;
+                }
+                // Nothing left to subtract from: the remaining target and the
+                // draft agree, so any token of the shared support is a correct
+                // draw and there is no point testing further candidates.
+                None => {
+                    return (None, cur.first().map(|(t, _)| *t).unwrap_or(0));
+                }
+            }
+        }
+        (None, crate::Sampler::pick(&cur, cur_total, final_draw))
     }
 
     /// Roll every kind of per-sequence memory back to the accepted prefix.

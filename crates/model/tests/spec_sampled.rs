@@ -171,3 +171,170 @@ fn a_draft_outside_the_targets_support_cannot_be_accepted() {
         "token {outside} is outside the support and must carry no weight"
     );
 }
+
+/// Does the multi-candidate rule still emit exactly the target's distribution?
+///
+/// This is the correctness question for a tree draft. The tempting rule — run
+/// several branches and keep whichever accepted — conditions on the outcome and
+/// biases what comes out, however natural it looks. The rule that does not is the
+/// one-candidate rule with the residual carried forward: reject `x_i` and the
+/// target becomes `norm((p - q)+)`, and the next candidate is tested against
+/// that.
+///
+/// Held to the same standard as the single-candidate test above: Monte Carlo
+/// against the target's own probabilities, with a deliberately mismatched drafter
+/// so rejection and the residual path carry most of the traffic. `B = 1` is
+/// included because it has to reduce to the rule the engine already ships.
+#[test]
+fn the_multi_candidate_composition_is_a_draw_from_the_target() {
+    const VOCAB: usize = 64;
+    const ROUNDS: usize = 400_000;
+
+    for b in [1usize, 2, 4] {
+        for (t, top_p, top_k) in [(1.0f32, 1.0f32, usize::MAX), (0.7, 0.95, 12)] {
+            let target_logits = logits(VOCAB, 0xccc);
+            let draft_logits = logits(VOCAB, 0xddd);
+            let sp = params(t, top_p, top_k, 1.0);
+
+            let mut s = Sampler::new(sp.clone());
+            let (tdist, ttotal) = s.distribution(&target_logits, &[]);
+            let target: Vec<(u32, f64)> = tdist
+                .iter()
+                .map(|(tok, w)| (*tok, *w as f64 / ttotal))
+                .collect();
+            let mut s2 = Sampler::new(sp.clone());
+            let (ddist, dtotal) = s2.distribution(&draft_logits, &[]);
+            let draft: Vec<(u32, f64)> = ddist
+                .iter()
+                .map(|(tok, w)| (*tok, *w as f64 / dtotal))
+                .collect();
+
+            let tvec: Vec<(u32, f32)> = target.iter().map(|(x, p)| (*x, *p as f32)).collect();
+            let qvec: Vec<(u32, f32)> = draft.iter().map(|(x, p)| (*x, *p as f32)).collect();
+
+            let mut st = 0x9E3779B97F4A7C15u64;
+            let mut next = || {
+                st ^= st << 13;
+                st ^= st >> 7;
+                st ^= st << 17;
+                (st >> 11) as f64 / (1u64 << 53) as f64
+            };
+
+            let mut counts: HashMap<u32, usize> = HashMap::new();
+            for _ in 0..ROUNDS {
+                // `b` candidates drawn i.i.d. from the draft — which is what a
+                // tree's siblings are, all sampled from their parent's `q`.
+                let cands: Vec<u32> = (0..b)
+                    .map(|_| {
+                        let mut r = next();
+                        let mut pick = draft.last().unwrap().0;
+                        for (tok, p) in &draft {
+                            r -= p;
+                            if r <= 0.0 {
+                                pick = *tok;
+                                break;
+                            }
+                        }
+                        pick
+                    })
+                    .collect();
+                let draws: Vec<f64> = (0..b).map(|_| next()).collect();
+                let (_, emitted) = tuili_model::Model::accept_multi(
+                    &tvec,
+                    1.0,
+                    &qvec,
+                    &cands,
+                    &draws,
+                    next(),
+                );
+                *counts.entry(emitted).or_default() += 1;
+            }
+
+            // The same bound the single-candidate test uses: at 400k rounds the
+            // standard error on a probability is under 0.0008, so 0.006 is seven
+            // sigma on the largest bin.
+            let mut worst = 0.0f64;
+            let mut worst_tok = 0u32;
+            for (tok, p) in &target {
+                let seen = *counts.get(tok).unwrap_or(&0) as f64 / ROUNDS as f64;
+                if (seen - p).abs() > worst {
+                    worst = (seen - p).abs();
+                    worst_tok = *tok;
+                }
+            }
+            assert!(
+                worst < 0.006,
+                "b={b} t={t} top_p={top_p} top_k={top_k}: token {worst_tok} came \
+                 out {worst:.4} away from the target's probability; the \
+                 multi-candidate composition is not sampling from the target"
+            );
+
+            // And nothing outside the target's support may ever come out.
+            for tok in counts.keys() {
+                assert!(
+                    target.iter().any(|(t2, _)| t2 == tok),
+                    "b={b}: token {tok} was emitted but is outside the target's \
+                     support"
+                );
+            }
+
+            // And the rule this is *not*: test each candidate against the
+            // original `p` and keep the first that passes. It looks like the
+            // same thing and is the obvious way to extend a tree, so the reason
+            // not to write it should be a measurement rather than a remark.
+            if b > 1 {
+                let mut st2 = 0x9E3779B97F4A7C15u64;
+                let mut next2 = || {
+                    st2 ^= st2 << 13;
+                    st2 ^= st2 >> 7;
+                    st2 ^= st2 << 17;
+                    (st2 >> 11) as f64 / (1u64 << 53) as f64
+                };
+                let p_of = |d: &[(u32, f64)], tok: u32| {
+                    d.iter().find(|(t2, _)| *t2 == tok).map(|(_, p)| *p).unwrap_or(0.0)
+                };
+                let mut naive: HashMap<u32, usize> = HashMap::new();
+                for _ in 0..ROUNDS {
+                    let cands: Vec<u32> = (0..b)
+                        .map(|_| {
+                            let mut r = next2();
+                            let mut pick = draft.last().unwrap().0;
+                            for (tok, p) in &draft {
+                                r -= p;
+                                if r <= 0.0 {
+                                    pick = *tok;
+                                    break;
+                                }
+                            }
+                            pick
+                        })
+                        .collect();
+                    let mut emitted = None;
+                    for x in &cands {
+                        let q = p_of(&draft, *x);
+                        let p = p_of(&target, *x);
+                        if q > 0.0 && p / q >= next2() {
+                            emitted = Some(*x);
+                            break;
+                        }
+                    }
+                    let e = emitted.unwrap_or_else(|| {
+                        tuili_model::Model::draw_residual(&tvec, 1.0, &qvec, next2())
+                    });
+                    *naive.entry(e).or_default() += 1;
+                }
+                let mut nworst = 0.0f64;
+                for (tok, p) in &target {
+                    let seen = *naive.get(tok).unwrap_or(&0) as f64 / ROUNDS as f64;
+                    nworst = nworst.max((seen - p).abs());
+                }
+                assert!(
+                    nworst > 0.006,
+                    "b={b} t={t}: the naive rule came within {nworst:.4} of the \
+                     target, so this test no longer distinguishes it from the \
+                     residual-carrying one and the comment above is unearned"
+                );
+            }
+        }
+    }
+}
