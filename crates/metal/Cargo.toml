@@ -30,6 +30,7 @@ tracing-subscriber.workspace = true
 # same logits fixture the CUDA tests use. Dev-only: the library itself knows
 # nothing about models.
 tuili-gguf.workspace = true
+tuili-tokenizer.workspace = true
 serde_json = "1"
 
 [[example]]

@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow};
 use half::f16;
 use tuili_gguf::{Gguf, GgmlType};
+use tuili_tokenizer::Tokenizer;
 use tuili_metal::{Buf, Device, LaunchConfig, View, ViewMut};
 
 const COMMON_METAL: &str = include_str!("../../kernels/src/msl/common.metal");
@@ -584,8 +585,57 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    let want_prompt = {
+        let mut a = std::env::args().skip_while(|a| a != "--prompt");
+        a.next();
+        a.next()
+    };
+
     let w = Weights::load(&dev, &g, &cfg)?;
     let eng = Engine { dev, cfg, w };
+
+    if let Some(prompt) = want_prompt {
+        let tok = Tokenizer::from_gguf(&g)?;
+        let ids = tok.encode(&prompt, Some(false), true);
+        let n_new = 96usize;
+        let mut sess = Session::new(&eng.dev, &eng.cfg, ids.len() + n_new + 1)?;
+
+        print!("{prompt}");
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+
+        let started = std::time::Instant::now();
+        let mut logits = eng.forward(&mut sess, &ids)?;
+        let prefill = started.elapsed();
+
+        let mut det = tok.detokenizer();
+        let decode_start = std::time::Instant::now();
+        let mut produced = 0usize;
+        for p in ids.len()..ids.len() + n_new {
+            let next = argmax(&logits);
+            if tok.is_eog(next) {
+                break;
+            }
+            print!("{}", det.push(next));
+            std::io::stdout().flush().ok();
+            produced += 1;
+            eng.step(&mut sess, next, p)?;
+            logits = sess.logits.to_vec();
+        }
+        print!("{}", det.finish());
+        println!();
+
+        let d = decode_start.elapsed();
+        eprintln!(
+            "\nprefill {:>7.1} ms ({:.1} tok/s over {} tokens)\ndecode  {:>7.1} ms ({:.1} tok/s over {produced} tokens)",
+            prefill.as_secs_f64() * 1e3,
+            ids.len() as f64 / prefill.as_secs_f64(),
+            ids.len(),
+            d.as_secs_f64() * 1e3,
+            produced as f64 / d.as_secs_f64(),
+        );
+        return Ok(());
+    }
 
     // The four cases from `crates/model/tests/fixtures/`, ids and all, so that
     // this reads the same oracle the CUDA tests read.

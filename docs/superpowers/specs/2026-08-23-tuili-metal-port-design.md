@@ -218,6 +218,31 @@ S1 是唯一有「改坏现有东西」风险的阶段，所以它的设计是**
   --workspace --all-targets` — 12.05s 通过。cudarc 开了 `dynamic-loading`，
   `libcuda` 是运行时 dlopen，编译期不链接
 
+## 进度（2026-08-24）
+
+**S0 基线** ✅ lenserver 上 WIP 已 stash，`cargo test --workspace --release` 63 个测试块
+全 ok、0 失败；两个 0.5B 模型的贪心输出已录。（坑：非交互 ssh 的 PATH 里没有 cargo，
+要显式 `$HOME/.cargo/bin`。）
+
+**S2 Metal 骨架** ✅ `crates/metal`：device / buffer / msl / launch 四个文件。7 个运行时
+测试在 M4 Max 上通过（simd 32、working set 28.1 GiB）。其中一个测试抓到真 bug：
+pipeline 缓存漏了源码哈希，改了源码会拿到旧 pipeline。
+
+**S3 F16 kernel** ✅ 9 个 MSL kernel（`crates/kernels/src/msl/{common,ops}.metal`），
+7 个对 CPU 参考的单测通过。**四个 fixture case 全部匹配参考 logits**——argmax 逐个精确、
+top-10 重合 9~10/10、std 差 ≤0.06。`--prompt` 能生成连贯文本，decode 107 tok/s
+（A4000 上 CUDA fp16 是 121.9 tok/s）。
+
+那个唯一的 bug 值得记住：7 个 kernel 单测全过而端到端 logits 全错（量级对、token 全不同），
+原因在组合层——24 层共用了一个 KV 平面，于是每层都在读第 23 层的历史。
+**是 `--cpu` 那个宿主仲裁器一次定位的**：kernel 测试只能发现 kernel 的错，
+发现接线错误需要一个独立的整模型参考。
+
+**尚未开始**：S1（把 `kernels`/`model` 泛型化，686 处类型引用 + 160 个 launch 站点，
+这是把垂直切片折进真引擎的那一步）、S4（MPS `gemm_f16`，让 prefill 不必逐 token 走）、
+S5（Q8_0）。现在的 demo 是 `crates/metal/examples/qwen2_f16.rs`，**它不是引擎**：
+没有调度器、没有分页 KV 池、没有批处理。
+
 ## 不包含什么
 
 做完 S5，**27B 还跑不了**。还差三样，每样值得独立一份 spec：
