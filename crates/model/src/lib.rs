@@ -1236,17 +1236,11 @@ impl Model {
                         // the loaded weights rather than from a stride, so a
                         // model with a different interleaving needs no change
                         // here.
-                        // `TUILI_EMBED_PROBE=1` reports the residual before
-                        // any block runs -- the embedding alone. A divergence
-                        // that is already present here is a gather or a token
-                        // id, not a layer.
-                        if layer == 0 && std::env::var_os("TUILI_EMBED_PROBE").is_some() {
-                            let stream = self.kern.device().stream();
-                            let row = stream.clone_dtoh(&self.act.x.slice(..d))?;
-                            self.kern.device().synchronize()?;
-                            let rms =
-                                (row.iter().map(|v| v * v).sum::<f32>() / d as f32).sqrt();
-                            tracing::info!(rms, first = row[0], "embedding probe");
+                        // The residual before any block runs -- the embedding
+                        // alone. A divergence already present here is a gather
+                        // or a token id, not a layer.
+                        if layer == 0 {
+                            probe(&self.kern, layer, "embedding", &self.act.x.slice(..d));
                         }
                         if self.layer_kinds[layer] {
                             self.linear_attention(layer, n_tokens, pool, s)?;
@@ -2803,7 +2797,6 @@ impl Model {
                 .add_bias(&mut self.act.proj.slice_mut(..n * d), &b.as_view(), d, n)?;
         }
         probe(&self.kern, layer, "o_proj_out", &self.act.proj.slice(..n * d));
-        probe(&self.kern, layer, "x_before_add", &self.act.x.slice(..n * d));
         if !self.ffn_norm_takes_residual(layer, n) {
             self.kern.add_assign(
                 &mut self.act.x.slice_mut(..n * d),
