@@ -209,6 +209,17 @@ impl LaunchBuilder {
         enc.dispatchThreadgroups_threadsPerThreadgroup(grid, group);
         enc.endEncoding();
         cb.commit();
+        // `TUILI_METAL_SYNC` waits for every dispatch, which is the crudest
+        // possible ordering guarantee. If a run is correct with it and wrong
+        // without, the problem is between command buffers rather than inside a
+        // kernel.
+        static SYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *SYNC.get_or_init(|| std::env::var_os("TUILI_METAL_SYNC").is_some()) {
+            cb.waitUntilCompleted();
+            if let Some(e) = cb.error() {
+                return Err(anyhow!("{}: {e}", self.func.name));
+            }
+        }
         self.stream.dev.remember_commit(cb);
         Ok(())
     }

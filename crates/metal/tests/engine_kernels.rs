@@ -566,3 +566,66 @@ fn the_embedding_gather_matches_the_host() -> Result<()> {
     close(&out.to_vec(), &want, 0.0, "gather_rows_f16");
     Ok(())
 }
+
+/// The mat-vec at more than one token.
+///
+/// The examples only ever ask for one, and so does decode -- but prefill asks
+/// for the whole prompt at once, and without a library GEMM this backend takes
+/// the mat-vec for all of it. One threadgroup holds `GEMV_TOKENS` tokens and
+/// the grid's second dimension covers the rest, which is the arrangement no
+/// test had exercised.
+#[test]
+fn the_matvec_matches_the_host_at_many_tokens() -> Result<()> {
+    let dev = Device::new(0)?;
+    let s = dev.stream();
+    const QUANT: &str = include_str!("../../kernels/src/msl/quant.metal");
+    let quant = format!("{COMMON}\n{QUANT}");
+
+    let (k, n) = (896usize, 137usize);
+    let wf = noise(k * n, 61);
+    let w: Vec<half::f16> = wf.iter().map(|&v| half::f16::from_f32(v)).collect();
+    let dw = s.memcpy_stod(&w)?;
+
+    // 1 is decode, 8 is exactly one threadgroup's worth, 9 and 41 need more
+    // than one -- which is where the grid's second dimension starts mattering.
+    for &n_tokens in &[1usize, 3, 8, 9, 41] {
+        let x = noise(n_tokens * k, 67);
+        let dx = s.memcpy_stod(&x)?;
+        let mut out = s.alloc_zeros::<f32>(n_tokens * n)?;
+
+        let f = dev.kernels().get("quant", &quant, "gemv_f16")?;
+        let (k_i, n_i, t_i) = (k as i32, n as i32, n_tokens as i32);
+        let mut b = s.launch_builder(&f);
+        b.arg(&out.as_view_mut())
+            .arg(&dw.as_view())
+            .arg(&dx.as_view())
+            .arg(&k_i)
+            .arg(&n_i)
+            .arg(&t_i);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (n as u32, (n_tokens as u32).div_ceil(8).max(1), 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })?
+        };
+        s.synchronize()?;
+
+        // `out[t * n + r] = dot(w[r, :], x[t, :])`
+        let mut want = vec![0.0f32; n_tokens * n];
+        for t in 0..n_tokens {
+            for r in 0..n {
+                want[t * n + r] = (0..k)
+                    .map(|i| w[r * k + i].to_f32() * x[t * k + i])
+                    .sum();
+            }
+        }
+        close(
+            &out.to_vec(),
+            &want,
+            2e-3,
+            &format!("gemv_f16 n_tokens={n_tokens}"),
+        );
+    }
+    Ok(())
+}
