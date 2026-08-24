@@ -629,6 +629,20 @@ impl Scheduler {
                         batch = plan.len(),
                         "per-step timing"
                     );
+                    // The same per-kernel table the speculative window prints,
+                    // so the two are comparable. That comparison is the whole
+                    // point: a verification pass costs 1.71x a one-row step
+                    // where a *batched* two-row step costs 1.40x, and 21 ms of
+                    // that gap is not accounted for by anything countable --
+                    // the extra GDN launches are 0.8 ms of state traffic, the
+                    // rollback journal is 13 MiB. Whatever it is, it is a kernel
+                    // that behaves differently at two rows of one sequence than
+                    // at one row, and only this table can name it.
+                    let report = self.model.device().profile().report();
+                    if !report.is_empty() {
+                        tracing::warn!("per-kernel, last {} steps:\n{report}", self.window);
+                    }
+                    self.model.device().profile().reset();
                     self.t_issue = 0.0;
                     self.t_sample = 0.0;
                     self.t_advance = 0.0;

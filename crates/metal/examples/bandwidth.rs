@@ -196,6 +196,88 @@ fn main() -> Result<()> {
             t / tokens as f64
         );
     }
+    // ---- 3a. every shape the 27B actually launches, one token against two --
+    //
+    // The two-against-one ratio is what a speculative round lives on: a
+    // verification pass is two rows, so if two rows cost twice one row there is
+    // nothing to win however good the drafter is. In-situ profiling says the
+    // engine's mat-vecs cost 1.79x at two rows while the two big Q4_K shapes
+    // measure 1.35x on their own -- so the average is being set by shapes that
+    // were never measured. This is all of them.
+    println!("\n  every 27B shape, 1 token vs 2 (host's own kernel and group width)");
+    println!("  {:<22} {:>8} {:>8} {:>8}  {:>6}", "tensor", "1 tok", "2 tok", "MiB", "ratio");
+    for (label, ty, k, n_rows) in [
+        ("ffn_down        Q4_K", "q4_K", 17408usize, 5120usize),
+        ("ffn_gate/up     Q4_K", "q4_K", 5120, 17408),
+        ("attn_qkv        Q8_0", "q8_0", 5120, 10240),
+        ("attn_gate       Q8_0", "q8_0", 5120, 6144),
+        ("ssm_out         Q8_0", "q8_0", 6144, 5120),
+        ("attn_q          Q8_0", "q8_0", 5120, 12288),
+        ("attn_k/v        Q8_0", "q8_0", 5120, 1024),
+        ("ssm_alpha/beta  Q8_0", "q8_0", 5120, 48),
+        ("output          Q6_K", "q6_K", 5120, 248320),
+        ("attn_output     Q6_K", "q6_K", 6144, 5120),
+    ] {
+        let bpb = match ty {
+            "q4_K" => 144.0f64,
+            "q6_K" => 210.0,
+            _ => 34.0 * 8.0,
+        };
+        let items = match ty {
+            "q4_K" => k / 32,
+            "q6_K" => k / 4,
+            _ => k / 8,
+        } as u32;
+        let block = items.next_multiple_of(32).clamp(32, 128);
+        let bytes = (k * n_rows) as f64 * bpb / 256.0;
+        let w = s.alloc_zeros::<u8>(bytes as usize)?;
+        let x = s.alloc_zeros::<f32>(k * 2)?;
+        let mut o = s.alloc_zeros::<f32>(n_rows * 2)?;
+        let ki = k as i32;
+        let ni = n_rows as i32;
+        let mut t1 = 0.0f64;
+        let mut t2 = 0.0f64;
+        for tokens in [1usize, 2] {
+            // Exactly what the host picks: multi-row for Q4_K at two or more.
+            let rows: u32 = if tokens >= 2 && ty == "q4_K" { 4 } else { 1 };
+            let name = if rows > 1 {
+                format!("gemv{tokens}x{rows}_{ty}")
+            } else if tokens == 1 {
+                format!("gemv1_{ty}")
+            } else {
+                format!("gemv{tokens}_{ty}")
+            };
+            let f = dev.kernels().get("quant", &quant, &name)?;
+            let ti = tokens as i32;
+            let t = ms(
+                || {
+                    let mut b = s.launch_builder(&f);
+                    b.arg(&o.as_view_mut())
+                        .arg(&w.as_view())
+                        .arg(&x.as_view())
+                        .arg(&ki)
+                        .arg(&ni)
+                        .arg(&ti);
+                    unsafe {
+                        b.launch(LaunchConfig {
+                            grid_dim: ((n_rows as u32).div_ceil(rows), 1, 1),
+                            block_dim: (block, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?
+                    };
+                    s.synchronize()
+                },
+                5,
+            )?;
+            if tokens == 1 { t1 = t } else { t2 = t }
+        }
+        println!(
+            "  {label:<22} {t1:7.3}ms {t2:7.3}ms {:>8.0}  {:>5.2}x",
+            bytes / (1u64 << 20) as f64,
+            t2 / t1
+        );
+    }
+
     // ---- 3b. four output rows a threadgroup -------------------------------
     println!("\n  one row a group vs four (Q4_K, one token)");
     for (label, k, n_rows) in [
