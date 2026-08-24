@@ -10,6 +10,7 @@ tuili-gguf.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 fancy-regex = "0.14"
+unicode-normalization = "0.1"
 minijinja = { version = "2", features = ["loop_controls", "builtins"] }
 serde_json = "1"
 rustc-hash = "2"

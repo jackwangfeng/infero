@@ -1,5 +1,5 @@
 {
- "model": "Qwen/Qwen2.5-0.5B-Instruct",
+ "model": "/tmp/qwen25-tok",
  "vocab_size": 151665,
  "bos_token_id": null,
  "eos_token_id": 151645,
@@ -9,19 +9,22 @@
    "ids": [
     9707,
     1879
-   ]
+   ],
+   "decoded": "Hello world"
   },
   {
    "text": "hello",
    "ids": [
     14990
-   ]
+   ],
+   "decoded": "hello"
   },
   {
    "text": " hello",
    "ids": [
     23811
-   ]
+   ],
+   "decoded": " hello"
   },
   {
    "text": "Hello, world!",
@@ -30,7 +33,8 @@
     11,
     1879,
     0
-   ]
+   ],
+   "decoded": "Hello, world!"
   },
   {
    "text": "don't stop believin'",
@@ -41,7 +45,8 @@
     2818,
     9603,
     6
-   ]
+   ],
+   "decoded": "don't stop believin'"
   },
   {
    "text": "2024-08-12",
@@ -56,7 +61,8 @@
     12,
     16,
     17
-   ]
+   ],
+   "decoded": "2024-08-12"
   },
   {
    "text": "The quick brown fox jumps over the lazy dog.",
@@ -71,7 +77,8 @@
     15678,
     5562,
     13
-   ]
+   ],
+   "decoded": "The quick brown fox jumps over the lazy dog."
   },
   {
    "text": "你好，世界！",
@@ -80,7 +87,8 @@
     3837,
     99489,
     6313
-   ]
+   ],
+   "decoded": "你好，世界！"
   },
   {
    "text": "日本語のテキストもトークン化する",
@@ -97,7 +105,8 @@
     15698,
     32108,
     53826
-   ]
+   ],
+   "decoded": "日本語のテキストもトークン化する"
   },
   {
    "text": "emoji: 🦀 rust 🚀 ship",
@@ -112,7 +121,8 @@
     248,
     222,
     8284
-   ]
+   ],
+   "decoded": "emoji: 🦀 rust 🚀 ship"
   },
   {
    "text": "def main():\n    print('hi')\n",
@@ -125,7 +135,8 @@
     492,
     6023,
     1305
-   ]
+   ],
+   "decoded": "def main():\n    print('hi')\n"
   },
   {
    "text": "a  b   c",
@@ -135,13 +146,15 @@
     293,
     256,
     272
-   ]
+   ],
+   "decoded": "a  b   c"
   },
   {
    "text": "\n\n\n",
    "ids": [
     1406
-   ]
+   ],
+   "decoded": "\n\n\n"
   },
   {
    "text": "   leading spaces",
@@ -149,7 +162,8 @@
     256,
     6388,
     12621
-   ]
+   ],
+   "decoded": "   leading spaces"
   },
   {
    "text": "trailing   ",
@@ -157,7 +171,8 @@
     376,
     14277,
     262
-   ]
+   ],
+   "decoded": "trailing   "
   },
   {
    "text": "CamelCaseIdentifier_and_snake_case",
@@ -170,7 +185,8 @@
     28022,
     726,
     19096
-   ]
+   ],
+   "decoded": "CamelCaseIdentifier_and_snake_case"
   },
   {
    "text": "1234567890",
@@ -185,7 +201,8 @@
     23,
     24,
     15
-   ]
+   ],
+   "decoded": "1234567890"
   },
   {
    "text": "<|im_start|>user\nhi<|im_end|>\n",
@@ -196,7 +213,8 @@
     6023,
     151645,
     198
-   ]
+   ],
+   "decoded": "<|im_start|>user\nhi<|im_end|>\n"
   },
   {
    "text": "mixed 中文 and English 混合 text",
@@ -211,7 +229,8 @@
     115,
     39762,
     1467
-   ]
+   ],
+   "decoded": "mixed 中文 and English 混合 text"
   },
   {
    "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
@@ -241,7 +260,8 @@
     44102,
     44102,
     44102
-   ]
+   ],
+   "decoded": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
   },
   {
    "text": "$1,234.56 (USD) — 50% off!",
@@ -265,7 +285,8 @@
     4,
     1007,
     0
-   ]
+   ],
+   "decoded": "$1,234.56 (USD) — 50% off!"
   },
   {
    "text": "https://example.com/path?a=1&b=2#frag",
@@ -284,7 +305,8 @@
     17,
     2,
     33198
-   ]
+   ],
+   "decoded": "https://example.com/path?a=1&b=2#frag"
   },
   {
    "text": "\t\ttabbed\tindent",
@@ -294,7 +316,8 @@
     2721,
     197,
     32840
-   ]
+   ],
+   "decoded": "\t\ttabbed\tindent"
   },
   {
    "text": "ünïcödé àccénts",
@@ -308,11 +331,150 @@
     638,
     963,
     65677
-   ]
+   ],
+   "decoded": "ünïcödé àccénts"
   },
   {
    "text": "",
-   "ids": []
+   "ids": [],
+   "decoded": ""
+  },
+  {
+   "text": "(\"hello\") [world] {and} <more>",
+   "ids": [
+    445,
+    14990,
+    899,
+    508,
+    14615,
+    60,
+    314,
+    437,
+    92,
+    366,
+    6384,
+    29
+   ],
+   "decoded": "(\"hello\") [world] {and} <more>"
+  },
+  {
+   "text": "don't--stop, really·now",
+   "ids": [
+    15007,
+    944,
+    313,
+    9495,
+    11,
+    2167,
+    13935,
+    3328
+   ],
+   "decoded": "don't--stop, really·now"
+  },
+  {
+   "text": "v3.8 has 248320 tokens and 27000000000 parameters",
+   "ids": [
+    85,
+    18,
+    13,
+    23,
+    702,
+    220,
+    17,
+    19,
+    23,
+    18,
+    17,
+    15,
+    11211,
+    323,
+    220,
+    17,
+    22,
+    15,
+    15,
+    15,
+    15,
+    15,
+    15,
+    15,
+    15,
+    15,
+    5029
+   ],
+   "decoded": "v3.8 has 248320 tokens and 27000000000 parameters"
+  },
+  {
+   "text": "café naïve résumé",
+   "ids": [
+    924,
+    58858,
+    94880,
+    586,
+    9333,
+    1242,
+    963
+   ],
+   "decoded": "café naïve résumé"
+  },
+  {
+   "text": "हिन्दी भाषा",
+   "ids": [
+    93948,
+    42311,
+    101,
+    30484,
+    99,
+    43647,
+    14925,
+    255,
+    31411,
+    115,
+    23868
+   ],
+   "decoded": "हिन्दी भाषा"
+  },
+  {
+   "text": "العَرَبِيَّة",
+   "ids": [
+    31382,
+    23224,
+    27910,
+    11071,
+    27910,
+    21360,
+    52704,
+    14558,
+    27910,
+    73771,
+    25871
+   ],
+   "decoded": "العَرَبِيَّة"
+  },
+  {
+   "text": "เกิด ข้อความ",
+   "ids": [
+    123949,
+    124039,
+    220,
+    47839,
+    51652,
+    123971
+   ],
+   "decoded": "เกิด ข้อความ"
+  },
+  {
+   "text": "שָלוֹם",
+   "ids": [
+    58411,
+    146,
+    116,
+    124314,
+    146,
+    117,
+    123802
+   ],
+   "decoded": "שָלוֹם"
   }
  ],
  "chat": [
