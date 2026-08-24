@@ -42,6 +42,15 @@ const MMQ_XA_STRIDE: u32 = 8 * 36 + 16;
 const MMQ_XK_STRIDE: u32 = 256 * 2;
 
 const COMMON_CUH: &str = include_str!("cu/common.cuh");
+
+// The Metal twins. File for file where one exists; a stub where it does not,
+// so that a kernel this backend has not got reports itself from the lookup as
+// a missing name rather than as a compiler error about a file full of CUDA.
+const COMMON_METAL: &str = include_str!("msl/common.metal");
+const OPS_METAL: &str = include_str!("msl/ops.metal");
+const QUANT_METAL: &str = include_str!("msl/quant.metal");
+const GDN_METAL: &str = include_str!("msl/gdn.metal");
+const UNIMPLEMENTED_METAL: &str = include_str!("msl/unimplemented.metal");
 const OPS_CU: &str = include_str!("cu/ops.cu");
 const QUANT_CU: &str = include_str!("cu/quant.cu");
 const TURBOQUANT_CU: &str = include_str!("cu/turboquant.cu");
@@ -72,18 +81,30 @@ pub const Q8_1_BLOCK_BYTES: usize = 36;
 /// Measured at 96 on an A4000; see `mmq_tiles` for the companion threshold.
 pub const MMQ_MAX_TOKENS: usize = 96;
 
+#[cfg(feature = "cuda")]
 fn ops_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     // The MMA helpers too: `attn_decode_mma_f32` uses the same `m16n8k16`
     // fragments the GEMM does, and `mma.cuh` is where their layout is pinned.
     SRC.get_or_init(|| format!("{COMMON_CUH}\n{MMA_CUH}\n{OPS_CU}"))
 }
+#[cfg(not(feature = "cuda"))]
+fn ops_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| format!("{COMMON_METAL}\n{OPS_METAL}"))
+}
 
 /// The GatedDeltaNet unit. Separate from `ops_src` so that a change to the
 /// linear-attention kernels does not force every other kernel to recompile.
+#[cfg(feature = "cuda")]
 fn gdn_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SRC.get_or_init(|| format!("{COMMON_CUH}\n{GDN_CU}"))
+}
+#[cfg(not(feature = "cuda"))]
+fn gdn_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| format!("{COMMON_METAL}\n{GDN_METAL}"))
 }
 
 /// The Qwen3.5 vision tower. Separate from `ops_src` for the same reason `gdn`
@@ -92,12 +113,19 @@ fn gdn_src() -> &'static str {
 /// interleaving, bidirectional not causal, two blocked rotary axes not three
 /// interleaved), so keeping the two apart keeps a reader from picking the wrong
 /// one by name.
+#[cfg(feature = "cuda")]
 fn vision_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SRC.get_or_init(|| format!("{COMMON_CUH}\n{VISION_CU}"))
 }
+#[cfg(not(feature = "cuda"))]
+fn vision_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| UNIMPLEMENTED_METAL.to_string())
+}
 
 /// The block-scaled FP8 unit.
+#[cfg(feature = "cuda")]
 fn fp8_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     // `TUILI_FP8_STRIP` prepends `#define`s that take pieces out of the mat-vec,
@@ -111,30 +139,66 @@ fn fp8_src() -> &'static str {
         )
     })
 }
+#[cfg(not(feature = "cuda"))]
+fn fp8_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| UNIMPLEMENTED_METAL.to_string())
+}
 
+#[cfg(feature = "cuda")]
 fn sample_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SRC.get_or_init(|| format!("{COMMON_CUH}\n{SAMPLE_CU}"))
 }
+#[cfg(not(feature = "cuda"))]
+fn sample_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| UNIMPLEMENTED_METAL.to_string())
+}
 
+#[cfg(feature = "cuda")]
 fn quant_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SRC.get_or_init(|| format!("{COMMON_CUH}\n{QUANT_CU}"))
 }
+#[cfg(not(feature = "cuda"))]
+fn quant_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| format!("{COMMON_METAL}\n{QUANT_METAL}"))
+}
 
+#[cfg(feature = "cuda")]
 fn mmq_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SRC.get_or_init(|| format!("{COMMON_CUH}\n{MMA_CUH}\n{MMQ_CU}"))
 }
+#[cfg(not(feature = "cuda"))]
+fn mmq_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| UNIMPLEMENTED_METAL.to_string())
+}
 
+#[cfg(feature = "cuda")]
 fn mmvq_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SRC.get_or_init(|| format!("{COMMON_CUH}\n{MMVQ_CU}"))
 }
+#[cfg(not(feature = "cuda"))]
+fn mmvq_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| UNIMPLEMENTED_METAL.to_string())
+}
 
+#[cfg(feature = "cuda")]
 fn tq_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SRC.get_or_init(|| format!("{COMMON_CUH}\n{TURBOQUANT_CU}"))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn tq_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| UNIMPLEMENTED_METAL.to_string())
 }
 
 /// Threads for a kernel that walks one vector of `d` per block.
@@ -162,6 +226,7 @@ pub struct Kernels {
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 pub struct TmaDesc([u8; 128]);
+#[cfg(feature = "cuda")]
 unsafe impl cudarc::driver::DeviceRepr for TmaDesc {}
 
 /// Launch one of the register-resident norms, with or without the f16 copy.
@@ -360,7 +425,7 @@ impl Kernels {
         // The tensor-core GEMM, both tile widths. Leaving these out made the
         // first request after startup pay for NVRTC — 20 tok/s against 27 on
         // every request after it.
-        if self.dev.arch() >= 80 {
+        if self.dev.caps().int_tensor_gemm {
             for tag in ["", "2"] {
                 for ty in WeightType::ALL
                     .iter()
@@ -2521,6 +2586,7 @@ impl Kernels {
     /// Cached: the same matrix is asked for every step, and a graph capture must
     /// not build one (it is a host call, and its result is baked into the
     /// launch as a by-value argument).
+    #[cfg(feature = "cuda")]
     fn tma_desc(&self, ptr: u64, n: usize, row_bytes: usize, rows: usize) -> Result<TmaDesc> {
         // `rows` is the box height and belongs in the key: two variants with
         // different row groups over the same matrix need different descriptors.
@@ -2843,9 +2909,9 @@ impl Kernels {
     ) -> Result<()> {
         anyhow::ensure!(Self::has_mmq(ty), "no tensor-core gemm for {ty}");
         anyhow::ensure!(
-            self.dev.arch() >= 80,
-            "mmq needs sm_80 or newer, device is sm_{}",
-            self.dev.arch()
+            self.dev.caps().int_tensor_gemm,
+            "the tensor-core integer gemm has no implementation on the {} backend",
+            tuili_gpu::BACKEND
         );
         anyhow::ensure!(k.is_multiple_of(32), "mmq needs k divisible by 32, got {k}");
         if matches!(ty, WeightType::Q4K | WeightType::Q6K) {
@@ -3361,6 +3427,11 @@ impl Kernels {
         // Built here because this is the only place that knows the shape; the
         // cache makes it a lookup after the first step, and a capture replays
         // the value it was handed.
+        // `mmqt*` needs a `CUtensorMap`, which exists only on CUDA and only
+        // from sm_90. A backend without TMA never selects one of those
+        // variants -- `mmq_f16_variant_for` gates on the capability -- so this
+        // is an unreachable branch on Metal rather than a missing feature.
+        #[cfg(feature = "cuda")]
         let desc = if variant.starts_with("mmqt") {
             use cudarc::driver::DevicePtr;
             let (ptr, _sync) = w.device_ptr(self.dev.stream());
@@ -3368,11 +3439,23 @@ impl Kernels {
         } else {
             None
         };
+        #[cfg(not(feature = "cuda"))]
+        let desc: Option<TmaDesc> = {
+            anyhow::ensure!(
+                !variant.starts_with("mmqt"),
+                "{variant} needs a CUtensorMap, which this backend has no equivalent of"
+            );
+            None
+        };
         let mut b = self.dev.stream().launch_builder(&f);
         b.arg(out).arg(w).arg(x_q8_1).arg(&k_i).arg(&n_i).arg(&t_i);
+        // Only the `mmqt*` variants take a descriptor, and only CUDA has them.
+        #[cfg(feature = "cuda")]
         if let Some(d) = desc.as_ref() {
             b.arg(d);
         }
+        #[cfg(not(feature = "cuda"))]
+        debug_assert!(desc.is_none());
         self.dev.profile().time("mmq", self.dev.stream(), || {
             unsafe { b.launch(cfg) }.context("mmq")?;
             Ok(())
@@ -3382,6 +3465,7 @@ impl Kernels {
 
     /// Blocks an SM the driver will resident, for a given block size and
     /// dynamic shared request. The answer that settles which resource binds.
+    #[cfg(feature = "cuda")]
     pub fn occupancy_blocks(
         &self,
         module: &'static str,
@@ -3409,6 +3493,7 @@ impl Kernels {
     /// still allow 128 threads while fitting fewer blocks on the SM. This is
     /// the number that settles it — 65536 registers per SM on sm_86 divided by
     /// `regs * block_threads` is the resident block count.
+    #[cfg(feature = "cuda")]
     pub fn kernel_registers(&self, module: &'static str, name: &str) -> Result<(i32, i32)> {
         let src = match module {
             "tuili_mmq" => mmq_src(),
@@ -3713,6 +3798,7 @@ impl Kernels {
     /// asking before cutting either: the batch-32 GEMM spends 54% of its time
     /// in the MMA pipeline against an instruction count that should be
     /// negligible, which is what unhidden shared-memory latency looks like.
+    #[cfg(feature = "cuda")]
     pub fn kernel_limits(&self, module: &'static str, name: &str) -> Result<(i32, i32)> {
         let src = match module {
             "tuili_mmq" => mmq_src(),
@@ -4421,6 +4507,31 @@ impl Kernels {
     /// `b` is the weight matrix in ggml layout, `[n, k]` row-major, already
     /// dequantized. cuBLAS is column-major, so both operands are handed over
     /// transposed-in-place and no data is moved.
+    /// Not available on this backend.
+    ///
+    /// The CUDA path hands both operands to cuBLAS transposed-in-place. The
+    /// Metal counterpart is `MPSMatrixMultiplication`, which is a library call
+    /// of the same shape and is simply not wired up yet -- so this fails loudly
+    /// rather than silently taking a slower path, because the dispatch only
+    /// reaches it above `GEMM_THRESHOLD` tokens and a silent fallback there
+    /// would look like a mysterious prefill regression.
+    #[cfg(not(feature = "cuda"))]
+    pub fn gemm_f16(
+        &self,
+        _c: &mut ViewMut<'_, f32>,
+        _a: &View<'_, f16>,
+        _b: &View<'_, f16>,
+        n_tokens: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<()> {
+        anyhow::bail!(
+            "gemm_f16 ({n_tokens}x{k}x{n}) has no implementation on this backend yet; \
+             prefill above GEMM_THRESHOLD tokens needs MPSMatrixMultiplication"
+        )
+    }
+
+    #[cfg(feature = "cuda")]
     pub fn gemm_f16(
         &self,
         c: &mut ViewMut<'_, f32>,

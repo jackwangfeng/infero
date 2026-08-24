@@ -245,34 +245,6 @@ kernel void attn_decode_f32(device float* out            [[buffer(0)]],
     }
 }
 
-// ---- projections ---------------------------------------------------------
-
-/// `out[r] = dot(w[r, :], x)` for an f16 weight in ggml's `[n, k]` row-major
-/// layout, one threadgroup an output row. The f32 accumulator matters: the
-/// reference the fixtures come from is f32 throughout, and accumulating in f16
-/// would show up as a shifted logit vector rather than as an obvious break.
-kernel void gemv_f16(device float* out            [[buffer(0)]],
-                     device const half* w         [[buffer(1)]],
-                     device const float* x        [[buffer(2)]],
-                     constant int& k              [[buffer(3)]],
-                     constant int& n              [[buffer(4)]],
-                     uint3 tgid  [[threadgroup_position_in_grid]],
-                     uint3 tid   [[thread_position_in_threadgroup]],
-                     uint3 tgdim [[threads_per_threadgroup]]) {
-    BLOCK_REDUCE_SCRATCH
-
-    const int row = int(tgid.x);
-    if (row >= n) return;
-    device const half* wr = w + size_t(row) * k;
-
-    float acc = 0.0f;
-    for (int i = int(tid.x); i < k; i += int(tgdim.x)) {
-        acc += float(wr[i]) * x[i];
-    }
-    const float sum = BLOCK_SUM(acc, tid.x, tgdim.x);
-    if (tid.x == 0) out[row] = sum;
-}
-
 // ---- Qwen3.5/3.8 additions ----------------------------------------------
 
 /// Per-head RMSNorm over `d_head`, applied where the head lies inside a row of

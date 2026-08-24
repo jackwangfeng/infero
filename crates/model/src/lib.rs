@@ -37,8 +37,7 @@ pub mod weights;
 
 use anyhow::{Context, Result};
 use tuili_gpu::{Buf, View, ViewMut};
-#[cfg(feature = "cuda")]
-use cudarc::driver::{CudaEvent, CudaStream};
+use tuili_gpu::{Event as CudaEvent, OwnedStream as CudaStream};
 use half::f16;
 use std::sync::Arc;
 use tuili_gpu::Device;
@@ -202,8 +201,8 @@ fn graph_kv_bucket() -> usize {
 ///
 /// The switch stays so the result is re-runnable; the default is what it has
 /// always been.
-fn graph_instantiate_flags() -> cudarc::driver::sys::CUgraphInstantiate_flags {
-    use cudarc::driver::sys::CUgraphInstantiate_flags as F;
+fn graph_instantiate_flags() -> tuili_gpu::GraphFlags {
+    use tuili_gpu::GraphFlags as F;
     static PLAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *PLAIN.get_or_init(|| std::env::var("TUILI_GRAPH_MODE").as_deref() == Ok("plain")) {
         // The enum has no zero variant; instantiate takes the raw value.
@@ -220,7 +219,7 @@ fn graph_instantiate_flags() -> cudarc::driver::sys::CUgraphInstantiate_flags {
 /// inference worker once and used only from there, so a graph has exactly one
 /// owner for its whole life. `CudaGraph` is `!Send` only because it wraps raw
 /// handles.
-struct SendGraph(cudarc::driver::CudaGraph);
+struct SendGraph(tuili_gpu::Graph);
 
 // Safety: as above — one owner, moved rather than shared, and every `Model`
 // method takes `&mut self`.
@@ -480,7 +479,7 @@ struct SampleBufs {
 /// It exists to attribute the 0.4 ms a step that subtracting per-kernel
 /// estimates from the wall clock could not.
 struct PhaseEvents {
-    ev: Vec<cudarc::driver::CudaEvent>,
+    ev: Vec<tuili_gpu::Event>,
     /// Accumulated spans and the step count, so one line covers many steps.
     sums: [f64; 3],
     steps: u64,
@@ -495,7 +494,7 @@ impl PhaseEvents {
         for _ in 0..4 {
             ev.push(
                 dev.context()
-                    .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?,
+                    .new_event(Some(tuili_gpu::EVENT_DEFAULT))?,
             );
         }
         Ok(Some(Self { ev, sums: [0.0; 3], steps: 0 }))
@@ -1207,7 +1206,7 @@ impl Model {
                 let stream = self.dev.stream().clone();
                 if record {
                     stream.begin_capture(
-                        cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+                        tuili_gpu::CAPTURE_RELAXED,
                     )?;
                 }
                 let kv = if graphable { key.2 } else { kv_len };
@@ -1357,7 +1356,7 @@ impl Model {
         let head_mmq = n_logit_rows > 1
             && self.use_mmq
             && Kernels::has_mmq(head.ty)
-            && self.kern.device().arch() >= 80
+            && self.kern.device().caps().int_tensor_gemm
             && Self::mmq_shape_ok(head);
         // Asked and answered: this checkpoint's head is Q8_0, 248320 x 5120,
         // and at one row it takes `mmvq` — 885 us for 1.29 GB, which is 1460
@@ -3319,7 +3318,7 @@ impl Model {
         // shape, and they should fall to the mat-vec rather than the float path.
         let mmq_ok = use_mmq
             && Kernels::has_mmq(w.ty)
-            && kern.device().arch() >= 80
+            && kern.device().caps().int_tensor_gemm
             && Self::mmq_shape_ok(w);
 
         // One token is the decode step, and it is bandwidth-bound: the integer

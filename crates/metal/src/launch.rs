@@ -65,6 +65,11 @@ impl Function {
         self.pipeline.maxTotalThreadsPerThreadgroup() as u32
     }
 
+    /// cudarc's name for the same ceiling.
+    pub fn max_threads_per_block(&self) -> Result<i32> {
+        Ok(self.max_threads_per_group() as i32)
+    }
+
     /// The SIMD width this kernel executes at -- 32 on every Apple GPU so far,
     /// and the number the ported shuffle reductions assume.
     pub fn thread_execution_width(&self) -> u32 {
@@ -94,16 +99,16 @@ pub enum Arg {
 /// argument *position* becomes the MSL `[[buffer(n)]]` index, so a kernel
 /// signature that lists its parameters in the same order as the CUDA one needs
 /// no change at the call site.
-pub struct LaunchBuilder<'a> {
-    stream: Stream<'a>,
+pub struct LaunchBuilder {
+    stream: Stream,
     func: Function,
     args: Vec<Arg>,
 }
 
-impl<'a> Stream<'a> {
-    pub fn launch_builder(&self, f: &Function) -> LaunchBuilder<'a> {
+impl Stream {
+    pub fn launch_builder(&self, f: &Function) -> LaunchBuilder {
         LaunchBuilder {
-            stream: *self,
+            stream: self.clone(),
             func: f.clone(),
             args: Vec::with_capacity(8),
         }
@@ -122,7 +127,7 @@ impl<'a> Stream<'a> {
     }
 }
 
-impl<'a> LaunchBuilder<'a> {
+impl LaunchBuilder {
     pub fn arg<A: KernelArg>(&mut self, a: &A) -> &mut Self {
         self.args.push(a.to_arg());
         self

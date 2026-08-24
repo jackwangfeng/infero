@@ -3,9 +3,17 @@
 //! The same surface `tuili_cuda::backend` exports, so `tuili-kernels` and
 //! `tuili-model` compile against either without naming a vendor.
 
-pub use crate::buffer::{Buf, View, ViewMut};
+pub use crate::buffer::{Buf, CopyDst, CopySrc, View, ViewMut};
 pub use crate::device::{Device, Stream};
 pub use crate::launch::{Function, KernelArg, LaunchConfig};
+pub use crate::compat::{
+    CaptureMode, Context, Event, EventFlags, Graph, GraphFlags, OwnedStream, PinnedHostSlice,
+};
+
+/// Flags the engine asks for by name rather than by value, so the call sites
+/// stay free of vendor enums.
+pub const EVENT_DEFAULT: EventFlags = EventFlags;
+pub const CAPTURE_RELAXED: CaptureMode = CaptureMode;
 
 /// Raise a kernel's dynamic shared-memory ceiling -- a no-op here.
 ///

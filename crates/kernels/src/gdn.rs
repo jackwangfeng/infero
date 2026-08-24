@@ -109,6 +109,7 @@ impl Kernels {
     /// over `dk` unrolls, and a dynamically indexed local array compiles fine,
     /// runs fine, and puts the state back in the DRAM the whole exercise was
     /// about. Non-zero here means the optimization did not happen.
+    #[cfg(feature = "cuda")]
     pub fn gdn_kernel_registers(&self, name: &str) -> Result<(i32, i32, i32)> {
         let f = self.dev.kernels().get("tuili_gdn", gdn_src(), name)?;
         Ok((f.num_regs()?, f.shared_size_bytes()?, f.local_size_bytes()?))
@@ -116,6 +117,7 @@ impl Kernels {
 
     /// Blocks an SM the driver will make resident for a GatedDeltaNet kernel at
     /// a given block size and dynamic shared request.
+    #[cfg(feature = "cuda")]
     pub fn gdn_occupancy_blocks(&self, name: &str, threads: u32, dynamic: usize) -> Result<u32> {
         let f = self.dev.kernels().get("tuili_gdn", gdn_src(), name)?;
         if dynamic > 48 * 1024 {

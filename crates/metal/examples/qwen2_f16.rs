@@ -26,6 +26,7 @@ use tuili_metal::{Buf, Device, LaunchConfig, View, ViewMut};
 
 const COMMON_METAL: &str = include_str!("../../kernels/src/msl/common.metal");
 const OPS_METAL: &str = include_str!("../../kernels/src/msl/ops.metal");
+const QUANT_METAL: &str = include_str!("../../kernels/src/msl/quant.metal");
 
 const BLOCK: u32 = 256;
 /// Threads for the reduction-shaped kernels. Fixed rather than occupancy-
@@ -36,6 +37,10 @@ const REDUCE_BLOCK: u32 = 256;
 
 fn ops_src() -> String {
     format!("{COMMON_METAL}\n{OPS_METAL}")
+}
+
+fn quant_src() -> String {
+    format!("{COMMON_METAL}\n{QUANT_METAL}")
 }
 
 // ---- config --------------------------------------------------------------
@@ -294,11 +299,17 @@ impl Engine {
     }
 
     fn gemv(&self, out: &mut ViewMut<'_, f32>, m: &Mat, x: &View<'_, f32>) -> Result<()> {
-        let f = self.f("gemv_f16")?;
-        let (k, n) = (m.k as i32, m.n as i32);
+        let f = self.dev.kernels().get("tuili_quant", &quant_src(), "gemv_f16")?;
+        // The quant module's mat-vecs take `n_tokens`; this slice is batch one.
+        let (k, n, t) = (m.k as i32, m.n as i32, 1i32);
         let s = self.dev.stream();
         let mut b = s.launch_builder(&f);
-        b.arg(out).arg(&m.w.as_view()).arg(x).arg(&k).arg(&n);
+        b.arg(out)
+            .arg(&m.w.as_view())
+            .arg(x)
+            .arg(&k)
+            .arg(&n)
+            .arg(&t);
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (m.n as u32, 1, 1),

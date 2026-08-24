@@ -11,9 +11,14 @@ use tuili_metal::{Device, LaunchConfig};
 
 const COMMON: &str = include_str!("../../kernels/src/msl/common.metal");
 const OPS: &str = include_str!("../../kernels/src/msl/ops.metal");
+const QUANT: &str = include_str!("../../kernels/src/msl/quant.metal");
 
 fn src() -> String {
     format!("{COMMON}\n{OPS}")
+}
+
+fn quant_src() -> String {
+    format!("{COMMON}\n{QUANT}")
 }
 
 const BLOCK: u32 = 256;
@@ -111,14 +116,17 @@ fn gemv_f16_matches_the_host() -> Result<()> {
     let dx = s.memcpy_stod(&x)?;
     let mut out = s.alloc_zeros::<f32>(n)?;
 
-    let f = dev.kernels().get("ops", &src(), "gemv_f16")?;
-    let (k_i, n_i) = (k as i32, n as i32);
+    let f = dev.kernels().get("quant", &quant_src(), "gemv_f16")?;
+    // The quant module's mat-vecs take `n_tokens`: one threadgroup decodes a
+    // weight once and spends it on every token it holds.
+    let (k_i, n_i, t_i) = (k as i32, n as i32, 1i32);
     let mut b = s.launch_builder(&f);
     b.arg(&out.as_view_mut())
         .arg(&dw.as_view())
         .arg(&dx.as_view())
         .arg(&k_i)
-        .arg(&n_i);
+        .arg(&n_i)
+        .arg(&t_i);
     unsafe {
         b.launch(LaunchConfig {
             grid_dim: (n as u32, 1, 1),

@@ -86,14 +86,14 @@ inline void q4k_scale_min(device const uchar* q, int j,
     uint3 tid   [[thread_position_in_threadgroup]],                            \
     uint3 tgdim [[threads_per_threadgroup]]
 
-kernel void gemv_f32_q(GEMV_ARGS) {
+kernel void gemv_f32(GEMV_ARGS) {
     GEMV_PROLOGUE
     device const float* wr = (device const float*)w + size_t(row) * k;
     for (int i = int(tid.x); i < k; i += int(tgdim.x)) GEMV_SPREAD(wr[i], i)
     GEMV_EPILOGUE
 }
 
-kernel void gemv_f16_q(GEMV_ARGS) {
+kernel void gemv_f16(GEMV_ARGS) {
     GEMV_PROLOGUE
     device const half* wr = (device const half*)w + size_t(row) * k;
     for (int i = int(tid.x); i < k; i += int(tgdim.x)) {

@@ -31,7 +31,6 @@ fn every_kernel_compiles_and_resolves() -> Result<()> {
                 "rope_neox_f32",
                 "store_kv_f16",
                 "attn_decode_f32",
-                "gemv_f16",
                 "qk_norm_f32",
                 "rope_partial_f32",
             ],
@@ -40,8 +39,8 @@ fn every_kernel_compiles_and_resolves() -> Result<()> {
             "tuili_quant",
             format!("{COMMON}\n{QUANT}"),
             &[
-                "gemv_f32_q",
-                "gemv_f16_q",
+                "gemv_f32",
+                "gemv_f16",
                 "gemv_q8_0",
                 "gemv_q4_K",
                 "gemv_q6_K",

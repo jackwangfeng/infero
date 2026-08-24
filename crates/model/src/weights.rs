@@ -12,8 +12,7 @@
 
 use anyhow::{Context, Result};
 use tuili_gpu::{Buf, View};
-#[cfg(feature = "cuda")]
-use cudarc::driver::PinnedHostSlice;
+use tuili_gpu::PinnedHostSlice;
 use tuili_gpu::Device;
 use tuili_gguf::{GgmlType, Gguf, TensorInfo};
 use tuili_kernels::WeightType;
