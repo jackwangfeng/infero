@@ -1,0 +1,25 @@
+[package]
+name = "tuili-gpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Which GPU the engine is built for, decided once.
+#
+# `tuili-kernels` and `tuili-model` import their device types from here rather
+# than from a backend crate, so the choice is made in one place and cannot drift
+# between them. No machine has both backends -- a Mac has no CUDA driver and a
+# Linux box has no Metal -- so this is a compile-time alias rather than a
+# runtime trait object, and nothing pays for an indirection on the launch path.
+
+[dependencies]
+tuili-cuda = { workspace = true, optional = true }
+tuili-metal = { workspace = true, optional = true }
+
+[features]
+default = ["cuda-13"]
+cuda-13 = ["cuda", "tuili-cuda/cuda-13"]
+cuda-12 = ["cuda", "tuili-cuda/cuda-12"]
+cuda = ["dep:tuili-cuda"]
+metal = ["dep:tuili-metal"]

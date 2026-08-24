@@ -9,6 +9,7 @@ pub mod device;
 pub mod loader;
 pub mod nvrtc;
 pub mod profile;
+pub mod backend;
 
 pub use device::Device;
 pub use nvrtc::{Kernel, KernelCache, set_max_dynamic_shared};

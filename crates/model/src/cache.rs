@@ -15,9 +15,9 @@
 //! slots stay contiguous and a gather reads a whole head vector coalesced.
 
 use anyhow::{Context, Result};
-use cudarc::driver::{CudaSlice, CudaView, CudaViewMut};
+use tuili_gpu::{Buf, View, ViewMut};
 use half::f16;
-use tuili_cuda::Device;
+use tuili_gpu::Device;
 use tuili_kernels::KvQuant;
 
 use crate::config::Config;
@@ -28,17 +28,17 @@ pub struct SeqId(pub usize);
 
 enum Storage {
     F16 {
-        keys: Vec<CudaSlice<f16>>,
-        values: Vec<CudaSlice<f16>>,
+        keys: Vec<Buf<f16>>,
+        values: Vec<Buf<f16>>,
     },
     TurboQuant {
         quant: KvQuant,
-        k_codes: Vec<CudaSlice<u8>>,
-        k_signs: Vec<CudaSlice<u8>>,
-        k_scale: Vec<CudaSlice<f16>>,
-        k_gamma: Vec<CudaSlice<f16>>,
-        v_codes: Vec<CudaSlice<u8>>,
-        v_scale: Vec<CudaSlice<f16>>,
+        k_codes: Vec<Buf<u8>>,
+        k_signs: Vec<Buf<u8>>,
+        k_scale: Vec<Buf<f16>>,
+        k_gamma: Vec<Buf<f16>>,
+        v_codes: Vec<Buf<u8>>,
+        v_scale: Vec<Buf<f16>>,
     },
 }
 
@@ -63,7 +63,7 @@ static NEXT_POOL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 pub struct KvPool {
     storage: Storage,
     /// `[max_seqs, max_seq]` on the device, mirrored on the host.
-    slot_table: CudaSlice<i32>,
+    slot_table: Buf<i32>,
     max_seqs: usize,
     max_seq: usize,
     n_slots: usize,
@@ -85,8 +85,8 @@ pub struct KvPool {
     /// Per sequence *slot*: where its tokens start in the batch and how many it
     /// contributes. Zero for a slot not in this batch. Sized by `max_seqs` so a
     /// single launch can cover the pool.
-    gdn_first: CudaSlice<i32>,
-    gdn_ntok: CudaSlice<i32>,
+    gdn_first: Buf<i32>,
+    gdn_ntok: Buf<i32>,
 }
 
 impl KvPool {
@@ -284,11 +284,11 @@ impl KvPool {
         self.max_seq
     }
 
-    pub(crate) fn slot_table(&self) -> &CudaSlice<i32> {
+    pub(crate) fn slot_table(&self) -> &Buf<i32> {
         &self.slot_table
     }
 
-    pub(crate) fn slot_table_mut(&mut self) -> &mut CudaSlice<i32> {
+    pub(crate) fn slot_table_mut(&mut self) -> &mut Buf<i32> {
         &mut self.slot_table
     }
 
@@ -543,10 +543,10 @@ impl KvPool {
         &mut self,
         ordinal: usize,
     ) -> (
-        CudaView<'_, i32>,
-        CudaView<'_, i32>,
-        CudaViewMut<'_, f32>,
-        CudaViewMut<'_, f32>,
+        View<'_, i32>,
+        View<'_, i32>,
+        ViewMut<'_, f32>,
+        ViewMut<'_, f32>,
     ) {
         let g = self.gdn.as_mut().expect("no recurrent state in this pool");
         let (recurrent, conv) = g.layer_views(ordinal);
@@ -597,14 +597,14 @@ impl KvPool {
 
     // ---- dense accessors ------------------------------------------------
 
-    pub(crate) fn dense(&self, layer: usize) -> (&CudaSlice<f16>, &CudaSlice<f16>) {
+    pub(crate) fn dense(&self, layer: usize) -> (&Buf<f16>, &Buf<f16>) {
         match &self.storage {
             Storage::F16 { keys, values } => (&keys[layer], &values[layer]),
             Storage::TurboQuant { .. } => unreachable!("dense accessor on a quantized pool"),
         }
     }
 
-    pub(crate) fn dense_mut(&mut self, layer: usize) -> (&mut CudaSlice<f16>, &mut CudaSlice<f16>) {
+    pub(crate) fn dense_mut(&mut self, layer: usize) -> (&mut Buf<f16>, &mut Buf<f16>) {
         match &mut self.storage {
             Storage::F16 { keys, values } => (&mut keys[layer], &mut values[layer]),
             Storage::TurboQuant { .. } => unreachable!("dense accessor on a quantized pool"),
@@ -618,10 +618,10 @@ impl KvPool {
         &self,
         layer: usize,
     ) -> (
-        &CudaSlice<u8>,
-        &CudaSlice<u8>,
-        &CudaSlice<f16>,
-        &CudaSlice<f16>,
+        &Buf<u8>,
+        &Buf<u8>,
+        &Buf<f16>,
+        &Buf<f16>,
     ) {
         match &self.storage {
             Storage::TurboQuant {
@@ -640,7 +640,7 @@ impl KvPool {
         }
     }
 
-    pub(crate) fn tq_value(&self, layer: usize) -> (&CudaSlice<u8>, &CudaSlice<f16>) {
+    pub(crate) fn tq_value(&self, layer: usize) -> (&Buf<u8>, &Buf<f16>) {
         match &self.storage {
             Storage::TurboQuant {
                 v_codes, v_scale, ..
@@ -654,10 +654,10 @@ impl KvPool {
         &mut self,
         layer: usize,
     ) -> (
-        &mut CudaSlice<u8>,
-        &mut CudaSlice<u8>,
-        &mut CudaSlice<f16>,
-        &mut CudaSlice<f16>,
+        &mut Buf<u8>,
+        &mut Buf<u8>,
+        &mut Buf<f16>,
+        &mut Buf<f16>,
     ) {
         match &mut self.storage {
             Storage::TurboQuant {
@@ -679,7 +679,7 @@ impl KvPool {
     pub(crate) fn tq_value_mut(
         &mut self,
         layer: usize,
-    ) -> (&mut CudaSlice<u8>, &mut CudaSlice<f16>) {
+    ) -> (&mut Buf<u8>, &mut Buf<f16>) {
         match &mut self.storage {
             Storage::TurboQuant {
                 v_codes, v_scale, ..

@@ -27,8 +27,8 @@
 //! attention model, and `bytes()` exists to be reported at startup.
 
 use anyhow::Result;
-use cudarc::driver::CudaSlice;
-use tuili_cuda::Device;
+use tuili_gpu::Buf;
+use tuili_gpu::Device;
 
 use crate::SeqId;
 
@@ -73,9 +73,9 @@ pub struct GdnState {
     ///
     /// The alternative, sequence-major, would need a slot-indirection array in
     /// the kernel — one more thing to get wrong, for no gain.
-    recurrent: CudaSlice<f32>,
+    recurrent: Buf<f32>,
     /// `[n_linear, max_seqs, conv_channels, conv_k - 1]`, same reasoning.
-    conv: CudaSlice<f32>,
+    conv: Buf<f32>,
     shape: GdnShape,
     n_linear: usize,
     max_seqs: usize,
@@ -148,13 +148,13 @@ impl GdnState {
 
     /// One linear layer's recurrent state for *every* sequence slot, which is
     /// what a single batched launch takes.
-    pub fn recurrent_layer_mut(&mut self, ordinal: usize) -> cudarc::driver::CudaViewMut<'_, f32> {
+    pub fn recurrent_layer_mut(&mut self, ordinal: usize) -> tuili_gpu::ViewMut<'_, f32> {
         let n = self.shape.state_floats() * self.max_seqs;
         self.recurrent.slice_mut(ordinal * n..(ordinal + 1) * n)
     }
 
     /// One linear layer's convolution windows for every sequence slot.
-    pub fn conv_layer_mut(&mut self, ordinal: usize) -> cudarc::driver::CudaViewMut<'_, f32> {
+    pub fn conv_layer_mut(&mut self, ordinal: usize) -> tuili_gpu::ViewMut<'_, f32> {
         let n = self.shape.conv_floats() * self.max_seqs;
         self.conv.slice_mut(ordinal * n..(ordinal + 1) * n)
     }
@@ -164,8 +164,8 @@ impl GdnState {
         &mut self,
         ordinal: usize,
     ) -> (
-        cudarc::driver::CudaViewMut<'_, f32>,
-        cudarc::driver::CudaViewMut<'_, f32>,
+        tuili_gpu::ViewMut<'_, f32>,
+        tuili_gpu::ViewMut<'_, f32>,
     ) {
         let rn = self.shape.state_floats() * self.max_seqs;
         let cn = self.shape.conv_floats() * self.max_seqs;
@@ -222,7 +222,7 @@ impl GdnState {
         // halves, the source wholly in one and the destination wholly in the
         // other, whichever way round they fall.
         let copy = |dev: &Device,
-                    buf: &mut cudarc::driver::CudaSlice<f32>,
+                    buf: &mut tuili_gpu::Buf<f32>,
                     from: std::ops::Range<usize>,
                     to: std::ops::Range<usize>|
          -> Result<()> {

@@ -43,9 +43,9 @@
 //! drafter's cache length after `n` rows is what a one-behind cache would be.
 
 use anyhow::{Context, Result};
-use cudarc::driver::{CudaSlice, CudaView, CudaViewMut};
+use tuili_gpu::{Buf, View, ViewMut};
 use half::f16;
-use tuili_cuda::Device;
+use tuili_gpu::Device;
 use tuili_kernels::{AttnDims, BatchLayout, Kernels, WeightType};
 
 use crate::weights::{Matrix, MtpWeights};
@@ -102,59 +102,59 @@ pub struct MtpHead {
     max_seq: usize,
 
     /// `[max_tokens, d_model]` — the gathered embedding of the shifted ids.
-    emb: CudaSlice<f32>,
+    emb: Buf<f32>,
     /// `[max_tokens, d_model]` — whatever is playing the part of the hidden
     /// state this step: the text model's final hidden on the first draft step,
     /// the head's own output on the ones after it.
-    hidden_in: CudaSlice<f32>,
+    hidden_in: Buf<f32>,
     /// `[max_tokens, 2 * d_model]` — `[e | h]`, the only place the concat order
     /// is expressed.
-    cat: CudaSlice<f32>,
+    cat: Buf<f32>,
     /// The residual stream.
-    x: CudaSlice<f32>,
-    xb: CudaSlice<f32>,
-    q: CudaSlice<f32>,
-    k: CudaSlice<f32>,
-    v: CudaSlice<f32>,
+    x: Buf<f32>,
+    xb: Buf<f32>,
+    q: Buf<f32>,
+    k: Buf<f32>,
+    v: Buf<f32>,
     /// Doubles as the `q_proj` output (`2 * d_attn` wide) and the FFN gate.
-    gate: CudaSlice<f32>,
-    up: CudaSlice<f32>,
-    ffn: CudaSlice<f32>,
+    gate: Buf<f32>,
+    up: Buf<f32>,
+    ffn: Buf<f32>,
     /// The attention output gate, de-interleaved out of `q_proj`'s output.
-    attn_gate: CudaSlice<f32>,
-    attn: CudaSlice<f32>,
-    scores: CudaSlice<f32>,
-    proj: CudaSlice<f32>,
+    attn_gate: Buf<f32>,
+    attn: Buf<f32>,
+    scores: Buf<f32>,
+    proj: Buf<f32>,
     /// `[max_tokens, d_model]` — the head's output, after `mtp.norm`. This is
     /// both what `lm_head` scores and what the next draft step feeds back in.
-    out: CudaSlice<f32>,
-    logits: CudaSlice<f32>,
-    x16: CudaSlice<f16>,
+    out: Buf<f32>,
+    logits: Buf<f32>,
+    x16: Buf<f16>,
 
-    ids: CudaSlice<i32>,
-    positions: CudaSlice<i32>,
-    slots: CudaSlice<i32>,
-    seq_of: CudaSlice<i32>,
+    ids: Buf<i32>,
+    positions: Buf<i32>,
+    slots: Buf<i32>,
+    seq_of: Buf<i32>,
     /// All ones: the head rotates every pair at the base frequency.
-    freqs: CudaSlice<f32>,
+    freqs: Buf<f32>,
 
     /// The drafter's own single-sequence KV cache, `[kv_heads, max_seq, d_head]`.
-    kc: CudaSlice<f16>,
-    vc: CudaSlice<f16>,
+    kc: Buf<f16>,
+    vc: Buf<f16>,
     /// `[branches, max_seq]` — position to slot, one row a branch.
     ///
     /// One branch is the linear draft and the table is the identity. A tree
     /// draft forks: every branch shares the prefix's slots and owns the slots
     /// past it, which is what lets siblings sit at the same position without
     /// overwriting each other's keys. See [`Self::fork`].
-    slot_table: CudaSlice<i32>,
+    slot_table: Buf<i32>,
     /// Branches the table holds, and so the widest tree level this head can run.
     branches: usize,
     /// Slots the shared prefix occupies. Positions below it map to themselves in
     /// every branch; above it each branch has its own.
     fork_at: usize,
     /// One row quantized to q8_1, for the integer vocabulary mat-vec.
-    q8_1: CudaSlice<u8>,
+    q8_1: Buf<u8>,
     /// How far the drafter's cache reaches, in positions.
     len: usize,
     /// Rows the last [`MtpHead::step`] produced.
@@ -182,7 +182,7 @@ impl MtpHead {
         let stream = dev.stream();
         let (d, da, dkv) = (dims.d_model, dims.d_attn(), dims.d_kv());
         let t = max_tokens;
-        let alloc = |n: usize, what: &str| -> Result<CudaSlice<f32>> {
+        let alloc = |n: usize, what: &str| -> Result<Buf<f32>> {
             stream
                 .alloc_zeros::<f32>(n)
                 .with_context(|| format!("allocating the MTP head's {what}"))
@@ -294,7 +294,7 @@ impl MtpHead {
         embed: &Matrix,
         shifted_ids: &[u32],
         positions: &[usize],
-        hidden: &CudaView<'_, f32>,
+        hidden: &View<'_, f32>,
     ) -> Result<()> {
         let n = shifted_ids.len();
         anyhow::ensure!(
@@ -343,7 +343,7 @@ impl MtpHead {
         embed: &Matrix,
         shifted_ids: &[u32],
         positions: &[usize],
-        hidden: &CudaView<'_, f32>,
+        hidden: &View<'_, f32>,
     ) -> Result<usize> {
         let n = shifted_ids.len();
         anyhow::ensure!(n > 0, "priming the drafter with no rows");
@@ -908,13 +908,13 @@ impl MtpHead {
     }
 
     /// The head's output for one row, which is what `lm_head` consumes.
-    pub fn output_row(&self, row: usize) -> CudaView<'_, f32> {
+    pub fn output_row(&self, row: usize) -> View<'_, f32> {
         let d = self.dims.d_model;
         self.out.slice(row * d..(row + 1) * d)
     }
 
     /// Every row the last step produced.
-    pub fn output(&self) -> CudaView<'_, f32> {
+    pub fn output(&self) -> View<'_, f32> {
         self.out.slice(..self.rows * self.dims.d_model)
     }
 
@@ -1668,10 +1668,10 @@ impl crate::Model {
 /// path to choose between.
 fn matmul(
     kern: &Kernels,
-    out: &mut CudaViewMut<'_, f32>,
+    out: &mut ViewMut<'_, f32>,
     w: &Matrix,
-    x16: &mut CudaSlice<f16>,
-    x: &CudaView<'_, f32>,
+    x16: &mut Buf<f16>,
+    x: &View<'_, f32>,
     n_tokens: usize,
 ) -> Result<()> {
     anyhow::ensure!(
@@ -1754,17 +1754,17 @@ pub fn argmax(v: &[f32]) -> u32 {
 /// tokens and measured 5.99 ms — hence `sample_rows_split`, whose candidate
 /// buffers are what `cand_v`/`cand_i` are.
 struct DraftSampleBufs {
-    params: CudaSlice<f32>,
-    pen_tok: CudaSlice<i32>,
-    pen_cnt: CudaSlice<i32>,
-    pen_len: CudaSlice<i32>,
-    rnd: CudaSlice<f64>,
-    out: CudaSlice<u32>,
-    cand_v: CudaSlice<f32>,
-    cand_i: CudaSlice<i32>,
-    surv_id: CudaSlice<u32>,
-    surv_p: CudaSlice<f32>,
-    surv_len: CudaSlice<i32>,
+    params: Buf<f32>,
+    pen_tok: Buf<i32>,
+    pen_cnt: Buf<i32>,
+    pen_len: Buf<i32>,
+    rnd: Buf<f64>,
+    out: Buf<u32>,
+    cand_v: Buf<f32>,
+    cand_i: Buf<i32>,
+    surv_id: Buf<u32>,
+    surv_p: Buf<f32>,
+    surv_len: Buf<i32>,
     /// Survivor entries and the penalty window's pitch.
     stride: usize,
 }

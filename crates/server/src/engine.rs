@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
-use tuili_cuda::Device;
+use tuili_gpu::Device;
 use tuili_gguf::Gguf;
 use tuili_model::{KvCacheQuant, Model, SamplingParams};
 

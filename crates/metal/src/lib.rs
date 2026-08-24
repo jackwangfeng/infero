@@ -19,6 +19,7 @@
 //! what it can (`threadExecutionWidth`, `maxTotalThreadsPerThreadgroup`) and
 //! grids here are fixed constants rather than occupancy-derived.
 
+pub mod backend;
 mod buffer;
 mod device;
 mod launch;

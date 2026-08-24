@@ -4,6 +4,7 @@ members = [
     "crates/gguf",
     "crates/safetensors",
     "crates/cuda",
+    "crates/gpu",
     "crates/metal",
     "crates/kernels",
     "crates/tokenizer",
@@ -22,6 +23,8 @@ license = "Apache-2.0"
 tuili-gguf = { path = "crates/gguf" }
 tuili-safetensors = { path = "crates/safetensors" }
 tuili-cuda = { path = "crates/cuda", default-features = false }
+tuili-metal = { path = "crates/metal" }
+tuili-gpu = { path = "crates/gpu", default-features = false }
 tuili-kernels = { path = "crates/kernels", default-features = false }
 tuili-tokenizer = { path = "crates/tokenizer" }
 tuili-model = { path = "crates/model", default-features = false }

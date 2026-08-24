@@ -11,8 +11,10 @@
 //! saving anything worth measuring.
 
 use anyhow::{Context, Result};
-use cudarc::driver::{CudaSlice, CudaView, PinnedHostSlice};
-use tuili_cuda::Device;
+use tuili_gpu::{Buf, View};
+#[cfg(feature = "cuda")]
+use cudarc::driver::PinnedHostSlice;
+use tuili_gpu::Device;
 use tuili_gguf::{GgmlType, Gguf, TensorInfo};
 use tuili_kernels::WeightType;
 
@@ -25,7 +27,7 @@ const BLOB_ALIGN: usize = 256;
 /// Where a matrix's bytes live.
 enum Storage {
     /// In VRAM, for the process lifetime.
-    Device(CudaSlice<u8>),
+    Device(Buf<u8>),
     /// In the owning layer's host blob, at this byte offset. The same offset
     /// addresses it inside the staging buffer once the layer is transferred.
     Streamed { offset: usize },
@@ -55,7 +57,7 @@ impl Matrix {
     ///
     /// `stage` must be the staging buffer currently holding this matrix's
     /// layer, and is unused for a resident matrix.
-    pub fn view<'a>(&'a self, stage: Option<&'a CudaSlice<u8>>) -> Result<CudaView<'a, u8>> {
+    pub fn view<'a>(&'a self, stage: Option<&'a Buf<u8>>) -> Result<View<'a, u8>> {
         match &self.storage {
             Storage::Device(d) => Ok(d.as_view()),
             Storage::Streamed { offset } => {
@@ -75,7 +77,7 @@ impl Matrix {
 }
 
 /// A 1-D parameter — norm gains and biases — always held as f32 on the device.
-pub type Vector = CudaSlice<f32>;
+pub type Vector = Buf<f32>;
 
 impl Matrix {
     /// Upload `[n, k]` f16 values, row-major, as a resident matrix.
@@ -1482,15 +1484,15 @@ fn to_f32(bytes: &[u8], info: &TensorInfo) -> Result<Vec<f32>> {
 pub struct VisionTower {
     pub shape: tuili_kernels::vision::VisionShape,
     pub cfg: crate::config::VisionConfig,
-    patch_embed_w: CudaSlice<half::f16>,
+    patch_embed_w: Buf<half::f16>,
     patch_embed_b: Vector,
     pos_embed: Vector,
     blocks: Vec<VisionBlock>,
     merger_norm_w: Vector,
     merger_norm_b: Vector,
-    merger_fc1_w: CudaSlice<half::f16>,
+    merger_fc1_w: Buf<half::f16>,
     merger_fc1_b: Vector,
-    merger_fc2_w: CudaSlice<half::f16>,
+    merger_fc2_w: Buf<half::f16>,
     merger_fc2_b: Vector,
     pub device_bytes: usize,
 }
@@ -1500,13 +1502,13 @@ struct VisionBlock {
     norm1_b: Vector,
     norm2_w: Vector,
     norm2_b: Vector,
-    qkv_w: CudaSlice<half::f16>,
+    qkv_w: Buf<half::f16>,
     qkv_b: Vector,
-    proj_w: CudaSlice<half::f16>,
+    proj_w: Buf<half::f16>,
     proj_b: Vector,
-    fc1_w: CudaSlice<half::f16>,
+    fc1_w: Buf<half::f16>,
     fc1_b: Vector,
-    fc2_w: CudaSlice<half::f16>,
+    fc2_w: Buf<half::f16>,
     fc2_b: Vector,
 }
 
@@ -1612,7 +1614,7 @@ pub fn load_vision(
     // makes `proj.weight`'s five dimensions a two-dimensional GEMM operand
     // without a copy.
     let matrix =
-        |name: &str, rows: usize, cols: usize, total: &mut usize| -> Result<CudaSlice<half::f16>> {
+        |name: &str, rows: usize, cols: usize, total: &mut usize| -> Result<Buf<half::f16>> {
             let t = w.tensor(name)?;
             let elems: usize = t.shape.iter().product();
             anyhow::ensure!(

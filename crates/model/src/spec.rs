@@ -50,8 +50,8 @@
 //! `crates/model/tests/spec.rs` measures what it would save.
 
 use anyhow::{Context, Result};
-use cudarc::driver::{CudaSlice, CudaView};
-use tuili_cuda::Device;
+use tuili_gpu::{Buf, View};
+use tuili_gpu::Device;
 use tuili_kernels::gdn::SeqLayout;
 
 use crate::config::LinearAttnConfig;
@@ -140,13 +140,13 @@ pub struct GdnRollback {
     /// recurrence over unfiltered inputs, and journalling between the
     /// convolution and the normalization replays it over unnormalized keys.
     /// `crates/model/tests/spec.rs` requires both to give a different state.
-    qkv: CudaSlice<f32>,
+    qkv: Buf<f32>,
     /// `[n_linear, cap, value_heads]` each, as `gdn_gate_decay` produced them.
-    g: CudaSlice<f32>,
-    beta: CudaSlice<f32>,
+    g: Buf<f32>,
+    beta: Buf<f32>,
     /// `[n_linear, cap, conv_channels]` — the **pre**-convolution row, which is
     /// what re-advancing the window over the accepted prefix needs.
-    qkv_pre: CudaSlice<f32>,
+    qkv_pre: Buf<f32>,
     /// `[n_linear, max_seqs, conv_channels * (conv_k - 1)]` — the convolution
     /// taps as they stood before the verification pass.
     ///
@@ -157,15 +157,15 @@ pub struct GdnRollback {
     /// and the candidates' inputs holds exactly the same history — the union is
     /// the wide window — and needs no kernel change. 120 KiB a layer a sequence
     /// against the widened window's 200 KiB at `k = 2`.
-    conv_pre: CudaSlice<f32>,
+    conv_pre: Buf<f32>,
     /// A working copy of one layer's recurrent state, so that the verification
     /// pass leaves the persistent one alone. See the module note.
-    state_scratch: CudaSlice<f32>,
+    state_scratch: Buf<f32>,
     /// Somewhere for the replay's outputs to go. The replay is run for its
     /// effect on the state; the readouts were already computed by the pass being
     /// replayed and are thrown away here.
-    out_scratch: CudaSlice<f32>,
-    conv_out_scratch: CudaSlice<f32>,
+    out_scratch: Buf<f32>,
+    conv_out_scratch: Buf<f32>,
 
     /// Set for the duration of a verification pass.
     armed: bool,
@@ -264,7 +264,7 @@ impl GdnRollback {
     }
 
     /// One layer's state, for a caller checking what a pass left behind.
-    pub fn working_state(&self) -> CudaView<'_, f32> {
+    pub fn working_state(&self) -> View<'_, f32> {
         self.state_scratch.as_view()
     }
 
@@ -308,12 +308,12 @@ impl GdnRollback {
 /// is legible at the call site.
 pub struct GdnTap<'a> {
     /// The input projection's packed row, before the convolution.
-    pub pre_conv: CudaView<'a, f32>,
+    pub pre_conv: View<'a, f32>,
     /// The same row after the convolution *and* after `q`/`k` were
     /// l2-normalized — what the recurrence actually consumes.
-    pub post_conv: CudaView<'a, f32>,
-    pub g: CudaView<'a, f32>,
-    pub beta: CudaView<'a, f32>,
+    pub post_conv: View<'a, f32>,
+    pub g: View<'a, f32>,
+    pub beta: View<'a, f32>,
 }
 
 impl GdnRollback {
@@ -322,7 +322,7 @@ impl GdnRollback {
         &mut self,
         dev: &Device,
         ordinal: usize,
-        conv: &CudaView<'_, f32>,
+        conv: &View<'_, f32>,
     ) -> Result<()> {
         let span = self.conv_span(ordinal);
         anyhow::ensure!(
@@ -341,7 +341,7 @@ impl GdnRollback {
     pub fn stage_state(
         &mut self,
         dev: &Device,
-        state: &CudaView<'_, f32>,
+        state: &View<'_, f32>,
     ) -> Result<()> {
         anyhow::ensure!(
             state.len() == self.state_scratch.len(),
@@ -355,7 +355,7 @@ impl GdnRollback {
         Ok(())
     }
 
-    pub fn state_scratch_mut(&mut self) -> cudarc::driver::CudaViewMut<'_, f32> {
+    pub fn state_scratch_mut(&mut self) -> tuili_gpu::ViewMut<'_, f32> {
         self.state_scratch.as_view_mut()
     }
 
@@ -385,9 +385,9 @@ impl GdnRollback {
         ordinal: usize,
         keep: usize,
         seqs: &SeqLayout<'_>,
-        conv_w: &CudaView<'_, f32>,
-        state: &mut cudarc::driver::CudaViewMut<'_, f32>,
-        conv: &mut cudarc::driver::CudaViewMut<'_, f32>,
+        conv_w: &View<'_, f32>,
+        state: &mut tuili_gpu::ViewMut<'_, f32>,
+        conv: &mut tuili_gpu::ViewMut<'_, f32>,
     ) -> Result<()> {
         anyhow::ensure!(keep <= self.rows, "keeping {keep} of {} rows", self.rows);
         let la = self.la;
@@ -993,7 +993,7 @@ impl Model {
 /// does; the weights are indexed by model layer. Walking the layers to find the
 /// n-th linear one keeps the two numberings from being conflated at the call
 /// site.
-fn pool_conv_weight(w: &crate::Weights, ordinal: usize) -> Result<CudaView<'_, f32>> {
+fn pool_conv_weight(w: &crate::Weights, ordinal: usize) -> Result<View<'_, f32>> {
     let mut seen = 0usize;
     for l in &w.layers {
         if let Some(g) = l.gdn.as_ref() {

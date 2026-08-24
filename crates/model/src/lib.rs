@@ -36,10 +36,12 @@ mod sampling;
 pub mod weights;
 
 use anyhow::{Context, Result};
-use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, CudaView, CudaViewMut};
+use tuili_gpu::{Buf, View, ViewMut};
+#[cfg(feature = "cuda")]
+use cudarc::driver::{CudaEvent, CudaStream};
 use half::f16;
 use std::sync::Arc;
-use tuili_cuda::Device;
+use tuili_gpu::Device;
 use tuili_gguf::Gguf;
 use tuili_kernels::{AttnDims, BatchLayout, Kernels, KvQuant, TqTables};
 
@@ -239,34 +241,34 @@ enum GraphSlot {
 /// Device-side activations, allocated once and reused for every forward pass.
 struct Activations {
     /// The residual stream, `[chunk, d_model]`.
-    x: CudaSlice<f32>,
+    x: Buf<f32>,
     /// Normalized copy of `x` feeding the projections.
-    xb: CudaSlice<f32>,
-    q: CudaSlice<f32>,
-    k: CudaSlice<f32>,
-    v: CudaSlice<f32>,
-    attn: CudaSlice<f32>,
-    proj: CudaSlice<f32>,
-    gate: CudaSlice<f32>,
-    up: CudaSlice<f32>,
-    ffn: CudaSlice<f32>,
+    xb: Buf<f32>,
+    q: Buf<f32>,
+    k: Buf<f32>,
+    v: Buf<f32>,
+    attn: Buf<f32>,
+    proj: Buf<f32>,
+    gate: Buf<f32>,
+    up: Buf<f32>,
+    ffn: Buf<f32>,
     /// `[n_heads, chunk, max_seq]`
-    scores: CudaSlice<f32>,
-    logits: CudaSlice<f32>,
-    token_ids: CudaSlice<i32>,
-    positions: CudaSlice<i32>,
+    scores: Buf<f32>,
+    logits: Buf<f32>,
+    token_ids: Buf<i32>,
+    positions: Buf<i32>,
     /// Per token: which sequence row it belongs to.
-    seq_of: CudaSlice<i32>,
+    seq_of: Buf<i32>,
     /// Per token: the pool slot its key/value go to.
-    slots: CudaSlice<i32>,
+    slots: Buf<i32>,
     /// Batch rows whose logits are wanted.
-    logit_rows: CudaSlice<i32>,
-    attn_partial: CudaSlice<f32>,
+    logit_rows: Buf<i32>,
+    attn_partial: Buf<f32>,
     /// Those rows, gathered and normalized.
-    head_in: CudaSlice<f32>,
+    head_in: Buf<f32>,
     /// The attention output gate, `[chunk, d_attn]`. Allocated only for models
     /// whose attention blocks carry one.
-    attn_gate: Option<CudaSlice<f32>>,
+    attn_gate: Option<Buf<f32>>,
     /// GatedDeltaNet scratch, allocated only for models that have such blocks.
     gdn: Option<GdnActs>,
 }
@@ -278,23 +280,23 @@ struct Activations {
 /// is 40 KiB a token.
 struct GdnActs {
     /// `[chunk, conv_channels]` — the input projection's output.
-    qkv: CudaSlice<f32>,
+    qkv: Buf<f32>,
     /// The same after the convolution and SiLU. A separate buffer because the
     /// convolution reads three tokens back and would otherwise consume values
     /// it had already overwritten.
-    qkv_conv: CudaSlice<f32>,
+    qkv_conv: Buf<f32>,
     /// `[chunk, value_dim]` — the output gate.
-    z: CudaSlice<f32>,
+    z: Buf<f32>,
     /// `[chunk, value_heads]` each.
-    a: CudaSlice<f32>,
-    b: CudaSlice<f32>,
+    a: Buf<f32>,
+    b: Buf<f32>,
     /// `[chunk, 2 * value_heads]` — `a` and `b` from the stacked projection,
     /// interleaved a token at a time. Unused when the loader could not stack.
-    ab: CudaSlice<f32>,
-    beta: CudaSlice<f32>,
-    g: CudaSlice<f32>,
+    ab: Buf<f32>,
+    beta: Buf<f32>,
+    g: Buf<f32>,
     /// `[chunk, value_dim]` — the recurrence's output, before the gated norm.
-    core: CudaSlice<f32>,
+    core: Buf<f32>,
 }
 
 /// Double-buffered staging for offloaded layers.
@@ -306,7 +308,7 @@ struct GdnActs {
 /// reading and the slot may be overwritten.
 struct Offload {
     copy_stream: Arc<CudaStream>,
-    stage: [CudaSlice<u8>; 2],
+    stage: [Buf<u8>; 2],
     ready: [CudaEvent; 2],
     consumed: [CudaEvent; 2],
     /// Which layer each slot currently holds.
@@ -343,21 +345,21 @@ impl Offload {
 /// undone once on the attention output — never on a cached vector.
 struct TqBuffers {
     tables: TqTables,
-    k_rot: CudaSlice<f32>,
-    v_rot: CudaSlice<f32>,
-    q_rot: CudaSlice<f32>,
+    k_rot: Buf<f32>,
+    v_rot: Buf<f32>,
+    q_rot: Buf<f32>,
     /// `S'·(Π·q)`, the query side of the QJL inner product.
-    q_qjl: CudaSlice<f32>,
+    q_qjl: Buf<f32>,
     /// The attention output before `Πᵀ` maps it back.
-    acc_rot: CudaSlice<f32>,
+    acc_rot: Buf<f32>,
 }
 
 /// Staging for the cuBLAS path: a dequantized weight matrix and f16 inputs.
 struct Scratch {
-    w16: CudaSlice<f16>,
-    x16: CudaSlice<f16>,
+    w16: Buf<f16>,
+    x16: Buf<f16>,
     /// The activation row in Q8_1, for the integer mat-vec.
-    q8_1: CudaSlice<u8>,
+    q8_1: Buf<u8>,
 }
 
 /// One row's sampling parameters plus its own uniform draw.
@@ -427,7 +429,7 @@ pub struct Model {
     /// which passes `Qwen3NextModel.forward`'s return value, whose last statement
     /// is the final norm. `tests/qwen35_mtp.rs` pins it numerically against the
     /// capture, which carries both tensors for exactly this reason.
-    mtp_hidden: Option<CudaSlice<f32>>,
+    mtp_hidden: Option<Buf<f32>>,
     /// The journal that undoes a rejected candidate's effect on the recurrent
     /// state. Only allocated for a model that has linear-attention blocks.
     gdn_rollback: Option<spec::GdnRollback>,
@@ -444,24 +446,24 @@ pub struct Model {
 /// Device-side scratch for sampling. Sized once, at the batch and vocabulary
 /// the model was built for.
 struct SampleBufs {
-    params: cudarc::driver::CudaSlice<f32>,
+    params: tuili_gpu::Buf<f32>,
     /// Slice winners for the split greedy argmax; see
     /// `Kernels::sample_rows_greedy`.
-    arg_v: cudarc::driver::CudaSlice<f32>,
-    arg_i: cudarc::driver::CudaSlice<i32>,
-    pen_tok: cudarc::driver::CudaSlice<i32>,
-    pen_cnt: cudarc::driver::CudaSlice<i32>,
-    pen_len: cudarc::driver::CudaSlice<i32>,
-    rnd: cudarc::driver::CudaSlice<f64>,
-    out: cudarc::driver::CudaSlice<u32>,
+    arg_v: tuili_gpu::Buf<f32>,
+    arg_i: tuili_gpu::Buf<i32>,
+    pen_tok: tuili_gpu::Buf<i32>,
+    pen_cnt: tuili_gpu::Buf<i32>,
+    pen_len: tuili_gpu::Buf<i32>,
+    rnd: tuili_gpu::Buf<f64>,
+    out: tuili_gpu::Buf<u32>,
     /// Per-slice top-k candidates for `Kernels::sample_rows_split`.
-    cand_v: cudarc::driver::CudaSlice<f32>,
-    cand_i: cudarc::driver::CudaSlice<i32>,
+    cand_v: tuili_gpu::Buf<f32>,
+    cand_i: tuili_gpu::Buf<i32>,
     /// The surviving distribution each row drew from, which is what the
     /// speculative acceptance rule composes with.
-    surv_id: cudarc::driver::CudaSlice<u32>,
-    surv_p: cudarc::driver::CudaSlice<f32>,
-    surv_len: cudarc::driver::CudaSlice<i32>,
+    surv_id: tuili_gpu::Buf<u32>,
+    surv_p: tuili_gpu::Buf<f32>,
+    surv_len: tuili_gpu::Buf<i32>,
     stride: usize,
     /// Entries the candidate and survivor buffers hold a row.
     top_k: usize,
@@ -1868,7 +1870,7 @@ impl Model {
         // bytes — 96 of a decode step's 104 `gemv` launches. Stacked they are
         // one launch, and `ab` holds them interleaved a token at a time.
         let stacked = gw.in_proj_ba.as_ref();
-        let gate: Vec<(&Matrix, &mut CudaSlice<f32>, usize)> = match stacked {
+        let gate: Vec<(&Matrix, &mut Buf<f32>, usize)> = match stacked {
             Some(ba) => vec![(ba, &mut acts.ab, 2 * heads)],
             None => vec![
                 (&gw.in_proj_a, &mut acts.a, heads),
@@ -3057,9 +3059,9 @@ impl Model {
     fn norm_for_group(
         kern: &Kernels,
         scratch: &mut Scratch,
-        act_xb: &mut CudaSlice<f32>,
-        x: &CudaView<'_, f32>,
-        weight: &CudaView<'_, f32>,
+        act_xb: &mut Buf<f32>,
+        x: &View<'_, f32>,
+        weight: &View<'_, f32>,
         n_tokens: usize,
         d: usize,
         eps: f32,
@@ -3155,10 +3157,10 @@ impl Model {
     fn matmul(
         kern: &Kernels,
         scratch: &mut Scratch,
-        out: &mut CudaViewMut<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
         w: &Matrix,
-        stage: Option<&CudaSlice<u8>>,
-        x: &CudaView<'_, f32>,
+        stage: Option<&Buf<u8>>,
+        x: &View<'_, f32>,
         n_tokens: usize,
         use_mmvq: bool,
         use_mmq: bool,
@@ -3203,10 +3205,10 @@ impl Model {
     fn matmul_pre(
         kern: &Kernels,
         scratch: &mut Scratch,
-        out: &mut CudaViewMut<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
         w: &Matrix,
-        stage: Option<&CudaSlice<u8>>,
-        x: &CudaView<'_, f32>,
+        stage: Option<&Buf<u8>>,
+        x: &View<'_, f32>,
         n_tokens: usize,
         use_mmvq: bool,
         use_mmq: bool,
@@ -3500,7 +3502,7 @@ impl Activations {
         let d_attn = cfg.d_attn();
         let kv_dim = cfg.d_kv();
 
-        let alloc_f32 = |n: usize, what: &str| -> Result<CudaSlice<f32>> {
+        let alloc_f32 = |n: usize, what: &str| -> Result<Buf<f32>> {
             stream
                 .alloc_zeros::<f32>(n)
                 .with_context(|| format!("allocating {what} ({} MiB)", (n * 4) >> 20))
@@ -3617,7 +3619,7 @@ impl Model {
 /// second image does not overwrite the first — the scratch is a per-call buffer
 /// and features have to outlive the call to reach the forward pass.
 pub struct VisionFeatures {
-    rows: CudaSlice<f32>,
+    rows: Buf<f32>,
     /// How many language-model tokens this image occupies, `patches / 4`.
     pub tokens: usize,
     pub out_hidden: usize,
@@ -3628,7 +3630,7 @@ pub struct VisionFeatures {
 }
 
 impl VisionFeatures {
-    pub fn view(&self) -> CudaView<'_, f32> {
+    pub fn view(&self) -> View<'_, f32> {
         self.rows.as_view()
     }
 }

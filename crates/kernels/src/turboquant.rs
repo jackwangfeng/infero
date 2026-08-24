@@ -585,8 +585,8 @@ mod tests {
 
 // ---- device side --------------------------------------------------------
 
-use cudarc::driver::CudaSlice;
-use tuili_cuda::Device;
+use tuili_gpu::Buf;
+use tuili_gpu::Device;
 
 /// How the KV cache is stored.
 ///
@@ -781,11 +781,11 @@ pub struct DeviceTables {
     /// The codebooks and matrices are public so tests can decode independently.
     pub quant: KvQuant,
     pub d: usize,
-    pub rotation: CudaSlice<f32>,
-    pub rotation_t: CudaSlice<f32>,
-    pub qjl: CudaSlice<f32>,
-    pub k_levels: CudaSlice<f32>,
-    pub v_levels: CudaSlice<f32>,
+    pub rotation: Buf<f32>,
+    pub rotation_t: Buf<f32>,
+    pub qjl: Buf<f32>,
+    pub k_levels: Buf<f32>,
+    pub v_levels: Buf<f32>,
     pub k_codebook: Codebook,
     pub v_codebook: Codebook,
 }

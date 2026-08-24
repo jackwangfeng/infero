@@ -38,7 +38,7 @@
 //! is load-bearing rather than cosmetic.
 
 use anyhow::{Context, Result};
-use cudarc::driver::{CudaSlice, CudaView, CudaViewMut, LaunchConfig, PushKernelArg};
+use tuili_gpu::{Buf, View, ViewMut, LaunchConfig, KernelArg};
 use half::f16;
 
 use crate::{ELEMENTWISE_BLOCK, Kernels, REDUCE_BLOCK, vision_src};
@@ -123,11 +123,11 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn vision_layer_norm(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        out_h: &mut CudaViewMut<'_, f16>,
-        x: &CudaView<'_, f32>,
-        w: &CudaView<'_, f32>,
-        b: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
+        out_h: &mut ViewMut<'_, f16>,
+        x: &View<'_, f32>,
+        w: &View<'_, f32>,
+        b: &View<'_, f32>,
         rows: usize,
         d: usize,
         eps: f32,
@@ -167,9 +167,9 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn vision_gelu(
         &self,
-        io: &mut CudaViewMut<'_, f32>,
-        out_h: &mut CudaViewMut<'_, f16>,
-        bias: &CudaView<'_, f32>,
+        io: &mut ViewMut<'_, f32>,
+        out_h: &mut ViewMut<'_, f16>,
+        bias: &View<'_, f32>,
         rows: usize,
         n_cols: usize,
         exact: bool,
@@ -208,9 +208,9 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn vision_rope_tables(
         &self,
-        cos: &mut CudaViewMut<'_, f32>,
-        sin: &mut CudaViewMut<'_, f32>,
-        pos_ids: &CudaView<'_, i32>,
+        cos: &mut ViewMut<'_, f32>,
+        sin: &mut ViewMut<'_, f32>,
+        pos_ids: &View<'_, i32>,
         n: usize,
         head_dim: usize,
         rope_dim: usize,
@@ -260,12 +260,12 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn vision_qkv_rope(
         &self,
-        q: &mut CudaViewMut<'_, f32>,
-        k: &mut CudaViewMut<'_, f32>,
-        v: &mut CudaViewMut<'_, f32>,
-        qkv: &CudaView<'_, f32>,
-        cos: &CudaView<'_, f32>,
-        sin: &CudaView<'_, f32>,
+        q: &mut ViewMut<'_, f32>,
+        k: &mut ViewMut<'_, f32>,
+        v: &mut ViewMut<'_, f32>,
+        qkv: &View<'_, f32>,
+        cos: &View<'_, f32>,
+        sin: &View<'_, f32>,
         n: usize,
         heads: usize,
         head_dim: usize,
@@ -318,10 +318,10 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn vision_attn(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        q: &CudaView<'_, f32>,
-        k: &CudaView<'_, f32>,
-        v: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
+        q: &View<'_, f32>,
+        k: &View<'_, f32>,
+        v: &View<'_, f32>,
         segs: &VisionSegments,
         heads: usize,
         head_dim: usize,
@@ -384,9 +384,9 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn vision_patchify(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        out_h: &mut CudaViewMut<'_, f16>,
-        frames: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
+        out_h: &mut ViewMut<'_, f16>,
+        frames: &View<'_, f32>,
         n_frames: usize,
         height: usize,
         width: usize,
@@ -463,10 +463,10 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn vision_add_pos_embed(
         &self,
-        hidden: &mut CudaViewMut<'_, f32>,
-        table: &CudaView<'_, f32>,
-        idx: &CudaView<'_, i32>,
-        wts: &CudaView<'_, f32>,
+        hidden: &mut ViewMut<'_, f32>,
+        table: &View<'_, f32>,
+        idx: &View<'_, i32>,
+        wts: &View<'_, f32>,
         n: usize,
         hidden_size: usize,
         taps: usize,
@@ -499,9 +499,9 @@ impl Kernels {
     /// with [`splice_targets`].
     pub fn vision_splice(
         &self,
-        embeds: &mut CudaViewMut<'_, f32>,
-        features: &CudaView<'_, f32>,
-        dst_row: &CudaView<'_, i32>,
+        embeds: &mut ViewMut<'_, f32>,
+        features: &View<'_, f32>,
+        dst_row: &View<'_, i32>,
         out_hidden: usize,
         n_features: usize,
     ) -> Result<()> {
@@ -569,9 +569,9 @@ pub fn splice_targets(input_ids: &[u32], n_features: usize) -> Result<Vec<i32>> 
 /// in and which query it starts at. Building it on the host costs one pass over
 /// the segment list.
 pub struct VisionSegments {
-    tile_a: CudaSlice<i32>,
-    tile_b: CudaSlice<i32>,
-    tile_q0: CudaSlice<i32>,
+    tile_a: Buf<i32>,
+    tile_b: Buf<i32>,
+    tile_q0: Buf<i32>,
     pub tiles: usize,
     pub total: usize,
     pub segments: usize,
@@ -581,7 +581,7 @@ impl VisionSegments {
     /// `cu` is the cumulative segment boundary list, `[0, l0, l0+l1, ...]` —
     /// what `tuili_model::qwen35_vision::cu_seqlens` returns. One segment a
     /// frame, not a grid entry: a `t`-frame video is `t` segments.
-    pub fn new(dev: &tuili_cuda::Device, cu: &[usize]) -> Result<Self> {
+    pub fn new(dev: &tuili_gpu::Device, cu: &[usize]) -> Result<Self> {
         anyhow::ensure!(
             cu.first() == Some(&0),
             "cu_seqlens must start at 0; got {:?}",
@@ -618,10 +618,10 @@ impl VisionSegments {
 /// check.
 pub struct VisionGeometry {
     pub segs: VisionSegments,
-    pub cos: CudaSlice<f32>,
-    pub sin: CudaSlice<f32>,
-    pub interp_idx: CudaSlice<i32>,
-    pub interp_wts: CudaSlice<f32>,
+    pub cos: Buf<f32>,
+    pub sin: Buf<f32>,
+    pub interp_idx: Buf<i32>,
+    pub interp_wts: Buf<f32>,
     pub taps: usize,
 }
 
@@ -682,22 +682,22 @@ impl VisionGeometry {
 /// `patch_embed.proj.bias` moves the patch embedding by 3.05 out of a peak of
 /// 3.15.
 pub struct VisionBlockWeights<'a> {
-    pub norm1_w: CudaView<'a, f32>,
-    pub norm1_b: CudaView<'a, f32>,
-    pub norm2_w: CudaView<'a, f32>,
-    pub norm2_b: CudaView<'a, f32>,
+    pub norm1_w: View<'a, f32>,
+    pub norm1_b: View<'a, f32>,
+    pub norm2_w: View<'a, f32>,
+    pub norm2_b: View<'a, f32>,
     /// `[3 * hidden, hidden]`, row-major: `[all q | all k | all v]` rows.
-    pub qkv_w: CudaView<'a, f16>,
-    pub qkv_b: CudaView<'a, f32>,
+    pub qkv_w: View<'a, f16>,
+    pub qkv_b: View<'a, f32>,
     /// `[hidden, hidden]`.
-    pub proj_w: CudaView<'a, f16>,
-    pub proj_b: CudaView<'a, f32>,
+    pub proj_w: View<'a, f16>,
+    pub proj_b: View<'a, f32>,
     /// `[intermediate, hidden]`.
-    pub fc1_w: CudaView<'a, f16>,
-    pub fc1_b: CudaView<'a, f32>,
+    pub fc1_w: View<'a, f16>,
+    pub fc1_b: View<'a, f32>,
     /// `[hidden, intermediate]`.
-    pub fc2_w: CudaView<'a, f16>,
-    pub fc2_b: CudaView<'a, f32>,
+    pub fc2_w: View<'a, f16>,
+    pub fc2_b: View<'a, f32>,
 }
 
 /// The whole tower's weights.
@@ -710,22 +710,22 @@ pub struct VisionWeights<'a> {
     /// `[hidden, patch_dim]` — `proj.weight` flattened, which is a free view of
     /// the checkpoint's `[1152, 3, 2, 16, 16]`. The patch embedding is a GEMM,
     /// not a convolution: kernel equals stride and the input arrives pre-tiled.
-    pub patch_embed_w: CudaView<'a, f16>,
-    pub patch_embed_b: CudaView<'a, f32>,
+    pub patch_embed_w: View<'a, f16>,
+    pub patch_embed_b: View<'a, f32>,
     /// `[num_position_embeddings, hidden]`, the learned 48x48 grid.
-    pub pos_embed: CudaView<'a, f32>,
+    pub pos_embed: View<'a, f32>,
     pub blocks: Vec<VisionBlockWeights<'a>>,
     /// `[hidden]` — **not** `[4 * hidden]`. The merger normalizes each patch
     /// before it groups them, and the checkpoint settles it: a post-shuffle norm
     /// would make this 4608 wide.
-    pub merger_norm_w: CudaView<'a, f32>,
-    pub merger_norm_b: CudaView<'a, f32>,
+    pub merger_norm_w: View<'a, f32>,
+    pub merger_norm_b: View<'a, f32>,
     /// `[4 * hidden, 4 * hidden]`.
-    pub merger_fc1_w: CudaView<'a, f16>,
-    pub merger_fc1_b: CudaView<'a, f32>,
+    pub merger_fc1_w: View<'a, f16>,
+    pub merger_fc1_b: View<'a, f32>,
     /// `[out_hidden, 4 * hidden]`.
-    pub merger_fc2_w: CudaView<'a, f16>,
-    pub merger_fc2_b: CudaView<'a, f32>,
+    pub merger_fc2_w: View<'a, f16>,
+    pub merger_fc2_b: View<'a, f32>,
 }
 
 /// Activation buffers for one vision call, sized by the patch count.
@@ -737,22 +737,22 @@ pub struct VisionWeights<'a> {
 /// boundary changes nothing about the result.
 pub struct VisionScratch {
     max_patches: usize,
-    pixels_h: CudaSlice<f16>,
-    hidden: CudaSlice<f32>,
-    normed: CudaSlice<f32>,
-    normed_h: CudaSlice<f16>,
-    qkv: CudaSlice<f32>,
-    qkv_split: CudaSlice<f32>,
-    ctx: CudaSlice<f32>,
-    ctx_h: CudaSlice<f16>,
-    wide: CudaSlice<f32>,
-    wide_h: CudaSlice<f16>,
-    sub: CudaSlice<f32>,
-    features: CudaSlice<f32>,
+    pixels_h: Buf<f16>,
+    hidden: Buf<f32>,
+    normed: Buf<f32>,
+    normed_h: Buf<f16>,
+    qkv: Buf<f32>,
+    qkv_split: Buf<f32>,
+    ctx: Buf<f32>,
+    ctx_h: Buf<f16>,
+    wide: Buf<f32>,
+    wide_h: Buf<f16>,
+    sub: Buf<f32>,
+    features: Buf<f32>,
 }
 
 impl VisionScratch {
-    pub fn new(dev: &tuili_cuda::Device, shape: &VisionShape, max_patches: usize) -> Result<Self> {
+    pub fn new(dev: &tuili_gpu::Device, shape: &VisionShape, max_patches: usize) -> Result<Self> {
         anyhow::ensure!(
             max_patches.is_multiple_of(shape.merge_unit()),
             "the merger folds {} patches into a token, so a call's patch count \
@@ -784,19 +784,19 @@ impl VisionScratch {
 
     /// The tower's `last_hidden_state`, `[n_patches, hidden]` — the residual
     /// stream before the merger.
-    pub fn last_hidden(&self) -> CudaView<'_, f32> {
+    pub fn last_hidden(&self) -> View<'_, f32> {
         self.hidden.as_view()
     }
 
     /// The merger's output, `[n_patches / 4, out_hidden]`. This is what the
     /// language model consumes — `pooler_output`, not `last_hidden_state`.
-    pub fn features(&self) -> CudaView<'_, f32> {
+    pub fn features(&self) -> View<'_, f32> {
         self.features.as_view()
     }
 
     /// The f16 `pixel_values` the patch embedding reads, for a caller that
     /// produces patches some other way than [`Kernels::vision_patchify`].
-    pub fn pixels_h_mut(&mut self) -> CudaViewMut<'_, f16> {
+    pub fn pixels_h_mut(&mut self) -> ViewMut<'_, f16> {
         self.pixels_h.as_view_mut()
     }
 }

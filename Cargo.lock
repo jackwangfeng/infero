@@ -2270,6 +2270,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuili-gpu"
+version = "0.1.0"
+dependencies = [
+ "tuili-cuda",
+ "tuili-metal",
+]
+
+[[package]]
 name = "tuili-kernels"
 version = "0.1.0"
 dependencies = [
@@ -2281,6 +2289,7 @@ dependencies = [
  "tracing-subscriber",
  "tuili-cuda",
  "tuili-gguf",
+ "tuili-gpu",
  "tuili-model",
  "tuili-safetensors",
 ]
@@ -2316,6 +2325,7 @@ dependencies = [
  "tracing-subscriber",
  "tuili-cuda",
  "tuili-gguf",
+ "tuili-gpu",
  "tuili-kernels",
  "tuili-safetensors",
  "tuili-tokenizer",
@@ -2350,8 +2360,8 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
- "tuili-cuda",
  "tuili-gguf",
+ "tuili-gpu",
  "tuili-model",
  "tuili-tokenizer",
 ]
