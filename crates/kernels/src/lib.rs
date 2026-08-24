@@ -52,6 +52,7 @@ const SAMPLE_CU: &str = include_str!("cu/sample.cu");
 const GDN_CU: &str = include_str!("cu/gdn.cu");
 const FP8_CU: &str = include_str!("cu/fp8.cu");
 const VISION_CU: &str = include_str!("cu/vision.cu");
+const MOE_CU: &str = include_str!("cu/moe.cu");
 
 /// Threads per block for the reduction kernels. 256 keeps eight warps busy
 /// without pushing occupancy off a cliff on sm_86.
@@ -130,6 +131,16 @@ fn mmq_src() -> &'static str {
 fn mmvq_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SRC.get_or_init(|| format!("{COMMON_CUH}\n{MMVQ_CU}"))
+}
+
+/// The MoE kernels compile against `mmvq.cu`, not beside it: `mmvq_moe` is the
+/// dense mat-vec with the weight base moved, so it uses the same `tq_dot_*`
+/// devices functions and the same block layout. Duplicating those would let the
+/// two drift, and a drifted dot product is a wrong answer rather than a
+/// compile error.
+fn moe_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| format!("{COMMON_CUH}\n{MMVQ_CU}\n{MOE_CU}"))
 }
 
 fn tq_src() -> &'static str {
@@ -2669,6 +2680,142 @@ impl Kernels {
         b.arg(out).arg(w).arg(x_q8_1).arg(&k_i).arg(&n_i).arg(&t_i);
         self.dev.profile().time("mmvq_batch", self.dev.stream(), || {
             unsafe { b.launch(cfg) }.context("mmvq_batch")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Whether an expert block's encoding has a MoE mat-vec.
+    pub fn has_mmvq_moe(ty: WeightType) -> bool {
+        matches!(
+            ty,
+            WeightType::Q4G128 | WeightType::Q4G128T | WeightType::Q8_0
+        )
+    }
+
+    /// Softmax, top-k and the combine weights, one block per token.
+    ///
+    /// `ids` and `weights` come out `[n_tokens, k]`, in descending order of
+    /// router logit.
+    pub fn moe_topk(
+        &self,
+        ids: &mut CudaViewMut<'_, i32>,
+        weights: &mut CudaViewMut<'_, f32>,
+        logits: &CudaView<'_, f32>,
+        n_experts: usize,
+        k: usize,
+        n_tokens: usize,
+        norm_topk_prob: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            k > 0 && k <= n_experts,
+            "routing to {k} of {n_experts} experts"
+        );
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_moe", moe_src(), "moe_topk_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_tokens as u32, 1, 1),
+            block_dim: (per_vector_block(n_experts), 1, 1),
+            shared_mem_bytes: (n_experts * 4) as u32,
+        };
+        let (ne, k_i, norm) = (n_experts as i32, k as i32, norm_topk_prob as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(ids).arg(weights).arg(logits).arg(&ne).arg(&k_i).arg(&norm);
+        self.dev.profile().time("moe_topk", self.dev.stream(), || {
+            unsafe { b.launch(cfg) }.context("moe_topk")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// The integer mat-vec against every (token, active expert) pair.
+    ///
+    /// `w_all` is the whole concatenated block and `stride` the bytes between
+    /// experts; `expert_ids` is one entry per slot and `out` comes out
+    /// `[n_slots, n]`. One launch, not one per slot — at top-8 and 48 layers a
+    /// loop would be 1152 launches a token.
+    ///
+    /// `y_group` is how many consecutive slots share an activation row:
+    /// `n_active` for `gate` and `up`, which read the token's residual, and 1
+    /// for `down`, which reads each slot's own SwiGLU product. This is what
+    /// makes one launch serve decode and prefill alike.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mmvq_moe(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        w_all: &CudaView<'_, u8>,
+        ty: WeightType,
+        expert_ids: &CudaView<'_, i32>,
+        x_q8_1: &CudaView<'_, u8>,
+        k: usize,
+        n: usize,
+        n_slots: usize,
+        stride: usize,
+        y_group: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(Self::has_mmvq_moe(ty), "no MoE mat-vec for {ty}");
+        anyhow::ensure!(
+            y_group > 0 && n_slots.is_multiple_of(y_group),
+            "{n_slots} slots do not group into activation rows of {y_group}"
+        );
+        let name = format!("mmvq_moe_{}", ty.suffix());
+        let f = self.dev.kernels().get("tuili_moe", moe_src(), &name)?;
+        let slices = match ty {
+            WeightType::Q8_0 => k / 8,
+            WeightType::Q4G128 | WeightType::Q4G128T => k / 32,
+            _ => unreachable!("guarded above"),
+        };
+        let block = (slices as u32).next_multiple_of(32).clamp(32, REDUCE_BLOCK);
+        let cfg = LaunchConfig {
+            grid_dim: (n as u32, n_slots as u32, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (k_i, n_i, stride_i, yg) =
+            (k as i32, n as i32, stride as i64, y_group as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out)
+            .arg(w_all)
+            .arg(expert_ids)
+            .arg(x_q8_1)
+            .arg(&k_i)
+            .arg(&n_i)
+            .arg(&stride_i)
+            .arg(&yg);
+        self.dev.profile().time("mmvq_moe", self.dev.stream(), || {
+            unsafe { b.launch(cfg) }.context("mmvq_moe")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// `out[t] = sum_a weights[t, a] * partials[t, a]`.
+    pub fn moe_combine(
+        &self,
+        out: &mut CudaViewMut<'_, f32>,
+        partials: &CudaView<'_, f32>,
+        weights: &CudaView<'_, f32>,
+        d: usize,
+        k: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_moe", moe_src(), "moe_combine_f32")?;
+        let total = d * n_tokens;
+        let (d_i, k_i, total_i) = (d as i32, k as i32, total as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out)
+            .arg(partials)
+            .arg(weights)
+            .arg(&d_i)
+            .arg(&k_i)
+            .arg(&total_i);
+        self.dev.profile().time("moe_combine", self.dev.stream(), || {
+            unsafe { b.launch(elementwise(total as u32)) }.context("moe_combine")?;
             Ok(())
         })?;
         Ok(())

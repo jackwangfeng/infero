@@ -15,7 +15,7 @@ use anyhow::Result;
 use tuili_cuda::Device;
 use tuili_kernels::Kernels;
 use tuili_model::mtp::{HeadDims, MtpHead};
-use tuili_model::weights::{AttnWeights, Layer, Matrix, MtpWeights};
+use tuili_model::weights::{AttnWeights, DenseFfn, Layer, Matrix, MtpWeights};
 
 /// Small but not degenerate: more than one kv head so the head expansion is
 /// exercised, and a rotary dimension short of `d_head` the way the 27B's is.
@@ -74,10 +74,13 @@ fn synth(dev: &Device, dims: HeadDims) -> Result<(MtpWeights, Matrix)> {
             }),
             gdn: None,
             ffn_norm: vec1(d)?,
-            w_gate: m(d, dims.d_ff)?,
-            w_up: m(d, dims.d_ff)?,
-            w_down: m(dims.d_ff, d)?,
-            w_gate_up: None,
+            dense: Some(DenseFfn {
+                w_gate: m(d, dims.d_ff)?,
+                w_up: m(d, dims.d_ff)?,
+                w_down: m(dims.d_ff, d)?,
+                w_gate_up: None,
+            }),
+            moe: None,
             blob: None,
         },
         device_bytes: 0,

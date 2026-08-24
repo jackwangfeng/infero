@@ -14,6 +14,11 @@ const SUPPORTED: &[&str] = &[
     // untested-architecture warning does not fire for a layout that is
     // recognised; the interleaving is enforced where the blocks are built.
     "qwen3_5",
+    // Qwen3-MoE: the same block as `qwen3` with a sparse FFN in place of the
+    // dense one. The attention half is unchanged, which is why it is listed
+    // here rather than treated as a new layout; what differs is `Config::moe`
+    // and the weights the FFN reads.
+    "qwen3_moe",
     "llama",
     "baichuan",
     "minicpm",
@@ -86,6 +91,41 @@ pub struct Config {
     pub mtp_dedicated_embeddings: bool,
     /// The vision tower, when the checkpoint carries one.
     pub vision: Option<VisionConfig>,
+    /// Set when this model's FFN is a mixture of experts. `None` for every
+    /// model tuili loaded before Qwen3-30B-A3B.
+    pub moe: Option<MoeConfig>,
+}
+
+/// How a sparse FFN is shaped, and which layers have one.
+///
+/// `d_ff` on [`Config`] stays the *dense* width and is still read, because a
+/// checkpoint may have both kinds of layer — `mlp_only_layers` names the ones
+/// that keep a dense FFN. An expert is `d_ff_expert` wide, which on Qwen3-MoE
+/// is an eighth of the dense width; taking `d_ff` for an expert sizes it 8x too
+/// large.
+#[derive(Debug, Clone)]
+pub struct MoeConfig {
+    pub n_experts: usize,
+    /// How many experts each token is routed to.
+    pub n_active: usize,
+    pub d_ff_expert: usize,
+    /// Whether the top-k router weights are renormalized to sum to one after
+    /// the truncation. True on Qwen3-MoE; a model that trained without it and
+    /// is served with it has every FFN output scaled by a token-dependent
+    /// factor, which is fluent and wrong.
+    pub norm_topk_prob: bool,
+    /// Every `sparse_step`-th layer is sparse. 1 on Qwen3-MoE, which is every
+    /// layer.
+    pub sparse_step: usize,
+    /// Layers that keep a dense FFN regardless of `sparse_step`.
+    pub dense_layers: Vec<usize>,
+}
+
+impl MoeConfig {
+    /// Whether layer `i` routes through experts.
+    pub fn is_sparse(&self, i: usize) -> bool {
+        !self.dense_layers.contains(&i) && self.sparse_step > 0 && i.is_multiple_of(self.sparse_step)
+    }
 }
 
 /// The vision tower's dimensions, and the ids that reserve room for its output.
@@ -281,6 +321,28 @@ impl Config {
             // vocabulary rather than a `vision_config` object.
             vision: None,
             mtp_dedicated_embeddings: false,
+            // GGUF states sparsity in its own metadata vocabulary, and reading
+            // it here means a MoE GGUF fails at the weights with "no
+            // ffn_gate_exps" rather than loading as a dense model and answering
+            // from a third of its parameters. The expert weights themselves are
+            // not read yet — see `docs/superpowers/specs/2026-08-24-moe-design.md`.
+            moe: match (
+                f.usize(&key("expert_count")).ok(),
+                f.usize(&key("expert_used_count")).ok(),
+            ) {
+                (Some(n_experts), Some(n_active)) if n_experts > 0 => Some(MoeConfig {
+                    n_experts,
+                    n_active,
+                    // GGUF names the expert width separately; falling back to
+                    // the dense one is right for the models that omit it,
+                    // because there the two are equal.
+                    d_ff_expert: f.usize(&key("expert_feed_forward_length")).unwrap_or(d_ff),
+                    norm_topk_prob: true,
+                    sparse_step: 1,
+                    dense_layers: Vec::new(),
+                }),
+                _ => None,
+            },
         })
     }
 
@@ -469,7 +531,62 @@ impl Config {
                 ),
             },
             vision: Self::vision_from_json(j, d_model)?,
+            moe: Self::moe_from_json(dims)?,
         })
+    }
+
+    /// The sparsity fields, when the checkpoint has them.
+    ///
+    /// All three sizing fields are required together. Defaulting the missing
+    /// half of a pair is the failure mode worth avoiding: `num_experts` with no
+    /// `num_experts_per_tok` would route to every expert, which runs, answers,
+    /// and does 16x the arithmetic the model was trained for.
+    fn moe_from_json(dims: &serde_json::Value) -> Result<Option<MoeConfig>> {
+        let u = |k: &str| dims[k].as_u64().map(|v| v as usize);
+        let (n_experts, n_active, d_ff_expert) = (
+            u("num_experts").or_else(|| u("n_routed_experts")),
+            u("num_experts_per_tok"),
+            u("moe_intermediate_size"),
+        );
+        match (n_experts, n_active, d_ff_expert) {
+            (None, None, None) => Ok(None),
+            (Some(n_experts), Some(n_active), Some(d_ff_expert)) => {
+                anyhow::ensure!(
+                    n_experts > 0 && n_active > 0,
+                    "a mixture of {n_experts} experts routing to {n_active} of them is empty"
+                );
+                anyhow::ensure!(
+                    n_active <= n_experts,
+                    "this config routes each token to {n_active} experts out of {n_experts}"
+                );
+                anyhow::ensure!(
+                    d_ff_expert > 0,
+                    "moe_intermediate_size must be non-zero"
+                );
+                let dense_layers = dims["mlp_only_layers"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as usize).collect())
+                    .unwrap_or_default();
+                Ok(Some(MoeConfig {
+                    n_experts,
+                    n_active,
+                    d_ff_expert,
+                    // Qwen3-MoE ships this true. Absent, the reference's own
+                    // default is true as well, so that is what an unstated
+                    // config means.
+                    norm_topk_prob: dims["norm_topk_prob"].as_bool().unwrap_or(true),
+                    sparse_step: u("decoder_sparse_step").unwrap_or(1),
+                    dense_layers,
+                }))
+            }
+            _ => anyhow::bail!(
+                "this config names some of the mixture-of-experts dimensions and \
+                 not others: num_experts={n_experts:?}, \
+                 num_experts_per_tok={n_active:?}, \
+                 moe_intermediate_size={d_ff_expert:?}. All three are needed to \
+                 size a sparse FFN"
+            ),
+        }
     }
 
     /// `vision_config`, when there is one.

@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use tuili_model::mtp::{HeadDims, MtpHead};
 use tuili_model::spec::DraftFeed;
-use tuili_model::weights::{AttnWeights, Layer, Matrix, MtpWeights};
+use tuili_model::weights::{AttnWeights, DenseFfn, Layer, Matrix, MtpWeights};
 use tuili_model::{BatchItem, KvCacheQuant, KvPool, Model, SeqId};
 use tuili_tokenizer::Tokenizer;
 
@@ -480,10 +480,13 @@ fn synthetic_head_branched(
             }),
             gdn: None,
             ffn_norm: vec1(d)?,
-            w_gate: m(d, dims.d_ff)?,
-            w_up: m(d, dims.d_ff)?,
-            w_down: m(dims.d_ff, d)?,
-            w_gate_up: None,
+            dense: Some(DenseFfn {
+                w_gate: m(d, dims.d_ff)?,
+                w_up: m(d, dims.d_ff)?,
+                w_down: m(dims.d_ff, d)?,
+                w_gate_up: None,
+            }),
+            moe: None,
             blob: None,
         },
         device_bytes: 0,

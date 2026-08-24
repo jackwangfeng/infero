@@ -74,6 +74,85 @@ impl Matrix {
     }
 }
 
+/// One projection of every expert in one layer, concatenated.
+///
+/// Expert `e` starts at `e * stride` and every expert has the same shape, so a
+/// kernel reaches its weights by offsetting a single base pointer. Three of
+/// these hold a sparse FFN's whole layer where the checkpoint spells it as
+/// `n_experts * 3` separate tensors — 384 device allocations a layer on
+/// Qwen3-30B-A3B, against three.
+///
+/// The layout is deliberately the one GGUF already uses for `*_exps` tensors
+/// (`[k, n, n_expert]`, one tensor per projection per layer), so a GGUF reader
+/// fills this the same way and neither the kernels nor the forward pass learn
+/// that a second checkpoint format exists.
+pub struct Experts {
+    pub ty: WeightType,
+    /// The contraction dimension of *one* expert.
+    pub k: usize,
+    /// The output dimension of *one* expert.
+    pub n: usize,
+    pub n_experts: usize,
+    /// Bytes per expert, which is also the offset multiplier.
+    pub stride: usize,
+    storage: Storage,
+}
+
+impl Experts {
+    pub fn n_bytes(&self) -> usize {
+        self.stride * self.n_experts
+    }
+
+    /// A device view of the whole block, for a kernel that indexes experts
+    /// itself. `stride` tells it how far apart they are.
+    pub fn view<'a>(&'a self, stage: Option<&'a CudaSlice<u8>>) -> Result<CudaView<'a, u8>> {
+        match &self.storage {
+            Storage::Device(d) => Ok(d.as_view()),
+            Storage::Streamed { offset } => {
+                let stage = stage
+                    .context("an offloaded expert block was used without its layer being staged")?;
+                let end = offset + self.n_bytes();
+                anyhow::ensure!(
+                    end <= stage.len(),
+                    "staging buffer holds {} bytes, expert block wants {}..{}",
+                    stage.len(),
+                    offset,
+                    end
+                );
+                Ok(stage.slice(*offset..end))
+            }
+        }
+    }
+
+    /// A device view of one expert, for the per-expert GEMM the prefill path
+    /// loops over.
+    pub fn view_of<'a>(
+        &'a self,
+        e: usize,
+        stage: Option<&'a CudaSlice<u8>>,
+    ) -> Result<CudaView<'a, u8>> {
+        anyhow::ensure!(
+            e < self.n_experts,
+            "expert {e} of {}",
+            self.n_experts
+        );
+        let whole = self.view(stage)?;
+        let at = e * self.stride;
+        Ok(whole.slice(at..at + self.stride))
+    }
+}
+
+/// The sparse half of a block: a router and the experts it selects between.
+pub struct MoeWeights {
+    /// `mlp.gate`. Excluded from quantization in Qwen3-MoE's AWQ export, so it
+    /// arrives as f16 and stays that way — it is `[n_experts, d_model]`, which
+    /// is 128 rows here and not worth a quantized kernel.
+    pub router: Matrix,
+    pub gate: Experts,
+    pub up: Experts,
+    pub down: Experts,
+}
+
 /// A 1-D parameter — norm gains and biases — always held as f32 on the device.
 pub type Vector = CudaSlice<f32>;
 
@@ -186,19 +265,42 @@ pub struct Layer {
     pub attn: Option<AttnWeights>,
     pub gdn: Option<GdnWeights>,
     pub ffn_norm: Vector,
+    /// The feed-forward half. Exactly one of these is `Some`, decided by
+    /// `MoeConfig::is_sparse` — grouped rather than left as five optional
+    /// matrices because "some of the dense FFN and some of the sparse one" is
+    /// not a layer any checkpoint describes, and three separate `Option`s that
+    /// must agree is the shape this file already warns about elsewhere.
+    pub dense: Option<DenseFfn>,
+    pub moe: Option<MoeWeights>,
+    /// Present when this layer's matrices are streamed rather than resident.
+    pub blob: Option<LayerBlob>,
+}
+
+/// The dense feed-forward half of a block.
+pub struct DenseFfn {
     pub w_gate: Matrix,
     pub w_up: Matrix,
     pub w_down: Matrix,
     /// `gate` and `up` stacked along `n`, under `TUILI_FUSE_FFN`. One matmul
     /// instead of two; see `stacked` in `load_awq`.
     pub w_gate_up: Option<Matrix>,
-    /// Present when this layer's matrices are streamed rather than resident.
-    pub blob: Option<LayerBlob>,
 }
 
 impl Layer {
     pub fn is_offloaded(&self) -> bool {
         self.blob.is_some()
+    }
+
+    /// The dense feed-forward half, for a layer the caller has established has
+    /// one.
+    ///
+    /// Panics for the same reason [`Self::attn`] does: reaching here on a
+    /// sparse layer means the FFN dispatch is wrong, which is a bug in the
+    /// caller rather than a condition to recover from.
+    pub fn dense(&self) -> &DenseFfn {
+        self.dense
+            .as_ref()
+            .expect("this layer's FFN is a mixture of experts, not a dense one")
     }
 
     /// The attention half, for a layer the caller has already established has
@@ -365,10 +467,16 @@ impl Weights {
                 }),
                 gdn: None,
                 ffn_norm: upload_vector(dev, f, &t("ffn_norm.weight"), &mut device_bytes)?,
-                w_gate: matrices.next().unwrap(),
-                w_up: matrices.next().unwrap(),
-                w_down: matrices.next().unwrap(),
-                w_gate_up: None,
+                dense: Some(DenseFfn {
+                    w_gate: matrices.next().unwrap(),
+                    w_up: matrices.next().unwrap(),
+                    w_down: matrices.next().unwrap(),
+                    w_gate_up: None,
+                }),
+                // No GGUF reader for `*_exps` yet; `Config::from_gguf` records
+                // the expert counts so that a MoE GGUF fails on the missing
+                // `blk.0.ffn_gate.weight` above rather than here.
+                moe: None,
                 blob,
             });
         }
@@ -471,9 +579,50 @@ impl Weights {
                 expect(&a.wv, d, kv_dim, "attn_v")?;
                 expect(&a.wo, da, d, "attn_output")?;
             }
-            expect(&l.w_gate, d, cfg.d_ff, "ffn_gate")?;
-            expect(&l.w_up, d, cfg.d_ff, "ffn_up")?;
-            expect(&l.w_down, cfg.d_ff, d, "ffn_down")?;
+            match (&l.dense, &l.moe) {
+                (Some(f), None) => {
+                    expect(&f.w_gate, d, cfg.d_ff, "ffn_gate")?;
+                    expect(&f.w_up, d, cfg.d_ff, "ffn_up")?;
+                    expect(&f.w_down, cfg.d_ff, d, "ffn_down")?;
+                }
+                (None, Some(m)) => {
+                    let moe = cfg
+                        .moe
+                        .as_ref()
+                        .context("a layer has expert weights but the config is not sparse")?;
+                    let dff = moe.d_ff_expert;
+                    // The router's width is the check that catches an expert
+                    // count read from the wrong field: 128 rows against a
+                    // config that says 64 loads, routes to experts that are
+                    // there, and silently never selects half of them.
+                    expect(&m.router, d, moe.n_experts, "mlp.gate")?;
+                    for (e, name) in [(&m.gate, "gate"), (&m.up, "up")] {
+                        anyhow::ensure!(
+                            e.k == d && e.n == dff && e.n_experts == moe.n_experts,
+                            "expert {name} is [{}, {}] x{} where the config wants \
+                             [{dff}, {d}] x{}",
+                            e.n,
+                            e.k,
+                            e.n_experts,
+                            moe.n_experts
+                        );
+                    }
+                    anyhow::ensure!(
+                        m.down.k == dff && m.down.n == d && m.down.n_experts == moe.n_experts,
+                        "expert down is [{}, {}] x{} where the config wants \
+                         [{d}, {dff}] x{}",
+                        m.down.n,
+                        m.down.k,
+                        m.down.n_experts,
+                        moe.n_experts
+                    );
+                }
+                (Some(_), Some(_)) => anyhow::bail!(
+                    "a layer has both a dense FFN and experts; the loader must \
+                     pick one from `MoeConfig::is_sparse`"
+                ),
+                (None, None) => anyhow::bail!("a layer has no FFN at all"),
+            }
         }
         Ok(())
     }
@@ -496,11 +645,20 @@ impl Weights {
                 ],
                 _ => vec![],
             };
-            for m in mixer
-                .into_iter()
-                .chain([&l.w_gate, &l.w_up, &l.w_down])
-            {
+            let ffn: Vec<&Matrix> = match &l.dense {
+                Some(f) => vec![&f.w_gate, &f.w_up, &f.w_down],
+                None => vec![],
+            };
+            for m in mixer.into_iter().chain(ffn) {
                 *totals.entry(m.ty).or_default() += m.n_bytes;
+            }
+            // The experts are most of a sparse model's bytes, so leaving them
+            // out would report the attention projections' encoding as the
+            // model's.
+            if let Some(m) = &l.moe {
+                for e in [&m.gate, &m.up, &m.down] {
+                    *totals.entry(e.ty).or_default() += e.n_bytes();
+                }
             }
         }
         totals
@@ -758,10 +916,13 @@ pub fn load_mtp(
         }),
         gdn: None,
         ffn_norm: vector(&format!("{l}.post_attention_layernorm.weight"), &mut bytes)?,
-        w_gate: projection(&format!("{l}.mlp.gate_proj"), &mut bytes)?,
-        w_up: projection(&format!("{l}.mlp.up_proj"), &mut bytes)?,
-        w_down: projection(&format!("{l}.mlp.down_proj"), &mut bytes)?,
-        w_gate_up: None,
+        dense: Some(DenseFfn {
+            w_gate: projection(&format!("{l}.mlp.gate_proj"), &mut bytes)?,
+            w_up: projection(&format!("{l}.mlp.up_proj"), &mut bytes)?,
+            w_down: projection(&format!("{l}.mlp.down_proj"), &mut bytes)?,
+            w_gate_up: None,
+        }),
+        moe: None,
         blob: None,
     };
 
@@ -1244,6 +1405,81 @@ pub fn load_awq(
     );
     tracing::info!(prefix = layer_prefix, "decoder layers");
 
+    let dense_ffn = |p: &str, total: &mut usize| -> Result<DenseFfn> {
+        Ok(DenseFfn {
+            w_gate: projection(&format!("{p}.mlp.gate_proj"), total)?,
+            w_up: projection(&format!("{p}.mlp.up_proj"), total)?,
+            w_gate_up: stacked(
+                &format!("{p}.mlp.gate_proj"),
+                &format!("{p}.mlp.up_proj"),
+                total,
+            )?,
+            w_down: projection(&format!("{p}.mlp.down_proj"), total)?,
+        })
+    };
+
+    // One projection of every expert, concatenated in expert order.
+    //
+    // The checkpoint spells this as `n_experts` separate tensors and they are
+    // read one at a time, so the only copy is into the buffer that gets
+    // uploaded — but that buffer is the whole projection for the layer, 115 MiB
+    // on Qwen3-30B-A3B, which is why it is built and dropped per projection
+    // rather than per layer.
+    let expert_projection = |p: &str, leaf: &str, n_experts: usize, total: &mut usize| -> Result<Experts> {
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut shape: Option<(WeightType, usize, usize, usize)> = None;
+        for e in 0..n_experts {
+            let (b, ty, k, n) = projection_bytes(&format!("{p}.mlp.experts.{e}.{leaf}"))?;
+            match shape {
+                None => {
+                    bytes.reserve(b.len() * n_experts);
+                    shape = Some((ty, k, n, b.len()));
+                }
+                // Every expert has to encode to the same number of bytes or the
+                // stride is a lie, and a wrong stride reads the tail of one
+                // expert as the head of the next. That produces plausible
+                // activations, so it has to be an error here rather than a
+                // surprise later.
+                Some((ty0, k0, n0, len0)) => anyhow::ensure!(
+                    (ty, k, n, b.len()) == (ty0, k0, n0, len0),
+                    "expert {e}'s {leaf} is {ty} [{n}, {k}] in {} bytes where \
+                     expert 0 is {ty0} [{n0}, {k0}] in {len0}",
+                    b.len()
+                ),
+            }
+            bytes.extend_from_slice(&b);
+        }
+        let (ty, k, n, stride) = shape.context("a sparse layer with no experts")?;
+        *total += bytes.len();
+        Ok(Experts {
+            ty,
+            k,
+            n,
+            n_experts,
+            stride,
+            storage: Storage::Device(dev.stream().clone_htod(&bytes)?),
+        })
+    };
+
+    let expert_block = |p: &str, total: &mut usize| -> Result<MoeWeights> {
+        let n_experts = cfg
+            .moe
+            .as_ref()
+            .context("a sparse layer with no MoeConfig")?
+            .n_experts;
+        Ok(MoeWeights {
+            // `mlp.gate`, not `mlp.gate_proj` — the router and an expert's gate
+            // projection are one character apart in the checkpoint and mean
+            // entirely different things. Qwen3-MoE's AWQ export lists
+            // `mlp.gate` in `modules_to_not_convert`, so this one comes through
+            // `projection_bytes`'s unquantized branch.
+            router: projection(&format!("{p}.mlp.gate"), total)?,
+            gate: expert_projection(p, "gate_proj", n_experts, total)?,
+            up: expert_projection(p, "up_proj", n_experts, total)?,
+            down: expert_projection(p, "down_proj", n_experts, total)?,
+        })
+    };
+
     let mut layers = Vec::with_capacity(cfg.n_layers);
     for i in 0..cfg.n_layers {
         let p = format!("{layer_prefix}.{i}");
@@ -1260,6 +1496,40 @@ pub fn load_awq(
         let is_linear = w
             .get(&format!("{p}.linear_attn.in_proj_qkv.weight"))
             .is_some();
+
+        // Sparse or dense, decided the same way as the mixer: by which tensors
+        // exist. `MoeConfig::is_sparse` says the same thing and is checked
+        // against this, because a config that disagrees with the checkpoint is
+        // the case worth failing loudly on rather than resolving in favour of
+        // either.
+        let has_experts = w
+            .get(&format!("{p}.mlp.experts.0.gate_proj.qweight"))
+            .or_else(|| w.get(&format!("{p}.mlp.experts.0.gate_proj.weight")))
+            .is_some();
+        let sparse = match (&cfg.moe, has_experts) {
+            (Some(m), true) => {
+                anyhow::ensure!(
+                    m.is_sparse(i),
+                    "layer {i} has expert weights but the config's \
+                     decoder_sparse_step / mlp_only_layers make it dense"
+                );
+                true
+            }
+            (Some(m), false) => {
+                anyhow::ensure!(
+                    !m.is_sparse(i),
+                    "the config makes layer {i} sparse but it has no \
+                     `mlp.experts.0.gate_proj`"
+                );
+                false
+            }
+            (None, true) => anyhow::bail!(
+                "layer {i} has expert weights but the config names no \
+                 num_experts; a sparse checkpoint read as dense would answer \
+                 from a fraction of its parameters"
+            ),
+            (None, false) => false,
+        };
 
         let attn = if is_linear {
             None
@@ -1338,14 +1608,12 @@ pub fn load_awq(
                 &format!("{p}.post_attention_layernorm.weight"),
                 &mut device_bytes,
             )?,
-            w_gate: projection(&format!("{p}.mlp.gate_proj"), &mut device_bytes)?,
-            w_up: projection(&format!("{p}.mlp.up_proj"), &mut device_bytes)?,
-            w_gate_up: stacked(
-                &format!("{p}.mlp.gate_proj"),
-                &format!("{p}.mlp.up_proj"),
-                &mut device_bytes,
-            )?,
-            w_down: projection(&format!("{p}.mlp.down_proj"), &mut device_bytes)?,
+            dense: if sparse { None } else { Some(dense_ffn(&p, &mut device_bytes)?) },
+            moe: if sparse {
+                Some(expert_block(&p, &mut device_bytes)?)
+            } else {
+                None
+            },
             blob: None,
         });
     }

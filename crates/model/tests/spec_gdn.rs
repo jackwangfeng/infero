@@ -24,7 +24,7 @@
 use anyhow::Result;
 use half::f16;
 use tuili_cuda::Device;
-use tuili_model::weights::{AttnWeights, GdnWeights, Layer, Matrix, Weights};
+use tuili_model::weights::{AttnWeights, DenseFfn, GdnWeights, Layer, Matrix, Weights};
 use tuili_model::{BatchItem, Config, KvCacheQuant, KvPool, Model, SeqId};
 
 /// Long enough for a polluted recurrent state to show up in the argmax.
@@ -150,10 +150,13 @@ fn synthetic_model(dev: &Device, cfg: &Config) -> Result<Model> {
             attn,
             gdn,
             ffn_norm: vec_at(d, 1.0, 0.1)?,
-            w_gate: m(d, d_ff, 0.2)?,
-            w_up: m(d, d_ff, 0.2)?,
-            w_down: m(d_ff, d, 0.2)?,
-            w_gate_up: None,
+            dense: Some(DenseFfn {
+                w_gate: m(d, d_ff, 0.2)?,
+                w_up: m(d, d_ff, 0.2)?,
+                w_down: m(d_ff, d, 0.2)?,
+                w_gate_up: None,
+            }),
+            moe: None,
             blob: None,
         });
     }

@@ -543,7 +543,18 @@ fn the_transposed_weight_layout_gives_the_same_answer() -> Result<()> {
     // Row stride `nb * 68` has to be 16-byte aligned, which needs k % 512 == 0
     // — `awq::transposable`. Every real projection width is; 1152 is not, and
     // faults rather than reading the wrong thing, which is the right failure.
-    for (k, n) in [(1024usize, 512usize), (4096, 296), (2048, 256)] {
+    // The last three are Qwen3-30B-A3B's attention widths: 32 heads of 128
+    // against a 2048-wide residual, so `q` is twice as wide as the stream it
+    // reads. Every shape above them has `n <= 512`, and the checkpoint's `q`
+    // has 4096 — which is where this layout stopped being right.
+    for (k, n) in [
+        (1024usize, 512usize),
+        (4096, 296),
+        (2048, 256),
+        (2048, 4096),
+        (2048, 512),
+        (4096, 2048),
+    ] {
         assert!(tuili_kernels::awq::transposable(k));
         let (qweight, qzeros, scales) = synthetic(k, n, 128);
         let packed = AwqTensor {

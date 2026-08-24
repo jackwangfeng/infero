@@ -269,6 +269,29 @@ struct Activations {
     attn_gate: Option<CudaSlice<f32>>,
     /// GatedDeltaNet scratch, allocated only for models that have such blocks.
     gdn: Option<GdnActs>,
+    /// Mixture-of-experts scratch, allocated only for sparse models.
+    moe: Option<MoeActs>,
+}
+
+/// Activation buffers a sparse FFN needs.
+///
+/// Sized by `chunk * n_active` rows rather than `chunk`: every token expands to
+/// `n_active` expert rows on the way in and collapses back on the way out. At
+/// `MAX_BATCH_TOKENS` of 256 and top-8 that is 2048 rows, which is 6 MiB at the
+/// expert width and 16 at the model width — small enough not to be behind a
+/// second flag, unlike the GatedDeltaNet buffers next door.
+struct MoeActs {
+    /// `[chunk, n_experts]` — the router's output, before the top-k.
+    router_logits: CudaSlice<f32>,
+    /// `[chunk, n_active]`, descending by router logit.
+    ids: CudaSlice<i32>,
+    weights: CudaSlice<f32>,
+    /// `[chunk * n_active, d_ff_expert]` each.
+    gate: CudaSlice<f32>,
+    up: CudaSlice<f32>,
+    hidden: CudaSlice<f32>,
+    /// `[chunk * n_active, d_model]` — what the combine reduces.
+    down: CudaSlice<f32>,
 }
 
 /// Activation buffers the GatedDeltaNet block needs.
@@ -710,7 +733,15 @@ impl Model {
                     MAX_BATCH_TOKENS * cfg.d_ff.max(cfg.d_model).max(cfg.d_attn()),
                 )?,
             q8_1: dev.stream().alloc_zeros::<u8>(
-                MAX_BATCH_TOKENS * Kernels::q8_1_bytes(cfg.d_ff.max(cfg.d_model)),
+                // A sparse FFN quantizes `down`'s activation once per active
+                // expert per token, so its row count is `chunk * n_active`
+                // rather than `chunk` — narrower rows, more of them, and the
+                // product is what has to fit.
+                (MAX_BATCH_TOKENS * Kernels::q8_1_bytes(cfg.d_ff.max(cfg.d_model))).max(
+                    cfg.moe.as_ref().map_or(0, |m| {
+                        MAX_BATCH_TOKENS * m.n_active * Kernels::q8_1_bytes(m.d_ff_expert)
+                    }),
+                ),
             )?,
         };
 
@@ -2132,10 +2163,15 @@ impl Model {
         // where one alone runs at 392 — each drains before the next can start
         // — and merging this group and the FFN's removes ninety-six of those.
         if Self::fusable(&[&l.attn().wq, &l.attn().wk, &l.attn().wv], shared, n, self.use_mmvq) {
+            // `q8_1_bytes(d)`: the operand is the residual row, which is `d`
+            // wide. `q`'s *output* is `da` wide, and the two differ on
+            // Qwen3-30B-A3B — the view was `..d`, which the kernel overran
+            // harmlessly because `act.q` is allocated `chunk * da`. Naming the
+            // real width keeps it that way for a reason rather than by luck.
             let bytes = Kernels::q8_1_bytes(d);
             let (q, k_, v) = (&mut self.act.q, &mut self.act.k, &mut self.act.v);
             self.kern.mmvq_fused3(
-                &mut q.slice_mut(..d),
+                &mut q.slice_mut(..da),
                 &mut k_.slice_mut(..kv_dim),
                 &mut v.slice_mut(..kv_dim),
                 &l.attn().wq.view(stage)?,
@@ -2468,8 +2504,17 @@ impl Model {
                         &mut vc.as_view_mut(),
                         &packed,
                         fused_w,
-                        d,
-                        d + kv_dim,
+                        // Where `k` and `v` start inside `[q | k | v]`, which is
+                        // after `q` — and `q` is `da` wide, not `d`. The two are
+                        // equal on every model that reached this path before
+                        // Qwen3-30B-A3B, whose 32 heads of 128 make `da` twice
+                        // `d`; passing `d` reads the *middle of q* as the keys
+                        // and the values. The attention output came out 200x
+                        // its right magnitude, and only above one token,
+                        // because the single-token path does not pack. The
+                        // rotary call above already takes `da` for this.
+                        da,
+                        da + kv_dim,
                         &self.act.slots.slice(..n),
                         n_kv_heads,
                         d_head,
@@ -2715,18 +2760,28 @@ impl Model {
         // Straight into the residual stream: this projection's result is only
         // ever added to it, and the mat-vec can do that itself.
         if l.attn().bo.is_none() && Self::residual_fusable(&l.attn().wo, n, self.use_mmvq) {
-            let bytes = Kernels::q8_1_bytes(d);
+            // `da`, not `d`: this projection contracts over the attention
+            // interior and produces the residual width. The two are equal on
+            // every model that reached this branch before Qwen3-30B-A3B, whose
+            // 32 heads of 128 make `da` twice `d` — and quantizing `d` of a
+            // `da`-wide row and then claiming `k = d` does not read half the
+            // weights, it reads the wrong *layout*: `nb` comes out 16 where the
+            // rows are 32 blocks long, so the scale block lands inside the
+            // quants and the mat-vec multiplies by reinterpreted nibbles. Every
+            // logit was NaN by layer 0.
+            let bytes = Kernels::q8_1_bytes(da);
+            debug_assert_eq!(l.attn().wo.k, da, "output projection contracts over d_attn");
             self.kern.quantize_q8_1(
                 &mut self.scratch.q8_1.slice_mut(..bytes),
-                &self.act.attn.slice(..d),
-                d,
+                &self.act.attn.slice(..da),
+                da,
             )?;
             self.kern.mmvq_add(
                 &mut self.act.x.slice_mut(..d),
                 &l.attn().wo.view(stage)?,
                 l.attn().wo.ty,
                 &self.scratch.q8_1.slice(..bytes),
-                d,
+                da,
                 l.attn().wo.n,
             )?;
             return Ok(());
@@ -2827,7 +2882,13 @@ impl Model {
         // The producer: the previous layer's `down` has to have left its output
         // in `proj` rather than adding itself into the stream, which is what the
         // single-token mat-vec path does.
-        consumer && !Self::residual_fusable(&prev.w_down, n, self.use_mmvq)
+        // A sparse previous layer has no single `down` to ask about, and its
+        // combine writes to `proj` unconditionally — so the producer side holds
+        // and the question is only whether the consumer wants f16.
+        match &prev.dense {
+            Some(f) => consumer && !Self::residual_fusable(&f.w_down, n, self.use_mmvq),
+            None => consumer,
+        }
     }
 
     fn ffn_norm_takes_residual(&self, layer: usize, n: usize) -> bool {
@@ -2837,11 +2898,15 @@ impl Model {
         if *OFF.get_or_init(|| std::env::var("TUILI_FUSE_RESIDUAL").as_deref() == Ok("0")) {
             return false;
         }
+        // The sparse FFN's own matmuls are the integer mat-vec and the
+        // per-expert GEMM, neither of which reads an f16 activation, so there is
+        // no consumer for the fused add-and-norm to write one for.
+        let Some(f) = &l.dense else { return false };
         self.use_mmq
             && n > 1
             && n <= tuili_kernels::MMQ_MAX_TOKENS
-            && Kernels::mmq_f16_variant_for(l.w_gate.ty).is_some()
-            && [&l.w_gate, &l.w_up].iter().all(|w| {
+            && Kernels::mmq_f16_variant_for(f.w_gate.ty).is_some()
+            && [&f.w_gate, &f.w_up].iter().all(|w| {
                 matches!(
                     w.ty,
                     tuili_kernels::WeightType::Q4G128 | tuili_kernels::WeightType::Q4G128T
@@ -2850,6 +2915,9 @@ impl Model {
     }
 
     fn feed_forward(&mut self, layer: usize, n: usize, slot: Option<usize>) -> Result<()> {
+        if self.w.layers[layer].moe.is_some() {
+            return self.feed_forward_moe(layer, n, slot);
+        }
         let stage = slot.map(|s| &self.offload.as_ref().unwrap().stage[s]);
         let cfg = &self.cfg;
         let (d, d_ff) = (cfg.d_model, cfg.d_ff);
@@ -2857,14 +2925,14 @@ impl Model {
 
         // `gate` and `up` share the normalized residual, as `q`/`k`/`v` do.
         let want_q = self.use_mmvq
-            && [&l.w_gate, &l.w_up]
+            && [&l.dense().w_gate, &l.dense().w_up]
                 .iter()
                 .all(|w| Kernels::has_mmvq(w.ty) && w.k == d);
         let want_h = self.use_mmq
             && n > 1
             && n <= tuili_kernels::MMQ_MAX_TOKENS
-            && Kernels::mmq_f16_variant_for(l.w_gate.ty).is_some()
-            && [&l.w_gate, &l.w_up].iter().all(|w| {
+            && Kernels::mmq_f16_variant_for(l.dense().w_gate.ty).is_some()
+            && [&l.dense().w_gate, &l.dense().w_up].iter().all(|w| {
                 matches!(
                     w.ty,
                     tuili_kernels::WeightType::Q4G128
@@ -2906,7 +2974,7 @@ impl Model {
         // cannot fill the device — `attn_k` reaches 261 GB/s against
         // `gate_up`'s 1368. This is the FFN half of what vLLM gets from
         // `MergedColumnParallelLinear`.
-        let stacked = l.w_gate_up.as_ref().filter(|_| n > 1 && want_h);
+        let stacked = l.dense().w_gate_up.as_ref().filter(|_| n > 1 && want_h);
         // Whether `down` will read its activation as f16, which is the only
         // case where writing that copy early is worth anything. Mirrors what
         // `matmul_pre` decides for itself; claiming it when the buffer was not
@@ -2916,11 +2984,11 @@ impl Model {
             && n > 1
             && n <= tuili_kernels::MMQ_MAX_TOKENS
             && matches!(
-                l.w_down.ty,
+                l.dense().w_down.ty,
                 tuili_kernels::WeightType::Q4G128 | tuili_kernels::WeightType::Q4G128T
             )
-            && Kernels::mmq_f16_variant_for_shape(l.w_down.ty, l.w_down.n).is_some()
-            && Self::mmq_shape_ok(&l.w_down);
+            && Kernels::mmq_f16_variant_for_shape(l.dense().w_down.ty, l.dense().w_down.n).is_some()
+            && Self::mmq_shape_ok(&l.dense().w_down);
         if let Some(gu) = stacked {
             Self::matmul_pre(
                 &self.kern,
@@ -2957,26 +3025,26 @@ impl Model {
                     n * d_ff,
                 )?;
             }
-        } else if Self::fusable(&[&l.w_gate, &l.w_up], shared, n, self.use_mmvq) {
+        } else if Self::fusable(&[&l.dense().w_gate, &l.dense().w_up], shared, n, self.use_mmvq) {
             let bytes = Kernels::q8_1_bytes(d);
             let (gate, up) = (&mut self.act.gate, &mut self.act.up);
             self.kern.mmvq_fused2(
                 &mut gate.slice_mut(..d_ff),
                 &mut up.slice_mut(..d_ff),
-                &l.w_gate.view(stage)?,
-                &l.w_up.view(stage)?,
-                l.w_gate.ty,
+                &l.dense().w_gate.view(stage)?,
+                &l.dense().w_up.view(stage)?,
+                l.dense().w_gate.ty,
                 &self.scratch.q8_1.slice(..bytes),
                 d,
-                l.w_gate.n,
-                l.w_up.n,
+                l.dense().w_gate.n,
+                l.dense().w_up.n,
             )?;
         } else {
             Self::matmul_pre(
                 &self.kern,
                 &mut self.scratch,
                 &mut self.act.gate.slice_mut(..n * d_ff),
-                &l.w_gate,
+                &l.dense().w_gate,
                 stage,
                 &self.act.xb.slice(..n * d),
                 n,
@@ -2989,7 +3057,7 @@ impl Model {
                 &self.kern,
                 &mut self.scratch,
                 &mut self.act.up.slice_mut(..n * d_ff),
-                &l.w_up,
+                &l.dense().w_up,
                 stage,
                 &self.act.xb.slice(..n * d),
                 n,
@@ -3010,7 +3078,7 @@ impl Model {
             )?;
         }
         // As with the output projection, straight into the residual stream.
-        if Self::residual_fusable(&l.w_down, n, self.use_mmvq) {
+        if Self::residual_fusable(&l.dense().w_down, n, self.use_mmvq) {
             let bytes = Kernels::q8_1_bytes(d_ff);
             self.kern.quantize_q8_1(
                 &mut self.scratch.q8_1.slice_mut(..bytes),
@@ -3019,11 +3087,11 @@ impl Model {
             )?;
             self.kern.mmvq_add(
                 &mut self.act.x.slice_mut(..d),
-                &l.w_down.view(stage)?,
-                l.w_down.ty,
+                &l.dense().w_down.view(stage)?,
+                l.dense().w_down.ty,
                 &self.scratch.q8_1.slice(..bytes),
                 d_ff,
-                l.w_down.n,
+                l.dense().w_down.n,
             )?;
             return Ok(());
         }
@@ -3032,7 +3100,7 @@ impl Model {
             &self.kern,
             &mut self.scratch,
             &mut self.act.proj.slice_mut(..n * d),
-            &l.w_down,
+            &l.dense().w_down,
             stage,
             &self.act.ffn.slice(..n * d_ff),
             n,
@@ -3041,6 +3109,161 @@ impl Model {
             None,
             ffn_f16,
         )?;
+        if !self.attn_norm_takes_residual(layer + 1, n) {
+            self.kern.add_assign(
+                &mut self.act.x.slice_mut(..n * d),
+                &self.act.proj.slice(..n * d),
+                n * d,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The sparse FFN: route, run the selected experts, combine.
+    ///
+    /// Same contract as [`Self::feed_forward`] — the result lands in `proj` and
+    /// the residual add is either the next block's fused norm or the
+    /// `add_assign` at the bottom. The dense path's two optimizations are absent
+    /// on purpose: there is no stacked `gate_up` because the checkpoint ships
+    /// experts separately, and no residual-fusing `down` because the combine,
+    /// not a matmul, is what writes the output.
+    fn feed_forward_moe(&mut self, layer: usize, n: usize, slot: Option<usize>) -> Result<()> {
+        let stage = slot.map(|s| &self.offload.as_ref().unwrap().stage[s]);
+        let d = self.cfg.d_model;
+        let m = self
+            .cfg
+            .moe
+            .clone()
+            .context("a sparse layer on a model whose config is not sparse")?;
+        let (k_act, d_ff) = (m.n_active, m.d_ff_expert);
+
+        // The normalized residual, without the f16 copy: nothing downstream of
+        // here reads one. `ffn_norm_takes_residual` returns false on a sparse
+        // layer for the same reason, so `x` still carries the attention
+        // residual and this only normalizes it.
+        Self::norm_for_group(
+            &self.kern,
+            &mut self.scratch,
+            &mut self.act.xb,
+            &self.act.x.slice(..n * d),
+            &self.w.layers[layer].ffn_norm.as_view(),
+            n,
+            d,
+            self.cfg.rms_eps,
+            false,
+            false,
+        )?;
+
+        // The router is f16 and 128 rows wide, so it goes through the same
+        // matmul the dense projections use rather than getting a kernel of its
+        // own.
+        {
+            let w = &self.w.layers[layer].moe.as_ref().unwrap().router;
+            let logits = &mut self.act.moe.as_mut().unwrap().router_logits;
+            Self::matmul_pre(
+                &self.kern,
+                &mut self.scratch,
+                &mut logits.slice_mut(..n * m.n_experts),
+                w,
+                stage,
+                &self.act.xb.slice(..n * d),
+                n,
+                self.use_mmvq,
+                self.use_mmq,
+                None,
+                false,
+            )?;
+        }
+        {
+            let a = self.act.moe.as_mut().unwrap();
+            self.kern.moe_topk(
+                &mut a.ids.slice_mut(..n * k_act),
+                &mut a.weights.slice_mut(..n * k_act),
+                &a.router_logits.slice(..n * m.n_experts),
+                m.n_experts,
+                k_act,
+                n,
+                m.norm_topk_prob,
+            )?;
+        }
+
+        // One row per (token, active expert), in that order — which is the
+        // layout `moe_combine` reduces, so nothing has to be grouped by expert
+        // and scattered back afterwards. The launch count is the same at one
+        // token as at two hundred; what grows is the rows each launch covers.
+        let slots = n * k_act;
+
+        // Every activation row in one launch: `quantize_q8_1` walks a flat array
+        // in blocks of 32 and both widths are multiples of it, so `n` rows of
+        // `d` land as `n` rows of `d / 32` blocks — which is what `y_group`
+        // indexes into.
+        let xb_bytes = Kernels::q8_1_bytes(d) * n;
+        self.kern.quantize_q8_1(
+            &mut self.scratch.q8_1.slice_mut(..xb_bytes),
+            &self.act.xb.slice(..n * d),
+            n * d,
+        )?;
+        {
+            let e = self.w.layers[layer].moe.as_ref().unwrap();
+            let a = self.act.moe.as_mut().unwrap();
+            for (w, out) in [(&e.gate, &mut a.gate), (&e.up, &mut a.up)] {
+                self.kern.mmvq_moe(
+                    &mut out.slice_mut(..slots * d_ff),
+                    &w.view(stage)?,
+                    w.ty,
+                    &a.ids.slice(..slots),
+                    &self.scratch.q8_1.slice(..xb_bytes),
+                    d,
+                    d_ff,
+                    slots,
+                    w.stride,
+                    // A token's `k` slots all read that token's residual row.
+                    k_act,
+                )?;
+            }
+            self.kern.silu_mul(
+                &mut a.hidden.slice_mut(..slots * d_ff),
+                &a.gate.slice(..slots * d_ff),
+                &a.up.slice(..slots * d_ff),
+                slots * d_ff,
+            )?;
+        }
+
+        {
+            let hidden_bytes = Kernels::q8_1_bytes(d_ff) * slots;
+            self.kern.quantize_q8_1(
+                &mut self.scratch.q8_1.slice_mut(..hidden_bytes),
+                &self.act.moe.as_ref().unwrap().hidden.slice(..slots * d_ff),
+                slots * d_ff,
+            )?;
+            let e = self.w.layers[layer].moe.as_ref().unwrap();
+            let a = self.act.moe.as_mut().unwrap();
+            self.kern.mmvq_moe(
+                &mut a.down.slice_mut(..slots * d),
+                &e.down.view(stage)?,
+                e.down.ty,
+                &a.ids.slice(..slots),
+                &self.scratch.q8_1.slice(..hidden_bytes),
+                d_ff,
+                d,
+                slots,
+                e.down.stride,
+                // `down` reads each slot's own SwiGLU product.
+                1,
+            )?;
+        }
+
+        {
+            let a = self.act.moe.as_ref().unwrap();
+            self.kern.moe_combine(
+                &mut self.act.proj.slice_mut(..n * d),
+                &a.down.slice(..slots * d),
+                &a.weights.slice(..slots),
+                d,
+                k_act,
+                n,
+            )?;
+        }
         if !self.attn_norm_takes_residual(layer + 1, n) {
             self.kern.add_assign(
                 &mut self.act.x.slice_mut(..n * d),
@@ -3560,6 +3783,21 @@ impl Activations {
                     g: alloc_f32(chunk * la.value_heads, "gdn g")?,
                     core: alloc_f32(chunk * la.value_dim(), "gdn core")?,
                 }),
+                None => None,
+            },
+            moe: match &cfg.moe {
+                Some(m) => {
+                    let rows = chunk * m.n_active;
+                    Some(MoeActs {
+                        router_logits: alloc_f32(chunk * m.n_experts, "moe router logits")?,
+                        ids: stream.alloc_zeros::<i32>(rows)?,
+                        weights: alloc_f32(rows, "moe combine weights")?,
+                        gate: alloc_f32(rows * m.d_ff_expert, "moe gate")?,
+                        up: alloc_f32(rows * m.d_ff_expert, "moe up")?,
+                        hidden: alloc_f32(rows * m.d_ff_expert, "moe hidden")?,
+                        down: alloc_f32(rows * d, "moe down")?,
+                    })
+                }
                 None => None,
             },
         })

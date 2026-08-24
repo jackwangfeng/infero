@@ -62,14 +62,53 @@ moe_combine -> out[d_model] = sum_e w_e * down[e]
 
 Three matmul launches a layer, the same order as a dense layer.
 
-**Prefill (n tokens, each with its own eight).** Group the rows by expert on the
-device — histogram, prefix sum, scatter — then one GEMM per expert over its
-gathered rows, scatter-adding the results back. This is what vLLM's `fused_moe`
-does and for the same reason.
+**Prefill (n tokens, each with its own eight).** The design said: group the rows
+by expert on the device — histogram, prefix sum, scatter — then one GEMM per
+expert, scatter-adding the results back, which is what vLLM's `fused_moe` does.
+**That is not what landed, and the simpler thing is better.**
 
-Two alternatives are recorded here as rejected, so they are not re-tried:
-looping the decode path per token is 2.3M launches on a 2000-token prompt, and
-computing all 128 experts and masking is 16x the arithmetic top-8 asked for.
+`grid.y` already indexes a slot rather than a token. Let the slot be the
+`(token, expert)` pair and add one parameter — `y_group`, how many consecutive
+slots share an activation row — and the same launch serves both: `gate` and `up`
+take `y_group = n_active`, because a token's `k` slots all read that token's
+residual, and `down` takes 1, because each slot has its own SwiGLU product. At
+one token every slot reads row zero, which is the decode case falling out of the
+general one.
+
+So there is no sort, no scatter-add, no histogram, and no separate prefill path
+— `feed_forward_moe` has no `if n == 1` in it. What it costs is that the rows
+are mat-vecs rather than a GEMM: with 2048 slots over 128 experts each expert's
+weights are re-read ~16 times where a grouped GEMM would read them once. That is
+the thing to fix when prefill throughput matters, and the numbers to beat should
+come from `docs/catching-vllm.md`'s methodology rather than from a guess.
+
+Two alternatives stay rejected: looping the decode path per token is 2.3M
+launches on a 2000-token prompt, and computing all 128 experts and masking is
+16x the arithmetic top-8 asked for.
+
+## What the widths cost, which was not in the plan
+
+Two bugs found on the way, both pre-existing and both in the `d_attn != d_model`
+path that `Config`'s own comment admits has no regression test. This checkpoint
+is the first quantized one to exercise it — 32 heads of 128 against a 2048-wide
+residual makes the attention interior exactly twice the stream.
+
+* `store_kv2_packed` was told the keys start at `d` inside the packed
+  `[q | k | v]` row. They start at `da`. So the KV cache was filled from the
+  middle of `q`, and the attention output came out 200x its right magnitude —
+  but only above one token, because the single-token path does not pack. Decode
+  was correct and prefill was word salad.
+* The fused-residual output projection quantized `d` of a `da`-wide row and told
+  the mat-vec `k = d`. That does not read half the weights, it reads the wrong
+  *layout*: `nb` comes out 16 where the rows are 32 blocks long, so the scale
+  block lands inside the quants. Every logit was NaN by layer 0, and the
+  illegal-address it eventually raised was the *next* step's embedding gather on
+  a garbage sampled id — three layers downstream of the cause.
+
+The lesson worth keeping: `TUILI_AWQ_PACKED=1` made the NaN go away, which
+looked like the transposed layout being wrong. It was not — the extended
+`q4g128` test passes at all three of this model's real shapes. The env var
+changed the *type*, which changed which path ran.
 
 ## Steps, each with the check that closes it
 

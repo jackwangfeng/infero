@@ -861,7 +861,7 @@ impl MtpHead {
         matmul(
             kern,
             &mut self.gate.slice_mut(..n * dims.d_ff),
-            &self.w.layer.w_gate,
+            &self.w.layer.dense().w_gate,
             &mut self.x16,
             &self.xb.slice(..n * d),
             n,
@@ -869,7 +869,7 @@ impl MtpHead {
         matmul(
             kern,
             &mut self.up.slice_mut(..n * dims.d_ff),
-            &self.w.layer.w_up,
+            &self.w.layer.dense().w_up,
             &mut self.x16,
             &self.xb.slice(..n * d),
             n,
@@ -883,7 +883,7 @@ impl MtpHead {
         matmul(
             kern,
             &mut self.proj.slice_mut(..n * d),
-            &self.w.layer.w_down,
+            &self.w.layer.dense().w_down,
             &mut self.x16,
             &self.ffn.slice(..n * dims.d_ff),
             n,

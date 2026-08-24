@@ -37,7 +37,7 @@ use half::f16;
 use tuili_cuda::Device;
 use tuili_kernels::Kernels;
 use tuili_model::mtp::{HeadDims, MtpHead};
-use tuili_model::weights::{AttnWeights, Layer, Matrix, MtpWeights};
+use tuili_model::weights::{AttnWeights, DenseFfn, Layer, Matrix, MtpWeights};
 
 static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -271,10 +271,13 @@ fn head_from_capture_width(
             }),
             gdn: None,
             ffn_norm: norm("w.post_attention_layernorm")?,
-            w_gate: proj("w.gate_proj")?,
-            w_up: proj("w.up_proj")?,
-            w_down: proj("w.down_proj")?,
-            w_gate_up: None,
+            dense: Some(DenseFfn {
+                w_gate: proj("w.gate_proj")?,
+                w_up: proj("w.up_proj")?,
+                w_down: proj("w.down_proj")?,
+                w_gate_up: None,
+            }),
+            moe: None,
             blob: None,
         },
         device_bytes: 0,
@@ -904,7 +907,7 @@ fn the_loader_adds_one_to_exactly_the_norms_that_are_stored_as_deltas() -> Resul
     assert_eq!((l.wk.k, l.wk.n), (d, kv_heads * d_head));
     assert_eq!((l.wo.k, l.wo.n), (d_attn, d), "o_proj narrows d_attn to d");
     assert_eq!(
-        (head.layer.w_down.k, head.layer.w_down.n),
+        (head.layer.dense().w_down.k, head.layer.dense().w_down.n),
         (d_ff, d),
         "down_proj"
     );
