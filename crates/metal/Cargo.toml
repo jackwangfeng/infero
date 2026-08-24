@@ -40,3 +40,7 @@ path = "examples/qwen2_f16.rs"
 [[example]]
 name = "qwen38_27b"
 path = "examples/qwen38_27b.rs"
+
+[[example]]
+name = "bandwidth"
+path = "examples/bandwidth.rs"
