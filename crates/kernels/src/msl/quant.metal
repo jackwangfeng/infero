@@ -45,30 +45,40 @@ inline void q4k_scale_min(device const uchar* q, int j,
 // and spends it on every token it holds, so a `t`-token batch cuts the weight
 // traffic by this factor -- which matters most for the vocab projection, the
 // largest matrix in the model.
+// Tokens a single threadgroup serves. A group decodes each weight element once
+// and spends it on every token it holds, so a `t`-token batch cuts the weight
+// traffic by this factor -- which matters most for the vocab projection, the
+// largest matrix in the model.
 #define GEMV_TOKENS 8
 
-#define GEMV_PROLOGUE                                                          \
+// The macros take the token count as a parameter so each mat-vec can be
+// instantiated twice: once batched and once specialised for a single token.
+//
+// Why that is worth two kernels rather than one. `GEMV_SPREAD`'s trip count has
+// to be a compile-time constant -- a runtime bound leaves the compiler unable to
+// prove the indices and `acc` lands in device memory, which for a kernel that is
+// otherwise pure streaming costs an order of magnitude. So the batched form runs
+// eight iterations with a predicate inside, and at one token seven of them are
+// dead: the predicate is false, but the loop, the compare and the address
+// arithmetic are still emitted. Decode is *always* one token, and decode is the
+// case this engine exists to serve.
+#define GEMV_PROLOGUE(T)                                                       \
     BLOCK_REDUCE_SCRATCH                                                       \
     const int row = int(tgid.x);                                               \
     if (row >= n) return;                                                      \
-    const int token0 = int(tgid.y) * GEMV_TOKENS;                              \
-    const int ntok = min(GEMV_TOKENS, n_tokens - token0);                      \
-    float acc[GEMV_TOKENS];                                                    \
-    for (int t = 0; t < GEMV_TOKENS; ++t) acc[t] = 0.0f;
+    const int token0 = int(tgid.y) * (T);                                      \
+    const int ntok = min((T), n_tokens - token0);                              \
+    float acc[(T)];                                                            \
+    for (int t = 0; t < (T); ++t) acc[t] = 0.0f;
 
 /// Spend one decoded weight element on every token this group holds.
-///
-/// The trip count is the compile-time `GEMV_TOKENS` with a predicate inside,
-/// not the runtime `ntok`: a runtime bound leaves the compiler unable to prove
-/// the indices and `acc` lands in device memory, which for a kernel that is
-/// otherwise pure streaming costs an order of magnitude.
-#define GEMV_SPREAD(WV, I)                                                     \
-    for (int t = 0; t < GEMV_TOKENS; ++t) {                                    \
+#define GEMV_SPREAD(T, WV, I)                                                  \
+    for (int t = 0; t < (T); ++t) {                                            \
         if (t < ntok) acc[t] += (WV) * x[size_t(token0 + t) * k + (I)];        \
     }
 
-#define GEMV_EPILOGUE                                                          \
-    for (int t = 0; t < GEMV_TOKENS; ++t) {                                    \
+#define GEMV_EPILOGUE(T)                                                       \
+    for (int t = 0; t < (T); ++t) {                                            \
         if (t < ntok) {                                                        \
             const float total = BLOCK_SUM(acc[t], tid.x, tgdim.x);            \
             if (tid.x == 0) out[size_t(token0 + t) * n + row] = total;         \
@@ -86,114 +96,116 @@ inline void q4k_scale_min(device const uchar* q, int j,
     uint3 tid   [[thread_position_in_threadgroup]],                            \
     uint3 tgdim [[threads_per_threadgroup]]
 
-kernel void gemv_f32(GEMV_ARGS) {
-    GEMV_PROLOGUE
-    device const float* wr = (device const float*)w + size_t(row) * k;
-    for (int i = int(tid.x); i < k; i += int(tgdim.x)) GEMV_SPREAD(wr[i], i)
-    GEMV_EPILOGUE
-}
+// ---- the bodies, one per encoding -----------------------------------------
 
-kernel void gemv_f16(GEMV_ARGS) {
-    GEMV_PROLOGUE
-    device const half* wr = (device const half*)w + size_t(row) * k;
-    for (int i = int(tid.x); i < k; i += int(tgdim.x)) {
-        GEMV_SPREAD(float(wr[i]), i)
-    }
-    GEMV_EPILOGUE
-}
+#define GEMV_BODY_F32(T)                                                       \
+    GEMV_PROLOGUE(T)                                                           \
+    device const float* wr = (device const float*)w + size_t(row) * k;         \
+    for (int i = int(tid.x); i < k; i += int(tgdim.x)) GEMV_SPREAD(T, wr[i], i)\
+    GEMV_EPILOGUE(T)
 
-/// Q8_0: one f16 scale per 32 int8 quants.
-kernel void gemv_q8_0(GEMV_ARGS) {
-    GEMV_PROLOGUE
-    const int nb = k / QK8_0;
-    device const block_q8_0* wr = (device const block_q8_0*)w + size_t(row) * nb;
+#define GEMV_BODY_F16(T)                                                       \
+    GEMV_PROLOGUE(T)                                                           \
+    device const half* wr = (device const half*)w + size_t(row) * k;           \
+    for (int i = int(tid.x); i < k; i += int(tgdim.x)) {                       \
+        GEMV_SPREAD(T, float(wr[i]), i)                                        \
+    }                                                                          \
+    GEMV_EPILOGUE(T)
 
-    // One thread per 32-element block: a row is only a handful of them, so
-    // splitting finer than the block would leave most of the group idle.
-    for (int c = int(tid.x); c < nb; c += int(tgdim.x)) {
-        device const block_q8_0* blk = wr + c;
-        const float d = float(blk->d);
-        const int base = c * QK8_0;
-        for (int i = 0; i < QK8_0; ++i) {
-            GEMV_SPREAD(d * float(blk->qs[i]), base + i)
-        }
-    }
-    GEMV_EPILOGUE
-}
+/// Q8_0: one f16 scale per 32 int8 quants. One thread a block -- a row is only
+/// a handful of them, so splitting finer would leave most of the group idle.
+#define GEMV_BODY_Q8_0(T)                                                      \
+    GEMV_PROLOGUE(T)                                                           \
+    const int nb = k / QK8_0;                                                  \
+    device const block_q8_0* wr =                                              \
+        (device const block_q8_0*)w + size_t(row) * nb;                        \
+    for (int c = int(tid.x); c < nb; c += int(tgdim.x)) {                       \
+        device const block_q8_0* blk = wr + c;                                 \
+        const float d = float(blk->d);                                         \
+        const int base = c * QK8_0;                                            \
+        for (int i = 0; i < QK8_0; ++i) {                                      \
+            GEMV_SPREAD(T, d * float(blk->qs[i]), base + i)                    \
+        }                                                                      \
+    }                                                                          \
+    GEMV_EPILOGUE(T)
 
-/// Q4_K: a 256-element super-block with eight 6-bit scale/min pairs.
-kernel void gemv_q4_K(GEMV_ARGS) {
-    GEMV_PROLOGUE
-    const int nb = k / QK_K;
-    device const block_q4_K* wr = (device const block_q4_K*)w + size_t(row) * nb;
+/// Q4_K: a 256-element super-block with eight 6-bit scale/min pairs. One thread
+/// a 32-element group, for the same reason as Q8_0.
+#define GEMV_BODY_Q4_K(T)                                                      \
+    GEMV_PROLOGUE(T)                                                           \
+    const int nb = k / QK_K;                                                   \
+    device const block_q4_K* wr =                                              \
+        (device const block_q4_K*)w + size_t(row) * nb;                        \
+    for (int c = int(tid.x); c < nb * 8; c += int(tgdim.x)) {                   \
+        device const block_q4_K* blk = wr + c / 8;                             \
+        const int g = c % 8;                                                   \
+        const int base = (c / 8) * QK_K + g * 32;                              \
+        uchar sc, m;                                                           \
+        q4k_scale_min(blk->scales, g, &sc, &m);                                \
+        const int high = g & 1;                                                \
+        const float d = float(blk->d) * float(sc);                             \
+        const float mn = float(blk->dmin) * float(m);                          \
+        device const uint* q32 =                                               \
+            (device const uint*)(device const void*)(blk->qs + (g / 2) * 32);   \
+        for (int wi = 0; wi < 8; ++wi) {                                       \
+            const uint packed = q32[wi];                                       \
+            for (int b = 0; b < 4; ++b) {                                      \
+                const int byte = int((packed >> (b * 8)) & 0xFF);              \
+                const int nib = high ? (byte >> 4) : (byte & 0xF);             \
+                GEMV_SPREAD(T, d * float(nib) - mn, base + wi * 4 + b)         \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+    GEMV_EPILOGUE(T)
 
-    // One thread per 32-element group rather than per super-block, for the same
-    // reason as Q8_0.
-    for (int c = int(tid.x); c < nb * 8; c += int(tgdim.x)) {
-        device const block_q4_K* blk = wr + c / 8;
-        const int g = c % 8;
-        const int base = (c / 8) * QK_K + g * 32;
+/// Q6_K: 4 low bits in `ql`, 2 high bits in `qh`, an int8 scale per 16. One
+/// thread a `l`, four output elements each, so consecutive threads read
+/// adjacent bytes.
+#define GEMV_BODY_Q6_K(T)                                                      \
+    GEMV_PROLOGUE(T)                                                           \
+    const int nb = k / QK_K;                                                   \
+    device const block_q6_K* wr =                                              \
+        (device const block_q6_K*)w + size_t(row) * nb;                        \
+    const int chunks = nb * 64;                                                \
+    for (int c = int(tid.x); c < chunks; c += int(tgdim.x)) {                   \
+        const int b = c / 64;                                                  \
+        const int rem = c % 64;                                                \
+        const int n2 = rem / 32;                                               \
+        const int l = rem % 32;                                                \
+        device const block_q6_K* blk = wr + b;                                 \
+        device const uchar* ql = blk->ql + n2 * 64;                            \
+        device const uchar* qh = blk->qh + n2 * 32;                            \
+        device const char* sc = blk->scales + n2 * 8;                          \
+        const int base = b * QK_K + n2 * 128;                                  \
+        const float d = float(blk->d);                                         \
+        const uchar h = qh[l];                                                 \
+        const int is = l / 16;                                                 \
+        const int q0 = int((ql[l] & 0xF) | (((h >> 0) & 3) << 4)) - 32;        \
+        const int q1 = int((ql[l + 32] & 0xF) | (((h >> 2) & 3) << 4)) - 32;   \
+        const int q2 = int((ql[l] >> 4) | (((h >> 4) & 3) << 4)) - 32;         \
+        const int q3 = int((ql[l + 32] >> 4) | (((h >> 6) & 3) << 4)) - 32;    \
+        GEMV_SPREAD(T, d * float(sc[is + 0]) * float(q0), base + l)            \
+        GEMV_SPREAD(T, d * float(sc[is + 2]) * float(q1), base + l + 32)       \
+        GEMV_SPREAD(T, d * float(sc[is + 4]) * float(q2), base + l + 64)       \
+        GEMV_SPREAD(T, d * float(sc[is + 6]) * float(q3), base + l + 96)       \
+    }                                                                          \
+    GEMV_EPILOGUE(T)
 
-        uchar sc, m;
-        q4k_scale_min(blk->scales, g, &sc, &m);
-        const int high = g & 1;
-        const float d = float(blk->d) * float(sc);
-        const float mn = float(blk->dmin) * float(m);
+// ---- and the two instantiations of each -----------------------------------
+//
+// `gemv1_*` is the decode kernel. The host picks it whenever `n_tokens == 1`,
+// which is every decode step, and the batched one for prefill.
 
-        // Four nibble-bytes at a time. A byte at a time makes a SIMD group
-        // issue 32 scattered one-byte requests and the memory system fetches a
-        // whole cache line for each. `qs` sits 16 bytes into a 144-byte block,
-        // so the word loads stay 4-byte aligned.
-        device const uint* q32 =
-            (device const uint*)(device const void*)(blk->qs + (g / 2) * 32);
-        for (int wi = 0; wi < 8; ++wi) {
-            const uint packed = q32[wi];
-            for (int b = 0; b < 4; ++b) {
-                const int byte = int((packed >> (b * 8)) & 0xFF);
-                const int nib = high ? (byte >> 4) : (byte & 0xF);
-                GEMV_SPREAD(d * float(nib) - mn, base + wi * 4 + b)
-            }
-        }
-    }
-    GEMV_EPILOGUE
-}
-
-/// Q6_K: 4 low bits in `ql`, 2 high bits in `qh`, an int8 scale per 16.
-kernel void gemv_q6_K(GEMV_ARGS) {
-    GEMV_PROLOGUE
-    const int nb = k / QK_K;
-    device const block_q6_K* wr = (device const block_q6_K*)w + size_t(row) * nb;
-
-    // One thread per `l`, four output elements each. Consecutive threads read
-    // adjacent bytes; one thread per super-block would put them 256 elements
-    // apart and coalesce into nothing.
-    const int chunks = nb * 64;     // two halves x 32 positions
-    for (int c = int(tid.x); c < chunks; c += int(tgdim.x)) {
-        const int b = c / 64;
-        const int rem = c % 64;
-        const int n2 = rem / 32;
-        const int l = rem % 32;
-
-        device const block_q6_K* blk = wr + b;
-        device const uchar* ql = blk->ql + n2 * 64;
-        device const uchar* qh = blk->qh + n2 * 32;
-        device const char* sc = blk->scales + n2 * 8;
-        const int base = b * QK_K + n2 * 128;
-        const float d = float(blk->d);
-
-        const uchar h = qh[l];
-        const int is = l / 16;
-        const int q0 = int((ql[l] & 0xF) | (((h >> 0) & 3) << 4)) - 32;
-        const int q1 = int((ql[l + 32] & 0xF) | (((h >> 2) & 3) << 4)) - 32;
-        const int q2 = int((ql[l] >> 4) | (((h >> 4) & 3) << 4)) - 32;
-        const int q3 = int((ql[l + 32] >> 4) | (((h >> 6) & 3) << 4)) - 32;
-        GEMV_SPREAD(d * float(sc[is + 0]) * float(q0), base + l)
-        GEMV_SPREAD(d * float(sc[is + 2]) * float(q1), base + l + 32)
-        GEMV_SPREAD(d * float(sc[is + 4]) * float(q2), base + l + 64)
-        GEMV_SPREAD(d * float(sc[is + 6]) * float(q3), base + l + 96)
-    }
-    GEMV_EPILOGUE
-}
+kernel void gemv_f32(GEMV_ARGS)  { GEMV_BODY_F32(GEMV_TOKENS) }
+kernel void gemv1_f32(GEMV_ARGS) { GEMV_BODY_F32(1) }
+kernel void gemv_f16(GEMV_ARGS)  { GEMV_BODY_F16(GEMV_TOKENS) }
+kernel void gemv1_f16(GEMV_ARGS) { GEMV_BODY_F16(1) }
+kernel void gemv_q8_0(GEMV_ARGS)  { GEMV_BODY_Q8_0(GEMV_TOKENS) }
+kernel void gemv1_q8_0(GEMV_ARGS) { GEMV_BODY_Q8_0(1) }
+kernel void gemv_q4_K(GEMV_ARGS)  { GEMV_BODY_Q4_K(GEMV_TOKENS) }
+kernel void gemv1_q4_K(GEMV_ARGS) { GEMV_BODY_Q4_K(1) }
+kernel void gemv_q6_K(GEMV_ARGS)  { GEMV_BODY_Q6_K(GEMV_TOKENS) }
+kernel void gemv1_q6_K(GEMV_ARGS) { GEMV_BODY_Q6_K(1) }
 
 /// Dequantize one Q4_K row into f32.
 ///

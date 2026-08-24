@@ -111,18 +111,24 @@ fn main() -> Result<()> {
         10,
     )?;
     let per = t * 1e3 / 100.0;
-    println!("empty dispatch: {per:.1} us each (one command buffer per launch)");
+    println!("empty dispatch: {per:.1} us each (batched into one command buffer)");
     println!("  a 27B decode step issues ~880 -> {:.1} ms of pure overhead\n", per * 880.0 / 1e3);
 
     // ---- 3. the real quantized mat-vec ------------------------------------
     // Shapes from the 27B, with the encoding each actually uses.
     let quant = format!("{COMMON}\n{QUANT}");
+    // Each shape twice: the batched kernel the host used to launch at every
+    // width, and the one-token specialisation. Decode is always one token, so
+    // the second column is the one that matters for a decode step.
     for (label, kernel, k, n_rows, bytes_per_256) in [
         ("output.weight     Q6_K", "gemv_q6_K", 5120usize, 248320usize, 210.0f64),
+        ("output.weight     Q6_K", "gemv1_q6_K", 5120, 248320, 210.0),
         ("ffn_down          Q4_K", "gemv_q4_K", 17408, 5120, 144.0),
+        ("ffn_down          Q4_K", "gemv1_q4_K", 17408, 5120, 144.0),
         ("ffn_gate/up       Q4_K", "gemv_q4_K", 5120, 17408, 144.0),
-        ("token_embd(head)  Q4_K", "gemv_q4_K", 5120, 248320, 144.0),
+        ("ffn_gate/up       Q4_K", "gemv1_q4_K", 5120, 17408, 144.0),
         ("attn_qkv          Q8_0", "gemv_q8_0", 5120, 10240, 34.0 * 8.0),
+        ("attn_qkv          Q8_0", "gemv1_q8_0", 5120, 10240, 34.0 * 8.0),
     ] {
         let bytes = (k * n_rows) as f64 * bytes_per_256 / 256.0;
         let w = s.alloc_zeros::<u8>(bytes as usize)?;

@@ -5,7 +5,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice};
 
-use crate::launch::LastCommit;
+use crate::launch::Batch;
 use crate::profile::Profile;
 use crate::msl::Modules;
 
@@ -51,7 +51,7 @@ struct Inner {
     caps: Caps,
     name: String,
     cores: u32,
-    last: LastCommit,
+    batch: Batch,
     profile: Profile,
 }
 
@@ -103,7 +103,7 @@ impl Device {
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(32),
-                last: LastCommit::default(),
+                batch: Batch::default(),
                 profile: Profile::new(),
             }),
         })
@@ -147,17 +147,8 @@ impl Device {
         &self.inner.queue
     }
 
-    pub(crate) fn remember_commit(
-        &self,
-        cb: Retained<ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>,
-    ) {
-        self.inner.last.set(cb);
-    }
-
-    pub(crate) fn take_last_commit(
-        &self,
-    ) -> Option<Retained<ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>> {
-        self.inner.last.take()
+    pub(crate) fn batch(&self) -> &Batch {
+        &self.inner.batch
     }
 
     pub fn profile(&self) -> &Profile {

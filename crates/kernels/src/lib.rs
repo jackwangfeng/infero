@@ -4285,7 +4285,28 @@ impl Kernels {
             "{ty:?} needs k ({k}) to be a multiple of {}",
             ty.block_size()
         );
-        let name = format!("gemv_{}", ty.suffix());
+        // A one-token specialisation where the backend has one.
+        //
+        // `GEMV_SPREAD`'s trip count must be a compile-time constant or the
+        // accumulator leaves registers, so the batched kernel runs eight
+        // iterations with a predicate and at one token seven are dead. Measured
+        // on an M4 Max, one token, against the batched kernel at the same shape:
+        //
+        //   output.weight Q6_K   61.9 -> 145.0 GB/s
+        //   ffn_down      Q4_K   41.8 ->  95.8
+        //   ffn_gate/up   Q4_K   41.2 ->  92.2
+        //   attn_qkv      Q8_0   73.7 -> 133.3
+        //
+        // Decode is always one token, so this is the decode path. The CUDA side
+        // has no `gemv1_*`: there `#pragma unroll` on a compile-time trip count
+        // already lets the compiler drop the dead iterations, which is the same
+        // fix by a different mechanism.
+        let one = n_tokens == 1 && !cfg!(feature = "cuda");
+        let name = if one {
+            format!("gemv1_{}", ty.suffix())
+        } else {
+            format!("gemv_{}", ty.suffix())
+        };
         let f = self.dev.kernels().get("tuili_quant", quant_src(), &name)?;
         // Size the block to the work rather than to a constant: an oversized
         // block idles most of its threads and still pays for the block-wide
@@ -4297,7 +4318,11 @@ impl Kernels {
         let cfg = LaunchConfig {
             grid_dim: (
                 n as u32,
-                (n_tokens as u32).div_ceil(GEMV_TOKENS_PER_BLOCK).max(1),
+                if one {
+                    1
+                } else {
+                    (n_tokens as u32).div_ceil(GEMV_TOKENS_PER_BLOCK).max(1)
+                },
                 1,
             ),
             block_dim: (block, 1, 1),

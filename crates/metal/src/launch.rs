@@ -123,14 +123,7 @@ impl Stream {
 
     /// Wait for everything submitted so far.
     pub fn synchronize(&self) -> Result<()> {
-        let last = self.dev.take_last_commit();
-        if let Some(cb) = last {
-            cb.waitUntilCompleted();
-            if let Some(err) = cb.error() {
-                return Err(anyhow!("command buffer failed: {err}"));
-            }
-        }
-        Ok(())
+        self.dev.batch().wait()
     }
 }
 
@@ -151,14 +144,16 @@ impl LaunchBuilder {
     /// the submit, and `engine.rs` already notes that the draft step is
     /// launch-bound. Left for a measurement rather than a guess.
     pub unsafe fn launch(&mut self, cfg: LaunchConfig) -> Result<()> {
-        let queue = self.stream.dev.raw_queue();
-        let cb = queue
-            .commandBuffer()
-            .ok_or_else(|| anyhow!("commandBuffer() returned nil"))?;
-        let enc = cb
-            .computeCommandEncoder()
-            .ok_or_else(|| anyhow!("computeCommandEncoder() returned nil"))?;
-
+        let limit = self.func.max_threads_per_group();
+        let threads = cfg.block_dim.0 * cfg.block_dim.1.max(1) * cfg.block_dim.2.max(1);
+        if threads > limit {
+            return Err(anyhow!(
+                "{}: {threads} threads a group exceeds this kernel's limit of {limit}",
+                self.func.name
+            ));
+        }
+        let dev = self.stream.dev.clone();
+        dev.batch().encode(dev.raw_queue(), |enc| {
         enc.setComputePipelineState(&self.func.pipeline);
         for (i, a) in self.args.iter().enumerate() {
             match a {
@@ -220,20 +215,16 @@ impl LaunchBuilder {
             }
         }
         enc.dispatchThreadgroups_threadsPerThreadgroup(grid, group);
-        enc.endEncoding();
-        cb.commit();
+            Ok(())
+        })?;
         // `TUILI_METAL_SYNC` waits for every dispatch, which is the crudest
-        // possible ordering guarantee. If a run is correct with it and wrong
-        // without, the problem is between command buffers rather than inside a
-        // kernel.
+        // possible ordering guarantee and defeats the batching on purpose. If a
+        // run is correct with it and wrong without, the problem is between
+        // dispatches rather than inside a kernel.
         static SYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *SYNC.get_or_init(|| std::env::var_os("TUILI_METAL_SYNC").is_some()) {
-            cb.waitUntilCompleted();
-            if let Some(e) = cb.error() {
-                return Err(anyhow!("{}: {e}", self.func.name));
-            }
+            dev.batch().wait()?;
         }
-        self.stream.dev.remember_commit(cb);
         Ok(())
     }
 }
@@ -285,25 +276,114 @@ macro_rules! scalar_arg {
 }
 scalar_arg!(i32, u32, f32, i64, u64);
 
-/// Tracks the most recent submission so `synchronize()` has something to wait
-/// on. One serial queue means the last buffer finishing implies all of them
-/// did, so this is a single slot rather than a list.
-#[derive(Default)]
-pub(crate) struct LastCommit {
-    slot: Mutex<Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
+/// One command buffer, open across many dispatches.
+///
+/// A command buffer per launch costs 17.9 us to create, encode and submit --
+/// measured, and a 27B decode step issues about 880 of them, so 15.7 ms of a
+/// step went to submission rather than arithmetic. Encoding them all into one
+/// buffer moves that to a single submit.
+///
+/// The ordering guarantee is unchanged and this is why: an encoder created
+/// without `MTLDispatchTypeConcurrent` is serial, so Metal inserts the barrier
+/// between consecutive dispatches itself. That is the same semantics a CUDA
+/// stream gives, and it is what the engine's kernels assume -- every one of them
+/// reads a buffer the previous one wrote.
+///
+/// The buffer is committed by `synchronize`, which every host-visible read
+/// already calls, and by `flush` when the dispatch count reaches `CAP` so a
+/// long prefill does not hold an unbounded encoder open.
+pub(crate) struct Batch {
+    open: Mutex<Option<Open>>,
+    /// The last committed buffer, for `synchronize` to wait on after a flush.
+    last: Mutex<Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
 }
 
-// SAFETY: command buffers are not thread-safe to *encode* into, but this only
-// ever stores an already-committed one and hands it back to be waited on.
-unsafe impl Send for LastCommit {}
-unsafe impl Sync for LastCommit {}
+struct Open {
+    cb: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    enc: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+    dispatches: usize,
+}
 
-impl LastCommit {
-    pub(crate) fn set(&self, cb: Retained<ProtocolObject<dyn MTLCommandBuffer>>) {
-        *self.slot.lock().unwrap() = Some(cb);
+/// Dispatches one command buffer holds before it is submitted on its own.
+///
+/// A decode step is about 880 and wants to be one buffer. A 256-token prefill
+/// is far more, and holding every one of those open would keep the GPU idle
+/// until the last was encoded -- so the cap exists to start the machine working
+/// while the host is still describing what to do.
+const CAP: usize = 1024;
+
+// SAFETY: a command encoder is not thread-safe, which is exactly what the mutex
+// is for: every path that touches the open one holds it. The scheduler shares
+// one `Device` across request threads and they serialise here rather than the
+// engine having to be single-threaded.
+unsafe impl Send for Batch {}
+unsafe impl Sync for Batch {}
+
+impl Default for Batch {
+    fn default() -> Self {
+        Self {
+            open: Mutex::new(None),
+            last: Mutex::new(None),
+        }
+    }
+}
+
+impl Batch {
+    /// Encode one dispatch, opening a buffer if none is open.
+    ///
+    /// The closure runs with the encoder held, so it cannot escape and the lock
+    /// covers exactly the encoding.
+    pub(crate) fn encode(
+        &self,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
+        f: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>) -> Result<()>,
+    ) -> Result<()> {
+        let mut guard = self.open.lock().unwrap();
+        if guard.is_none() {
+            let cb = queue
+                .commandBuffer()
+                .ok_or_else(|| anyhow!("commandBuffer() returned nil"))?;
+            let enc = cb
+                .computeCommandEncoder()
+                .ok_or_else(|| anyhow!("computeCommandEncoder() returned nil"))?;
+            *guard = Some(Open {
+                cb,
+                enc,
+                dispatches: 0,
+            });
+        }
+        let open = guard.as_mut().unwrap();
+        f(&open.enc)?;
+        open.dispatches += 1;
+        let full = open.dispatches >= CAP;
+        drop(guard);
+        if full {
+            self.commit()?;
+        }
+        Ok(())
     }
 
-    pub(crate) fn take(&self) -> Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
-        self.slot.lock().unwrap().take()
+    /// End the open encoder and submit, without waiting.
+    pub(crate) fn commit(&self) -> Result<()> {
+        let Some(open) = self.open.lock().unwrap().take() else {
+            return Ok(());
+        };
+        open.enc.endEncoding();
+        open.cb.commit();
+        *self.last.lock().unwrap() = Some(open.cb);
+        Ok(())
+    }
+
+    /// Submit whatever is open and wait for everything submitted.
+    pub(crate) fn wait(&self) -> Result<()> {
+        self.commit()?;
+        let last = self.last.lock().unwrap().take();
+        if let Some(cb) = last {
+            cb.waitUntilCompleted();
+            if let Some(err) = cb.error() {
+                return Err(anyhow!("command buffer failed: {err}"));
+            }
+        }
+        Ok(())
     }
 }
