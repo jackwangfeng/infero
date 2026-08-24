@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
@@ -22,10 +22,20 @@ unsafe impl Elem for i32 {}
 unsafe impl Elem for u32 {}
 unsafe impl Elem for u8 {}
 unsafe impl Elem for i8 {}
+// The device sampler draws in f64: a uniform in f32 quantises visibly at the
+// tail of a 248320-wide nucleus.
+unsafe impl Elem for f64 {}
 
 struct Raw {
     buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     bytes: usize,
+    /// Whatever owns the memory when Metal does not.
+    ///
+    /// `newBufferWithBytesNoCopy` aliases pages it did not allocate and will not
+    /// free, so the mapping has to outlive the buffer. Holding it here rather
+    /// than asking the caller to is the difference between a safe API and a
+    /// convention.
+    keep: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 // SAFETY: `MTLBuffer` is thread-safe; see `device.rs`. Unified memory means
@@ -80,6 +90,22 @@ impl<T: Elem> Buf<T> {
         self.slice_mut(..)
     }
 
+    /// Two non-overlapping windows, split at `mid`.
+    pub fn split_at(&self, mid: usize) -> (View<'_, T>, View<'_, T>) {
+        (self.slice(..mid), self.slice(mid..))
+    }
+
+    pub fn split_at_mut(&mut self, mid: usize) -> (ViewMut<'_, T>, ViewMut<'_, T>) {
+        let (lo, hi) = (
+            resolve(&(..mid), self.len),
+            resolve(&(mid..), self.len),
+        );
+        (
+            ViewMut { raw: &self.raw, off: lo.0, len: lo.1, _t: PhantomData },
+            ViewMut { raw: &self.raw, off: hi.0, len: hi.1, _t: PhantomData },
+        )
+    }
+
     /// Reinterpret the allocation as another element type.
     ///
     /// # Safety
@@ -104,10 +130,11 @@ impl<T: Elem> Buf<T> {
 
     /// Read the whole allocation back to the host.
     ///
-    /// Unified memory makes this a `memcpy` from a pointer the GPU also sees,
-    /// so the only thing that has to happen first is that the work which wrote
-    /// it has completed -- which is the caller's business, exactly as it is on
-    /// CUDA.
+    /// Unified memory makes this a `memcpy` from a pointer the GPU also sees.
+    /// It does **not** synchronise -- there is no stream here to synchronise on
+    /// -- so the caller must have waited. `Stream::memcpy_dtoh` is the ordered
+    /// one and is what the engine takes; this is for tests and examples that
+    /// have just called `synchronize` themselves.
     pub fn to_vec(&self) -> Vec<T> {
         let mut out = Vec::with_capacity(self.len);
         // SAFETY: `contents()` is valid for `bytes` and `len * size_of::<T>()`
@@ -147,6 +174,43 @@ macro_rules! view_common {
                 &self,
             ) -> Retained<ProtocolObject<dyn MTLBuffer>> {
                 self.raw.buf.clone()
+            }
+
+            /// Reinterpret this window as another element type.
+            ///
+            /// # Safety
+            /// As `Buf::transmute`: every `Elem` is plain data, so the real
+            /// obligation is that the byte count fits.
+            pub unsafe fn transmute<U: Elem>(&self, n: usize) -> Result<View<'a, U>> {
+                let want = n * std::mem::size_of::<U>();
+                let have = self.len * std::mem::size_of::<T>();
+                if want > have {
+                    return Err(anyhow!(
+                        "transmute to {n} x {} exceeds this {have} byte window",
+                        std::mem::size_of::<U>()
+                    ));
+                }
+                // The element offset scales with the size change; a window that
+                // does not start on a `U` boundary is a caller error and is
+                // rejected rather than silently rounded.
+                let byte_off = self.off * std::mem::size_of::<T>();
+                if byte_off % std::mem::size_of::<U>() != 0 {
+                    return Err(anyhow!(
+                        "window starts {byte_off} bytes in, which is not a multiple of {}",
+                        std::mem::size_of::<U>()
+                    ));
+                }
+                Ok(View {
+                    raw: self.raw,
+                    off: byte_off / std::mem::size_of::<U>(),
+                    len: n,
+                    _t: PhantomData,
+                })
+            }
+
+            /// Two non-overlapping windows, split at `mid`.
+            pub fn split_at(&self, mid: usize) -> (View<'a, T>, View<'a, T>) {
+                (self.slice(..mid), self.slice(mid..))
             }
 
             pub fn slice<R: RangeBounds<usize>>(&self, r: R) -> View<'a, T> {
@@ -201,6 +265,19 @@ impl<'a, T: Elem> ViewMut<'a, T> {
             _t: PhantomData,
         }
     }
+
+    pub fn split_at_mut(&mut self, mid: usize) -> (ViewMut<'_, T>, ViewMut<'_, T>) {
+        let mid = mid.min(self.len);
+        (
+            ViewMut { raw: self.raw, off: self.off, len: mid, _t: PhantomData },
+            ViewMut {
+                raw: self.raw,
+                off: self.off + mid,
+                len: self.len - mid,
+                _t: PhantomData,
+            },
+        )
+    }
 }
 
 fn resolve<R: RangeBounds<usize>>(r: &R, cap: usize) -> (usize, usize) {
@@ -218,7 +295,56 @@ fn resolve<R: RangeBounds<usize>>(r: &R, cap: usize) -> (usize, usize) {
     (start, end.saturating_sub(start))
 }
 
-impl Stream<'_> {
+/// Anything a host-to-device copy can write into.
+///
+/// cudarc reaches the same generality through `DevicePtrMut`; the engine's call
+/// sites pass an owned `Buf` in some places and a `ViewMut` in others, and both
+/// spellings should work without the caller inserting a conversion.
+pub trait CopyDst<T: Elem> {
+    fn as_dst(&mut self) -> ViewMut<'_, T>;
+}
+
+impl<T: Elem> CopyDst<T> for Buf<T> {
+    fn as_dst(&mut self) -> ViewMut<'_, T> {
+        self.as_view_mut()
+    }
+}
+
+impl<T: Elem> CopyDst<T> for ViewMut<'_, T> {
+    fn as_dst(&mut self) -> ViewMut<'_, T> {
+        ViewMut {
+            raw: self.raw,
+            off: self.off,
+            len: self.len,
+            _t: PhantomData,
+        }
+    }
+}
+
+/// Anything a device-to-host copy can read from.
+pub trait CopySrc<T: Elem> {
+    fn as_src(&self) -> View<'_, T>;
+}
+
+impl<T: Elem> CopySrc<T> for Buf<T> {
+    fn as_src(&self) -> View<'_, T> {
+        self.as_view()
+    }
+}
+
+impl<T: Elem> CopySrc<T> for View<'_, T> {
+    fn as_src(&self) -> View<'_, T> {
+        *self
+    }
+}
+
+impl<T: Elem> CopySrc<T> for ViewMut<'_, T> {
+    fn as_src(&self) -> View<'_, T> {
+        self.as_view()
+    }
+}
+
+impl Stream {
     /// A zeroed allocation. `MTLResourceOptions::StorageModeShared` puts it in
     /// the unified pool, which is the only sensible mode on Apple Silicon: a
     /// private-mode buffer would need a blit to read back and buy nothing,
@@ -239,10 +365,108 @@ impl Stream<'_> {
             std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, alloc);
         }
         Ok(Buf {
-            raw: Arc::new(Raw { buf, bytes: alloc }),
+            raw: Arc::new(Raw {
+                buf,
+                bytes: alloc,
+                keep: None,
+            }),
             len: n,
             _t: PhantomData,
         })
+    }
+
+    /// Host to device, into a window that already exists.
+    pub fn memcpy_htod<T: Elem, D: CopyDst<T>>(&self, src: &[T], dst: &mut D) -> Result<()> {
+        self.copy_into(&mut dst.as_dst(), src)
+    }
+
+    /// Device to host, into a caller-owned slice.
+    /// Device to host, into a caller-owned slice.
+    ///
+    /// Synchronises first, because cudarc's is stream-ordered: it queues behind
+    /// the launches already submitted. Reading `contents()` without waiting
+    /// looks like it works -- unified memory means the pointer is valid -- and
+    /// returns whatever the GPU had written by that instant. Which is most of
+    /// the answer, most of the time, and produced fluent nonsense from the real
+    /// engine while every kernel test passed.
+    pub fn memcpy_dtoh<T: Elem, S: CopySrc<T>>(&self, src: &S, dst: &mut [T]) -> Result<()> {
+        self.synchronize()?;
+        let src = src.as_src();
+        if src.len() > dst.len() {
+            return Err(anyhow!(
+                "reading {} elements into a {} element slice",
+                src.len(),
+                dst.len()
+            ));
+        }
+        // SAFETY: bounds checked; shared storage is host-visible.
+        unsafe {
+            let p = src.raw_buf().contents().as_ptr() as *const u8;
+            std::ptr::copy_nonoverlapping(
+                p.add(src.byte_offset()) as *const T,
+                dst.as_mut_ptr(),
+                src.len(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Device to host, allocating the destination.
+    pub fn clone_dtoh<T: Elem, S: CopySrc<T>>(&self, src: &S) -> Result<Vec<T>> {
+        self.memcpy_dtov(&src.as_src())
+    }
+
+    /// Device to device.
+    ///
+    /// A plain `memmove` in unified memory. Overlap is permitted because the
+    /// engine's uses -- sliding a KV window, adopting a forked sequence's
+    /// slots -- can genuinely overlap, and CUDA's `memcpy_dtod` allows it too.
+    pub fn memcpy_dtod<T: Elem, S: CopySrc<T>, D: CopyDst<T>>(
+        &self,
+        src: &S,
+        dst: &mut D,
+    ) -> Result<()> {
+        self.synchronize()?;
+        let src = src.as_src();
+        let mut dst = dst.as_dst();
+        if src.len() > dst.len() {
+            return Err(anyhow!(
+                "copying {} elements into a {} element window",
+                src.len(),
+                dst.len()
+            ));
+        }
+        // SAFETY: both windows are inside live allocations; `copy` (not
+        // `copy_nonoverlapping`) because the ranges may overlap.
+        unsafe {
+            let sp = (src.raw_buf().contents().as_ptr() as *const u8).add(src.byte_offset());
+            let dp = (dst.raw_buf().contents().as_ptr() as *mut u8).add(dst.byte_offset());
+            std::ptr::copy(sp as *const T, dp as *mut T, src.len());
+        }
+        Ok(())
+    }
+
+    /// Host to device, by cudarc's name for it.
+    pub fn clone_htod<T: Elem>(&self, src: &[T]) -> Result<Buf<T>> {
+        self.memcpy_stod(src)
+    }
+
+    /// Zero a window. Unified memory makes this a host `write_bytes`, which is
+    /// why it takes no kernel: the pages the GPU reads are the ones written.
+    pub fn memset_zeros<T: Elem, D: CopyDst<T>>(&self, dst: &mut D) -> Result<()> {
+        self.synchronize()?;
+        let mut dst = dst.as_dst();
+        // SAFETY: the window is within an allocation and shared storage is
+        // host-visible.
+        unsafe {
+            let p = dst.raw_buf().contents().as_ptr() as *mut u8;
+            std::ptr::write_bytes(
+                p.add(dst.byte_offset()),
+                0,
+                dst.len() * std::mem::size_of::<T>(),
+            );
+        }
+        Ok(())
     }
 
     /// Host to device. A `memcpy` into unified memory.
@@ -252,7 +476,11 @@ impl Stream<'_> {
         Ok(b)
     }
 
+    /// Host to device. Stream-ordered for the same reason the read is: writing
+    /// a buffer a queued kernel has not finished reading would change its input
+    /// underneath it.
     pub fn copy_into<T: Elem>(&self, dst: &mut ViewMut<'_, T>, src: &[T]) -> Result<()> {
+        self.synchronize()?;
         if src.len() > dst.len() {
             return Err(anyhow!(
                 "copying {} elements into a {} element window",
@@ -269,8 +497,9 @@ impl Stream<'_> {
         Ok(())
     }
 
-    /// Device to host.
+    /// Device to host. Stream-ordered, as above.
     pub fn memcpy_dtov<T: Elem>(&self, src: &View<'_, T>) -> Result<Vec<T>> {
+        self.synchronize()?;
         let mut out = Vec::with_capacity(src.len());
         // SAFETY: as above.
         unsafe {
@@ -281,4 +510,72 @@ impl Stream<'_> {
         }
         Ok(out)
     }
+}
+
+/// A whole file, aliased into device memory without a copy.
+///
+/// The point of this on unified memory. A GGUF is already `mmap`ed, so
+/// `clone_htod` on each tensor reads the mapped page in and then memcpies it
+/// into a fresh `MTLBuffer` -- and the copy is not the worst of it. It leaves
+/// the file's pages in the page cache *and* the same bytes in device buffers, so
+/// an 18 GiB checkpoint commits 36 GiB on a 36 GiB machine and the OS starts
+/// evicting. Measured on the 27B: 24.1 s to load weights where the disk reads
+/// the file in 4.3 s.
+///
+/// `newBufferWithBytesNoCopy` points a buffer at pages Metal did not allocate.
+/// Two rules come with it, and both are why this maps the whole file rather than
+/// each tensor: the address must be page-aligned -- an `mmap` base is, a tensor
+/// offset inside it is not -- and so must the length. `mmap` makes
+/// `ceil(len / page) * page` bytes addressable, the tail zero-filled, so
+/// rounding the length up stays inside the mapping.
+///
+/// The `Mmap` moves into the buffer, which is what makes this safe rather than
+/// merely convenient: nothing outside can drop it while the GPU still reads it.
+pub fn map_file(dev: &crate::Device, path: &std::path::Path) -> Result<Buf<u8>> {
+    use objc2_metal::MTLDevice;
+
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("opening {} to map it", path.display()))?;
+    // SAFETY: the file is opened read-only and the mapping is owned by the
+    // buffer below for as long as the buffer lives. A concurrent truncation
+    // would be a data race, which is true of the `Gguf` mapping this replaces.
+    let map = unsafe { memmap2::Mmap::map(&file) }
+        .with_context(|| format!("mapping {}", path.display()))?;
+    let len = map.len();
+    anyhow::ensure!(len > 0, "{} is empty", path.display());
+
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let rounded = len.next_multiple_of(page);
+    let ptr = std::ptr::NonNull::new(map.as_ptr() as *mut std::ffi::c_void)
+        .context("mmap returned null")?;
+    anyhow::ensure!(
+        ptr.as_ptr() as usize % page == 0,
+        "mapping of {} is not page-aligned",
+        path.display()
+    );
+
+    // SAFETY: `ptr` addresses `rounded` bytes of the mapping (see above), and
+    // the `Mmap` that owns them is moved into the buffer's keepalive on the next
+    // lines. A nil deallocator tells Metal it does not own the pages.
+    let buf = unsafe {
+        dev.raw().newBufferWithBytesNoCopy_length_options_deallocator(
+            ptr,
+            rounded,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        )
+    }
+    .ok_or_else(|| anyhow!("aliasing {} MiB of {} failed", len >> 20, path.display()))?;
+
+    Ok(Buf {
+        raw: Arc::new(Raw {
+            buf,
+            bytes: rounded,
+            keep: Some(Box::new(map)),
+        }),
+        // The file's real length, not the rounded one: a slice past the end is a
+        // bug and should be caught rather than reading the zero-fill.
+        len,
+        _t: PhantomData,
+    })
 }

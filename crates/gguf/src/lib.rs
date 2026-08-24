@@ -191,6 +191,15 @@ impl Gguf {
         self.tensors.get(name)
     }
 
+    /// A tensor's byte offset from the start of the *file*.
+    ///
+    /// `TensorInfo::offset` is relative to the data section; a caller that has
+    /// mapped the whole file -- to alias it into device memory rather than copy
+    /// out of it -- needs the absolute one.
+    pub fn file_offset(&self, t: &TensorInfo) -> usize {
+        self.data_offset + t.offset as usize
+    }
+
     /// The raw bytes of a tensor, still in its ggml block encoding.
     pub fn data(&self, t: &TensorInfo) -> &[u8] {
         let start = self.data_offset + t.offset as usize;

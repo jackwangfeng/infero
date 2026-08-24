@@ -13,6 +13,9 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+memmap2.workspace = true
+objc2-metal-performance-shaders = "0.3"
+libc = "0.2"
 half.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -36,3 +39,11 @@ serde_json = "1"
 [[example]]
 name = "qwen2_f16"
 path = "examples/qwen2_f16.rs"
+
+[[example]]
+name = "qwen38_27b"
+path = "examples/qwen38_27b.rs"
+
+[[example]]
+name = "bandwidth"
+path = "examples/bandwidth.rs"

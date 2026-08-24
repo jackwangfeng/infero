@@ -17,9 +17,9 @@ pub mod vision;
 mod weight;
 
 use anyhow::{Context, Result};
-use cudarc::driver::{CudaView, CudaViewMut, LaunchConfig, PushKernelArg};
+use tuili_gpu::{View, ViewMut, LaunchConfig, KernelArg};
 use half::f16;
-use tuili_cuda::Device;
+use tuili_gpu::Device;
 
 pub use BatchLayout as Batch;
 pub use turboquant::{Codebook, DeviceTables as TqTables, KvQuant};
@@ -42,6 +42,17 @@ const MMQ_XA_STRIDE: u32 = 8 * 36 + 16;
 const MMQ_XK_STRIDE: u32 = 256 * 2;
 
 const COMMON_CUH: &str = include_str!("cu/common.cuh");
+
+// The Metal twins. File for file where one exists; a stub where it does not,
+// so that a kernel this backend has not got reports itself from the lookup as
+// a missing name rather than as a compiler error about a file full of CUDA.
+const COMMON_METAL: &str = include_str!("msl/common.metal");
+const OPS_METAL: &str = include_str!("msl/ops.metal");
+const QUANT_METAL: &str = include_str!("msl/quant.metal");
+const GDN_METAL: &str = include_str!("msl/gdn.metal");
+const MMVQ_METAL: &str = include_str!("msl/mmvq.metal");
+const SAMPLE_METAL: &str = include_str!("msl/sample.metal");
+const UNIMPLEMENTED_METAL: &str = include_str!("msl/unimplemented.metal");
 const OPS_CU: &str = include_str!("cu/ops.cu");
 const QUANT_CU: &str = include_str!("cu/quant.cu");
 const TURBOQUANT_CU: &str = include_str!("cu/turboquant.cu");
@@ -58,6 +69,19 @@ const MOE_CU: &str = include_str!("cu/moe.cu");
 /// without pushing occupancy off a cliff on sm_86.
 const REDUCE_BLOCK: u32 = 256;
 
+/// Tokens at which the Q4_K mat-vec switches to the matrix units. See the note
+/// at the switch itself for the measurements behind the default.
+fn mma_min() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("TUILI_MMA_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(8)
+    })
+}
+
 /// Registers per thread in the fused norm; must match `RMS_REGS` in mmvq.cu.
 const RMS_REGS: u32 = 8;
 const ELEMENTWISE_BLOCK: u32 = 256;
@@ -73,18 +97,30 @@ pub const Q8_1_BLOCK_BYTES: usize = 36;
 /// Measured at 96 on an A4000; see `mmq_tiles` for the companion threshold.
 pub const MMQ_MAX_TOKENS: usize = 96;
 
+#[cfg(feature = "cuda")]
 fn ops_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     // The MMA helpers too: `attn_decode_mma_f32` uses the same `m16n8k16`
     // fragments the GEMM does, and `mma.cuh` is where their layout is pinned.
     SRC.get_or_init(|| format!("{COMMON_CUH}\n{MMA_CUH}\n{OPS_CU}"))
 }
+#[cfg(not(feature = "cuda"))]
+fn ops_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| format!("{COMMON_METAL}\n{OPS_METAL}"))
+}
 
 /// The GatedDeltaNet unit. Separate from `ops_src` so that a change to the
 /// linear-attention kernels does not force every other kernel to recompile.
+#[cfg(feature = "cuda")]
 fn gdn_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SRC.get_or_init(|| format!("{COMMON_CUH}\n{GDN_CU}"))
+}
+#[cfg(not(feature = "cuda"))]
+fn gdn_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| format!("{COMMON_METAL}\n{GDN_METAL}"))
 }
 
 /// The Qwen3.5 vision tower. Separate from `ops_src` for the same reason `gdn`
@@ -93,12 +129,19 @@ fn gdn_src() -> &'static str {
 /// interleaving, bidirectional not causal, two blocked rotary axes not three
 /// interleaved), so keeping the two apart keeps a reader from picking the wrong
 /// one by name.
+#[cfg(feature = "cuda")]
 fn vision_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SRC.get_or_init(|| format!("{COMMON_CUH}\n{VISION_CU}"))
 }
+#[cfg(not(feature = "cuda"))]
+fn vision_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| UNIMPLEMENTED_METAL.to_string())
+}
 
 /// The block-scaled FP8 unit.
+#[cfg(feature = "cuda")]
 fn fp8_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     // `TUILI_FP8_STRIP` prepends `#define`s that take pieces out of the mat-vec,
@@ -112,25 +155,54 @@ fn fp8_src() -> &'static str {
         )
     })
 }
+#[cfg(not(feature = "cuda"))]
+fn fp8_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| UNIMPLEMENTED_METAL.to_string())
+}
 
+#[cfg(feature = "cuda")]
 fn sample_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SRC.get_or_init(|| format!("{COMMON_CUH}\n{SAMPLE_CU}"))
 }
+#[cfg(not(feature = "cuda"))]
+fn sample_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| format!("{COMMON_METAL}\n{SAMPLE_METAL}"))
+}
 
+#[cfg(feature = "cuda")]
 fn quant_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SRC.get_or_init(|| format!("{COMMON_CUH}\n{QUANT_CU}"))
 }
+#[cfg(not(feature = "cuda"))]
+fn quant_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| format!("{COMMON_METAL}\n{QUANT_METAL}"))
+}
 
+#[cfg(feature = "cuda")]
 fn mmq_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SRC.get_or_init(|| format!("{COMMON_CUH}\n{MMA_CUH}\n{MMQ_CU}"))
 }
+#[cfg(not(feature = "cuda"))]
+fn mmq_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| UNIMPLEMENTED_METAL.to_string())
+}
 
+#[cfg(feature = "cuda")]
 fn mmvq_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SRC.get_or_init(|| format!("{COMMON_CUH}\n{MMVQ_CU}"))
+}
+#[cfg(not(feature = "cuda"))]
+fn mmvq_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| format!("{COMMON_METAL}\n{MMVQ_METAL}"))
 }
 
 /// The MoE kernels compile against `mmvq.cu`, not beside it: `mmvq_moe` is the
@@ -138,14 +210,25 @@ fn mmvq_src() -> &'static str {
 /// devices functions and the same block layout. Duplicating those would let the
 /// two drift, and a drifted dot product is a wrong answer rather than a
 /// compile error.
+///
+/// CUDA-only: there is no Metal `MOE_CU` counterpart yet, matching the design
+/// doc's own AWQ-first scope for the sparse path.
+#[cfg(feature = "cuda")]
 fn moe_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SRC.get_or_init(|| format!("{COMMON_CUH}\n{MMVQ_CU}\n{MOE_CU}"))
 }
 
+#[cfg(feature = "cuda")]
 fn tq_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SRC.get_or_init(|| format!("{COMMON_CUH}\n{TURBOQUANT_CU}"))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn tq_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| UNIMPLEMENTED_METAL.to_string())
 }
 
 /// Threads for a kernel that walks one vector of `d` per block.
@@ -173,6 +256,7 @@ pub struct Kernels {
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 pub struct TmaDesc([u8; 128]);
+#[cfg(feature = "cuda")]
 unsafe impl cudarc::driver::DeviceRepr for TmaDesc {}
 
 /// Launch one of the register-resident norms, with or without the f16 copy.
@@ -187,24 +271,28 @@ unsafe impl cudarc::driver::DeviceRepr for TmaDesc {}
 /// separates the plain norm from the f16-writing one.
 fn b_args(
     k: &Kernels,
-    f: &tuili_cuda::Kernel,
+    f: &tuili_gpu::Function,
     cfg: LaunchConfig,
-    out: &mut CudaViewMut<'_, f32>,
-    h_out: Option<&mut CudaViewMut<'_, f16>>,
-    x: &CudaView<'_, f32>,
-    weight: &CudaView<'_, f32>,
+    out: &mut ViewMut<'_, f32>,
+    h_out: Option<&mut ViewMut<'_, f16>>,
+    x: &View<'_, f32>,
+    weight: &View<'_, f32>,
     d: i32,
     eps: f32,
     label: &'static str,
 ) -> Result<()> {
-    let null: u64 = 0;
     let mut b = k.device().stream().launch_builder(f);
     match h_out {
         Some(h) => {
             b.arg(out).arg(h).arg(x).arg(weight).arg(&d).arg(&eps);
         }
         None => {
-            b.arg(out).arg(&null).arg(x).arg(weight).arg(&d).arg(&eps);
+            b.arg(out)
+                .arg(&tuili_gpu::NULL_BUFFER)
+                .arg(x)
+                .arg(weight)
+                .arg(&d)
+                .arg(&eps);
         }
     }
     k.device().profile().time(label, k.device().stream(), || {
@@ -222,9 +310,9 @@ fn b_args(
 /// back is a kilobyte — against the 993 KB of logits the host would need to
 /// reconstruct it, which measured a third of a draft's time.
 pub struct Survivors<'a> {
-    pub id: &'a mut CudaViewMut<'a, u32>,
-    pub p: &'a mut CudaViewMut<'a, f32>,
-    pub len: &'a mut CudaViewMut<'a, i32>,
+    pub id: &'a mut ViewMut<'a, u32>,
+    pub p: &'a mut ViewMut<'a, f32>,
+    pub len: &'a mut ViewMut<'a, i32>,
     /// Entries a row. The kernel reports the true `keep` in `len` even when it
     /// exceeds this, so truncation is visible rather than silent.
     pub stride: usize,
@@ -294,7 +382,12 @@ impl Kernels {
         ] {
             self.dev.kernels().get("tuili_gdn", gdn_src(), name)?;
         }
-        // The FP8 unit, warmed the same way and for the same reason.
+        // The FP8 unit, warmed the same way and for the same reason -- and
+        // skipped where the hardware has no FP8 matmul. That is the same fact
+        // `matmul` reads before it dispatches to these, so warming them anyway
+        // would turn a capability the engine already routes around into a
+        // startup failure.
+        if self.dev.caps().fp8 {
         for name in [
             "mmv_f8_block_f32",
             // One per token width; see `fp8::BATCH_KERNELS`, which is what
@@ -309,9 +402,16 @@ impl Kernels {
         ] {
             self.dev.kernels().get("tuili_fp8", fp8_src(), name)?;
         }
+        }
         // And the vision tower, which is its own translation unit again. A
         // multimodal request pays for these once at startup instead of stalling
         // the first image behind NVRTC.
+        //
+        // CUDA-only for now, and for a different reason than FP8: nothing about
+        // Apple hardware prevents these, `vision.cu` simply has no MSL twin
+        // yet. Gating on the feature rather than on a capability says which of
+        // the two it is.
+        #[cfg(feature = "cuda")]
         for name in [
             "vision_layer_norm_f32",
             "vision_gelu_tanh_f32",
@@ -325,6 +425,14 @@ impl Kernels {
         ] {
             self.dev.kernels().get("tuili_vision", vision_src(), name)?;
         }
+        // Every weight type's gemv, row gather and dequantisation.
+        //
+        // CUDA-only: this backend has MSL for a subset of the types, and
+        // warm-up is an optimisation -- it moves a first-token compile stall to
+        // startup. Warming a type the file will never contain would turn that
+        // optimisation into a startup failure, so the Metal path pays the stall
+        // for whichever types its checkpoint actually uses.
+        #[cfg(feature = "cuda")]
         for ty in WeightType::ALL {
             // The transposed AWQ layout is read by the tensor-core GEMM and by
             // the prefill dequantization, and by nothing else yet — the
@@ -368,28 +476,39 @@ impl Kernels {
                 self.dev.kernels().get("tuili_mmvq", mmvq_src(), &name)?;
             }
         }
-        // The tensor-core GEMM, both tile widths. Leaving these out made the
-        // first request after startup pay for NVRTC — 20 tok/s against 27 on
-        // every request after it.
-        if self.dev.arch() >= 80 {
-            for tag in ["", "2"] {
-                for ty in WeightType::ALL
-                    .iter()
-                    .filter(|t| Self::has_mmq(**t) && **t != WeightType::Q4G128T)
-                {
-                    let name = format!("mmq{tag}_{}", ty.suffix());
-                    self.dev.kernels().get("tuili_mmq", mmq_src(), &name)?;
+        // CUDA-only from here: `mmq.cu` and `turboquant.cu` have no MSL
+        // twins. The dispatch already routes around the first through
+        // `caps().int_tensor_gemm`, and the second is only reached when
+        // `--kv-quant` asks for a compressed cache.
+        #[cfg(feature = "cuda")]
+        {
+            // The tensor-core GEMM, both tile widths. CUDA-only: `mmq.cu` has no
+            // MSL twin, and `caps().int_tensor_gemm` already keeps the dispatch
+            // away from it.
+            //
+            // Leaving these out made the
+            // first request after startup pay for NVRTC — 20 tok/s against 27 on
+            // every request after it.
+            if self.dev.caps().int_tensor_gemm {
+                for tag in ["", "2"] {
+                    for ty in WeightType::ALL
+                        .iter()
+                        .filter(|t| Self::has_mmq(**t) && **t != WeightType::Q4G128T)
+                    {
+                        let name = format!("mmq{tag}_{}", ty.suffix());
+                        self.dev.kernels().get("tuili_mmq", mmq_src(), &name)?;
+                    }
                 }
             }
-        }
-        for name in [
-            "tq_matvec",
-            "tq_store_v",
-            "tq_store_k",
-            "tq_attn_scores",
-            "tq_attn_output",
-        ] {
-            self.dev.kernels().get("tuili_turboquant", tq_src(), name)?;
+            for name in [
+                "tq_matvec",
+                "tq_store_v",
+                "tq_store_k",
+                "tq_attn_scores",
+                "tq_attn_output",
+            ] {
+                self.dev.kernels().get("tuili_turboquant", tq_src(), name)?;
+            }
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "kernels compiled");
         Ok(())
@@ -407,8 +526,8 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn qk_norm(
         &self,
-        buf: &mut CudaViewMut<'_, f32>,
-        weight: &CudaView<'_, f32>,
+        buf: &mut ViewMut<'_, f32>,
+        weight: &View<'_, f32>,
         n_tokens: usize,
         n_heads: usize,
         d_head: usize,
@@ -446,9 +565,9 @@ impl Kernels {
 
     pub fn rms_norm(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        x: &CudaView<'_, f32>,
-        weight: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
+        x: &View<'_, f32>,
+        weight: &View<'_, f32>,
         n_tokens: usize,
         d: usize,
         eps: f32,
@@ -486,9 +605,9 @@ impl Kernels {
     /// `out = a + b`, elementwise. Aliasing `out` with either input is fine.
     pub fn add(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        a: &CudaView<'_, f32>,
-        b_in: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
+        a: &View<'_, f32>,
+        b_in: &View<'_, f32>,
         n: usize,
     ) -> Result<()> {
         let f = self.dev.kernels().get("tuili_ops", ops_src(), "add_f32")?;
@@ -505,8 +624,8 @@ impl Kernels {
     /// `out += b`, in place.
     pub fn add_assign(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        b_in: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
+        b_in: &View<'_, f32>,
         n: usize,
     ) -> Result<()> {
         let f = self
@@ -529,8 +648,8 @@ impl Kernels {
     /// `out[t, j] += bias[j]`
     pub fn add_bias(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        bias: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
+        bias: &View<'_, f32>,
         n_cols: usize,
         n_rows: usize,
     ) -> Result<()> {
@@ -560,9 +679,9 @@ impl Kernels {
     /// `out = silu(gate) * up`, the SwiGLU non-linearity.
     pub fn silu_mul(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        gate: &CudaView<'_, f32>,
-        up: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
+        gate: &View<'_, f32>,
+        up: &View<'_, f32>,
         n: usize,
     ) -> Result<()> {
         let f = self
@@ -585,10 +704,10 @@ impl Kernels {
     /// the stacked weight produces.
     pub fn split_qkv(
         &self,
-        q: &mut CudaViewMut<'_, f32>,
-        k: &mut CudaViewMut<'_, f32>,
-        v: &mut CudaViewMut<'_, f32>,
-        fused: &CudaView<'_, f32>,
+        q: &mut ViewMut<'_, f32>,
+        k: &mut ViewMut<'_, f32>,
+        v: &mut ViewMut<'_, f32>,
+        fused: &View<'_, f32>,
         d: usize,
         kv_dim: usize,
         n_tokens: usize,
@@ -616,8 +735,8 @@ impl Kernels {
     /// concatenated weight produces.
     pub fn silu_mul_split(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        xy: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
+        xy: &View<'_, f32>,
         d_ff: usize,
         total: usize,
     ) -> Result<()> {
@@ -642,9 +761,9 @@ impl Kernels {
     /// kernel is already positioned to do.
     pub fn silu_mul_split_f16(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        hout: &mut CudaViewMut<'_, f16>,
-        xy: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
+        hout: &mut ViewMut<'_, f16>,
+        xy: &View<'_, f32>,
         d_ff: usize,
         total: usize,
     ) -> Result<()> {
@@ -685,7 +804,15 @@ impl Kernels {
     /// vocabulary rules the kernel out on a card whose limit is 48 KiB without
     /// an opt-in this does not take.
     pub fn can_sample_on_device(vocab: usize, max_top_k: usize) -> bool {
-        max_top_k <= Self::SAMPLE_MAX_TOP_K && Self::sample_shared(vocab) <= 48 * 1024
+        // The limit is the backend's threadgroup/shared budget, and Apple's is
+        // 32 KiB against a CUDA card's 48. That is not a detail: the bitset is
+        // `vocab / 32` words, so 151936 tokens fit on both and 248320 fit on
+        // neither once the reduction scratch is added -- Qwen3.8 lands in the
+        // gap. `sample_rows_split`, whose bitset covers one sixty-fourth of the
+        // vocabulary, is what serves the ones this excludes, and the caller
+        // reaching for it does not consult this.
+        let budget = if cfg!(feature = "cuda") { 48 * 1024 } else { 32 * 1024 };
+        max_top_k <= Self::SAMPLE_MAX_TOP_K && Self::sample_shared(vocab) <= budget
     }
 
     fn sample_shared(vocab: usize) -> u32 {
@@ -714,14 +841,14 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn sample_rows_greedy(
         &self,
-        out: &mut CudaViewMut<'_, u32>,
-        pv: &mut CudaViewMut<'_, f32>,
-        pi: &mut CudaViewMut<'_, i32>,
-        logits: &CudaView<'_, f32>,
-        params: &CudaView<'_, f32>,
-        pen_tok: &CudaView<'_, i32>,
-        pen_cnt: &CudaView<'_, i32>,
-        pen_len: &CudaView<'_, i32>,
+        out: &mut ViewMut<'_, u32>,
+        pv: &mut ViewMut<'_, f32>,
+        pi: &mut ViewMut<'_, i32>,
+        logits: &View<'_, f32>,
+        params: &View<'_, f32>,
+        pen_tok: &View<'_, i32>,
+        pen_cnt: &View<'_, i32>,
+        pen_len: &View<'_, i32>,
         n_rows: usize,
         vocab: usize,
         pen_stride: usize,
@@ -812,15 +939,15 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn sample_rows_split(
         &self,
-        out: &mut CudaViewMut<'_, u32>,
-        cand_v: &mut CudaViewMut<'_, f32>,
-        cand_i: &mut CudaViewMut<'_, i32>,
-        logits: &CudaView<'_, f32>,
-        params: &CudaView<'_, f32>,
-        pen_tok: &CudaView<'_, i32>,
-        pen_cnt: &CudaView<'_, i32>,
-        pen_len: &CudaView<'_, i32>,
-        rnd: &CudaView<'_, f64>,
+        out: &mut ViewMut<'_, u32>,
+        cand_v: &mut ViewMut<'_, f32>,
+        cand_i: &mut ViewMut<'_, i32>,
+        logits: &View<'_, f32>,
+        params: &View<'_, f32>,
+        pen_tok: &View<'_, i32>,
+        pen_cnt: &View<'_, i32>,
+        pen_len: &View<'_, i32>,
+        rnd: &View<'_, f64>,
         n_rows: usize,
         vocab: usize,
         pen_stride: usize,
@@ -872,7 +999,6 @@ impl Kernels {
             shared_mem_bytes: (256 * 4 * 4) as u32,
         };
         let sstride = survivors.as_ref().map_or(0, |x| x.stride) as i32;
-        let null: u64 = 0;
         let mut b2 = self.dev.stream().launch_builder(&f2);
         // The candidates are read-only here; the mutable views were stage one's.
         let cv = cand_v.as_view();
@@ -889,7 +1015,7 @@ impl Kernels {
                 b2.arg(x.id).arg(x.p).arg(x.len);
             }
             None => {
-                b2.arg(&null).arg(&null).arg(&null);
+                b2.arg(&tuili_gpu::NULL_BUFFER).arg(&tuili_gpu::NULL_BUFFER).arg(&tuili_gpu::NULL_BUFFER);
             }
         }
         b2.arg(&sstride);
@@ -904,13 +1030,13 @@ impl Kernels {
 
     pub fn sample_rows(
         &self,
-        out: &mut CudaViewMut<'_, u32>,
-        logits: &CudaView<'_, f32>,
-        params: &CudaView<'_, f32>,
-        pen_tok: &CudaView<'_, i32>,
-        pen_cnt: &CudaView<'_, i32>,
-        pen_len: &CudaView<'_, i32>,
-        rnd: &CudaView<'_, f64>,
+        out: &mut ViewMut<'_, u32>,
+        logits: &View<'_, f32>,
+        params: &View<'_, f32>,
+        pen_tok: &View<'_, i32>,
+        pen_cnt: &View<'_, i32>,
+        pen_len: &View<'_, i32>,
+        rnd: &View<'_, f64>,
         n_rows: usize,
         vocab: usize,
         pen_stride: usize,
@@ -931,7 +1057,6 @@ impl Kernels {
         let ps = pen_stride as i32;
         let mut b = self.dev.stream().launch_builder(&f);
         let sstride = survivors.as_ref().map_or(0, |v| v.stride) as i32;
-        let null: u64 = 0;
         b.arg(out)
             .arg(logits)
             .arg(params)
@@ -946,7 +1071,7 @@ impl Kernels {
                 b.arg(v.id).arg(v.p).arg(v.len);
             }
             None => {
-                b.arg(&null).arg(&null).arg(&null);
+                b.arg(&tuili_gpu::NULL_BUFFER).arg(&tuili_gpu::NULL_BUFFER).arg(&tuili_gpu::NULL_BUFFER);
             }
         }
         b.arg(&sstride);
@@ -961,9 +1086,9 @@ impl Kernels {
 
     pub fn take_rows(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        x: &CudaView<'_, f32>,
-        rows: &CudaView<'_, i32>,
+        out: &mut ViewMut<'_, f32>,
+        x: &View<'_, f32>,
+        rows: &View<'_, i32>,
         n_rows: usize,
         d: usize,
     ) -> Result<()> {
@@ -994,8 +1119,8 @@ impl Kernels {
 
     pub fn to_f16(
         &self,
-        out: &mut CudaViewMut<'_, f16>,
-        x: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f16>,
+        x: &View<'_, f32>,
         n: usize,
     ) -> Result<()> {
         self.to_f16_inner(out, x, n, false)
@@ -1008,8 +1133,8 @@ impl Kernels {
     /// weights, and the activations are a thousandth of the bytes.
     pub fn to_f16_kperm(
         &self,
-        out: &mut CudaViewMut<'_, f16>,
-        x: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f16>,
+        x: &View<'_, f32>,
         n: usize,
     ) -> Result<()> {
         self.to_f16_inner(out, x, n, true)
@@ -1017,8 +1142,8 @@ impl Kernels {
 
     fn to_f16_inner(
         &self,
-        out: &mut CudaViewMut<'_, f16>,
-        x: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f16>,
+        x: &View<'_, f32>,
         n: usize,
         kperm: bool,
     ) -> Result<()> {
@@ -1056,10 +1181,10 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn rope_qk(
         &self,
-        q: &mut CudaViewMut<'_, f32>,
-        k: &mut CudaViewMut<'_, f32>,
-        positions: &CudaView<'_, i32>,
-        freq_factors: &CudaView<'_, f32>,
+        q: &mut ViewMut<'_, f32>,
+        k: &mut ViewMut<'_, f32>,
+        positions: &View<'_, i32>,
+        freq_factors: &View<'_, f32>,
         n_tokens: usize,
         n_heads: usize,
         n_kv_heads: usize,
@@ -1096,10 +1221,10 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn rope_qk_partial(
         &self,
-        q: &mut CudaViewMut<'_, f32>,
-        k: &mut CudaViewMut<'_, f32>,
-        positions: &CudaView<'_, i32>,
-        freq_factors: &CudaView<'_, f32>,
+        q: &mut ViewMut<'_, f32>,
+        k: &mut ViewMut<'_, f32>,
+        positions: &View<'_, i32>,
+        freq_factors: &View<'_, f32>,
         n_tokens: usize,
         n_heads: usize,
         n_kv_heads: usize,
@@ -1174,13 +1299,13 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn rope_qk_packed(
         &self,
-        q_dst: &mut CudaViewMut<'_, f32>,
-        packed: &mut CudaViewMut<'_, f32>,
+        q_dst: &mut ViewMut<'_, f32>,
+        packed: &mut ViewMut<'_, f32>,
         stride: usize,
         q_off: usize,
         k_off: usize,
-        positions: &CudaView<'_, i32>,
-        freq_factors: &CudaView<'_, f32>,
+        positions: &View<'_, i32>,
+        freq_factors: &View<'_, f32>,
         n_tokens: usize,
         n_heads: usize,
         n_kv_heads: usize,
@@ -1221,13 +1346,13 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn rope_qk_packed_partial(
         &self,
-        q_dst: &mut CudaViewMut<'_, f32>,
-        packed: &mut CudaViewMut<'_, f32>,
+        q_dst: &mut ViewMut<'_, f32>,
+        packed: &mut ViewMut<'_, f32>,
         stride: usize,
         q_off: usize,
         k_off: usize,
-        positions: &CudaView<'_, i32>,
-        freq_factors: &CudaView<'_, f32>,
+        positions: &View<'_, i32>,
+        freq_factors: &View<'_, f32>,
         n_tokens: usize,
         n_heads: usize,
         n_kv_heads: usize,
@@ -1313,13 +1438,13 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn store_kv2_packed(
         &self,
-        k_cache: &mut CudaViewMut<'_, f16>,
-        v_cache: &mut CudaViewMut<'_, f16>,
-        packed: &CudaView<'_, f32>,
+        k_cache: &mut ViewMut<'_, f16>,
+        v_cache: &mut ViewMut<'_, f16>,
+        packed: &View<'_, f32>,
         stride: usize,
         k_off: usize,
         v_off: usize,
-        slots: &CudaView<'_, i32>,
+        slots: &View<'_, i32>,
         n_kv_heads: usize,
         d_head: usize,
         n_slots: usize,
@@ -1368,9 +1493,9 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn rope(
         &self,
-        x: &mut CudaViewMut<'_, f32>,
-        positions: &CudaView<'_, i32>,
-        freq_factors: &CudaView<'_, f32>,
+        x: &mut ViewMut<'_, f32>,
+        positions: &View<'_, i32>,
+        freq_factors: &View<'_, f32>,
         n_tokens: usize,
         n_heads: usize,
         d_head: usize,
@@ -1425,11 +1550,11 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn store_kv2(
         &self,
-        k_cache: &mut CudaViewMut<'_, f16>,
-        v_cache: &mut CudaViewMut<'_, f16>,
-        k_src: &CudaView<'_, f32>,
-        v_src: &CudaView<'_, f32>,
-        slots: &CudaView<'_, i32>,
+        k_cache: &mut ViewMut<'_, f16>,
+        v_cache: &mut ViewMut<'_, f16>,
+        k_src: &View<'_, f32>,
+        v_src: &View<'_, f32>,
+        slots: &View<'_, i32>,
         n_kv_heads: usize,
         d_head: usize,
         n_slots: usize,
@@ -1475,9 +1600,9 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn store_kv(
         &self,
-        cache: &mut CudaViewMut<'_, f16>,
-        src: &CudaView<'_, f32>,
-        slots: &CudaView<'_, i32>,
+        cache: &mut ViewMut<'_, f16>,
+        src: &View<'_, f32>,
+        slots: &View<'_, i32>,
         n_kv_heads: usize,
         d_head: usize,
         n_slots: usize,
@@ -1522,10 +1647,10 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn write_slot_table(
         &self,
-        table: &mut CudaViewMut<'_, i32>,
-        seq_of: &CudaView<'_, i32>,
-        positions: &CudaView<'_, i32>,
-        slots: &CudaView<'_, i32>,
+        table: &mut ViewMut<'_, i32>,
+        seq_of: &View<'_, i32>,
+        positions: &View<'_, i32>,
+        slots: &View<'_, i32>,
         table_stride: usize,
         n_tokens: usize,
     ) -> Result<()> {
@@ -1555,9 +1680,9 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn attn_scores(
         &self,
-        scores: &mut CudaViewMut<'_, f32>,
-        q: &CudaView<'_, f32>,
-        k_cache: &CudaView<'_, f16>,
+        scores: &mut ViewMut<'_, f32>,
+        q: &View<'_, f32>,
+        k_cache: &View<'_, f16>,
         batch: BatchLayout<'_>,
         dims: AttnDims,
         kv_len: usize,
@@ -1567,7 +1692,13 @@ impl Kernels {
         // than one. `d_head` above 128 would not fit the four registers the
         // grouped kernel holds it in.
         let group = dims.n_heads / dims.n_kv_heads.max(1);
-        let gqa = group > 1 && dims.d_head <= 4 * 32 && dims.d_head.is_multiple_of(32);
+        // The GQA-shaped score kernels -- one warp serving a whole query group
+        // instead of one key -- are CUDA-only for now. Saying false takes the
+        // plain per-key kernel, which is ported and correct.
+        let gqa = cfg!(feature = "cuda")
+            && group > 1
+            && dims.d_head <= 4 * 32
+            && dims.d_head.is_multiple_of(32);
         let f = self.dev.kernels().get(
             "tuili_ops",
             ops_src(),
@@ -1654,7 +1785,7 @@ impl Kernels {
     /// In-place softmax over the kv axis of `scores[n_heads, n_tokens, kv_len]`.
     pub fn attn_softmax(
         &self,
-        scores: &mut CudaViewMut<'_, f32>,
+        scores: &mut ViewMut<'_, f32>,
         n_heads: usize,
         n_tokens: usize,
         kv_len: usize,
@@ -1690,6 +1821,14 @@ impl Kernels {
     /// blocks; it also costs a second pass over the partials, so it is only
     /// worth it when the grid is actually short.
     fn attn_chunks(&self, dims: &AttnDims, kv_len: usize) -> (u32, u32) {
+        // One chunk on a backend without the split kernels. They are a grid
+        // recovery for shapes where a layer's V cache has left L2 -- an
+        // optimisation, and `attn_output_f32` covers every shape without them,
+        // walking the whole key range in one threadgroup instead of several
+        // walking chunks that a third launch then reduces.
+        if !cfg!(feature = "cuda") {
+            return (1, 0);
+        }
         // Counted ungrouped on purpose. The grouped value kernel gives a block
         // to each (KV head, token) and reads each V row once for the whole
         // query group — a quarter of the traffic at Llama-3.1's 32-over-8 —
@@ -1892,6 +2031,14 @@ impl Kernels {
     pub fn flash_attention(&self, dims: &AttnDims, kv_len: usize) -> bool {
         // Read once: this is asked per layer per step, and `std::env::var`
         // takes the environment lock and allocates every time.
+        // The split flash path (`attn_flash_f32` plus its reduce) is CUDA-only
+        // for now. False takes the unsplit scores/softmax/output sequence,
+        // which is ported: one threadgroup walks a whole key range instead of
+        // several walking chunks, so a long context loses parallelism rather
+        // than correctness.
+        if !cfg!(feature = "cuda") {
+            return false;
+        }
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| !std::env::var("TUILI_NO_FLASH_ATTN").is_ok_and(|v| v != "0"))
             && self.attn_flash_split(dims, kv_len).is_some()
@@ -1903,9 +2050,9 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn attn_kv_probe(
         &self,
-        sink: &mut CudaViewMut<'_, f32>,
-        k_cache: &CudaView<'_, f16>,
-        v_cache: &CudaView<'_, f16>,
+        sink: &mut ViewMut<'_, f32>,
+        k_cache: &View<'_, f16>,
+        v_cache: &View<'_, f16>,
         batch: BatchLayout<'_>,
         dims: AttnDims,
         kv_len: usize,
@@ -1955,6 +2102,14 @@ impl Kernels {
     /// It wants a real query group, a `d_head` its lanes divide evenly, and a
     /// group narrow enough that `group * 32` is a legal block.
     pub fn decode_attention(&self, dims: &AttnDims) -> bool {
+        // `attn_decode_gqa_f32` is CUDA-only for now: it is the fused
+        // three-kernels-in-one that `docs/catching-vllm.md` measured at +4.7%,
+        // and saying false here takes the unfused scores/softmax/output path
+        // instead -- which is ported, correct, and slower by about that much.
+        // Worth porting, and not worth blocking on.
+        if !cfg!(feature = "cuda") {
+            return false;
+        }
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *OFF.get_or_init(|| std::env::var("TUILI_NO_DECODE_ATTN").is_ok_and(|v| v != "0")) {
             return false;
@@ -2004,16 +2159,16 @@ impl Kernels {
     /// rather than assume.
     pub fn attn_decode(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        hout: Option<&mut CudaViewMut<'_, f16>>,
-        q: &CudaView<'_, f32>,
-        k_cache: &CudaView<'_, f16>,
-        v_cache: &CudaView<'_, f16>,
+        out: &mut ViewMut<'_, f32>,
+        hout: Option<&mut ViewMut<'_, f16>>,
+        q: &View<'_, f32>,
+        k_cache: &View<'_, f16>,
+        v_cache: &View<'_, f16>,
         batch: BatchLayout<'_>,
         dims: AttnDims,
         kv_len: usize,
         scale: f32,
-        partial: &mut CudaViewMut<'_, f32>,
+        partial: &mut ViewMut<'_, f32>,
     ) -> Result<bool> {
         anyhow::ensure!(self.decode_attention(&dims), "attn_decode: unsupported shape");
         let group = dims.n_heads / dims.n_kv_heads;
@@ -2160,15 +2315,15 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn attn_flash(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        q: &CudaView<'_, f32>,
-        k_cache: &CudaView<'_, f16>,
-        v_cache: &CudaView<'_, f16>,
+        out: &mut ViewMut<'_, f32>,
+        q: &View<'_, f32>,
+        k_cache: &View<'_, f16>,
+        v_cache: &View<'_, f16>,
         batch: BatchLayout<'_>,
         dims: AttnDims,
         kv_len: usize,
         scale: f32,
-        partial: &mut CudaViewMut<'_, f32>,
+        partial: &mut ViewMut<'_, f32>,
     ) -> Result<()> {
         let (n_chunks, chunk) = self
             .attn_flash_split(&dims, kv_len)
@@ -2286,13 +2441,13 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn attn_output(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        scores: &CudaView<'_, f32>,
-        v_cache: &CudaView<'_, f16>,
+        out: &mut ViewMut<'_, f32>,
+        scores: &View<'_, f32>,
+        v_cache: &View<'_, f16>,
         batch: BatchLayout<'_>,
         dims: AttnDims,
         kv_len: usize,
-        partial: Option<&mut CudaViewMut<'_, f32>>,
+        partial: Option<&mut ViewMut<'_, f32>>,
     ) -> Result<()> {
         let (stride, h, kh, dh, ms, kl) = (
             batch.table_stride as i32,
@@ -2315,7 +2470,7 @@ impl Kernels {
             // what makes this affordable: on its own the grouped kernel is a
             // quarter of the grid, which is why the unsplit one below is off.
             let group = dims.n_heads / dims.n_kv_heads.max(1);
-            let gqa = group > 1 && group <= 8;
+            let gqa = cfg!(feature = "cuda") && group > 1 && group <= 8;
             let f = self.dev.kernels().get(
                 "tuili_ops",
                 ops_src(),
@@ -2397,7 +2552,11 @@ impl Kernels {
         // Eight halves per thread and sixteen key slices per block, which is a
         // load width and a count of loads in flight rather than a different
         // sum. `TUILI_ATTN_V1` puts the two-byte version back for A/B.
-        let wide = dims.d_head.is_multiple_of(8)
+        // `attn_output_v4_f32` -- eight halves a thread, sixteen key slices a
+        // block -- and the GQA variant are CUDA-only for now; false takes
+        // `attn_output_f32`, which is ported.
+        let wide = cfg!(feature = "cuda")
+            && dims.d_head.is_multiple_of(8)
             && dims.d_head >= 8
             && std::env::var_os("TUILI_ATTN_V1").is_none();
         let (lanes, slices) = if wide {
@@ -2459,10 +2618,10 @@ impl Kernels {
     /// `out[t, :] = dequant(w[rows[t], :])`, the embedding lookup.
     pub fn gather_rows(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        w: &CudaView<'_, u8>,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
         ty: WeightType,
-        rows: &CudaView<'_, i32>,
+        rows: &View<'_, i32>,
         n_tokens: usize,
         k: usize,
     ) -> Result<()> {
@@ -2492,8 +2651,8 @@ impl Kernels {
     /// Decode a whole weight matrix into f16, for the cuBLAS prefill path.
     pub fn dequant_to_f16(
         &self,
-        out: &mut CudaViewMut<'_, f16>,
-        w: &CudaView<'_, u8>,
+        out: &mut ViewMut<'_, f16>,
+        w: &View<'_, u8>,
         ty: WeightType,
         n_elements: usize,
     ) -> Result<()> {
@@ -2532,6 +2691,7 @@ impl Kernels {
     /// Cached: the same matrix is asked for every step, and a graph capture must
     /// not build one (it is a host call, and its result is baked into the
     /// launch as a by-value argument).
+    #[cfg(feature = "cuda")]
     fn tma_desc(&self, ptr: u64, n: usize, row_bytes: usize, rows: usize) -> Result<TmaDesc> {
         // `rows` is the box height and belongs in the key: two variants with
         // different row groups over the same matrix need different descriptors.
@@ -2584,6 +2744,20 @@ impl Kernels {
     /// absent on purpose: it exists for the batched vocab projection, and a
     /// single row never reaches it.
     pub fn has_mmvq(ty: WeightType) -> bool {
+        // The integer mat-vec is CUDA-only for now. It rests on `__dp4a` --
+        // four int8 products retired in one instruction -- and the sensible
+        // Metal equivalent is a different formulation rather than a
+        // transliteration, so `mmvq.cu`'s dot products are not ported.
+        //
+        // Saying false here is not a stub: `matmul` reads exactly this before
+        // it dispatches, and answers with the float `gemv` family, which is
+        // ported and correct. It decodes each weight to f32 instead of
+        // retiring four at a time, so a quantized decode step costs more
+        // instructions for the same bytes -- the first thing to fix when this
+        // backend's mat-vecs are worth optimising.
+        if !cfg!(feature = "cuda") {
+            return false;
+        }
         matches!(
             ty,
             WeightType::Q8_0
@@ -2597,8 +2771,8 @@ impl Kernels {
     /// Quantize one activation row to Q8_1, the form the integer mat-vec wants.
     pub fn quantize_q8_1(
         &self,
-        out: &mut CudaViewMut<'_, u8>,
-        x: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, u8>,
+        x: &View<'_, f32>,
         k: usize,
     ) -> Result<()> {
         anyhow::ensure!(
@@ -2649,10 +2823,10 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn mmvq_batch(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        w: &CudaView<'_, u8>,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
         ty: WeightType,
-        x_q8_1: &CudaView<'_, u8>,
+        x_q8_1: &View<'_, u8>,
         k: usize,
         n: usize,
         n_tokens: usize,
@@ -2697,11 +2871,15 @@ impl Kernels {
     ///
     /// `ids` and `weights` come out `[n_tokens, k]`, in descending order of
     /// router logit.
+    ///
+    /// CUDA-only, matching `moe_src`'s own note: MoE is AWQ-first and has no
+    /// Metal kernel yet.
+    #[cfg(feature = "cuda")]
     pub fn moe_topk(
         &self,
-        ids: &mut CudaViewMut<'_, i32>,
-        weights: &mut CudaViewMut<'_, f32>,
-        logits: &CudaView<'_, f32>,
+        ids: &mut ViewMut<'_, i32>,
+        weights: &mut ViewMut<'_, f32>,
+        logits: &View<'_, f32>,
         n_experts: usize,
         k: usize,
         n_tokens: usize,
@@ -2741,14 +2919,16 @@ impl Kernels {
     /// `n_active` for `gate` and `up`, which read the token's residual, and 1
     /// for `down`, which reads each slot's own SwiGLU product. This is what
     /// makes one launch serve decode and prefill alike.
+    /// CUDA-only; see `moe_topk`.
+    #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
     pub fn mmvq_moe(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        w_all: &CudaView<'_, u8>,
+        out: &mut ViewMut<'_, f32>,
+        w_all: &View<'_, u8>,
         ty: WeightType,
-        expert_ids: &CudaView<'_, i32>,
-        x_q8_1: &CudaView<'_, u8>,
+        expert_ids: &View<'_, i32>,
+        x_q8_1: &View<'_, u8>,
         k: usize,
         n: usize,
         n_slots: usize,
@@ -2792,11 +2972,14 @@ impl Kernels {
     }
 
     /// `out[t] = sum_a weights[t, a] * partials[t, a]`.
+    ///
+    /// CUDA-only; see `moe_topk`.
+    #[cfg(feature = "cuda")]
     pub fn moe_combine(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        partials: &CudaView<'_, f32>,
-        weights: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
+        partials: &View<'_, f32>,
+        weights: &View<'_, f32>,
         d: usize,
         k: usize,
         n_tokens: usize,
@@ -2834,11 +3017,11 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn add_rms_norm_f16(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        h_out: Option<&mut CudaViewMut<'_, f16>>,
-        x: &mut CudaViewMut<'_, f32>,
-        b: &CudaView<'_, f32>,
-        weight: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
+        h_out: Option<&mut ViewMut<'_, f16>>,
+        x: &mut ViewMut<'_, f32>,
+        b: &View<'_, f32>,
+        weight: &View<'_, f32>,
         n_tokens: usize,
         d: usize,
         eps: f32,
@@ -2858,14 +3041,13 @@ impl Kernels {
             shared_mem_bytes: 0,
         };
         let (d_i, eps_f) = (d as i32, eps);
-        let null: u64 = 0;
         let mut bl = self.dev.stream().launch_builder(&f);
         match h_out {
             Some(h) => {
                 bl.arg(out).arg(h);
             }
             None => {
-                bl.arg(out).arg(&null);
+                bl.arg(out).arg(&tuili_gpu::NULL_BUFFER);
             }
         }
         bl.arg(&mut *x).arg(b).arg(weight).arg(&d_i).arg(&eps_f);
@@ -2878,10 +3060,10 @@ impl Kernels {
 
     pub fn rms_norm_f16(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        h_out: Option<&mut CudaViewMut<'_, f16>>,
-        x: &CudaView<'_, f32>,
-        weight: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
+        h_out: Option<&mut ViewMut<'_, f16>>,
+        x: &View<'_, f32>,
+        weight: &View<'_, f32>,
         n_tokens: usize,
         d: usize,
         eps: f32,
@@ -2912,10 +3094,10 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn rms_norm_q8_1(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        q_out: &mut CudaViewMut<'_, u8>,
-        x: &CudaView<'_, f32>,
-        weight: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
+        q_out: &mut ViewMut<'_, u8>,
+        x: &View<'_, f32>,
+        weight: &View<'_, f32>,
         n_tokens: usize,
         d: usize,
         eps: f32,
@@ -2980,19 +3162,19 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn mmq(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        w: &CudaView<'_, u8>,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
         ty: WeightType,
-        x_q8_1: &CudaView<'_, u8>,
+        x_q8_1: &View<'_, u8>,
         k: usize,
         n: usize,
         n_tokens: usize,
     ) -> Result<()> {
         anyhow::ensure!(Self::has_mmq(ty), "no tensor-core gemm for {ty}");
         anyhow::ensure!(
-            self.dev.arch() >= 80,
-            "mmq needs sm_80 or newer, device is sm_{}",
-            self.dev.arch()
+            self.dev.caps().int_tensor_gemm,
+            "the tensor-core integer gemm has no implementation on the {} backend",
+            tuili_gpu::BACKEND
         );
         anyhow::ensure!(k.is_multiple_of(32), "mmq needs k divisible by 32, got {k}");
         if matches!(ty, WeightType::Q4K | WeightType::Q6K) {
@@ -3083,10 +3265,10 @@ impl Kernels {
     pub fn mmq_variant(
         &self,
         variant: &str,
-        out: &mut CudaViewMut<'_, f32>,
-        w: &CudaView<'_, u8>,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
         ty: WeightType,
-        x_q8_1: &CudaView<'_, u8>,
+        x_q8_1: &View<'_, u8>,
         k: usize,
         n: usize,
         n_tokens: usize,
@@ -3488,7 +3670,7 @@ impl Kernels {
         }
         let f = self.dev.kernels().get("tuili_mmq", mmq_src(), &name)?;
         if dyn_shared > 0 {
-            tuili_cuda::set_max_dynamic_shared(&f, dyn_shared)?;
+            tuili_gpu::set_max_dynamic_shared(&f, dyn_shared)?;
         }
         let cfg = LaunchConfig {
             grid_dim: (
@@ -3508,6 +3690,11 @@ impl Kernels {
         // Built here because this is the only place that knows the shape; the
         // cache makes it a lookup after the first step, and a capture replays
         // the value it was handed.
+        // `mmqt*` needs a `CUtensorMap`, which exists only on CUDA and only
+        // from sm_90. A backend without TMA never selects one of those
+        // variants -- `mmq_f16_variant_for` gates on the capability -- so this
+        // is an unreachable branch on Metal rather than a missing feature.
+        #[cfg(feature = "cuda")]
         let desc = if variant.starts_with("mmqt") {
             use cudarc::driver::DevicePtr;
             let (ptr, _sync) = w.device_ptr(self.dev.stream());
@@ -3515,11 +3702,23 @@ impl Kernels {
         } else {
             None
         };
+        #[cfg(not(feature = "cuda"))]
+        let desc: Option<TmaDesc> = {
+            anyhow::ensure!(
+                !variant.starts_with("mmqt"),
+                "{variant} needs a CUtensorMap, which this backend has no equivalent of"
+            );
+            None
+        };
         let mut b = self.dev.stream().launch_builder(&f);
         b.arg(out).arg(w).arg(x_q8_1).arg(&k_i).arg(&n_i).arg(&t_i);
+        // Only the `mmqt*` variants take a descriptor, and only CUDA has them.
+        #[cfg(feature = "cuda")]
         if let Some(d) = desc.as_ref() {
             b.arg(d);
         }
+        #[cfg(not(feature = "cuda"))]
+        debug_assert!(desc.is_none());
         self.dev.profile().time("mmq", self.dev.stream(), || {
             unsafe { b.launch(cfg) }.context("mmq")?;
             Ok(())
@@ -3529,6 +3728,7 @@ impl Kernels {
 
     /// Blocks an SM the driver will resident, for a given block size and
     /// dynamic shared request. The answer that settles which resource binds.
+    #[cfg(feature = "cuda")]
     pub fn occupancy_blocks(
         &self,
         module: &'static str,
@@ -3544,7 +3744,7 @@ impl Kernels {
         };
         let f = self.dev.kernels().get(module, src, name)?;
         if dynamic > 48 * 1024 {
-            tuili_cuda::set_max_dynamic_shared(&f, dynamic as u32)?;
+            tuili_gpu::set_max_dynamic_shared(&f, dynamic as u32)?;
         }
         Ok(f.occupancy_max_active_blocks_per_multiprocessor(threads, dynamic, None)?)
     }
@@ -3556,6 +3756,7 @@ impl Kernels {
     /// still allow 128 threads while fitting fewer blocks on the SM. This is
     /// the number that settles it — 65536 registers per SM on sm_86 divided by
     /// `regs * block_threads` is the resident block count.
+    #[cfg(feature = "cuda")]
     pub fn kernel_registers(&self, module: &'static str, name: &str) -> Result<(i32, i32)> {
         let src = match module {
             "tuili_mmq" => mmq_src(),
@@ -3575,8 +3776,8 @@ impl Kernels {
     pub fn mmq_bw_probe(
         &self,
         wide: bool,
-        sink: &mut CudaViewMut<'_, f32>,
-        w: &CudaView<'_, u8>,
+        sink: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
         nb: usize,
         n: usize,
         blocks: u32,
@@ -3621,8 +3822,8 @@ impl Kernels {
     /// kernels: it is what this card gives a kernel that does nothing but read.
     pub fn stream_read_probe(
         &self,
-        sink: &mut CudaViewMut<'_, f32>,
-        src: &CudaView<'_, u8>,
+        sink: &mut ViewMut<'_, f32>,
+        src: &View<'_, u8>,
     ) -> Result<()> {
         let f = self
             .dev
@@ -3860,6 +4061,7 @@ impl Kernels {
     /// asking before cutting either: the batch-32 GEMM spends 54% of its time
     /// in the MMA pipeline against an instruction count that should be
     /// negligible, which is what unhidden shared-memory latency looks like.
+    #[cfg(feature = "cuda")]
     pub fn kernel_limits(&self, module: &'static str, name: &str) -> Result<(i32, i32)> {
         let src = match module {
             "tuili_mmq" => mmq_src(),
@@ -3875,8 +4077,8 @@ impl Kernels {
     /// scalar gather it would replace — and hand both back for comparison.
     pub fn ldmatrix_probe(
         &self,
-        out: &mut CudaViewMut<'_, i32>,
-        a: &CudaView<'_, i8>,
+        out: &mut ViewMut<'_, i32>,
+        a: &View<'_, i8>,
     ) -> Result<()> {
         let f = self
             .dev
@@ -3896,8 +4098,8 @@ impl Kernels {
     /// [`Self::ldmatrix_probe`] for the B operand.
     pub fn ldmatrix_b_probe(
         &self,
-        out: &mut CudaViewMut<'_, i32>,
-        b_in: &CudaView<'_, i8>,
+        out: &mut ViewMut<'_, i32>,
+        b_in: &View<'_, i8>,
     ) -> Result<()> {
         let f = self
             .dev
@@ -3922,9 +4124,9 @@ impl Kernels {
     /// trusted.
     pub fn mma_s8_probe(
         &self,
-        d: &mut CudaViewMut<'_, i32>,
-        a: &CudaView<'_, i8>,
-        b_in: &CudaView<'_, i8>,
+        d: &mut ViewMut<'_, i32>,
+        a: &View<'_, i8>,
+        b_in: &View<'_, i8>,
     ) -> Result<()> {
         let f = self
             .dev
@@ -3953,9 +4155,9 @@ impl Kernels {
     pub fn mmq_f16(
         &self,
         variant: &str,
-        out: &mut CudaViewMut<'_, f32>,
-        w: &CudaView<'_, u8>,
-        x_f16: &CudaView<'_, half::f16>,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
+        x_f16: &View<'_, half::f16>,
         k: usize,
         n: usize,
         n_tokens: usize,
@@ -3998,9 +4200,9 @@ impl Kernels {
     /// reason: the f16-operand GEMM builds its fragments by hand.
     pub fn mma_f16_probe(
         &self,
-        d: &mut CudaViewMut<'_, f32>,
-        a: &CudaView<'_, half::f16>,
-        b_in: &CudaView<'_, half::f16>,
+        d: &mut ViewMut<'_, f32>,
+        a: &View<'_, half::f16>,
+        b_in: &View<'_, half::f16>,
     ) -> Result<()> {
         let f = self
             .dev
@@ -4021,8 +4223,8 @@ impl Kernels {
     /// out by logical k. Tests only; see `mmq_deq4_f16_probe` in `mmq.cu`.
     pub fn deq4_f16_probe(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        w: &CudaView<'_, u8>,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
     ) -> Result<()> {
         let f = self
             .dev
@@ -4051,12 +4253,12 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn mmvq_fused2(
         &self,
-        out0: &mut CudaViewMut<'_, f32>,
-        out1: &mut CudaViewMut<'_, f32>,
-        w0: &CudaView<'_, u8>,
-        w1: &CudaView<'_, u8>,
+        out0: &mut ViewMut<'_, f32>,
+        out1: &mut ViewMut<'_, f32>,
+        w0: &View<'_, u8>,
+        w1: &View<'_, u8>,
         ty: WeightType,
-        x_q8_1: &CudaView<'_, u8>,
+        x_q8_1: &View<'_, u8>,
         k: usize,
         n0: usize,
         n1: usize,
@@ -4088,14 +4290,14 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn mmvq_fused3(
         &self,
-        out0: &mut CudaViewMut<'_, f32>,
-        out1: &mut CudaViewMut<'_, f32>,
-        out2: &mut CudaViewMut<'_, f32>,
-        w0: &CudaView<'_, u8>,
-        w1: &CudaView<'_, u8>,
-        w2: &CudaView<'_, u8>,
+        out0: &mut ViewMut<'_, f32>,
+        out1: &mut ViewMut<'_, f32>,
+        out2: &mut ViewMut<'_, f32>,
+        w0: &View<'_, u8>,
+        w1: &View<'_, u8>,
+        w2: &View<'_, u8>,
         ty: WeightType,
-        x_q8_1: &CudaView<'_, u8>,
+        x_q8_1: &View<'_, u8>,
         k: usize,
         ns: [usize; 3],
     ) -> Result<()> {
@@ -4126,7 +4328,7 @@ impl Kernels {
         &self,
         ty: WeightType,
         prefix: &str,
-    ) -> Result<cudarc::driver::CudaFunction> {
+    ) -> Result<tuili_gpu::Function> {
         anyhow::ensure!(Self::has_mmvq(ty), "no integer mat-vec for {ty}");
         let name = format!("{prefix}{}", ty.suffix());
         self.dev.kernels().get("tuili_mmvq", mmvq_src(), &name)
@@ -4152,10 +4354,10 @@ impl Kernels {
 
     pub fn mmvq(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        w: &CudaView<'_, u8>,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
         ty: WeightType,
-        x_q8_1: &CudaView<'_, u8>,
+        x_q8_1: &View<'_, u8>,
         k: usize,
         n: usize,
     ) -> Result<()> {
@@ -4170,10 +4372,10 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn mmvq_add(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        w: &CudaView<'_, u8>,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
         ty: WeightType,
-        x_q8_1: &CudaView<'_, u8>,
+        x_q8_1: &View<'_, u8>,
         k: usize,
         n: usize,
     ) -> Result<()> {
@@ -4183,10 +4385,10 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     fn mmvq_inner(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        w: &CudaView<'_, u8>,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
         ty: WeightType,
-        x_q8_1: &CudaView<'_, u8>,
+        x_q8_1: &View<'_, u8>,
         k: usize,
         n: usize,
         accum: bool,
@@ -4244,12 +4446,45 @@ impl Kernels {
     /// a few tokens and the wrong one for a long prefill — see
     /// [`Kernels::gemm_f16`].
     #[allow(clippy::too_many_arguments)]
+    /// The Q4_K mat-vec on the matrix units: eight rows and eight tokens a
+    /// simdgroup, one simdgroup a threadgroup.
+    fn gemv_mma(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
+        x: &View<'_, f32>,
+        k: usize,
+        n: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_quant", quant_src(), "gemv_mma_q4_K")?;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (n as u32).div_ceil(8),
+                (n_tokens as u32).div_ceil(8).max(1),
+                1,
+            ),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (k_i, n_i, nt_i) = (k as i32, n as i32, n_tokens as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(w).arg(x).arg(&k_i).arg(&n_i).arg(&nt_i);
+        self.dev.profile().time("gemv_mma", self.dev.stream(), || {
+            unsafe { b.launch(cfg) }.context("gemv_mma")?;
+            Ok(())
+        })
+    }
+
     pub fn gemv(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        w: &CudaView<'_, u8>,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
         ty: WeightType,
-        x: &CudaView<'_, f32>,
+        x: &View<'_, f32>,
         k: usize,
         n: usize,
         n_tokens: usize,
@@ -4259,19 +4494,141 @@ impl Kernels {
             "{ty:?} needs k ({k}) to be a multiple of {}",
             ty.block_size()
         );
-        let name = format!("gemv_{}", ty.suffix());
+        // A one-token specialisation where the backend has one.
+        //
+        // `GEMV_SPREAD`'s trip count must be a compile-time constant or the
+        // accumulator leaves registers, so the batched kernel runs eight
+        // iterations with a predicate and at one token seven are dead. Measured
+        // on an M4 Max, one token, against the batched kernel at the same shape:
+        //
+        //   output.weight Q6_K   61.9 -> 145.0 GB/s
+        //   ffn_down      Q4_K   41.8 ->  95.8
+        //   ffn_gate/up   Q4_K   41.2 ->  92.2
+        //   attn_qkv      Q8_0   73.7 -> 133.3
+        //
+        // Decode is always one token, so this is the decode path. The CUDA side
+        // has no `gemv1_*`: there `#pragma unroll` on a compile-time trip count
+        // already lets the compiler drop the dead iterations, which is the same
+        // fix by a different mechanism.
+        //
+        // `gemv2_*` and `gemv4_*` exist for the same reason and were added for a
+        // narrower case: speculation's verification pass is `k + 1` rows, so at
+        // the default `k = 1` every round runs a two-row matmul. Sending that
+        // through the eight-token kernel cost 2.3x -- six dead iterations a
+        // weight element -- and it turned a 1.76-token acceptance into a
+        // *slowdown*, 8.4 tok/s down to 4.0. A round is only worth running if
+        // its wide pass costs about what the narrow one it replaces did.
+        //
+        // The group width is the smallest specialisation that covers the rows,
+        // and `token0 = tgid.y * T` in `GEMV_PROLOGUE` means the grid follows
+        // from it without the kernel knowing which one it is.
+        // Rows one threadgroup owns.
+        //
+        // Four for a batch, one for a decode step, and the asymmetry is
+        // measured rather than chosen. `out[n] = W . x` re-reads the whole
+        // activation for every output row, so the activation traffic is
+        // `n * k * 4` against the weights' `n * k * 4.5/8` -- 7.1x -- and four
+        // rows sharing one load divides it by four. But at one token that
+        // traffic is not yet binding: Q4_K measures 1.50 TB/s of combined
+        // weight-plus-activation traffic there, and the four block reductions
+        // and the extra registers cost 7%. At two tokens it is 1.81 TB/s, which
+        // is the wall, and sharing wins:
+        //
+        //   ffn_gate/up Q4_K   1 tok  0.26 -> 0.28 ms   (four rows loses)
+        //                      2 tok  0.41 -> 0.35      1.17x
+        //                      4 tok  0.68 -> 0.46      1.48x
+        //
+        // The gain growing with the token count is the signature of activation
+        // traffic being what is amortised, and it is why the same change did
+        // nothing when first tried at one token.
+        //
+        // Q4_K only so far: Q8_0 already amortises (1.04x at two tokens, so
+        // there is nothing to win) and Q6_K does not (1.74x) but is one launch
+        // a step against 448.
+        let rows = if cfg!(feature = "cuda") || n_tokens < 2 || ty != WeightType::Q4K {
+            1
+        } else {
+            4
+        };
+        // Tokens one group carries. Capped at four rather than eight for the
+        // multi-row path, because `gemv_q4_K` at eight tokens measures 3.95 ms
+        // where two four-token launches measure 0.92 -- the wide kernel is
+        // *worse than looping* past four, which is also why four concurrent
+        // sequences cost 3.23x a step instead of ~1.1x.
+        let per = if cfg!(feature = "cuda") {
+            GEMV_TOKENS_PER_BLOCK as usize
+        } else {
+            match n_tokens {
+                0 | 1 => 1,
+                2 => 2,
+                3 | 4 => 4,
+                _ if rows > 1 => 4,
+                _ => GEMV_TOKENS_PER_BLOCK as usize,
+            }
+        };
+        // The matrix units, for a batch wide enough to fill an 8x8 tile.
+        //
+        // Measured against the scalar kernel, Q4_K, as a multiple of the
+        // one-token scalar cost -- the MMA kernel's cost is flat in the token
+        // count, which is the whole property:
+        //
+        //   tokens   scalar        mma
+        //        2   1.30 1.26   1.73 2.12
+        //        4   1.88 2.01   1.57 2.10
+        //        8   3.66 4.20   1.66 2.33
+        //
+        // So it loses at two -- which is what a speculative verification pass
+        // is, and why speculation cannot be rescued this way -- and wins from
+        // eight, by 1.8x to 2.2x. `TUILI_MMA_MIN` moves the line.
+        let mma = !cfg!(feature = "cuda")
+            && ty == WeightType::Q4K
+            && n_tokens >= mma_min()
+            && n as u32 >= 8;
+        if mma {
+            return self.gemv_mma(out, w, x, k, n, n_tokens);
+        }
+        let name = if rows > 1 {
+            format!("gemv{per}x{rows}_{}", ty.suffix())
+        } else if per == GEMV_TOKENS_PER_BLOCK as usize {
+            format!("gemv_{}", ty.suffix())
+        } else {
+            format!("gemv{per}_{}", ty.suffix())
+        };
         let f = self.dev.kernels().get("tuili_quant", quant_src(), &name)?;
         // Size the block to the work rather than to a constant: an oversized
         // block idles most of its threads and still pays for the block-wide
         // reduction, which for the vocab projection is the difference between
         // one warp and eight.
+        // Capped well below `REDUCE_BLOCK`, and the cap is the point.
+        //
+        // Sizing the group to the work is right as far as it goes -- an
+        // oversized group idles threads and still pays for the block-wide
+        // reduction -- but "to the work" was reading as "one unit of work a
+        // thread", and at that width the kernel is a launch and a reduction with
+        // nothing in between. Measured on an M4 Max, the same kernel and the
+        // same answer at five group widths:
+        //
+        //   ffn_gate/up Q4_K   32:190.2  64:183.2  128:183.2  160:130.2  256:132.0
+        //   ffn_down    Q4_K   32:176.5  64:175.0  128:187.3  160:184.0  256:183.7
+        //   attn_qkv    Q8_0   32:209.7  64:217.7  128:221.1  160:196.1  256:188.1
+        //   output.w    Q6_K   32:154.5  64:152.4  128:150.7  160:149.8  256:145.4
+        //
+        // `ffn_gate/up` is the shape this rule chose 160 for, because Q4_K at
+        // k = 5120 is exactly 160 work items -- and 160 is the worst column in
+        // its row by 1.46x. Every one of these four is fastest at or below 128,
+        // so 128 is the cap; two of them peak there and the other two give up
+        // 3-4% against their own best, which is not worth a per-shape table.
+        //
+        // A thread looping four or five times over its own chunk hides the
+        // reduction behind real work. One doing a single chunk cannot.
+        const GEMV_BLOCK_MAX: u32 = 128;
         let block = (ty.gemv_work_items(k) as u32)
             .next_multiple_of(32)
-            .clamp(32, REDUCE_BLOCK);
+            .clamp(32, GEMV_BLOCK_MAX);
         let cfg = LaunchConfig {
             grid_dim: (
-                n as u32,
-                (n_tokens as u32).div_ceil(GEMV_TOKENS_PER_BLOCK).max(1),
+                (n as u32).div_ceil(rows as u32),
+                (n_tokens as u32).div_ceil(per as u32).max(1),
                 1,
             ),
             block_dim: (block, 1, 1),
@@ -4296,9 +4653,9 @@ impl Kernels {
     /// `out[v] = M · x[v]`. Safe to call with `out` aliasing `x`.
     pub fn tq_matvec(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        x: &CudaView<'_, f32>,
-        mat: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
+        x: &View<'_, f32>,
+        mat: &View<'_, f32>,
         d: usize,
         n_vec: usize,
     ) -> Result<()> {
@@ -4327,11 +4684,11 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn tq_store_v(
         &self,
-        codes: &mut CudaViewMut<'_, u8>,
-        scale: &mut CudaViewMut<'_, f16>,
-        src: &CudaView<'_, f32>,
-        slots: &CudaView<'_, i32>,
-        levels: &CudaView<'_, f32>,
+        codes: &mut ViewMut<'_, u8>,
+        scale: &mut ViewMut<'_, f16>,
+        src: &View<'_, f32>,
+        slots: &View<'_, i32>,
+        levels: &View<'_, f32>,
         bits: u8,
         n_kv_heads: usize,
         d: usize,
@@ -4379,14 +4736,14 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn tq_store_k(
         &self,
-        codes: &mut CudaViewMut<'_, u8>,
-        signs: &mut CudaViewMut<'_, u8>,
-        scale: &mut CudaViewMut<'_, f16>,
-        gamma: &mut CudaViewMut<'_, f16>,
-        src: &CudaView<'_, f32>,
-        qjl: &CudaView<'_, f32>,
-        slots: &CudaView<'_, i32>,
-        levels: &CudaView<'_, f32>,
+        codes: &mut ViewMut<'_, u8>,
+        signs: &mut ViewMut<'_, u8>,
+        scale: &mut ViewMut<'_, f16>,
+        gamma: &mut ViewMut<'_, f16>,
+        src: &View<'_, f32>,
+        qjl: &View<'_, f32>,
+        slots: &View<'_, i32>,
+        levels: &View<'_, f32>,
         bits: u8,
         n_kv_heads: usize,
         d: usize,
@@ -4437,15 +4794,15 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn tq_attn_scores(
         &self,
-        scores: &mut CudaViewMut<'_, f32>,
-        q_rot: &CudaView<'_, f32>,
-        q_qjl: &CudaView<'_, f32>,
-        codes: &CudaView<'_, u8>,
-        signs: &CudaView<'_, u8>,
-        scale: &CudaView<'_, f16>,
-        gamma: &CudaView<'_, f16>,
+        scores: &mut ViewMut<'_, f32>,
+        q_rot: &View<'_, f32>,
+        q_qjl: &View<'_, f32>,
+        codes: &View<'_, u8>,
+        signs: &View<'_, u8>,
+        scale: &View<'_, f16>,
+        gamma: &View<'_, f16>,
         batch: BatchLayout<'_>,
-        levels: &CudaView<'_, f32>,
+        levels: &View<'_, f32>,
         bits: u8,
         dims: AttnDims,
         kv_len: usize,
@@ -4509,12 +4866,12 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn tq_attn_output(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        scores: &CudaView<'_, f32>,
-        codes: &CudaView<'_, u8>,
-        scale: &CudaView<'_, f16>,
+        out: &mut ViewMut<'_, f32>,
+        scores: &View<'_, f32>,
+        codes: &View<'_, u8>,
+        scale: &View<'_, f16>,
         batch: BatchLayout<'_>,
-        levels: &CudaView<'_, f32>,
+        levels: &View<'_, f32>,
         bits: u8,
         dims: AttnDims,
         kv_len: usize,
@@ -4568,11 +4925,47 @@ impl Kernels {
     /// `b` is the weight matrix in ggml layout, `[n, k]` row-major, already
     /// dequantized. cuBLAS is column-major, so both operands are handed over
     /// transposed-in-place and no data is moved.
+    /// Not available on this backend.
+    ///
+    /// The CUDA path hands both operands to cuBLAS transposed-in-place. The
+    /// Metal counterpart is `MPSMatrixMultiplication`, which is a library call
+    /// of the same shape and is simply not wired up yet -- so this fails loudly
+    /// rather than silently taking a slower path, because the dispatch only
+    /// reaches it above `GEMM_THRESHOLD` tokens and a silent fallback there
+    /// would look like a mysterious prefill regression.
+    #[cfg(not(feature = "cuda"))]
+    /// `c = a * b^T` through `MPSMatrixMultiplication`.
+    ///
+    /// The whole implementation is in the backend, because reaching MPS needs
+    /// the raw `MTLBuffer` behind a view and that is not something a neutral
+    /// caller should be able to do. See `tuili_metal::gemm`.
+    ///
+    /// One difference from the cuBLAS path worth carrying at the call site:
+    /// cuBLAS is asked for an f32 accumulator with f16 operands, and MPS
+    /// requires all three matrices to share a type, so this accumulates in f16.
+    /// Over `k = 17408` that is a real precision difference. It is a prefill
+    /// path -- the decode mat-vec accumulates in f32 and does not come here --
+    /// and prefill feeds attention rather than a sampler, but it is not nothing.
     pub fn gemm_f16(
         &self,
-        c: &mut CudaViewMut<'_, f32>,
-        a: &CudaView<'_, f16>,
-        b: &CudaView<'_, f16>,
+        c: &mut ViewMut<'_, f32>,
+        a: &View<'_, f16>,
+        b: &View<'_, f16>,
+        n_tokens: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<()> {
+        self.dev.profile().time("gemm_f16", self.dev.stream(), || {
+            tuili_gpu::gemm_f16_to_f32(&self.dev, c, a, b, n_tokens, k, n)
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn gemm_f16(
+        &self,
+        c: &mut ViewMut<'_, f32>,
+        a: &View<'_, f16>,
+        b: &View<'_, f16>,
         n_tokens: usize,
         k: usize,
         n: usize,
@@ -4639,9 +5032,9 @@ pub struct AttnDims {
 /// contiguous, ordered, or the same length.
 #[derive(Clone, Copy)]
 pub struct BatchLayout<'a> {
-    pub seq_of: &'a CudaView<'a, i32>,
-    pub positions: &'a CudaView<'a, i32>,
-    pub slot_table: &'a CudaView<'a, i32>,
+    pub seq_of: &'a View<'a, i32>,
+    pub positions: &'a View<'a, i32>,
+    pub slot_table: &'a View<'a, i32>,
     /// Row length of `slot_table`, i.e. the longest sequence it can describe.
     pub table_stride: usize,
 }

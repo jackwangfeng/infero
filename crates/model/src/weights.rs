@@ -10,9 +10,12 @@
 //! layer, and streaming them would add descriptors to the transfer without
 //! saving anything worth measuring.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
-use cudarc::driver::{CudaSlice, CudaView, PinnedHostSlice};
-use tuili_cuda::Device;
+use tuili_gpu::{Buf, View};
+use tuili_gpu::PinnedHostSlice;
+use tuili_gpu::Device;
 use tuili_gguf::{GgmlType, Gguf, TensorInfo};
 use tuili_kernels::WeightType;
 
@@ -25,7 +28,15 @@ const BLOB_ALIGN: usize = 256;
 /// Where a matrix's bytes live.
 enum Storage {
     /// In VRAM, for the process lifetime.
-    Device(CudaSlice<u8>),
+    Device(Buf<u8>),
+    /// A window into the checkpoint file, aliased into device memory.
+    ///
+    /// Unified memory only, and it is the difference between an 18 GiB
+    /// checkpoint taking 24 s to load and taking none: the pages the GPU reads
+    /// *are* the file's pages, so there is nothing to upload. The `Arc` is what
+    /// keeps the mapping alive -- one per checkpoint, shared by every matrix in
+    /// it.
+    Mapped { file: Arc<Buf<u8>>, offset: usize },
     /// In the owning layer's host blob, at this byte offset. The same offset
     /// addresses it inside the staging buffer once the layer is transferred.
     Streamed { offset: usize },
@@ -55,9 +66,19 @@ impl Matrix {
     ///
     /// `stage` must be the staging buffer currently holding this matrix's
     /// layer, and is unused for a resident matrix.
-    pub fn view<'a>(&'a self, stage: Option<&'a CudaSlice<u8>>) -> Result<CudaView<'a, u8>> {
+    pub fn view<'a>(&'a self, stage: Option<&'a Buf<u8>>) -> Result<View<'a, u8>> {
         match &self.storage {
             Storage::Device(d) => Ok(d.as_view()),
+            Storage::Mapped { file, offset } => {
+                anyhow::ensure!(
+                    offset + self.n_bytes <= file.len(),
+                    "matrix wants {}..{} of a {}-byte checkpoint",
+                    offset,
+                    offset + self.n_bytes,
+                    file.len()
+                );
+                Ok(file.slice(*offset..offset + self.n_bytes))
+            }
             Storage::Streamed { offset } => {
                 let stage =
                     stage.context("an offloaded matrix was used without its layer being staged")?;
@@ -105,9 +126,26 @@ impl Experts {
 
     /// A device view of the whole block, for a kernel that indexes experts
     /// itself. `stride` tells it how far apart they are.
-    pub fn view<'a>(&'a self, stage: Option<&'a CudaSlice<u8>>) -> Result<CudaView<'a, u8>> {
+    pub fn view<'a>(&'a self, stage: Option<&'a Buf<u8>>) -> Result<View<'a, u8>> {
         match &self.storage {
             Storage::Device(d) => Ok(d.as_view()),
+            // No loader ever puts an expert block here today — `load_awq`'s
+            // `expert_projection` always uploads to `Storage::Device`, and
+            // there is no GGUF `_exps` reader yet to alias from a mapped
+            // checkpoint — but `Storage` is the same enum `Matrix` uses, so
+            // this match has to be exhaustive over what the type allows, not
+            // just what today's loaders produce.
+            Storage::Mapped { file, offset } => {
+                let end = offset + self.n_bytes();
+                anyhow::ensure!(
+                    end <= file.len(),
+                    "expert block wants {}..{} of a {}-byte checkpoint",
+                    offset,
+                    end,
+                    file.len()
+                );
+                Ok(file.slice(*offset..end))
+            }
             Storage::Streamed { offset } => {
                 let stage = stage
                     .context("an offloaded expert block was used without its layer being staged")?;
@@ -129,8 +167,8 @@ impl Experts {
     pub fn view_of<'a>(
         &'a self,
         e: usize,
-        stage: Option<&'a CudaSlice<u8>>,
-    ) -> Result<CudaView<'a, u8>> {
+        stage: Option<&'a Buf<u8>>,
+    ) -> Result<View<'a, u8>> {
         anyhow::ensure!(
             e < self.n_experts,
             "expert {e} of {}",
@@ -154,7 +192,7 @@ pub struct MoeWeights {
 }
 
 /// A 1-D parameter — norm gains and biases — always held as f32 on the device.
-pub type Vector = CudaSlice<f32>;
+pub type Vector = Buf<f32>;
 
 impl Matrix {
     /// Upload `[n, k]` f16 values, row-major, as a resident matrix.
@@ -391,12 +429,26 @@ impl Weights {
         let mut host_bytes = 0usize;
         let mut max_blob_bytes = 0usize;
 
-        let token_embd = upload_matrix(dev, f, "token_embd.weight", &mut device_bytes)?;
+        // Ask the backend whether it can alias the file instead of copying out
+        // of it. Unified memory can; a discrete card cannot, and answers `None`
+        // rather than failing. Mapped once here and shared by every matrix, so
+        // the mapping's lifetime is the weights'.
+        //
+        // The offloaded path is untouched: a streamed layer is copied into
+        // page-locked host memory by `pack_layer`, which is a different question
+        // from where the resident ones live.
+        let mapped = tuili_gpu::map_file(dev, f.path())?.map(Arc::new);
+        let mapped = mapped.as_ref();
+        if mapped.is_some() {
+            tracing::info!("checkpoint aliased into device memory; no upload");
+        }
+
+        let token_embd = upload_matrix(dev, f, mapped, "token_embd.weight", &mut device_bytes)?;
         let output_norm = upload_vector(dev, f, "output_norm.weight", &mut device_bytes)?;
         let output = if cfg.tied_embeddings {
             None
         } else {
-            Some(upload_matrix(dev, f, "output.weight", &mut device_bytes)?)
+            Some(upload_matrix(dev, f, mapped, "output.weight", &mut device_bytes)?)
         };
 
         // Llama 3.1 ships these precomputed; everything else wants no scaling.
@@ -418,20 +470,46 @@ impl Weights {
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let t = |s: &str| format!("blk.{i}.{s}");
-            let names = [
-                t("attn_q.weight"),
-                t("attn_k.weight"),
-                t("attn_v.weight"),
-                t("attn_output.weight"),
-                t("ffn_gate.weight"),
-                t("ffn_up.weight"),
-                t("ffn_down.weight"),
-            ];
+            // Which mixer this block has is read off the file rather than
+            // inferred from an interval: Qwen3.5 states an explicit 64-element
+            // `layer_types`, and a block that carries `ssm_a` is a linear one
+            // whatever a stride would say.
+            let is_linear = f.get_tensor(&t("ssm_a")).is_some();
+            let names: Vec<String> = if is_linear {
+                vec![
+                    t("attn_qkv.weight"),
+                    t("attn_gate.weight"),
+                    t("ssm_alpha.weight"),
+                    t("ssm_beta.weight"),
+                    t("ssm_out.weight"),
+                    t("ffn_gate.weight"),
+                    t("ffn_up.weight"),
+                    t("ffn_down.weight"),
+                ]
+            } else {
+                vec![
+                    t("attn_q.weight"),
+                    t("attn_k.weight"),
+                    t("attn_v.weight"),
+                    t("attn_output.weight"),
+                    t("ffn_gate.weight"),
+                    t("ffn_up.weight"),
+                    t("ffn_down.weight"),
+                ]
+            };
+            // llama.cpp names the pre-FFN norm `ffn_norm` for a llama-style
+            // block and `post_attention_norm` for Qwen3.5. The same norm in the
+            // same place; only the spelling moved.
+            let ffn_norm_name = if f.get_tensor(&t("ffn_norm.weight")).is_some() {
+                t("ffn_norm.weight")
+            } else {
+                t("post_attention_norm.weight")
+            };
 
             let (matrices, blob) = if i < n_gpu_layers {
                 let mut m = Vec::with_capacity(names.len());
                 for name in &names {
-                    m.push(upload_matrix(dev, f, name, &mut device_bytes)?);
+                    m.push(upload_matrix(dev, f, mapped, name, &mut device_bytes)?);
                 }
                 (m, None)
             } else {
@@ -443,30 +521,70 @@ impl Weights {
             };
             let mut matrices = matrices.into_iter();
 
+            let (attn, gdn) = if is_linear {
+                let qkv = matrices.next().unwrap();
+                let z = matrices.next().unwrap();
+                let a = matrices.next().unwrap();
+                let b = matrices.next().unwrap();
+                let out = matrices.next().unwrap();
+                (
+                    None,
+                    Some(GdnWeights {
+                        in_proj_qkv: qkv,
+                        in_proj_z: z,
+                        in_proj_a: a,
+                        in_proj_b: b,
+                        // Stacking `a` and `b` is a launch-count optimisation
+                        // the safetensors path takes when they share a dense
+                        // type. Not taken here: a GGUF stores them as two
+                        // tensors and concatenating quantized blocks is not a
+                        // reinterpretation.
+                        in_proj_ba: None,
+                        conv1d: upload_vector(
+                            dev, f, &t("ssm_conv1d.weight"), &mut device_bytes)?,
+                        a_log: upload_a_log(dev, f, &t("ssm_a"), &mut device_bytes)?,
+                        dt_bias: upload_vector(
+                            dev, f, &t("ssm_dt.bias"), &mut device_bytes)?,
+                        // The one norm in this architecture that is a plain
+                        // gain: `Qwen3_5RMSNormGated`. llama.cpp's converter
+                        // adds one to every *other* norm weight and leaves this
+                        // one alone, which is why nothing is undone here.
+                        norm: upload_vector(
+                            dev, f, &t("ssm_norm.weight"), &mut device_bytes)?,
+                        out_proj: out,
+                    }),
+                )
+            } else {
+                (
+                    Some(AttnWeights {
+                        wq: matrices.next().unwrap(),
+                        wk: matrices.next().unwrap(),
+                        wv: matrices.next().unwrap(),
+                        wo: matrices.next().unwrap(),
+                        // Qwen2 carries QKV biases; Llama does not.
+                        bq: upload_optional_vector(dev, f, &t("attn_q.bias"), &mut device_bytes)?,
+                        bk: upload_optional_vector(dev, f, &t("attn_k.bias"), &mut device_bytes)?,
+                        bv: upload_optional_vector(dev, f, &t("attn_v.bias"), &mut device_bytes)?,
+                        bo: upload_optional_vector(
+                            dev, f, &t("attn_output.bias"), &mut device_bytes)?,
+                        // Qwen3's per-head q/k norms; llama.cpp names them this
+                        // way.
+                        q_norm: upload_optional_vector(
+                            dev, f, &t("attn_q_norm.weight"), &mut device_bytes)?,
+                        k_norm: upload_optional_vector(
+                            dev, f, &t("attn_k_norm.weight"), &mut device_bytes)?,
+                        w_qkv: None,
+                        output_gate: cfg.attn_output_gate,
+                    }),
+                    None,
+                )
+            };
+
             layers.push(Layer {
                 attn_norm: upload_vector(dev, f, &t("attn_norm.weight"), &mut device_bytes)?,
-                // No GGUF conversion of a linear-attention model exists yet, so
-                // every block out of this path is a softmax-attention one.
-                attn: Some(AttnWeights {
-                    wq: matrices.next().unwrap(),
-                    wk: matrices.next().unwrap(),
-                    wv: matrices.next().unwrap(),
-                    wo: matrices.next().unwrap(),
-                    // Qwen2 carries QKV biases; Llama does not.
-                    bq: upload_optional_vector(dev, f, &t("attn_q.bias"), &mut device_bytes)?,
-                    bk: upload_optional_vector(dev, f, &t("attn_k.bias"), &mut device_bytes)?,
-                    bv: upload_optional_vector(dev, f, &t("attn_v.bias"), &mut device_bytes)?,
-                    bo: upload_optional_vector(dev, f, &t("attn_output.bias"), &mut device_bytes)?,
-                    // Qwen3's per-head q/k norms; llama.cpp names them this way.
-                    q_norm: upload_optional_vector(
-                        dev, f, &t("attn_q_norm.weight"), &mut device_bytes)?,
-                    k_norm: upload_optional_vector(
-                        dev, f, &t("attn_k_norm.weight"), &mut device_bytes)?,
-                    w_qkv: None,
-                    output_gate: false,
-                }),
-                gdn: None,
-                ffn_norm: upload_vector(dev, f, &t("ffn_norm.weight"), &mut device_bytes)?,
+                attn,
+                gdn,
+                ffn_norm: upload_vector(dev, f, &ffn_norm_name, &mut device_bytes)?,
                 dense: Some(DenseFfn {
                     w_gate: matrices.next().unwrap(),
                     w_up: matrices.next().unwrap(),
@@ -1637,20 +1755,38 @@ pub fn load_awq(
     })
 }
 
-fn upload_matrix(dev: &Device, f: &Gguf, name: &str, total: &mut usize) -> Result<Matrix> {
+fn upload_matrix(
+    dev: &Device,
+    f: &Gguf,
+    mapped: Option<&Arc<Buf<u8>>>,
+    name: &str,
+    total: &mut usize,
+) -> Result<Matrix> {
     let (ty, k, n, n_bytes) = describe(f, name)?;
-    let bytes = f.tensor_data(name)?;
-    *total += bytes.len();
-    let data = dev
-        .stream()
-        .clone_htod(bytes)
-        .with_context(|| format!("uploading {name} ({} MiB)", bytes.len() >> 20))?;
+    *total += n_bytes;
+    // Aliased when the backend can alias, copied when it cannot. The two
+    // produce the same `View` for every caller above this, which is why the
+    // engine does not know which one it got.
+    let storage = match mapped {
+        Some(file) => Storage::Mapped {
+            file: Arc::clone(file),
+            offset: f.file_offset(f.tensor(name)?),
+        },
+        None => {
+            let bytes = f.tensor_data(name)?;
+            Storage::Device(
+                dev.stream()
+                    .clone_htod(bytes)
+                    .with_context(|| format!("uploading {name} ({} MiB)", bytes.len() >> 20))?,
+            )
+        }
+    };
     Ok(Matrix {
         ty,
         k,
         n,
         n_bytes,
-        storage: Storage::Device(data),
+        storage,
     })
 }
 
@@ -1719,6 +1855,31 @@ fn upload_vector(dev: &Device, f: &Gguf, name: &str, total: &mut usize) -> Resul
     Ok(dev.stream().clone_htod(&host)?)
 }
 
+/// `ssm_a` back into the `A_log` the recurrence wants.
+///
+/// llama.cpp's converter stores `-exp(A_log)`, not `A_log`: this checkpoint's
+/// `blk.0.ssm_a` spans [-0.3376, -0.0038], which is exactly `-exp` of the
+/// reference's [-5.5625, -1.0859]. `gdn_gate_decay` computes
+/// `-exp(a_log) * softplus(...)`, so feeding it the file's value directly turns
+/// a decay of 0.03 into 0.97 and every linear block remembers everything.
+///
+/// Inverting here rather than adding a kernel variant keeps one gate kernel for
+/// both loaders, which is the same trade the safetensors path makes for the
+/// norm gains.
+fn upload_a_log(dev: &Device, f: &Gguf, name: &str, total: &mut usize) -> Result<Vector> {
+    let info = f.tensor(name)?;
+    let raw = to_f32(f.data(info), info).with_context(|| format!("decoding {name}"))?;
+    let host: Vec<f32> = raw
+        .iter()
+        .map(|a| {
+            debug_assert!(*a < 0.0, "{name}: {a} is not -exp(A_log)");
+            (-a).ln()
+        })
+        .collect();
+    *total += host.len() * 4;
+    Ok(dev.stream().clone_htod(&host)?)
+}
+
 fn to_f32(bytes: &[u8], info: &TensorInfo) -> Result<Vec<f32>> {
     Ok(match info.ty {
         GgmlType::F32 => bytes
@@ -1750,15 +1911,15 @@ fn to_f32(bytes: &[u8], info: &TensorInfo) -> Result<Vec<f32>> {
 pub struct VisionTower {
     pub shape: tuili_kernels::vision::VisionShape,
     pub cfg: crate::config::VisionConfig,
-    patch_embed_w: CudaSlice<half::f16>,
+    patch_embed_w: Buf<half::f16>,
     patch_embed_b: Vector,
     pos_embed: Vector,
     blocks: Vec<VisionBlock>,
     merger_norm_w: Vector,
     merger_norm_b: Vector,
-    merger_fc1_w: CudaSlice<half::f16>,
+    merger_fc1_w: Buf<half::f16>,
     merger_fc1_b: Vector,
-    merger_fc2_w: CudaSlice<half::f16>,
+    merger_fc2_w: Buf<half::f16>,
     merger_fc2_b: Vector,
     pub device_bytes: usize,
 }
@@ -1768,13 +1929,13 @@ struct VisionBlock {
     norm1_b: Vector,
     norm2_w: Vector,
     norm2_b: Vector,
-    qkv_w: CudaSlice<half::f16>,
+    qkv_w: Buf<half::f16>,
     qkv_b: Vector,
-    proj_w: CudaSlice<half::f16>,
+    proj_w: Buf<half::f16>,
     proj_b: Vector,
-    fc1_w: CudaSlice<half::f16>,
+    fc1_w: Buf<half::f16>,
     fc1_b: Vector,
-    fc2_w: CudaSlice<half::f16>,
+    fc2_w: Buf<half::f16>,
     fc2_b: Vector,
 }
 
@@ -1880,7 +2041,7 @@ pub fn load_vision(
     // makes `proj.weight`'s five dimensions a two-dimensional GEMM operand
     // without a copy.
     let matrix =
-        |name: &str, rows: usize, cols: usize, total: &mut usize| -> Result<CudaSlice<half::f16>> {
+        |name: &str, rows: usize, cols: usize, total: &mut usize| -> Result<Buf<half::f16>> {
             let t = w.tensor(name)?;
             let elems: usize = t.shape.iter().product();
             anyhow::ensure!(
@@ -1970,4 +2131,119 @@ pub fn load_vision(
         "vision tower loaded"
     );
     Ok(Some(tower))
+}
+
+/// The MTP head out of llama.cpp's sidecar GGUF.
+///
+/// `mtp-Qwen3.8-27B-Q8_0.gguf` is a standalone file rather than a fragment: the
+/// head is `blk.64` of a 65-block model, and the file repackages `token_embd`
+/// and `output` so llama.cpp can open it alone. Those two are copies of the text
+/// model's, not dedicated ones — the head shares, which is what
+/// `mtp_use_dedicated_embeddings = false` means — so they are read past rather
+/// than loaded.
+///
+/// That is the one place this differs from [`load_mtp`]. There, the *absence* of
+/// `mtp.embed_tokens` is the evidence for sharing, and the loader refuses a
+/// checkpoint that ships one. Here the file's self-containment destroys that
+/// evidence: a repackaged copy and a dedicated head's own embedding look
+/// identical from the tensor list. So the claim has to be carried by the
+/// metadata instead, and it is the weaker of the two checks. Worth saying rather
+/// than papering over.
+///
+/// Everything else maps without interpretation. `blk.64` is shaped exactly like
+/// one of the text model's sixteen attention blocks — output gate packed into
+/// the high half of `attn_q`, q/k norms per head, `post_attention_norm` before
+/// the FFN — so the layer loads through the same names at index `n_layers`. The
+/// four tensors with no text-model counterpart are the ones under `nextn.`.
+pub fn load_mtp_gguf(dev: &Device, f: &Gguf, cfg: &Config) -> Result<Option<MtpWeights>> {
+    let t = |s: &str| format!("blk.{}.{s}", cfg.n_layers);
+    if f.get_tensor(&t("nextn.eh_proj.weight")).is_none() {
+        return Ok(None);
+    }
+    // The head's depth, from the sidecar rather than from `cfg`: the main
+    // checkpoint's metadata does not mention the head at all, so the file
+    // carrying the tensors is the only one that can say how many layers they
+    // are. `cfg.mtp_layers` stays zero on this path and is not consulted.
+    let depth = f
+        .usize(&f.akey("nextn_predict_layers")?)
+        .context(
+            "the sidecar carries `nextn.eh_proj` but no `nextn_predict_layers`; \
+             the draft loop indexes layers by it and guessing is not safe",
+        )?;
+    anyhow::ensure!(
+        depth == 1,
+        "this loader builds a one-layer MTP head, the sidecar says {depth}. The \
+         draft loop indexes `spec_step_idx % nextn_predict_layers`, which is only \
+         the identity at one layer"
+    );
+    // The head's layer is a full-attention block, which the file settles without
+    // interpretation. Same check as the safetensors path and for the same
+    // reason: a drafter that ran a GatedDeltaNet layer would advance recurrent
+    // state on every speculative token.
+    anyhow::ensure!(
+        f.get_tensor(&t("ssm_a")).is_none(),
+        "blk.{} carries `ssm_a`, so it is a linear-attention block rather than \
+         the full-attention one this drafter assumes; drafting would touch \
+         recurrent state",
+        cfg.n_layers
+    );
+
+    let started = std::time::Instant::now();
+    let mut bytes = 0usize;
+    let mapped = tuili_gpu::map_file(dev, f.path())?.map(Arc::new);
+    let mapped = mapped.as_ref();
+    let layer = Layer {
+        attn_norm: upload_vector(dev, f, &t("attn_norm.weight"), &mut bytes)?,
+        attn: Some(AttnWeights {
+            wq: upload_matrix(dev, f, mapped, &t("attn_q.weight"), &mut bytes)?,
+            wk: upload_matrix(dev, f, mapped, &t("attn_k.weight"), &mut bytes)?,
+            wv: upload_matrix(dev, f, mapped, &t("attn_v.weight"), &mut bytes)?,
+            wo: upload_matrix(dev, f, mapped, &t("attn_output.weight"), &mut bytes)?,
+            bq: upload_optional_vector(dev, f, &t("attn_q.bias"), &mut bytes)?,
+            bk: upload_optional_vector(dev, f, &t("attn_k.bias"), &mut bytes)?,
+            bv: upload_optional_vector(dev, f, &t("attn_v.bias"), &mut bytes)?,
+            bo: upload_optional_vector(dev, f, &t("attn_output.bias"), &mut bytes)?,
+            q_norm: upload_optional_vector(dev, f, &t("attn_q_norm.weight"), &mut bytes)?,
+            k_norm: upload_optional_vector(dev, f, &t("attn_k_norm.weight"), &mut bytes)?,
+            w_qkv: None,
+            output_gate: cfg.attn_output_gate,
+        }),
+        gdn: None,
+        ffn_norm: upload_vector(dev, f, &t("post_attention_norm.weight"), &mut bytes)?,
+        dense: Some(DenseFfn {
+            w_gate: upload_matrix(dev, f, mapped, &t("ffn_gate.weight"), &mut bytes)?,
+            w_up: upload_matrix(dev, f, mapped, &t("ffn_up.weight"), &mut bytes)?,
+            w_down: upload_matrix(dev, f, mapped, &t("ffn_down.weight"), &mut bytes)?,
+            w_gate_up: None,
+        }),
+        // The MTP head's own block is always a full-attention, dense-FFN one —
+        // enforced above by refusing a sidecar whose layer carries `ssm_a` —
+        // so there is nothing sparse here for a MoE checkpoint's drafter to
+        // load.
+        moe: None,
+        blob: None,
+    };
+    let w = MtpWeights {
+        // `[k = 2 * d_model, n = d_model]`, embedding in the low half. The name
+        // is llama.cpp's evidence for the order: `eh_proj` projects `[e | h]`,
+        // and the conversion writes the HF `fc` through untransposed.
+        //
+        // If that order were wrong the drafts would simply stop being accepted —
+        // speculation verifies every token against the target model, so a broken
+        // head costs throughput and never correctness. The acceptance rate is
+        // the test, and it is a sharp one: near zero if this is backwards.
+        fc: upload_matrix(dev, f, mapped, &t("nextn.eh_proj.weight"), &mut bytes)?,
+        pre_fc_norm_embedding: upload_vector(dev, f, &t("nextn.enorm.weight"), &mut bytes)?,
+        pre_fc_norm_hidden: upload_vector(dev, f, &t("nextn.hnorm.weight"), &mut bytes)?,
+        norm: upload_vector(dev, f, &t("nextn.shared_head_norm.weight"), &mut bytes)?,
+        layer,
+        device_bytes: bytes,
+    };
+    dev.synchronize()?;
+    tracing::info!(
+        mib = bytes >> 20,
+        ms = started.elapsed().as_millis(),
+        "MTP head loaded from sidecar"
+    );
+    Ok(Some(w))
 }

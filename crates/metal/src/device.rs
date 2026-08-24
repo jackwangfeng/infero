@@ -5,7 +5,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice};
 
-use crate::launch::LastCommit;
+use crate::launch::Batch;
+use crate::profile::Profile;
 use crate::msl::Modules;
 
 /// What the host is allowed to assume about this GPU.
@@ -49,7 +50,10 @@ struct Inner {
     modules: Modules,
     caps: Caps,
     name: String,
-    last: LastCommit,
+    cores: u32,
+    batch: Batch,
+    gemm: crate::gemm::GemmCache,
+    profile: Profile,
 }
 
 // SAFETY: `MTLDevice`, `MTLCommandQueue` and `MTLBuffer` are documented as safe
@@ -96,7 +100,13 @@ impl Device {
                 queue,
                 caps,
                 name,
-                last: LastCommit::default(),
+                cores: std::env::var("TUILI_METAL_CORES")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(32),
+                batch: Batch::default(),
+                gemm: Default::default(),
+                profile: Profile::new(),
             }),
         })
     }
@@ -119,8 +129,16 @@ impl Device {
     /// The single command queue. Named `stream()` to match the CUDA side; the
     /// ordering guarantee is the same, because dispatches encoded serially into
     /// one queue observe each other's writes.
-    pub fn stream(&self) -> Stream<'_> {
-        Stream { dev: self }
+    /// A handle for submitting work.
+    ///
+    /// Owned rather than borrowed, and cheap: `Device` is an `Arc` inside, so
+    /// this is one relaxed increment. Borrowing instead made `dev.stream()`
+    /// hold a shared borrow of the `Model` that owns the device, which collides
+    /// with the `&mut self` closure the graph-capture path builds -- a conflict
+    /// cudarc does not have because it hands back a reference to an `Arc` the
+    /// caller already owns.
+    pub fn stream(&self) -> Stream {
+        Stream { dev: self.clone() }
     }
 
     pub(crate) fn raw(&self) -> &ProtocolObject<dyn MTLDevice> {
@@ -131,17 +149,54 @@ impl Device {
         &self.inner.queue
     }
 
-    pub(crate) fn remember_commit(
-        &self,
-        cb: Retained<ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>,
-    ) {
-        self.inner.last.set(cb);
+    pub(crate) fn batch(&self) -> &Batch {
+        &self.inner.batch
     }
 
-    pub(crate) fn take_last_commit(
-        &self,
-    ) -> Option<Retained<ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>> {
-        self.inner.last.take()
+    pub(crate) fn gemm_cache(&self) -> &crate::gemm::GemmCache {
+        &self.inner.gemm
+    }
+
+    pub fn profile(&self) -> &Profile {
+        &self.inner.profile
+    }
+
+    /// Parallel units, for the grid heuristics that aim at "enough blocks to
+    /// fill the machine".
+    ///
+    /// Metal exposes no core count -- there is no `MTLDevice` property for it,
+    /// and the CUDA `multiProcessorCount` it stands in for has no counterpart.
+    /// So this is a *default*, overridable with `TUILI_METAL_CORES`, and the
+    /// eight call sites that read it all use it the same way: `sm_count() * k`
+    /// as a target block count. Being wrong by a factor of two changes a tile
+    /// count, not an answer.
+    pub fn sm_count(&self) -> u32 {
+        self.inner.cores
+    }
+
+    pub fn synchronize(&self) -> Result<()> {
+        self.stream().synchronize()
+    }
+
+    /// The context the CUDA path hangs streams, events and pinned allocations
+    /// off. Metal has no separate context object, so this is a handle whose
+    /// only job is to carry those constructors -- and to refuse the two of
+    /// them that have no counterpart. See `compat.rs`.
+    pub fn context(&self) -> crate::compat::Context {
+        crate::compat::Context
+    }
+
+    /// Free and total bytes, in `cuMemGetInfo`'s order.
+    ///
+    /// "Total" is the working-set budget rather than installed RAM: on unified
+    /// memory the GPU shares the machine's DRAM with everything else, so the
+    /// number that bounds an allocation is the one Metal recommends, not the 36
+    /// GB the box has. "Free" subtracts what this device has already been
+    /// allocated, which `currentAllocatedSize` reports.
+    pub fn mem_info(&self) -> Result<(usize, usize)> {
+        let total = self.inner.caps.working_set_bytes as usize;
+        let used = self.inner.raw.currentAllocatedSize();
+        Ok((total.saturating_sub(used), total))
     }
 
     /// Bytes the GPU can hold before the OS starts paging.
@@ -152,13 +207,28 @@ impl Device {
 
 /// A handle for submitting work. Borrowed rather than owned so that the call
 /// sites read `dev.stream().launch_builder(&f)` exactly as they do on CUDA.
-#[derive(Clone, Copy)]
-pub struct Stream<'a> {
-    pub(crate) dev: &'a Device,
+#[derive(Clone)]
+pub struct Stream {
+    pub(crate) dev: Device,
 }
 
-impl Stream<'_> {
+impl Stream {
     pub fn device(&self) -> &Device {
-        self.dev
+        &self.dev
+    }
+
+    pub fn wait(&self, _e: &crate::compat::Event) -> anyhow::Result<()> {
+        anyhow::bail!("events are a CUDA-only path on this backend")
+    }
+
+    pub fn begin_capture(&self, _mode: crate::compat::CaptureMode) -> anyhow::Result<()> {
+        anyhow::bail!("graph capture is a CUDA-only path on this backend")
+    }
+
+    pub fn end_capture(
+        &self,
+        _flags: crate::compat::GraphFlags,
+    ) -> anyhow::Result<Option<crate::compat::Graph>> {
+        anyhow::bail!("graph capture is a CUDA-only path on this backend")
     }
 }

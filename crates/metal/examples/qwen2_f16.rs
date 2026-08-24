@@ -26,6 +26,7 @@ use tuili_metal::{Buf, Device, LaunchConfig, View, ViewMut};
 
 const COMMON_METAL: &str = include_str!("../../kernels/src/msl/common.metal");
 const OPS_METAL: &str = include_str!("../../kernels/src/msl/ops.metal");
+const QUANT_METAL: &str = include_str!("../../kernels/src/msl/quant.metal");
 
 const BLOCK: u32 = 256;
 /// Threads for the reduction-shaped kernels. Fixed rather than occupancy-
@@ -36,6 +37,10 @@ const REDUCE_BLOCK: u32 = 256;
 
 fn ops_src() -> String {
     format!("{COMMON_METAL}\n{OPS_METAL}")
+}
+
+fn quant_src() -> String {
+    format!("{COMMON_METAL}\n{QUANT_METAL}")
 }
 
 // ---- config --------------------------------------------------------------
@@ -294,11 +299,17 @@ impl Engine {
     }
 
     fn gemv(&self, out: &mut ViewMut<'_, f32>, m: &Mat, x: &View<'_, f32>) -> Result<()> {
-        let f = self.f("gemv_f16")?;
-        let (k, n) = (m.k as i32, m.n as i32);
+        let f = self.dev.kernels().get("tuili_quant", &quant_src(), "gemv_f16")?;
+        // The quant module's mat-vecs take `n_tokens`; this slice is batch one.
+        let (k, n, t) = (m.k as i32, m.n as i32, 1i32);
         let s = self.dev.stream();
         let mut b = s.launch_builder(&f);
-        b.arg(out).arg(&m.w.as_view()).arg(x).arg(&k).arg(&n);
+        b.arg(out)
+            .arg(&m.w.as_view())
+            .arg(x)
+            .arg(&k)
+            .arg(&n)
+            .arg(&t);
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (m.n as u32, 1, 1),
@@ -394,6 +405,20 @@ impl Engine {
             }?;
         }
 
+        // `TUILI_TRACE=1` reports the residual after each block, the same
+        // measurement `TUILI_LAYER_RMS` takes inside the engine -- so a
+        // known-good pass can be diffed against a suspect one layer by layer.
+        // Only the first forward of the first prompt: the trace exists to be
+        // diffed against another implementation's, and four fixture cases each
+        // firing at position zero would leave the *last* one's numbers in the
+        // dump while the engine's are from the first.
+        static TRACED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        let trace = std::env::var_os("TUILI_TRACE").is_some()
+            && pos == 0
+            && !TRACED.swap(true, std::sync::atomic::Ordering::Relaxed);
+        let rms = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
+
         let kv = cfg.n_kv * cfg.d_head;
         let plane = sess.max_pos * sess.kv_stride;
         for (li, l) in self.w.layers.iter().enumerate() {
@@ -421,8 +446,15 @@ impl Engine {
             self.rope(&mut sess.q.as_view_mut(), &pos_v, &freq_v, cfg.n_heads)?;
             self.rope(&mut sess.k.as_view_mut(), &pos_v, &freq_v, cfg.n_kv)?;
 
+            if trace && li == 0 {
+                s.synchronize()?;
+                let r = |v: &Vec<f32>| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
+                eprintln!("  example probe q rms {:.6} first {:.6}", r(&sess.q.to_vec()), sess.q.to_vec()[0]);
+                eprintln!("  example probe k rms {:.6}", r(&sess.k.to_vec()));
+                eprintln!("  example probe v rms {:.6}", r(&sess.v.to_vec()));
+            }
             {
-                let f = self.f("store_kv_f16")?;
+                let f = self.f("store_kv_contig_f16")?;
                 let (nkv, dh, p) = (cfg.n_kv as i32, cfg.d_head as i32, pos as i32);
                 let mut b = s.launch_builder(&f);
                 b.arg(&sess.kcache.slice_mut(lo..hi))
@@ -460,11 +492,32 @@ impl Engine {
             }
 
             self.gemv(&mut sess.proj.as_view_mut(), &l.wo, &sess.attn.as_view())?;
+            if trace && li == 0 {
+                s.synchronize()?;
+                let r = |v: Vec<f32>| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
+                eprintln!("  example attn_out     rms {:.9} first {:.9}", r(sess.attn.to_vec()), sess.attn.to_vec()[0]);
+                eprintln!("  example o_proj_out   rms {:.9} first {:.9}", r(sess.proj.to_vec()), sess.proj.to_vec()[0]);
+            }
             self.add_assign(
                 &mut sess.x.as_view_mut(),
                 &sess.proj.as_view(),
                 cfg.d_model,
             )?;
+            if trace && li == 0 {
+                s.synchronize()?;
+                let r = |v: Vec<f32>| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
+                eprintln!("  example x_after_attn rms {:.9} first {:.9}", r(sess.x.to_vec()), sess.x.to_vec()[0]);
+                if let Ok(dir) = std::env::var("TUILI_PROBE_DUMP") {
+                    for (nm, v) in [
+                        ("x_after_attn", sess.x.to_vec()),
+                        ("o_proj_out", sess.proj.to_vec()),
+                        ("attn_out", sess.attn.to_vec()),
+                    ] {
+                        let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                        let _ = std::fs::write(format!("{dir}/ex.{nm}.f32"), b);
+                    }
+                }
+            }
 
             // --- feed forward ---
             self.rms_norm(
@@ -494,6 +547,10 @@ impl Engine {
                 &sess.proj.as_view(),
                 cfg.d_model,
             )?;
+            if trace {
+                s.synchronize()?;
+                eprintln!("  example layer {li:2} rms {:.6}", rms(&sess.x.to_vec()));
+            }
         }
 
         self.rms_norm(

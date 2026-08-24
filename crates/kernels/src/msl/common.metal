@@ -12,6 +12,7 @@
 // kernel bodies readable next to their CUDA originals.
 
 #include <metal_stdlib>
+#include <metal_simdgroup_matrix>
 using namespace metal;
 
 #define WARP_SIZE 32

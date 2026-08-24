@@ -19,12 +19,17 @@
 //! what it can (`threadExecutionWidth`, `maxTotalThreadsPerThreadgroup`) and
 //! grids here are fixed constants rather than occupancy-derived.
 
+pub mod backend;
+mod compat;
 mod buffer;
 mod device;
+mod gemm;
 mod launch;
 mod msl;
+mod profile;
 
-pub use buffer::{Buf, View, ViewMut};
+pub use buffer::{Buf, CopyDst, CopySrc, View, ViewMut};
 pub use device::{Caps, Device, Stream};
-pub use launch::{Function, KernelArg, LaunchBuilder, LaunchConfig};
+pub use launch::{Function, KernelArg, LaunchBuilder, LaunchConfig, NullBuffer};
+pub use profile::{Entry, Profile};
 pub use msl::Modules;

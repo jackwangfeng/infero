@@ -19,7 +19,7 @@
 //! matrix, is not a rounding difference — it is a different matrix.
 
 use anyhow::{Context, Result};
-use cudarc::driver::{CudaView, CudaViewMut, LaunchConfig, PushKernelArg};
+use tuili_gpu::{View, ViewMut, LaunchConfig, KernelArg};
 use half::f16;
 
 use crate::{Kernels, fp8_src};
@@ -482,8 +482,8 @@ impl Kernels {
     /// left zero in the padding.
     pub fn fp8_repack_rows(
         &self,
-        dst: &mut CudaViewMut<'_, u8>,
-        src: &CudaView<'_, u8>,
+        dst: &mut ViewMut<'_, u8>,
+        src: &View<'_, u8>,
         k: usize,
         n: usize,
     ) -> Result<()> {
@@ -524,9 +524,9 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn mmv_f8_block(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        w: &CudaView<'_, u8>,
-        x: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
+        x: &View<'_, f32>,
         k: usize,
         n: usize,
         accum: bool,
@@ -591,9 +591,9 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn mma_f8_block(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        w: &CudaView<'_, u8>,
-        x: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
+        x: &View<'_, f32>,
         k: usize,
         n: usize,
         n_tokens: usize,
@@ -691,9 +691,9 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn mmv_f8_block_batch(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        w: &CudaView<'_, u8>,
-        x: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
+        x: &View<'_, f32>,
         k: usize,
         n: usize,
         n_tokens: usize,
@@ -762,8 +762,8 @@ impl Kernels {
     /// host and cost 22 GiB of resident memory.
     pub fn dequant_f8_block_to_f16(
         &self,
-        out: &mut CudaViewMut<'_, f16>,
-        w: &CudaView<'_, u8>,
+        out: &mut ViewMut<'_, f16>,
+        w: &View<'_, u8>,
         k: usize,
         n: usize,
     ) -> Result<()> {

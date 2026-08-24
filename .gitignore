@@ -2,3 +2,7 @@
 /models
 # A symlink into a conda install, not source.
 /vendor/cuda
+
+# Weight-derived reference captures: regenerate with
+#   python3 tools/capture_qwen35_layers.py <model-dir> fixtures/qwen35_capture --tokens 12
+fixtures/

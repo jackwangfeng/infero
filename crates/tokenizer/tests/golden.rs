@@ -21,6 +21,11 @@ struct Fixtures {
 struct EncodeCase {
     text: String,
     ids: Vec<u32>,
+    /// What the reference decodes these ids back to, which is not always
+    /// `text`: the NFC normalizer composes, so a decomposed accent comes back
+    /// composed. Asserting the round trip against `text` would be asserting
+    /// that the tokenizer does *not* normalise.
+    decoded: String,
 }
 
 #[derive(Deserialize)]
@@ -39,137 +44,152 @@ fn workspace() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-fn load() -> Option<(Tokenizer, Fixtures)> {
-    let model = std::env::var("TUILI_TEST_GGUF")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| workspace().join("models/qwen2.5-0.5b-instruct-q8_0.gguf"));
+/// Every checkpoint with both a GGUF and a fixture, paired.
+///
+/// Two rather than one, and the second is not redundant: Qwen2.5 and Qwen3.8
+/// differ in their pre-tokenizer by exactly one thing -- whether a combining
+/// mark counts as a letter -- so running the same cases through both is what
+/// distinguishes "the split is right" from "the split is close enough for
+/// English". `tokenizer.ggml.pre` is `qwen2` in one file and `qwen35` in the
+/// other, and until the second name existed here it fell through to the GPT-2
+/// split.
+const MODELS: &[(&str, &str)] = &[
+    (
+        "models/qwen2.5-0.5b-instruct-fp16.gguf",
+        "qwen2.5-0.5b-instruct",
+    ),
+    ("models/Qwen3.8-27B-Q4_K_M.gguf", "qwen3.8-27b"),
+];
+
+fn workspace_models() -> Vec<(String, Tokenizer, Fixtures)> {
+    // A single override still works, and then it is paired with whichever
+    // fixture the caller names.
+    if let Ok(p) = std::env::var("TUILI_TEST_GGUF") {
+        let name = std::env::var("TUILI_TEST_FIXTURE")
+            .unwrap_or_else(|_| "qwen2.5-0.5b-instruct".to_string());
+        return open(&PathBuf::from(p), &name).into_iter().collect();
+    }
+    MODELS
+        .iter()
+        .filter_map(|(gguf, fixture)| open(&workspace().join(gguf), fixture))
+        .collect()
+}
+
+fn open(model: &PathBuf, fixture: &str) -> Option<(String, Tokenizer, Fixtures)> {
     if !model.exists() {
         eprintln!("skipping: {} not downloaded", model.display());
         return None;
     }
-
-    let gguf = Gguf::open(&model).expect("opening model");
-    let tok = Tokenizer::from_gguf(&gguf).expect("building tokenizer");
-
-    let fixture_path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen2.5-0.5b-instruct.json");
-    let raw = std::fs::read_to_string(&fixture_path).expect("reading fixtures");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(format!("{fixture}.json"));
+    let raw = std::fs::read_to_string(&path).expect("reading fixtures");
     let fixtures: Fixtures = serde_json::from_str(&raw).expect("parsing fixtures");
-
-    Some((tok, fixtures))
-}
-
-macro_rules! setup {
-    () => {
-        match load() {
-            Some(x) => x,
-            None => return,
-        }
-    };
+    let gguf = Gguf::open(model).expect("opening model");
+    let tok = Tokenizer::from_gguf(&gguf).expect("building tokenizer");
+    Some((fixture.to_string(), tok, fixtures))
 }
 
 #[test]
 fn encodes_identically_to_huggingface() {
-    let (tok, fx) = setup!();
-
-    let mut failures = Vec::new();
-    for case in &fx.encode {
-        // parse_special = false: HF's `encode(add_special_tokens=False)` still
-        // splits out added tokens, which is the same behaviour we want here.
-        let got = tok.encode(&case.text, Some(false), true);
-        if got != case.ids {
-            failures.push(format!(
-                "  {:?}\n    want {:?}\n    got  {:?}",
-                case.text, case.ids, got
-            ));
+    for (name, tok, fx) in workspace_models() {
+        let mut failures = Vec::new();
+        for case in &fx.encode {
+            // parse_special = false: HF's `encode(add_special_tokens=False)`
+            // still splits out added tokens, which is the behaviour we want.
+            let got = tok.encode(&case.text, Some(false), true);
+            if got != case.ids {
+                failures.push(format!(
+                    "  {:?}\n    want {:?}\n    got  {:?}",
+                    case.text, case.ids, got
+                ));
+            }
         }
-    }
-    assert!(
-        failures.is_empty(),
-        "{} of {} encode cases differ:\n{}",
-        failures.len(),
-        fx.encode.len(),
-        failures.join("\n")
-    );
-}
-
-#[test]
-fn decode_roundtrips_every_case() {
-    let (tok, fx) = setup!();
-    for case in &fx.encode {
-        let ids = tok.encode(&case.text, Some(false), true);
-        assert_eq!(
-            tok.decode(&ids, false),
-            case.text,
-            "roundtrip {:?}",
-            case.text
+        assert!(
+            failures.is_empty(),
+            "{name}: {} of {} encode cases differ:\n{}",
+            failures.len(),
+            fx.encode.len(),
+            failures.join("\n")
         );
     }
 }
 
 #[test]
-fn streaming_decode_matches_batch_decode() {
-    let (tok, fx) = setup!();
-    for case in &fx.encode {
-        let ids = tok.encode(&case.text, Some(false), true);
-        let mut de = tok.detokenizer();
-        let mut streamed = String::new();
-        for &id in &ids {
-            streamed.push_str(&de.push(id));
+fn decode_roundtrips_every_case() {
+    for (name, tok, fx) in workspace_models() {
+        for case in &fx.encode {
+            let ids = tok.encode(&case.text, Some(false), true);
+            assert_eq!(tok.decode(&ids, false), case.decoded, "{name} roundtrip {:?}", case.text);
         }
-        streamed.push_str(&de.finish());
-        assert_eq!(streamed, case.text, "streaming {:?}", case.text);
+    }
+}
+
+#[test]
+fn streaming_decode_matches_batch_decode() {
+    for (name, tok, fx) in workspace_models() {
+        for case in &fx.encode {
+            let ids = tok.encode(&case.text, Some(false), true);
+            let mut de = tok.detokenizer();
+            let mut streamed = String::new();
+            for &id in &ids {
+                streamed.push_str(&de.push(id));
+            }
+            streamed.push_str(&de.finish());
+            assert_eq!(streamed, case.decoded, "{name} streaming {:?}", case.text);
+        }
     }
 }
 
 #[test]
 fn chat_template_matches_huggingface() {
-    let (tok, fx) = setup!();
-    let template = tok.chat_template().expect("model has a chat template");
-
-    for case in &fx.chat {
-        let msgs: Vec<ChatMessage> = case
-            .messages
-            .iter()
-            .map(|m| ChatMessage::new(&m.role, &m.content))
-            .collect();
-        let got = template.render(&msgs, true).expect("rendering");
-        assert_eq!(got, case.prompt);
+    for (name, tok, fx) in workspace_models() {
+        let template = tok.chat_template().expect("model has a chat template");
+        for case in &fx.chat {
+            let msgs: Vec<ChatMessage> = case
+                .messages
+                .iter()
+                .map(|m| ChatMessage::new(&m.role, &m.content))
+                .collect();
+            let got = template.render(&msgs, true).expect("rendering");
+            assert_eq!(got, case.prompt, "{name} chat template");
+        }
     }
 }
 
 #[test]
 fn vocab_and_special_ids_agree() {
-    let (tok, fx) = setup!();
-    // GGUF pads the vocab out to the embedding matrix's row count, so it is
-    // larger than HF's `len(tokenizer)`. The trailing entries are unused
-    // placeholders; every real token must still be there.
-    assert!(
-        tok.vocab_size() >= fx.vocab_size,
-        "gguf vocab {} < hf vocab {}",
-        tok.vocab_size(),
-        fx.vocab_size
-    );
-    assert_eq!(tok.eos_id(), Some(fx.eos_token_id));
-    assert!(tok.is_eog(fx.eos_token_id));
-    assert!(tok.is_special(tok.token_to_id("<|im_start|>").unwrap()));
+    for (name, tok, fx) in workspace_models() {
+        // GGUF pads the vocab out to the embedding matrix's row count, so it is
+        // larger than HF's `len(tokenizer)`. The trailing entries are unused
+        // placeholders; every real token must still be there.
+        assert!(
+            tok.vocab_size() >= fx.vocab_size,
+            "{name}: gguf vocab {} < hf vocab {}",
+            tok.vocab_size(),
+            fx.vocab_size
+        );
+        assert_eq!(tok.eos_id(), Some(fx.eos_token_id), "{name} eos");
+        assert!(tok.is_eog(fx.eos_token_id), "{name} eog");
+        assert!(tok.is_special(tok.token_to_id("<|im_start|>").unwrap()), "{name}");
+    }
 }
 
 #[test]
 fn special_tokens_are_atomic_when_parsed() {
-    let (tok, fx) = setup!();
-    let _ = fx;
-    let im_start = tok.token_to_id("<|im_start|>").unwrap();
+    for (name, tok, _fx) in workspace_models() {
+        let im_start = tok.token_to_id("<|im_start|>").unwrap();
+        let parsed = tok.encode("<|im_start|>user", Some(false), true);
+        assert_eq!(parsed[0], im_start, "{name}");
 
-    let parsed = tok.encode("<|im_start|>user", Some(false), true);
-    assert_eq!(parsed[0], im_start);
-
-    // With parsing off the marker is just text, and must not collapse to the
-    // control token — that is what keeps user input from forging a turn.
-    let literal = tok.encode("<|im_start|>user", Some(false), false);
-    assert!(
-        !literal.contains(&im_start),
-        "special token leaked: {literal:?}"
-    );
-    assert_eq!(tok.decode(&literal, false), "<|im_start|>user");
+        // With parsing off the marker is just text, and must not collapse to
+        // the control token -- that is what keeps user input from forging a
+        // turn.
+        let literal = tok.encode("<|im_start|>user", Some(false), false);
+        assert!(
+            !literal.contains(&im_start),
+            "{name}: special token leaked: {literal:?}"
+        );
+        assert_eq!(tok.decode(&literal, false), "<|im_start|>user", "{name}");
+    }
 }

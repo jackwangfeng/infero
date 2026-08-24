@@ -8,11 +8,12 @@ license.workspace = true
 [dependencies]
 tuili-safetensors.workspace = true
 tuili-gguf.workspace = true
-tuili-cuda.workspace = true
+tuili-cuda = { workspace = true, optional = true }
+tuili-gpu.workspace = true
 anyhow.workspace = true
 half.workspace = true
 tracing.workspace = true
-cudarc = { version = "0.19.9", default-features = false, features = ["std", "driver", "nvrtc", "cublas", "f16", "dynamic-loading"] }
+cudarc = { version = "0.19.9", default-features = false, optional = true, features = ["std", "driver", "nvrtc", "cublas", "f16", "dynamic-loading"] }
 tuili-kernels.workspace = true
 rand = "0.9"
 serde_json = "1"
@@ -25,5 +26,7 @@ tuili-tokenizer.workspace = true
 
 [features]
 default = ["cuda-13"]
-cuda-13 = ["tuili-kernels/cuda-13", "tuili-cuda/cuda-13", "cudarc/cuda-13010"]
-cuda-12 = ["tuili-kernels/cuda-12", "tuili-cuda/cuda-12", "cudarc/cuda-12080"]
+cuda = ["dep:tuili-cuda", "dep:cudarc", "tuili-kernels/cuda", "tuili-gpu/cuda"]
+cuda-13 = ["cuda", "tuili-kernels/cuda-13", "tuili-cuda/cuda-13", "cudarc/cuda-13010", "tuili-gpu/cuda-13"]
+cuda-12 = ["cuda", "tuili-kernels/cuda-12", "tuili-cuda/cuda-12", "cudarc/cuda-12080", "tuili-gpu/cuda-12"]
+metal = ["tuili-kernels/metal", "tuili-gpu/metal"]

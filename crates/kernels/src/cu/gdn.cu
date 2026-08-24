@@ -161,7 +161,12 @@ extern "C" __global__ void gdn_qk_l2norm_f32(float* __restrict__ qkv,
 // The head expansion happens here rather than by materializing a wider q and k.
 // There are `key_heads` key heads against `heads` value heads — 16 against 48 in
 // this checkpoint — and the reference widens them with `repeat_interleave`, so
-// value head `h` reads key head `h / (heads / key_heads)`. Expanding modularly
+// value head `h` reads key head `h / (heads / key_heads)` when the checkpoint
+// stores V heads *grouped* by key head, which a Hugging Face one does. A GGUF
+// does not: llama.cpp reorders them to tiled order so that ggml's broadcast can
+// use `repeat` instead of an interleaved repeat, and then the mapping is
+// `h % key_heads`. `v_tiled` selects between the two, because both run to
+// completion and give different models. Expanding modularly on a grouped
 // (`h % key_heads`) also runs, and gives a different model.
 //
 // One block a (head, sequence); thread `j` owns column `j` of S, so the reads
@@ -185,7 +190,7 @@ extern "C" __global__ void gdn_delta_rule_f32(float* __restrict__ out,
                                               int heads, int key_heads,
                                               int dk, int dv,
                                               int stride, int q_off, int k_off,
-                                              int v_off) {
+                                              int v_off, int v_tiled) {
     extern __shared__ float shared[];
     float* qs = shared;          // dk
     float* ks = shared + dk;     // dk
@@ -199,7 +204,8 @@ extern "C" __global__ void gdn_delta_rule_f32(float* __restrict__ out,
     if (nt <= 0) return;
     const int t0 = first_token[seq];
     const int j = threadIdx.x;
-    const int khead = head / (heads / key_heads);
+    const int khead = v_tiled ? (head % key_heads)
+                              : (head / (heads / key_heads));
 
     float* S = state + ((size_t)seq * heads + head) * (size_t)dk * dv;
 
@@ -333,7 +339,7 @@ __device__ __forceinline__ void gdn_delta_rule_reg_body(
         const float* __restrict__ qkv, const float* __restrict__ g,
         const float* __restrict__ beta, const int* __restrict__ first_token,
         const int* __restrict__ n_tok, int heads, int key_heads, int stride,
-        int q_off, int k_off, int v_off, float* smem) {
+        int q_off, int k_off, int v_off, int v_tiled, float* smem) {
     // A thread is both a lane of q and k and a piece of a column of S, which
     // is one index only when the two head dims agree.
     static_assert(DK_C == DV_C, "the register block needs dk == dv");
@@ -356,7 +362,8 @@ __device__ __forceinline__ void gdn_delta_rule_reg_body(
     const int part = lane % R;     // which slice of it, in adjacent lanes
     const int i0 = part * RB;
     // repeat_interleave, not modular — see the note on the version above.
-    const int khead = head / (heads / key_heads);
+    const int khead = v_tiled ? (head % key_heads)
+                              : (head / (heads / key_heads));
 
     // Double-buffered: buffer `n & 1` is the token being consumed.
     float* qs = smem;                  // 2 * DK_C
@@ -466,7 +473,7 @@ extern "C" __global__ __launch_bounds__(256) void gdn_delta_rule_reg128_f32(
         const float* __restrict__ qkv, const float* __restrict__ g,
         const float* __restrict__ beta, const int* __restrict__ first_token,
         const int* __restrict__ n_tok, int heads, int key_heads, int dk, int dv,
-        int stride, int q_off, int k_off, int v_off) {
+        int stride, int q_off, int k_off, int v_off, int v_tiled) {
     // `dk` and `dv` are template parameters here; they stay in the signature so
     // that the launcher pushes one argument list for any of the three kernels.
     (void)dk;
@@ -474,7 +481,7 @@ extern "C" __global__ __launch_bounds__(256) void gdn_delta_rule_reg128_f32(
     extern __shared__ float smem[];
     gdn_delta_rule_reg_body<128, 128, 2, 4>(out, state, qkv, g, beta,
                                             first_token, n_tok, heads, key_heads,
-                                            stride, q_off, k_off, v_off, smem);
+                                            stride, q_off, k_off, v_off, v_tiled, smem);
 }
 
 // The middle ground: S in dynamic shared memory rather than registers.
@@ -512,7 +519,7 @@ extern "C" __global__ void gdn_delta_rule_smem_f32(
         const float* __restrict__ qkv, const float* __restrict__ g,
         const float* __restrict__ beta, const int* __restrict__ first_token,
         const int* __restrict__ n_tok, int heads, int key_heads, int dk, int dv,
-        int stride, int q_off, int k_off, int v_off) {
+        int stride, int q_off, int k_off, int v_off, int v_tiled) {
     extern __shared__ float smem[];
 
     const int head = blockIdx.x;
@@ -521,7 +528,8 @@ extern "C" __global__ void gdn_delta_rule_smem_f32(
     if (nt <= 0) return;   // idle slot: no read, no write
     const int t0 = first_token[seq];
     const int j = threadIdx.x;
-    const int khead = head / (heads / key_heads);
+    const int khead = v_tiled ? (head % key_heads)
+                              : (head / (heads / key_heads));
 
     float* qs = smem;               // dk
     float* ks = smem + dk;          // dk

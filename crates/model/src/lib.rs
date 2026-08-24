@@ -36,10 +36,11 @@ mod sampling;
 pub mod weights;
 
 use anyhow::{Context, Result};
-use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, CudaView, CudaViewMut};
+use tuili_gpu::{Buf, View, ViewMut};
+use tuili_gpu::{Event as CudaEvent, OwnedStream as CudaStream};
 use half::f16;
 use std::sync::Arc;
-use tuili_cuda::Device;
+use tuili_gpu::Device;
 use tuili_gguf::Gguf;
 use tuili_kernels::{AttnDims, BatchLayout, Kernels, KvQuant, TqTables};
 
@@ -51,14 +52,57 @@ pub use weights::Weights;
 
 use weights::Matrix;
 
-/// Tokens one forward pass may carry, summed over every sequence in the batch.
+/// Ceiling on the tokens one forward pass may carry, summed over the batch.
 ///
-/// Bounds the attention score buffer, which is the one activation that grows
-/// with both batch size and context length.
+/// A compile-time bound now, with [`max_batch_tokens`] the value actually used.
+/// It bounds the attention score buffer -- `n_heads * chunk * max_seq`, the one
+/// activation that grows with both batch size and context length, 201 MiB at 256
+/// tokens and a 8192 context on this model -- so raising it is a memory trade
+/// against a real number, not a free knob.
+///
+/// Higher on Metal, and for a reason that does not apply to CUDA. Prefill
+/// dequantises each weight to f16 once *per chunk*, so a 2561-token prompt in
+/// 256-token chunks does it ten times; a bigger chunk divides that. cuBLAS is
+/// reached at four tokens there and the same argument would apply, but it is
+/// untested on that hardware and 256 is what is tuned.
+#[cfg(feature = "cuda")]
 pub const MAX_BATCH_TOKENS: usize = 256;
+#[cfg(not(feature = "cuda"))]
+pub const MAX_BATCH_TOKENS: usize = 1024;
 
-/// Kept for callers that still think in terms of a single sequence's prefill.
-pub const PREFILL_CHUNK: usize = MAX_BATCH_TOKENS;
+/// What one attention score buffer is allowed to cost.
+///
+/// The buffer is `n_heads * chunk * max_seq` floats, so the chunk and the
+/// context multiply. This is the budget that decides which one gives.
+const SCORE_BUDGET: usize = 1 << 30;
+
+/// Tokens one forward pass carries, given the context it has to hold scores for.
+///
+/// Not a constant, because the two things it trades against move independently.
+/// A bigger chunk amortises prefill's per-chunk dequantisation -- measured on the
+/// 27B, a 2561-token prompt: 31.2 s at 256, 25.0 at 512, 22.7 at 1024 -- and a
+/// bigger context multiplies the score buffer by the same chunk. At 24 heads and
+/// a 8192 context, 1024 tokens is 0.75 GiB; at the 262144 context this model
+/// advertises it would be 24 GiB, which does not start at all. Raising the chunk
+/// without this bound would have quietly cut the largest usable context by four.
+///
+/// The floor is 64 rather than 1: below `GEMM_THRESHOLD` a chunk takes the
+/// mat-vec, and a chunk small enough to do that has given up the thing chunks
+/// are being enlarged for.
+///
+/// `TUILI_BATCH_TOKENS` overrides it outright, budget included, because the
+/// person measuring is entitled to a worse setting than this picks.
+pub fn batch_tokens_for(n_heads: usize, max_seq: usize) -> usize {
+    if let Some(n) = std::env::var("TUILI_BATCH_TOKENS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+    {
+        return n.min(MAX_BATCH_TOKENS);
+    }
+    let per_token = n_heads.max(1) * max_seq.max(1) * std::mem::size_of::<f32>();
+    (SCORE_BUDGET / per_token.max(1)).clamp(64, MAX_BATCH_TOKENS)
+}
 
 /// Default ceiling on sequences that may ask for logits in one pass.
 ///
@@ -154,10 +198,53 @@ impl<'a> BatchItem<'a> {
     }
 }
 
-/// Above this many tokens a projection goes through cuBLAS instead of the
-/// mat-vec. The mat-vec re-reads the weights once per token, so the crossover
-/// is early.
-const GEMM_THRESHOLD: usize = 4;
+/// Above this many tokens a projection goes through the library GEMM instead of
+/// the mat-vec. The mat-vec re-reads the weights once per token, so on CUDA the
+/// crossover is early.
+///
+/// A backend with no GEMM has a different crossover: infinity. The float
+/// mat-vec is correct at any width -- it batches `GEMV_TOKENS` tokens per
+/// threadgroup and its grid covers the rest -- so prefill takes it and pays the
+/// re-reads rather than failing. That is the whole cost of not having
+/// `MPSMatrixMultiplication` wired up yet, and it is a prefill cost only:
+/// decode is one token and never reaches here.
+#[cfg(feature = "cuda")]
+const GEMM_THRESHOLD_DEFAULT: usize = 4;
+/// Twelve times CUDA's 4, and the gap is the cost of MPS wanting one data type
+/// for all three matrices: reaching the GEMM means dequantising the weight to
+/// f16 first, 3.56x the bytes of Q4_K, plus splitting the open command encoder.
+/// A handful of tokens cannot pay that back. Measured, prompt tokens through the
+/// 27B, one chunk each:
+///
+/// ```text
+///   prompt   GEMM on   GEMM off
+///       11    147.2       42.7   ms a token
+///       31     53.5       48.9
+///       71     27.0       52.0
+///      151     15.5       52.7
+///      311     14.9       52.2
+/// ```
+///
+/// The crossing is between 31 and 71, and 48 sits in it. Erring high is the
+/// cheaper mistake in the other direction too: a short prompt is short, so
+/// paying 5 ms a token extra on 31 of them is 150 ms, while a 5-token prompt
+/// sent to the GEMM pays 500 ms for nothing -- which is what a threshold of 4
+/// did to four concurrent requests, 19.7 tok/s against 23.9.
+#[cfg(not(feature = "cuda"))]
+const GEMM_THRESHOLD_DEFAULT: usize = 48;
+
+/// Tokens above which a matmul takes the GEMM rather than repeating the
+/// mat-vec, overridable so the trade can be re-measured rather than argued.
+fn gemm_threshold() -> usize {
+    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("TUILI_GEMM_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(GEMM_THRESHOLD_DEFAULT)
+    })
+}
 /// Up to this many tokens, a weight type with no tensor-core GEMM repeats the
 /// integer mat-vec once per token instead of taking the float path. Measured
 /// against Llama-3.1-8B Q4_K_M, whose Q6_K matrices are the ones affected.
@@ -200,8 +287,8 @@ fn graph_kv_bucket() -> usize {
 ///
 /// The switch stays so the result is re-runnable; the default is what it has
 /// always been.
-fn graph_instantiate_flags() -> cudarc::driver::sys::CUgraphInstantiate_flags {
-    use cudarc::driver::sys::CUgraphInstantiate_flags as F;
+fn graph_instantiate_flags() -> tuili_gpu::GraphFlags {
+    use tuili_gpu::GraphFlags as F;
     static PLAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *PLAIN.get_or_init(|| std::env::var("TUILI_GRAPH_MODE").as_deref() == Ok("plain")) {
         // The enum has no zero variant; instantiate takes the raw value.
@@ -218,7 +305,7 @@ fn graph_instantiate_flags() -> cudarc::driver::sys::CUgraphInstantiate_flags {
 /// inference worker once and used only from there, so a graph has exactly one
 /// owner for its whole life. `CudaGraph` is `!Send` only because it wraps raw
 /// handles.
-struct SendGraph(cudarc::driver::CudaGraph);
+struct SendGraph(tuili_gpu::Graph);
 
 // Safety: as above — one owner, moved rather than shared, and every `Model`
 // method takes `&mut self`.
@@ -239,34 +326,34 @@ enum GraphSlot {
 /// Device-side activations, allocated once and reused for every forward pass.
 struct Activations {
     /// The residual stream, `[chunk, d_model]`.
-    x: CudaSlice<f32>,
+    x: Buf<f32>,
     /// Normalized copy of `x` feeding the projections.
-    xb: CudaSlice<f32>,
-    q: CudaSlice<f32>,
-    k: CudaSlice<f32>,
-    v: CudaSlice<f32>,
-    attn: CudaSlice<f32>,
-    proj: CudaSlice<f32>,
-    gate: CudaSlice<f32>,
-    up: CudaSlice<f32>,
-    ffn: CudaSlice<f32>,
+    xb: Buf<f32>,
+    q: Buf<f32>,
+    k: Buf<f32>,
+    v: Buf<f32>,
+    attn: Buf<f32>,
+    proj: Buf<f32>,
+    gate: Buf<f32>,
+    up: Buf<f32>,
+    ffn: Buf<f32>,
     /// `[n_heads, chunk, max_seq]`
-    scores: CudaSlice<f32>,
-    logits: CudaSlice<f32>,
-    token_ids: CudaSlice<i32>,
-    positions: CudaSlice<i32>,
+    scores: Buf<f32>,
+    logits: Buf<f32>,
+    token_ids: Buf<i32>,
+    positions: Buf<i32>,
     /// Per token: which sequence row it belongs to.
-    seq_of: CudaSlice<i32>,
+    seq_of: Buf<i32>,
     /// Per token: the pool slot its key/value go to.
-    slots: CudaSlice<i32>,
+    slots: Buf<i32>,
     /// Batch rows whose logits are wanted.
-    logit_rows: CudaSlice<i32>,
-    attn_partial: CudaSlice<f32>,
+    logit_rows: Buf<i32>,
+    attn_partial: Buf<f32>,
     /// Those rows, gathered and normalized.
-    head_in: CudaSlice<f32>,
+    head_in: Buf<f32>,
     /// The attention output gate, `[chunk, d_attn]`. Allocated only for models
     /// whose attention blocks carry one.
-    attn_gate: Option<CudaSlice<f32>>,
+    attn_gate: Option<Buf<f32>>,
     /// GatedDeltaNet scratch, allocated only for models that have such blocks.
     gdn: Option<GdnActs>,
     /// Mixture-of-experts scratch, allocated only for sparse models.
@@ -282,16 +369,16 @@ struct Activations {
 /// second flag, unlike the GatedDeltaNet buffers next door.
 struct MoeActs {
     /// `[chunk, n_experts]` — the router's output, before the top-k.
-    router_logits: CudaSlice<f32>,
+    router_logits: Buf<f32>,
     /// `[chunk, n_active]`, descending by router logit.
-    ids: CudaSlice<i32>,
-    weights: CudaSlice<f32>,
+    ids: Buf<i32>,
+    weights: Buf<f32>,
     /// `[chunk * n_active, d_ff_expert]` each.
-    gate: CudaSlice<f32>,
-    up: CudaSlice<f32>,
-    hidden: CudaSlice<f32>,
+    gate: Buf<f32>,
+    up: Buf<f32>,
+    hidden: Buf<f32>,
     /// `[chunk * n_active, d_model]` — what the combine reduces.
-    down: CudaSlice<f32>,
+    down: Buf<f32>,
 }
 
 /// Activation buffers the GatedDeltaNet block needs.
@@ -301,23 +388,23 @@ struct MoeActs {
 /// is 40 KiB a token.
 struct GdnActs {
     /// `[chunk, conv_channels]` — the input projection's output.
-    qkv: CudaSlice<f32>,
+    qkv: Buf<f32>,
     /// The same after the convolution and SiLU. A separate buffer because the
     /// convolution reads three tokens back and would otherwise consume values
     /// it had already overwritten.
-    qkv_conv: CudaSlice<f32>,
+    qkv_conv: Buf<f32>,
     /// `[chunk, value_dim]` — the output gate.
-    z: CudaSlice<f32>,
+    z: Buf<f32>,
     /// `[chunk, value_heads]` each.
-    a: CudaSlice<f32>,
-    b: CudaSlice<f32>,
+    a: Buf<f32>,
+    b: Buf<f32>,
     /// `[chunk, 2 * value_heads]` — `a` and `b` from the stacked projection,
     /// interleaved a token at a time. Unused when the loader could not stack.
-    ab: CudaSlice<f32>,
-    beta: CudaSlice<f32>,
-    g: CudaSlice<f32>,
+    ab: Buf<f32>,
+    beta: Buf<f32>,
+    g: Buf<f32>,
     /// `[chunk, value_dim]` — the recurrence's output, before the gated norm.
-    core: CudaSlice<f32>,
+    core: Buf<f32>,
 }
 
 /// Double-buffered staging for offloaded layers.
@@ -329,7 +416,7 @@ struct GdnActs {
 /// reading and the slot may be overwritten.
 struct Offload {
     copy_stream: Arc<CudaStream>,
-    stage: [CudaSlice<u8>; 2],
+    stage: [Buf<u8>; 2],
     ready: [CudaEvent; 2],
     consumed: [CudaEvent; 2],
     /// Which layer each slot currently holds.
@@ -366,21 +453,21 @@ impl Offload {
 /// undone once on the attention output — never on a cached vector.
 struct TqBuffers {
     tables: TqTables,
-    k_rot: CudaSlice<f32>,
-    v_rot: CudaSlice<f32>,
-    q_rot: CudaSlice<f32>,
+    k_rot: Buf<f32>,
+    v_rot: Buf<f32>,
+    q_rot: Buf<f32>,
     /// `S'·(Π·q)`, the query side of the QJL inner product.
-    q_qjl: CudaSlice<f32>,
+    q_qjl: Buf<f32>,
     /// The attention output before `Πᵀ` maps it back.
-    acc_rot: CudaSlice<f32>,
+    acc_rot: Buf<f32>,
 }
 
 /// Staging for the cuBLAS path: a dequantized weight matrix and f16 inputs.
 struct Scratch {
-    w16: CudaSlice<f16>,
-    x16: CudaSlice<f16>,
+    w16: Buf<f16>,
+    x16: Buf<f16>,
     /// The activation row in Q8_1, for the integer mat-vec.
-    q8_1: CudaSlice<u8>,
+    q8_1: Buf<u8>,
 }
 
 /// One row's sampling parameters plus its own uniform draw.
@@ -420,6 +507,9 @@ pub struct Model {
     /// Cleared by `TUILI_NO_GRAPH`, for measuring what the graphs are worth.
     use_graph: bool,
     max_logit_rows: usize,
+    /// Tokens one forward pass carries, resolved once against this session's
+    /// context length. See [`batch_tokens_for`].
+    batch_tokens: usize,
     max_seq: usize,
     /// Per layer, whether it mixes with a recurrence. Cached because the pool
     /// needs it to size the state and the layer loop consults it every block.
@@ -450,7 +540,7 @@ pub struct Model {
     /// which passes `Qwen3NextModel.forward`'s return value, whose last statement
     /// is the final norm. `tests/qwen35_mtp.rs` pins it numerically against the
     /// capture, which carries both tensors for exactly this reason.
-    mtp_hidden: Option<CudaSlice<f32>>,
+    mtp_hidden: Option<Buf<f32>>,
     /// The journal that undoes a rejected candidate's effect on the recurrent
     /// state. Only allocated for a model that has linear-attention blocks.
     gdn_rollback: Option<spec::GdnRollback>,
@@ -467,24 +557,24 @@ pub struct Model {
 /// Device-side scratch for sampling. Sized once, at the batch and vocabulary
 /// the model was built for.
 struct SampleBufs {
-    params: cudarc::driver::CudaSlice<f32>,
+    params: tuili_gpu::Buf<f32>,
     /// Slice winners for the split greedy argmax; see
     /// `Kernels::sample_rows_greedy`.
-    arg_v: cudarc::driver::CudaSlice<f32>,
-    arg_i: cudarc::driver::CudaSlice<i32>,
-    pen_tok: cudarc::driver::CudaSlice<i32>,
-    pen_cnt: cudarc::driver::CudaSlice<i32>,
-    pen_len: cudarc::driver::CudaSlice<i32>,
-    rnd: cudarc::driver::CudaSlice<f64>,
-    out: cudarc::driver::CudaSlice<u32>,
+    arg_v: tuili_gpu::Buf<f32>,
+    arg_i: tuili_gpu::Buf<i32>,
+    pen_tok: tuili_gpu::Buf<i32>,
+    pen_cnt: tuili_gpu::Buf<i32>,
+    pen_len: tuili_gpu::Buf<i32>,
+    rnd: tuili_gpu::Buf<f64>,
+    out: tuili_gpu::Buf<u32>,
     /// Per-slice top-k candidates for `Kernels::sample_rows_split`.
-    cand_v: cudarc::driver::CudaSlice<f32>,
-    cand_i: cudarc::driver::CudaSlice<i32>,
+    cand_v: tuili_gpu::Buf<f32>,
+    cand_i: tuili_gpu::Buf<i32>,
     /// The surviving distribution each row drew from, which is what the
     /// speculative acceptance rule composes with.
-    surv_id: cudarc::driver::CudaSlice<u32>,
-    surv_p: cudarc::driver::CudaSlice<f32>,
-    surv_len: cudarc::driver::CudaSlice<i32>,
+    surv_id: tuili_gpu::Buf<u32>,
+    surv_p: tuili_gpu::Buf<f32>,
+    surv_len: tuili_gpu::Buf<i32>,
     stride: usize,
     /// Entries the candidate and survivor buffers hold a row.
     top_k: usize,
@@ -501,7 +591,7 @@ struct SampleBufs {
 /// It exists to attribute the 0.4 ms a step that subtracting per-kernel
 /// estimates from the wall clock could not.
 struct PhaseEvents {
-    ev: Vec<cudarc::driver::CudaEvent>,
+    ev: Vec<tuili_gpu::Event>,
     /// Accumulated spans and the step count, so one line covers many steps.
     sums: [f64; 3],
     steps: u64,
@@ -516,7 +606,7 @@ impl PhaseEvents {
         for _ in 0..4 {
             ev.push(
                 dev.context()
-                    .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?,
+                    .new_event(Some(tuili_gpu::EVENT_DEFAULT))?,
             );
         }
         Ok(Some(Self { ev, sums: [0.0; 3], steps: 0 }))
@@ -718,6 +808,15 @@ impl Model {
                 "the block stack is not homogeneous"
             );
         }
+        // Resolved here and stored, not recomputed: the buffers below are sized
+        // from it and `forward` splits its input by it, and those two disagreeing
+        // is the kind of mismatch `add_assign` already cost a day of.
+        let batch_tokens = batch_tokens_for(cfg.n_heads, max_seq);
+        tracing::info!(
+            batch_tokens,
+            score_mib = cfg.n_heads * batch_tokens * max_seq * 4 >> 20,
+            "tokens a pass carries"
+        );
         let act = Activations::new(&dev, &cfg, max_seq, max_logit_rows)?;
         let scratch = Scratch {
             w16: dev
@@ -730,23 +829,23 @@ impl Model {
                 // output — and that last one is `d_attn` wide, which stopped
                 // being covered by `d_model` on Qwen3.8.
                 .alloc_zeros::<f16>(
-                    MAX_BATCH_TOKENS * cfg.d_ff.max(cfg.d_model).max(cfg.d_attn()),
+                    batch_tokens * cfg.d_ff.max(cfg.d_model).max(cfg.d_attn()),
                 )?,
             q8_1: dev.stream().alloc_zeros::<u8>(
                 // A sparse FFN quantizes `down`'s activation once per active
-                // expert per token, so its row count is `chunk * n_active`
-                // rather than `chunk` — narrower rows, more of them, and the
-                // product is what has to fit.
-                (MAX_BATCH_TOKENS * Kernels::q8_1_bytes(cfg.d_ff.max(cfg.d_model))).max(
+                // expert per token, so its row count is `batch_tokens *
+                // n_active` rather than `batch_tokens` — narrower rows, more
+                // of them, and the product is what has to fit.
+                (batch_tokens * Kernels::q8_1_bytes(cfg.d_ff.max(cfg.d_model))).max(
                     cfg.moe.as_ref().map_or(0, |m| {
-                        MAX_BATCH_TOKENS * m.n_active * Kernels::q8_1_bytes(m.d_ff_expert)
+                        batch_tokens * m.n_active * Kernels::q8_1_bytes(m.d_ff_expert)
                     }),
                 ),
             )?,
         };
 
         let tq = if kv_quant.is_quantized() {
-            let chunk = MAX_BATCH_TOKENS;
+            let chunk = batch_tokens;
             let kv_dim = cfg.d_kv();
             // These three hold rotated queries and the attention accumulator,
             // so they are `d_attn` wide, not `d_model`.
@@ -771,7 +870,15 @@ impl Model {
         // illegal on a stream that is capturing. The two tools answer different
         // questions anyway: a graph hides launch cost, and profiling measures
         // it, so asking for one turns the other off.
-        let use_graph = std::env::var_os("TUILI_NO_GRAPH").is_none() && !dev.profile().enabled();
+        // Graph replay needs stream capture, which is CUDA's. Metal's nearest
+        // mechanism is an indirect command buffer -- a fixed argument set
+        // encoded up front rather than a captured stream -- so the replay path
+        // is off here and every step is encoded fresh. That is where a good
+        // part of this backend's per-step overhead lives: 880 dispatches at
+        // 18.3 us of command-buffer submit each.
+        let use_graph = cfg!(feature = "cuda")
+            && std::env::var_os("TUILI_NO_GRAPH").is_none()
+            && !dev.profile().enabled();
         let use_mmq = std::env::var_os("TUILI_NO_MMQ").is_none();
         if !use_mmq {
             tracing::warn!("TUILI_NO_MMQ set: batches will use dequant + cuBLAS");
@@ -806,6 +913,7 @@ impl Model {
             graphs: std::collections::HashMap::new(),
             use_graph,
             max_logit_rows,
+            batch_tokens,
             max_seq,
             layer_kinds,
             logit_rows: 0,
@@ -833,6 +941,11 @@ impl Model {
     /// verification pass can be — and so which tree shapes are possible.
     pub fn max_logit_rows(&self) -> usize {
         self.max_logit_rows
+    }
+
+    /// Tokens one forward pass carries. See [`batch_tokens_for`].
+    pub fn batch_tokens(&self) -> usize {
+        self.batch_tokens
     }
 
     pub fn max_seq(&self) -> usize {
@@ -967,8 +1080,9 @@ impl Model {
             session.pool.max_seq()
         );
 
-        let n_chunks = tokens.len().div_ceil(MAX_BATCH_TOKENS);
-        for (i, chunk) in tokens.chunks(MAX_BATCH_TOKENS).enumerate() {
+        let chunk_len = self.batch_tokens();
+        let n_chunks = tokens.len().div_ceil(chunk_len);
+        for (i, chunk) in tokens.chunks(chunk_len).enumerate() {
             let last = i + 1 == n_chunks;
             let item = if last {
                 BatchItem::new(seq, chunk)
@@ -1025,8 +1139,9 @@ impl Model {
         let n_tokens: usize = items.iter().map(|i| i.tokens.len()).sum();
         anyhow::ensure!(n_tokens > 0, "batch carries no tokens");
         anyhow::ensure!(
-            n_tokens <= MAX_BATCH_TOKENS,
-            "batch of {n_tokens} tokens exceeds the {MAX_BATCH_TOKENS} a pass can carry"
+            n_tokens <= self.batch_tokens(),
+            "batch of {n_tokens} tokens exceeds the {} a pass can carry",
+            self.batch_tokens()
         );
         for (i, (item, want)) in items.iter().zip(tail).enumerate() {
             anyhow::ensure!(
@@ -1236,7 +1351,7 @@ impl Model {
                 let stream = self.dev.stream().clone();
                 if record {
                     stream.begin_capture(
-                        cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+                        tuili_gpu::CAPTURE_RELAXED,
                     )?;
                 }
                 let kv = if graphable { key.2 } else { kv_len };
@@ -1248,6 +1363,12 @@ impl Model {
                         // the loaded weights rather than from a stride, so a
                         // model with a different interleaving needs no change
                         // here.
+                        // The residual before any block runs -- the embedding
+                        // alone. A divergence already present here is a gather
+                        // or a token id, not a layer.
+                        if layer == 0 {
+                            probe(&self.kern, layer, "embedding", &self.act.x.slice(..d));
+                        }
                         if self.layer_kinds[layer] {
                             self.linear_attention(layer, n_tokens, pool, s)?;
                         } else {
@@ -1386,7 +1507,7 @@ impl Model {
         let head_mmq = n_logit_rows > 1
             && self.use_mmq
             && Kernels::has_mmq(head.ty)
-            && self.kern.device().arch() >= 80
+            && self.kern.device().caps().int_tensor_gemm
             && Self::mmq_shape_ok(head);
         // Asked and answered: this checkpoint's head is Q8_0, 248320 x 5120,
         // and at one row it takes `mmvq` — 885 us for 1.29 GB, which is 1460
@@ -1899,7 +2020,7 @@ impl Model {
         // bytes — 96 of a decode step's 104 `gemv` launches. Stacked they are
         // one launch, and `ab` holds them interleaved a token at a time.
         let stacked = gw.in_proj_ba.as_ref();
-        let gate: Vec<(&Matrix, &mut CudaSlice<f32>, usize)> = match stacked {
+        let gate: Vec<(&Matrix, &mut Buf<f32>, usize)> = match stacked {
             Some(ba) => vec![(ba, &mut acts.ab, 2 * heads)],
             None => vec![
                 (&gw.in_proj_a, &mut acts.a, heads),
@@ -2037,6 +2158,7 @@ impl Model {
             la.key_head_dim,
             la.value_head_dim,
             (width, 0, key_dim, 2 * key_dim),
+                    la.v_heads_tiled,
         )?;
         // `staged` borrowed the journal for the launch above; letting it fall out
         // of scope here rather than at the end of the function keeps the journal
@@ -2157,6 +2279,7 @@ impl Model {
                 want_h,
             )?
         };
+        probe(&self.kern, layer, "after_attn_norm", &self.act.xb.slice(..n * d));
 
         // All three read the same Q8_1 activation, so one launch covers them.
         // Two hundred and twenty-five mat-vecs back to back run at 328 GB/s
@@ -2537,6 +2660,9 @@ impl Model {
                         dims.n_slots,
                         n,
                     )?;
+                    probe(&self.kern, layer, "q_after_rope", &self.act.q.slice(..n * da));
+                    probe(&self.kern, layer, "k_after_rope", &self.act.k.slice(..n * kv_dim));
+                    probe(&self.kern, layer, "v", &self.act.v.slice(..n * kv_dim));
                 }
 
                 let table = pool.slot_table().as_view();
@@ -2628,6 +2754,7 @@ impl Model {
                         kv_len,
                         Some(&mut partial.as_view_mut()),
                     )?;
+                    probe(&self.kern, layer, "attn_out", &self.act.attn.slice(..n * da));
                 }
             }
             Some(tq) => {
@@ -2820,6 +2947,7 @@ impl Model {
             self.kern
                 .add_bias(&mut self.act.proj.slice_mut(..n * d), &b.as_view(), d, n)?;
         }
+        probe(&self.kern, layer, "o_proj_out", &self.act.proj.slice(..n * d));
         if !self.ffn_norm_takes_residual(layer, n) {
             self.kern.add_assign(
                 &mut self.act.x.slice_mut(..n * d),
@@ -2827,6 +2955,7 @@ impl Model {
                 n * d,
             )?;
         }
+        probe(&self.kern, layer, "x_after_attn", &self.act.x.slice(..n * d));
         Ok(())
     }
 
@@ -3116,6 +3245,7 @@ impl Model {
                 n * d,
             )?;
         }
+        probe(&self.kern, layer, "after_ffn", &self.act.x.slice(..self.cfg.d_model));
         Ok(())
     }
 
@@ -3280,9 +3410,9 @@ impl Model {
     fn norm_for_group(
         kern: &Kernels,
         scratch: &mut Scratch,
-        act_xb: &mut CudaSlice<f32>,
-        x: &CudaView<'_, f32>,
-        weight: &CudaView<'_, f32>,
+        act_xb: &mut Buf<f32>,
+        x: &View<'_, f32>,
+        weight: &View<'_, f32>,
         n_tokens: usize,
         d: usize,
         eps: f32,
@@ -3378,10 +3508,10 @@ impl Model {
     fn matmul(
         kern: &Kernels,
         scratch: &mut Scratch,
-        out: &mut CudaViewMut<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
         w: &Matrix,
-        stage: Option<&CudaSlice<u8>>,
-        x: &CudaView<'_, f32>,
+        stage: Option<&Buf<u8>>,
+        x: &View<'_, f32>,
         n_tokens: usize,
         use_mmvq: bool,
         use_mmq: bool,
@@ -3426,10 +3556,10 @@ impl Model {
     fn matmul_pre(
         kern: &Kernels,
         scratch: &mut Scratch,
-        out: &mut CudaViewMut<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
         w: &Matrix,
-        stage: Option<&CudaSlice<u8>>,
-        x: &CudaView<'_, f32>,
+        stage: Option<&Buf<u8>>,
+        x: &View<'_, f32>,
         n_tokens: usize,
         use_mmvq: bool,
         use_mmq: bool,
@@ -3540,7 +3670,7 @@ impl Model {
         // shape, and they should fall to the mat-vec rather than the float path.
         let mmq_ok = use_mmq
             && Kernels::has_mmq(w.ty)
-            && kern.device().arch() >= 80
+            && kern.device().caps().int_tensor_gemm
             && Self::mmq_shape_ok(w);
 
         // One token is the decode step, and it is bandwidth-bound: the integer
@@ -3671,7 +3801,7 @@ impl Model {
             return Ok(());
         }
 
-        if n_tokens <= GEMM_THRESHOLD {
+        if n_tokens <= gemm_threshold() {
             return kern.gemv(out, &weights, w.ty, x, w.k, w.n, n_tokens);
         }
 
@@ -3705,6 +3835,33 @@ impl Model {
     }
 }
 
+/// `TUILI_PROBE=<layer>` reports the RMS of named intermediates inside that
+/// block. Enough to bisect a block against a second implementation of the same
+/// forward pass -- which is the only way the last two composition bugs were
+/// found, and the only tool that would have found them faster.
+fn probe(kern: &Kernels, layer: usize, name: &'static str, v: &View<'_, f32>) {
+    static WANT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let want = WANT.get_or_init(|| {
+        std::env::var("TUILI_PROBE").ok().and_then(|v| v.parse().ok())
+    });
+    if *want != Some(layer) {
+        return;
+    }
+    let Ok(row) = kern.device().stream().clone_dtoh(v) else { return };
+    let _ = kern.device().synchronize();
+    let n = row.len().max(1);
+    let rms = (row.iter().map(|x| x * x).sum::<f32>() / n as f32).sqrt();
+    tracing::info!(layer, name, rms, len = row.len(), first = row.first().copied(), "probe");
+    // `TUILI_PROBE_DUMP=<dir>` also writes the raw f32, so two implementations
+    // of the same forward pass can be diffed element by element rather than
+    // through summary statistics. RMS and element zero can both agree while the
+    // vectors differ, which is how this cost an hour.
+    if let Ok(dir) = std::env::var("TUILI_PROBE_DUMP") {
+        let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let _ = std::fs::write(format!("{dir}/eng.{name}.f32"), bytes);
+    }
+}
+
 impl Activations {
 
     fn new(
@@ -3714,7 +3871,7 @@ impl Activations {
         max_logit_rows: usize,
     ) -> Result<Self> {
         let stream = dev.stream();
-        let chunk = MAX_BATCH_TOKENS;
+        let chunk = batch_tokens_for(cfg.n_heads, max_seq);
         let d = cfg.d_model;
         // The attention interior can be wider than the residual stream — 24
         // heads of 256 against 5120 on Qwen3.8 — so `q` and the attention
@@ -3723,7 +3880,7 @@ impl Activations {
         let d_attn = cfg.d_attn();
         let kv_dim = cfg.d_kv();
 
-        let alloc_f32 = |n: usize, what: &str| -> Result<CudaSlice<f32>> {
+        let alloc_f32 = |n: usize, what: &str| -> Result<Buf<f32>> {
             stream
                 .alloc_zeros::<f32>(n)
                 .with_context(|| format!("allocating {what} ({} MiB)", (n * 4) >> 20))
@@ -3855,7 +4012,7 @@ impl Model {
 /// second image does not overwrite the first — the scratch is a per-call buffer
 /// and features have to outlive the call to reach the forward pass.
 pub struct VisionFeatures {
-    rows: CudaSlice<f32>,
+    rows: Buf<f32>,
     /// How many language-model tokens this image occupies, `patches / 4`.
     pub tokens: usize,
     pub out_hidden: usize,
@@ -3866,7 +4023,7 @@ pub struct VisionFeatures {
 }
 
 impl VisionFeatures {
-    pub fn view(&self) -> CudaView<'_, f32> {
+    pub fn view(&self) -> View<'_, f32> {
         self.rows.as_view()
     }
 }

@@ -14,6 +14,11 @@ const SUPPORTED: &[&str] = &[
     // untested-architecture warning does not fire for a layout that is
     // recognised; the interleaving is enforced where the blocks are built.
     "qwen3_5",
+    // The same model as `qwen3_5`, under the name llama.cpp's converter writes
+    // into a GGUF. Two spellings because the two loaders read two different
+    // files: `config.json`'s `model_type` for a safetensors checkpoint, and
+    // `general.architecture` for a GGUF.
+    "qwen35",
     // Qwen3-MoE: the same block as `qwen3` with a sparse FFN in place of the
     // dense one. The attention half is unchanged, which is why it is listed
     // here rather than treated as a new layout; what differs is `Config::moe`
@@ -193,6 +198,22 @@ pub struct LinearAttnConfig {
     pub value_head_dim: usize,
     /// Depthwise convolution width; the carried window is one shorter.
     pub conv_kernel: usize,
+    /// Whether the checkpoint stores V heads *tiled* rather than grouped by key
+    /// head.
+    ///
+    /// False for Hugging Face, which stores `[G0_v0..v2, G1_v0..v2, ...]` so
+    /// value head `h` belongs to key head `h / (heads / key_heads)` --
+    /// `repeat_interleave`. True for a GGUF, because llama.cpp reorders to
+    /// `[G0_v0, G1_v0, ..., G0_v1, ...]` and then the mapping is
+    /// `h % key_heads`. The same permutation is applied to `in_proj_z`,
+    /// `in_proj_a`, `in_proj_b`, `A_log`, `dt_bias`, the V channels of `conv1d`
+    /// and the columns of `out_proj`, so everything indexed by a value head
+    /// agrees and only the q/k lookup has to know.
+    ///
+    /// Both readings run. Reading a GGUF as grouped produces grammatical,
+    /// fluent, content-free text -- the prompt's own words and the commonest
+    /// function words, with the answer absent from the top ten.
+    pub v_heads_tiled: bool,
 }
 
 impl LinearAttnConfig {
@@ -253,9 +274,14 @@ impl Config {
         let n_kv_heads = f.usize(&key("attention.head_count_kv")).unwrap_or(n_heads);
         let d_ff = f.usize(&key("feed_forward_length"))?;
 
-        // Most models leave rope.dimension_count implicit at d_model/n_heads.
+        // `attention.key_length` when the file states it, because on Qwen3.5 the
+        // head is 256 wide and only 64 of it rotates -- so `rope.dimension_count`
+        // is the *rotary* width there and reading it as the head width makes
+        // every projection the wrong shape. Every other model this path loads
+        // states neither and gets `d_model / n_heads`.
         let d_head = f
-            .usize(&key("rope.dimension_count"))
+            .usize(&key("attention.key_length"))
+            .or_else(|_| f.usize(&key("rope.dimension_count")))
             .unwrap_or_else(|_| d_model / n_heads.max(1));
 
         if n_heads == 0 || n_kv_heads == 0 {
@@ -264,9 +290,30 @@ impl Config {
         if !n_heads.is_multiple_of(n_kv_heads) {
             bail!("{n_heads} query heads do not divide into {n_kv_heads} kv heads");
         }
-        if d_head * n_heads != d_model {
-            // Some models genuinely have a head dim that isn't d_model/n_heads,
-            // but our q/k/v buffers assume the projections are square.
+        // The recurrence's shape, when the file states one. Its presence is
+        // also what says the attention interior may be wider than the residual
+        // and that the attention blocks carry an output gate -- both true of
+        // Qwen3.5 and of nothing else this loader reads.
+        let linear_attn = match f.usize(&key("ssm.group_count")) {
+            Ok(key_heads) => {
+                let dim = f.usize(&key("ssm.state_size"))?;
+                Some(LinearAttnConfig {
+                    key_heads,
+                    value_heads: f.usize(&key("ssm.time_step_rank"))?,
+                    key_head_dim: dim,
+                    value_head_dim: dim,
+                    conv_kernel: f.usize(&key("ssm.conv_kernel"))?,
+                    v_heads_tiled: true,
+                })
+            }
+            Err(_) => None,
+        };
+
+        // `d_attn` is `n_heads * d_head` and equals `d_model` on every model but
+        // this one: Qwen3.5 has 24 heads of 256 over a 5120-wide residual, so
+        // its `o_proj` is `[6144, 5120]` rather than square. The guard stays for
+        // everything else, because there it catches a misread head width.
+        if d_head * n_heads != d_model && linear_attn.is_none() {
             bail!(
                 "d_head {d_head} * n_heads {n_heads} != d_model {d_model}; \
                  this layout is not supported"
@@ -296,22 +343,28 @@ impl Config {
                 .f32(&key("attention.layer_norm_rms_epsilon"))
                 .unwrap_or(1e-5),
             rope_theta: f.f32(&key("rope.freq_base")).unwrap_or(10_000.0),
-            // GGUF's `rope.dimension_count` *is* the rotary width, and it is
-            // already what `d_head` was read from above; the two coincide for
-            // every architecture that reaches this path, since the check that
-            // `d_head * n_heads == d_model` rules out the partial-rope models.
-            // A GGUF conversion of one would need this to become its own key.
-            rotary_dim: d_head,
+            // `rope.dimension_count` is the rotary width, which coincides with
+            // `d_head` on every model but Qwen3.5 -- 64 of 256 there, with the
+            // frequency exponent normalized by *this* width rather than by the
+            // head's. Reading it as the head width is the mistake the `d_head`
+            // expression above avoids; reading the head width as the rotary one
+            // is this line's.
+            rotary_dim: f
+                .usize(&key("rope.dimension_count"))
+                .unwrap_or(d_head),
             rope_freq_scale: f
                 .f32(&key("rope.scaling.factor"))
                 .map(|s| if s > 0.0 { 1.0 / s } else { 1.0 })
                 .unwrap_or(1.0),
             tied_embeddings: f.get_tensor("output.weight").is_none(),
             interleaved_rope: INTERLEAVED_ROPE.contains(&arch.as_str()),
-            // No GGUF conversion of a linear-attention model exists; when one
-            // does it will need its own metadata keys rather than a guess.
-            linear_attn: None,
-            attn_output_gate: false,
+            // The output gate follows from the mixer, not from a key: every
+            // Qwen3.5 attention block has one, which is why its `attn_q` is
+            // twice as wide as its head count implies. The loader still checks
+            // the projection's actual width against this rather than trusting
+            // it -- a config cannot silently change the arithmetic.
+            attn_output_gate: linear_attn.is_some(),
+            linear_attn,
             // Likewise for the MTP head: no GGUF conversion carries one, and
             // guessing a depth would build a drafter out of tensors that are
             // not there.
@@ -519,7 +572,10 @@ impl Config {
                         key_head_dim: kd as usize,
                         value_head_dim: vd as usize,
                         conv_kernel: ck as usize,
-                    })
+                        // Hugging Face stores V heads grouped by key head; only a GGUF
+                    // is tiled. See the field's own note.
+                    v_heads_tiled: false,
+                })
                 }
                 (None, None, None, None, None) => None,
                 _ => anyhow::bail!(

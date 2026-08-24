@@ -15,7 +15,7 @@
 //! just moving a length counter.
 
 use anyhow::{Context, Result};
-use cudarc::driver::{CudaView, CudaViewMut, LaunchConfig, PushKernelArg};
+use tuili_gpu::{View, ViewMut, LaunchConfig, KernelArg};
 
 use crate::{Kernels, REDUCE_BLOCK, gdn_src};
 
@@ -28,8 +28,8 @@ use crate::{Kernels, REDUCE_BLOCK, gdn_src};
 /// indexes with them; keeping them on the host would mean one launch per
 /// sequence.
 pub struct SeqLayout<'a> {
-    pub first_token: &'a CudaView<'a, i32>,
-    pub n_tokens: &'a CudaView<'a, i32>,
+    pub first_token: &'a View<'a, i32>,
+    pub n_tokens: &'a View<'a, i32>,
     pub n_seqs: usize,
     pub total_tokens: usize,
 }
@@ -93,7 +93,13 @@ impl DeltaVariant {
             // 128 is what `gdn_delta_rule_reg128_f32` is instantiated for. A
             // second instantiation is a one-line change, but every one costs
             // NVRTC time on a cold cache for a shape no checkpoint here uses.
-            Self::Auto if dk == 128 && dv == 128 => Self::Reg,
+            // The register-resident kernel is CUDA-only: it rests on a
+            // per-thread state slice, `__shfl_xor_sync` partner reductions and
+            // a double-buffered shared stage that were tuned against a specific
+            // register budget. The global one is ported and is what a backend
+            // without it takes -- slower by the ratio in the note above, and
+            // correct.
+            Self::Auto if dk == 128 && dv == 128 && cfg!(feature = "cuda") => Self::Reg,
             Self::Auto => Self::Global,
             other => other,
         }
@@ -109,6 +115,7 @@ impl Kernels {
     /// over `dk` unrolls, and a dynamically indexed local array compiles fine,
     /// runs fine, and puts the state back in the DRAM the whole exercise was
     /// about. Non-zero here means the optimization did not happen.
+    #[cfg(feature = "cuda")]
     pub fn gdn_kernel_registers(&self, name: &str) -> Result<(i32, i32, i32)> {
         let f = self.dev.kernels().get("tuili_gdn", gdn_src(), name)?;
         Ok((f.num_regs()?, f.shared_size_bytes()?, f.local_size_bytes()?))
@@ -116,10 +123,11 @@ impl Kernels {
 
     /// Blocks an SM the driver will make resident for a GatedDeltaNet kernel at
     /// a given block size and dynamic shared request.
+    #[cfg(feature = "cuda")]
     pub fn gdn_occupancy_blocks(&self, name: &str, threads: u32, dynamic: usize) -> Result<u32> {
         let f = self.dev.kernels().get("tuili_gdn", gdn_src(), name)?;
         if dynamic > 48 * 1024 {
-            tuili_cuda::set_max_dynamic_shared(&f, dynamic as u32)?;
+            tuili_gpu::set_max_dynamic_shared(&f, dynamic as u32)?;
         }
         Ok(f.occupancy_max_active_blocks_per_multiprocessor(threads, dynamic, None)?)
     }
@@ -132,10 +140,10 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_conv(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        x: &CudaView<'_, f32>,
-        state: &mut CudaViewMut<'_, f32>,
-        w: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
+        x: &View<'_, f32>,
+        state: &mut ViewMut<'_, f32>,
+        w: &View<'_, f32>,
         seqs: &SeqLayout<'_>,
         channels: usize,
         k: usize,
@@ -186,12 +194,12 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_gate_decay(
         &self,
-        beta: &mut CudaViewMut<'_, f32>,
-        g: &mut CudaViewMut<'_, f32>,
-        a: &CudaView<'_, f32>,
-        b_in: &CudaView<'_, f32>,
-        a_log: &CudaView<'_, f32>,
-        dt_bias: &CudaView<'_, f32>,
+        beta: &mut ViewMut<'_, f32>,
+        g: &mut ViewMut<'_, f32>,
+        a: &View<'_, f32>,
+        b_in: &View<'_, f32>,
+        a_log: &View<'_, f32>,
+        dt_bias: &View<'_, f32>,
         n_tokens: usize,
         heads: usize,
         // `stride` is the row pitch of `a` and `b`: `heads` when they are their
@@ -244,7 +252,7 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_qk_l2norm(
         &self,
-        qkv: &mut CudaViewMut<'_, f32>,
+        qkv: &mut ViewMut<'_, f32>,
         n_tokens: usize,
         key_heads: usize,
         dk: usize,
@@ -307,17 +315,18 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_delta_rule(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        state: &mut CudaViewMut<'_, f32>,
-        qkv: &CudaView<'_, f32>,
-        g: &CudaView<'_, f32>,
-        beta: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
+        state: &mut ViewMut<'_, f32>,
+        qkv: &View<'_, f32>,
+        g: &View<'_, f32>,
+        beta: &View<'_, f32>,
         seqs: &SeqLayout<'_>,
         heads: usize,
         key_heads: usize,
         dk: usize,
         dv: usize,
         offsets: (usize, usize, usize, usize),
+        v_tiled: bool,
     ) -> Result<()> {
         self.gdn_delta_rule_variant(
             out,
@@ -331,6 +340,7 @@ impl Kernels {
             dk,
             dv,
             offsets,
+            v_tiled,
             DeltaVariant::Auto,
         )
     }
@@ -345,17 +355,20 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_delta_rule_variant(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        state: &mut CudaViewMut<'_, f32>,
-        qkv: &CudaView<'_, f32>,
-        g: &CudaView<'_, f32>,
-        beta: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
+        state: &mut ViewMut<'_, f32>,
+        qkv: &View<'_, f32>,
+        g: &View<'_, f32>,
+        beta: &View<'_, f32>,
         seqs: &SeqLayout<'_>,
         heads: usize,
         key_heads: usize,
         dk: usize,
         dv: usize,
         offsets: (usize, usize, usize, usize),
+        // Whether the checkpoint stores V heads tiled rather than grouped by
+        // key head; see `LinearAttnConfig::v_heads_tiled`.
+        v_tiled: bool,
         variant: DeltaVariant,
     ) -> Result<()> {
         let (stride, q_off, k_off, v_off) = offsets;
@@ -406,7 +419,7 @@ impl Kernels {
         // asks for more without it fails with an invalid-value error rather
         // than falling back to something smaller.
         if shared > 48 * 1024 {
-            tuili_cuda::set_max_dynamic_shared(&f, shared as u32).with_context(|| {
+            tuili_gpu::set_max_dynamic_shared(&f, shared as u32).with_context(|| {
                 format!(
                     "the shared-memory delta rule wants {shared} bytes a block \
                      for a {dk}x{dv} state, which this device will not give it"
@@ -421,6 +434,7 @@ impl Kernels {
         let (h, kh) = (heads as i32, key_heads as i32);
         let (a, b_) = (dk as i32, dv as i32);
         let (st, qo, ko, vo) = (stride as i32, q_off as i32, k_off as i32, v_off as i32);
+        let vt = i32::from(v_tiled);
         let mut bl = self.dev.stream().launch_builder(&f);
         bl.arg(out)
             .arg(state)
@@ -436,7 +450,8 @@ impl Kernels {
             .arg(&st)
             .arg(&qo)
             .arg(&ko)
-            .arg(&vo);
+            .arg(&vo)
+            .arg(&vt);
         self.dev
             .profile()
             .time("gdn_delta_rule", self.dev.stream(), || {
@@ -453,10 +468,10 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_gated_rmsnorm(
         &self,
-        out: &mut CudaViewMut<'_, f32>,
-        x: &CudaView<'_, f32>,
-        z: &CudaView<'_, f32>,
-        weight: &CudaView<'_, f32>,
+        out: &mut ViewMut<'_, f32>,
+        x: &View<'_, f32>,
+        z: &View<'_, f32>,
+        weight: &View<'_, f32>,
         rows: usize,
         dv: usize,
         eps: f32,
@@ -492,9 +507,9 @@ impl Kernels {
     /// split down the middle — the split down the middle also runs.
     pub fn split_interleaved(
         &self,
-        q: &mut CudaViewMut<'_, f32>,
-        gate: &mut CudaViewMut<'_, f32>,
-        src: &CudaView<'_, f32>,
+        q: &mut ViewMut<'_, f32>,
+        gate: &mut ViewMut<'_, f32>,
+        src: &View<'_, f32>,
         n_tokens: usize,
         heads: usize,
         head_dim: usize,
@@ -532,8 +547,8 @@ impl Kernels {
     /// config's `output_gate_type: "swish"`.
     pub fn sigmoid_gate(
         &self,
-        x: &mut CudaViewMut<'_, f32>,
-        gate: &CudaView<'_, f32>,
+        x: &mut ViewMut<'_, f32>,
+        gate: &View<'_, f32>,
         n: usize,
     ) -> Result<()> {
         debug_assert!(x.len() >= n && gate.len() >= n);

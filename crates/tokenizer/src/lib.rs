@@ -28,6 +28,16 @@ mod token_type {
     pub const BYTE: i64 = 6;
 }
 
+/// Whether this vocabulary family was trained through an NFC normalizer.
+///
+/// Inference, and only needed for a GGUF: the format has no normalizer field.
+/// Every Qwen `tokenizer.json` declares NFC; GPT-2 and Llama-3 declare none,
+/// and adding one there would change tokenisation for text that those models
+/// tokenise correctly today.
+fn nfc_for(pre_kind: &str) -> bool {
+    matches!(pre_kind, "qwen2" | "qwen35")
+}
+
 pub struct Tokenizer {
     /// id -> piece, still in the byte-level alphabet.
     pieces: Vec<String>,
@@ -37,6 +47,19 @@ pub struct Tokenizer {
     bpe: Bpe,
     bytelevel: ByteLevel,
     pre: PreTokenizer,
+    /// Whether to compose the input to NFC before splitting it.
+    ///
+    /// Both Qwen `tokenizer.json` files declare `"normalizer": {"type": "NFC"}`,
+    /// and the model was trained through it, so `cafe` + U+0301 has to become
+    /// `café` before the split sees it or the bytes handed to BPE are not the
+    /// bytes it has merges for.
+    ///
+    /// A GGUF does not record this. `tokenizer.ggml.*` has a `pre` and a
+    /// `model` and no normalizer field, because llama.cpp does not normalize for
+    /// byte-level BPE at all -- so for a GGUF it has to be inferred from the
+    /// vocabulary family, which is what `nfc_for` does. Reading it off
+    /// `tokenizer.json` when there is one is strictly better and that path does.
+    nfc: bool,
 
     specials: Vec<(String, u32)>,
     special_ids: FxHashSet<u32>,
@@ -169,6 +192,7 @@ impl Tokenizer {
             byte_ids,
             bpe,
             bytelevel,
+            nfc: nfc_for(pre.kind()),
             pre,
             specials,
             special_ids,
@@ -302,6 +326,18 @@ impl Tokenizer {
             .collect();
 
         let pre = PreTokenizer::from_json(&tj["pre_tokenizer"])?;
+        // Declared, so no inference needed. Only NFC is recognised: it is what
+        // every byte-level BPE checkpoint this reader has seen uses, and a
+        // different one silently ignored would be worse than a refusal.
+        let declared_nfc = match tj["normalizer"]["type"].as_str() {
+            None => None,
+            Some("NFC") => Some(true),
+            Some(other) => anyhow::bail!(
+                "tokenizer.json declares a `{other}` normalizer; this reader \
+                 implements NFC only, and applying the wrong one changes the \
+                 bytes BPE merges over"
+            ),
+        };
 
         // `tokenizer_config.json` names its special tokens; look the strings up.
         let id_of = |v: &serde_json::Value| -> Option<u32> {
@@ -346,6 +382,7 @@ impl Tokenizer {
             byte_ids,
             bpe,
             bytelevel,
+            nfc: declared_nfc.unwrap_or_else(|| nfc_for(pre.kind())),
             pre,
             specials,
             special_ids,
@@ -468,6 +505,21 @@ impl Tokenizer {
 
     fn encode_ordinary(&self, text: &str, out: &mut Vec<u32>) {
         if text.is_empty() {
+            return;
+        }
+        // Per ordinary segment rather than over the whole input, which is where
+        // Hugging Face applies it too: added tokens are matched on the raw text
+        // first and only the text between them is normalised. Normalising first
+        // would let a composition change the bytes of a marker.
+        //
+        // `is_nfc_quick` is a table lookup per character and says Yes for all
+        // ASCII, so text that is already composed -- nearly all of it -- pays
+        // nothing and never allocates.
+        if self.nfc && !matches!(unicode_normalization::is_nfc_quick(text.chars()), unicode_normalization::IsNormalized::Yes) {
+            let composed: String = unicode_normalization::UnicodeNormalization::nfc(text.chars()).collect();
+            for piece in self.pre.split(&composed) {
+                self.encode_pretoken(piece, out);
+            }
             return;
         }
         for piece in self.pre.split(text) {

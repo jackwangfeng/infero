@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
-use tuili_model::{BatchItem, KvPool, MAX_BATCH_TOKENS, Model, Sampler, SeqId, VisionFeatures};
+use tuili_model::{BatchItem, KvPool, Model, Sampler, SeqId, VisionFeatures};
 use tuili_tokenizer::Tokenizer;
 
 use crate::engine::{Event, FinishReason, PendingImage, Request};
@@ -208,7 +208,22 @@ impl Scheduler {
         // an ordinary prompt is one pass, narrow enough that `scores` stays at
         // `heads * 64 * max_seq` rather than a prompt's worth of it.
         const PRIME_CHUNK: usize = 64;
-        if !self.model.load_mtp_head(dir, PRIME_CHUNK.max(k + 1))? {
+        let rows = PRIME_CHUNK.max(k + 1);
+        // Where the head lives depends on how the model was packaged. A
+        // safetensors checkpoint keeps it among its own shards, so the directory
+        // is the whole address. A GGUF keeps it in a second file — llama.cpp's
+        // conversion writes `mtp-<model>.gguf`, a standalone 65-block model, and
+        // leaves the text model's file ending at `blk.63` — so the path has to
+        // be found rather than derived.
+        let found = if std::path::Path::new(dir).is_dir() {
+            self.model.load_mtp_head(dir, rows)?
+        } else if let Some(side) = mtp_sidecar(dir) {
+            tracing::info!(path = %side.display(), "MTP sidecar");
+            self.model.load_mtp_head_gguf(&side, rows)?
+        } else {
+            false
+        };
+        if !found {
             tracing::info!("this checkpoint has no MTP head; speculation stays off");
             return Ok(false);
         }
@@ -426,6 +441,17 @@ impl Scheduler {
                     accept = format!("{:.2}", self.spec_tokens as f64 / self.spec_steps as f64),
                     "per-round timing"
                 );
+                // The per-kernel table, which the device layer has been
+                // accumulating all along and nothing was printing. Beside the
+                // draft/verify split because the two are one question: that
+                // split says *which half* the round is spent in, and this says
+                // which kernel inside it. Reset with the window so the next
+                // hundred rounds are read on their own.
+                let report = self.model.device().profile().report();
+                if !report.is_empty() {
+                    tracing::warn!("per-kernel, last {} rounds:\n{report}", self.spec_window);
+                }
+                self.model.device().profile().reset();
                 self.spec_draft_ms = 0.0;
                 self.spec_verify_ms = 0.0;
                 self.spec_after_ms = 0.0;
@@ -658,6 +684,20 @@ impl Scheduler {
                         batch = plan.len(),
                         "per-step timing"
                     );
+                    // The same per-kernel table the speculative window prints,
+                    // so the two are comparable. That comparison is the whole
+                    // point: a verification pass costs 1.71x a one-row step
+                    // where a *batched* two-row step costs 1.40x, and 21 ms of
+                    // that gap is not accounted for by anything countable --
+                    // the extra GDN launches are 0.8 ms of state traffic, the
+                    // rollback journal is 13 MiB. Whatever it is, it is a kernel
+                    // that behaves differently at two rows of one sequence than
+                    // at one row, and only this table can name it.
+                    let report = self.model.device().profile().report();
+                    if !report.is_empty() {
+                        tracing::warn!("per-kernel, last {} steps:\n{report}", self.window);
+                    }
+                    self.model.device().profile().reset();
                     self.t_issue = 0.0;
                     self.t_sample = 0.0;
                     self.t_advance = 0.0;
@@ -733,21 +773,25 @@ impl Scheduler {
         );
         // The splice that writes the tower's output runs once, over one
         // `BatchItem`, so the whole placeholder run has to fit in a single
-        // step — `forward_batch_device` refuses more than `MAX_BATCH_TOKENS`
-        // in one pass, and that ceiling sizes fixed scratch buffers, not a
-        // preference `plan` could work around by splitting across steps the
-        // way it already does for plain text. `vision_max_patches` bounds the
-        // resize target; this is the check that turns a resize past what one
-        // step can carry into a clear refusal instead of an internal error
-        // that would otherwise surface as every *other* running request
-        // failing alongside this one, once the batch it landed in overruns
-        // the ceiling.
+        // step — `forward_batch_device` refuses more than `self.model
+        // .batch_tokens()` in one pass, and that ceiling sizes fixed scratch
+        // buffers, not a preference `plan` could work around by splitting
+        // across steps the way it already does for plain text. This is now a
+        // per-model value, not the old fixed `MAX_BATCH_TOKENS` — a wide-head
+        // model's own attention-score buffer can pull it below that ceiling,
+        // and checking against the compile-time constant here would accept a
+        // request `forward_batch_device` then had to refuse anyway, taking
+        // every *other* running request down with it once the batch it landed
+        // in overran the real limit. `vision_max_patches` bounds the resize
+        // target; this is the check that turns a resize past what one step
+        // can carry into a clear refusal instead of that internal error.
+        let batch_tokens = self.model.batch_tokens();
         let expanded_len = prompt.len() - 1 + tokens;
         anyhow::ensure!(
-            expanded_len <= MAX_BATCH_TOKENS,
+            expanded_len <= batch_tokens,
             "this image resizes to {tokens} language-model tokens ({th}x{tw} \
              at patch {}), and the rest of the prompt is {} more — {expanded_len} \
-             total, over the {MAX_BATCH_TOKENS} one prefill step can carry. \
+             total, over the {batch_tokens} this model's prefill step can carry. \
              Send a smaller image; splitting one image's placeholder run \
              across steps is not supported yet",
             shape.patch,
@@ -903,7 +947,7 @@ impl Scheduler {
     /// Decide who gets tokens this step.
     fn plan(&self) -> Vec<(usize, Work)> {
         let mut plan = Vec::with_capacity(self.running.len());
-        let mut budget = MAX_BATCH_TOKENS;
+        let mut budget = self.model.batch_tokens();
 
         // A fresh vision sequence's placeholder splice runs once, over one
         // `BatchItem`, so its whole prompt has to land in a single step rather
@@ -911,8 +955,9 @@ impl Scheduler {
         // comment on the second loop. Reserving its length here, before
         // decodes draw from the same budget, is what guarantees it that room:
         // `admit`'s token-count check already bounds it to fit inside
-        // `MAX_BATCH_TOKENS` on its own, so this cannot starve every decode in
-        // the batch, only reduce how many of them fit into this one step.
+        // `self.model.batch_tokens()` on its own, so this cannot starve every
+        // decode in the batch, only reduce how many of them fit into this one
+        // step.
         // `encode_pending_image` also guarantees there is at most one such
         // sequence at a time — a second one, if it were somehow admitted,
         // would simply wait for a later step, the same as any prefill does
@@ -1215,4 +1260,50 @@ pub fn make_pool(model: &Model, max_seqs: usize, slots: Option<usize>) -> Result
     model
         .new_pool(lo, max_seqs)
         .context("allocating the kv pool")
+}
+
+/// The MTP sidecar beside a GGUF model, if there is one.
+///
+/// `TUILI_MTP` names it outright. Otherwise this looks in the model's own
+/// directory for a single `mtp*.gguf`, which is what llama.cpp's conversion
+/// produces and what the ggml-org repacks ship. Two of them is ambiguous rather
+/// than a reason to guess, so it takes neither and speculation stays off — a
+/// user with two heads should say which.
+fn mtp_sidecar(model: &str) -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("TUILI_MTP") {
+        let p = std::path::PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+        tracing::warn!(path = %p.display(), "TUILI_MTP does not name a file");
+        return None;
+    }
+    let path = std::path::Path::new(model);
+    if path.extension().is_none_or(|e| e != "gguf") {
+        return None;
+    }
+    let dir = path.parent()?;
+    let mut hits: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().is_some_and(|e| e == "gguf")
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("mtp"))
+        })
+        .collect();
+    hits.sort();
+    match hits.len() {
+        1 => hits.pop(),
+        0 => None,
+        n => {
+            tracing::warn!(
+                count = n,
+                "several mtp*.gguf beside the model; name one with TUILI_MTP"
+            );
+            None
+        }
+    }
 }

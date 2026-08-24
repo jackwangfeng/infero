@@ -20,6 +20,30 @@ const QWEN2: &str = concat!(
     r"|\s+",
 );
 
+// Qwen3.5 / Qwen3.8, read off `tokenizer.json` in `Qwen/Qwen3.8-27B` rather
+// than guessed from the family name.
+//
+// `QWEN2` with one change: combining marks count as letters. A decomposed
+// accent, Devanagari matras, Arabic and Hebrew diacritics, Thai vowel signs --
+// under `QWEN2` each of those is a `\p{M}` that falls to the punctuation
+// alternative and cuts the word it belongs to in half.
+//
+// llama.cpp writes `qwen35` into `tokenizer.ggml.pre` for these checkpoints,
+// which matched nothing here, and the unknown-name fallback is `GPT2`. That is
+// the wrong neighbour to fall back to: `GPT2` takes digits in runs where every
+// Qwen takes them one at a time, and only allows a *space* before a word where
+// Qwen allows any single non-letter -- so `("hello` chunks differently. This is
+// what the 27B has been serving with.
+const QWEN35: &str = concat!(
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)",
+    r"|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+",
+    r"|\p{N}",
+    r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*",
+    r"|\s*[\r\n]+",
+    r"|\s+(?!\S)",
+    r"|\s+",
+);
+
 const LLAMA3: &str = concat!(
     r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])",
     r"|[^\r\n\p{L}\p{N}]?\p{L}+",
@@ -72,6 +96,7 @@ impl PreTokenizer {
         }
         let name = match find_split(node) {
             Some(p) if p == LLAMA3 || p == LLAMA3_HF => "llama3",
+            Some(p) if p == QWEN35 => "qwen35",
             Some(p) if p == QWEN2 => "qwen2",
             Some(p) if p == GPT2 => "gpt2",
             Some(p) => {
@@ -89,6 +114,7 @@ impl PreTokenizer {
 
     fn from_name(pre: &str) -> Result<Self> {
         let (kind, pattern) = match pre {
+            "qwen35" | "qwen3" => ("qwen35", QWEN35),
             "qwen2" => ("qwen2", QWEN2),
             "llama3" | "llama-v3" | "llama-bpe" => ("llama3", LLAMA3),
             "default" | "gpt-2" | "gpt2" | "olmo" | "jais" => ("gpt2", GPT2),

@@ -307,6 +307,9 @@ fn the_delta_rule_matches_the_reference() -> Result<()> {
         DK,
         DV,
         off,
+        // V heads grouped by key head, as a Hugging Face checkpoint
+        // stores them.
+        false,
     )?;
     k.device().synchronize()?;
 
@@ -394,6 +397,9 @@ fn the_recurrence_carries_state_across_calls() -> Result<()> {
                 DK,
                 DV,
                 off,
+                // V heads grouped by key head, as a Hugging Face checkpoint
+                // stores them.
+                false,
             )?;
             k.device().synchronize()?;
             let piece = stream.clone_dtoh(&out)?;
@@ -480,6 +486,9 @@ fn two_sequences_in_one_batch_keep_separate_state() -> Result<()> {
         DK,
         DV,
         off,
+        // V heads grouped by key head, as a Hugging Face checkpoint
+        // stores them.
+        false,
     )?;
     k.device().synchronize()?;
     let batched = stream.clone_dtoh(&out)?;
@@ -523,6 +532,9 @@ fn two_sequences_in_one_batch_keep_separate_state() -> Result<()> {
             DK,
             DV,
             off,
+            // V heads grouped by key head, as a Hugging Face checkpoint
+            // stores them.
+            false,
         )?;
         k.device().synchronize()?;
         let solo = stream.clone_dtoh(&alone)?;
@@ -811,6 +823,9 @@ fn run_variant(
             DK,
             DV,
             off,
+            // V heads grouped by key head, as a Hugging Face checkpoint
+            // stores them.
+            false,
             variant,
         )?;
         k.device().synchronize()?;
@@ -926,6 +941,9 @@ fn the_fallback_kernels_keep_sequences_apart_and_idle_slots_untouched() -> Resul
             DK,
             DV,
             off,
+            // V heads grouped by key head, as a Hugging Face checkpoint
+            // stores them.
+            false,
             variant,
         )?;
         k.device().synchronize()?;
@@ -1044,6 +1062,9 @@ fn a_non_square_head_shape_falls_back_and_still_matches_the_reference() -> Resul
         dk,
         dv,
         off,
+        // V heads grouped by key head, as a Hugging Face checkpoint
+        // stores them.
+        false,
     )?;
     k.device().synchronize()?;
     let got = stream.clone_dtoh(&d_out)?;
@@ -1069,6 +1090,9 @@ fn a_non_square_head_shape_falls_back_and_still_matches_the_reference() -> Resul
         dk,
         dv,
         off,
+        // V heads grouped by key head, as a Hugging Face checkpoint
+        // stores them.
+        false,
         DeltaVariant::Reg,
     );
     assert!(
