@@ -4316,6 +4316,39 @@ impl Kernels {
         // The group width is the smallest specialisation that covers the rows,
         // and `token0 = tgid.y * T` in `GEMV_PROLOGUE` means the grid follows
         // from it without the kernel knowing which one it is.
+        // Rows one threadgroup owns.
+        //
+        // Four for a batch, one for a decode step, and the asymmetry is
+        // measured rather than chosen. `out[n] = W . x` re-reads the whole
+        // activation for every output row, so the activation traffic is
+        // `n * k * 4` against the weights' `n * k * 4.5/8` -- 7.1x -- and four
+        // rows sharing one load divides it by four. But at one token that
+        // traffic is not yet binding: Q4_K measures 1.50 TB/s of combined
+        // weight-plus-activation traffic there, and the four block reductions
+        // and the extra registers cost 7%. At two tokens it is 1.81 TB/s, which
+        // is the wall, and sharing wins:
+        //
+        //   ffn_gate/up Q4_K   1 tok  0.26 -> 0.28 ms   (four rows loses)
+        //                      2 tok  0.41 -> 0.35      1.17x
+        //                      4 tok  0.68 -> 0.46      1.48x
+        //
+        // The gain growing with the token count is the signature of activation
+        // traffic being what is amortised, and it is why the same change did
+        // nothing when first tried at one token.
+        //
+        // Q4_K only so far: Q8_0 already amortises (1.04x at two tokens, so
+        // there is nothing to win) and Q6_K does not (1.74x) but is one launch
+        // a step against 448.
+        let rows = if cfg!(feature = "cuda") || n_tokens < 2 || ty != WeightType::Q4K {
+            1
+        } else {
+            4
+        };
+        // Tokens one group carries. Capped at four rather than eight for the
+        // multi-row path, because `gemv_q4_K` at eight tokens measures 3.95 ms
+        // where two four-token launches measure 0.92 -- the wide kernel is
+        // *worse than looping* past four, which is also why four concurrent
+        // sequences cost 3.23x a step instead of ~1.1x.
         let per = if cfg!(feature = "cuda") {
             GEMV_TOKENS_PER_BLOCK as usize
         } else {
@@ -4323,10 +4356,13 @@ impl Kernels {
                 0 | 1 => 1,
                 2 => 2,
                 3 | 4 => 4,
+                _ if rows > 1 => 4,
                 _ => GEMV_TOKENS_PER_BLOCK as usize,
             }
         };
-        let name = if per == GEMV_TOKENS_PER_BLOCK as usize {
+        let name = if rows > 1 {
+            format!("gemv{per}x{rows}_{}", ty.suffix())
+        } else if per == GEMV_TOKENS_PER_BLOCK as usize {
             format!("gemv_{}", ty.suffix())
         } else {
             format!("gemv{per}_{}", ty.suffix())
@@ -4336,12 +4372,35 @@ impl Kernels {
         // block idles most of its threads and still pays for the block-wide
         // reduction, which for the vocab projection is the difference between
         // one warp and eight.
+        // Capped well below `REDUCE_BLOCK`, and the cap is the point.
+        //
+        // Sizing the group to the work is right as far as it goes -- an
+        // oversized group idles threads and still pays for the block-wide
+        // reduction -- but "to the work" was reading as "one unit of work a
+        // thread", and at that width the kernel is a launch and a reduction with
+        // nothing in between. Measured on an M4 Max, the same kernel and the
+        // same answer at five group widths:
+        //
+        //   ffn_gate/up Q4_K   32:190.2  64:183.2  128:183.2  160:130.2  256:132.0
+        //   ffn_down    Q4_K   32:176.5  64:175.0  128:187.3  160:184.0  256:183.7
+        //   attn_qkv    Q8_0   32:209.7  64:217.7  128:221.1  160:196.1  256:188.1
+        //   output.w    Q6_K   32:154.5  64:152.4  128:150.7  160:149.8  256:145.4
+        //
+        // `ffn_gate/up` is the shape this rule chose 160 for, because Q4_K at
+        // k = 5120 is exactly 160 work items -- and 160 is the worst column in
+        // its row by 1.46x. Every one of these four is fastest at or below 128,
+        // so 128 is the cap; two of them peak there and the other two give up
+        // 3-4% against their own best, which is not worth a per-shape table.
+        //
+        // A thread looping four or five times over its own chunk hides the
+        // reduction behind real work. One doing a single chunk cannot.
+        const GEMV_BLOCK_MAX: u32 = 128;
         let block = (ty.gemv_work_items(k) as u32)
             .next_multiple_of(32)
-            .clamp(32, REDUCE_BLOCK);
+            .clamp(32, GEMV_BLOCK_MAX);
         let cfg = LaunchConfig {
             grid_dim: (
-                n as u32,
+                (n as u32).div_ceil(rows as u32),
                 (n_tokens as u32).div_ceil(per as u32).max(1),
                 1,
             ),

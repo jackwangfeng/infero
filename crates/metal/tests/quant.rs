@@ -138,8 +138,24 @@ fn noise(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-/// Check `gemv` on the first `rows` rows of a real tensor.
-fn check(g: &Gguf, name: &str, kernel: &str, rows: usize, tol: f32) -> Result<()> {
+/// Check a mat-vec on the first `rows` rows of a real tensor.
+///
+/// `tokens` is how many activation rows the launch carries and `per_group` how
+/// many output rows one threadgroup owns -- the two dimensions the kernel family
+/// is specialised over. Every `(token, row)` output is checked, not a sample:
+/// the multi-row kernels index `out[token * n + row]` and clamp their weight
+/// reads to `n - 1` for a tail group, so a wrong index or a missing write guard
+/// shows up as one bad element and nowhere else.
+fn check_at(
+    g: &Gguf,
+    name: &str,
+    kernel: &str,
+    rows: usize,
+    tokens: usize,
+    per_group: u32,
+    tok_per_group: u32,
+    tol: f32,
+) -> Result<()> {
     let dev = Device::new(0)?;
     let s = dev.stream();
     let t = g.tensor(name)?;
@@ -148,13 +164,15 @@ fn check(g: &Gguf, name: &str, kernel: &str, rows: usize, tol: f32) -> Result<()
     let bytes_per_row = t.n_bytes / n;
     let raw = &g.data(t)[..rows * bytes_per_row];
 
-    let x = noise(k, 4242);
+    // A different activation per token, so a kernel that reads token 0's row for
+    // every token cannot pass.
+    let x: Vec<f32> = (0..tokens).flat_map(|t| noise(k, 4242 + t as u64)).collect();
     let dw = s.memcpy_stod(raw)?;
     let dx = s.memcpy_stod(&x)?;
-    let mut out = s.alloc_zeros::<f32>(rows)?;
+    let mut out = s.alloc_zeros::<f32>(rows * tokens)?;
 
     let f = dev.kernels().get("quant", &src(), kernel)?;
-    let (ki, ni, ti) = (k as i32, rows as i32, 1i32);
+    let (ki, ni, ti) = (k as i32, rows as i32, tokens as i32);
     let mut b = s.launch_builder(&f);
     b.arg(&out.as_view_mut())
         .arg(&dw.as_view())
@@ -164,8 +182,12 @@ fn check(g: &Gguf, name: &str, kernel: &str, rows: usize, tol: f32) -> Result<()
         .arg(&ti);
     unsafe {
         b.launch(LaunchConfig {
-            grid_dim: (rows as u32, 1, 1),
-            block_dim: (256, 1, 1),
+            grid_dim: (
+                (rows as u32).div_ceil(per_group),
+                (tokens as u32).div_ceil(tok_per_group).max(1),
+                1,
+            ),
+            block_dim: (128, 1, 1),
             shared_mem_bytes: 0,
         })?
     };
@@ -173,19 +195,25 @@ fn check(g: &Gguf, name: &str, kernel: &str, rows: usize, tol: f32) -> Result<()
 
     let got = out.to_vec();
     let mut worst = 0.0f32;
-    let mut at = 0usize;
+    let mut at = (0usize, 0usize);
     for r in 0..rows {
         let w = dequant_row(t.ty, &raw[r * bytes_per_row..(r + 1) * bytes_per_row], k);
-        let want: f32 = (0..k).map(|i| w[i] * x[i]).sum();
-        let e = (got[r] - want).abs() / want.abs().max(1.0);
-        if e > worst {
-            worst = e;
-            at = r;
+        for tk in 0..tokens {
+            let want: f32 = (0..k).map(|i| w[i] * x[tk * k + i]).sum();
+            let e = (got[tk * rows + r] - want).abs() / want.abs().max(1.0);
+            if e > worst {
+                worst = e;
+                at = (tk, r);
+            }
         }
     }
-    eprintln!("  {name:34} {kernel:12} {rows} rows, worst {worst:.3e}");
-    assert!(worst <= tol, "{name} via {kernel}: {worst:.3e} at row {at}");
+    eprintln!("  {name:30} {kernel:14} {rows} rows x {tokens} tok, worst {worst:.3e}");
+    assert!(worst <= tol, "{name} via {kernel}: {worst:.3e} at token {} row {}", at.0, at.1);
     Ok(())
+}
+
+fn check(g: &Gguf, name: &str, kernel: &str, rows: usize, tol: f32) -> Result<()> {
+    check_at(g, name, kernel, rows, 1, 1, 1, tol)
 }
 
 #[test]
@@ -196,6 +224,28 @@ fn the_quantized_matvecs_match_a_host_dequant() -> Result<()> {
     check(&g, "blk.0.ffn_gate.weight", "gemv_q4_K", 64, 2e-3)?;
     check(&g, "output.weight", "gemv_q6_K", 64, 2e-3)?;
     check(&g, "token_embd.weight", "gemv_q4_K", 64, 2e-3)?;
+    Ok(())
+}
+
+/// The four-rows-a-threadgroup Q4_K mat-vec, which is the one the engine
+/// launches for a batch of two or more.
+///
+/// 67 rows on purpose: not a multiple of four, so the last group owns three real
+/// rows and one that does not exist. That group still reads a real row's weights
+/// -- clamped, to keep the loop uniform -- and must not write the answer.
+#[test]
+fn the_multi_row_matvec_matches_a_host_dequant() -> Result<()> {
+    let Some(g) = model() else { return Ok(()) };
+    for (kernel, tokens, tok_per_group) in [
+        ("gemv1x4_q4_K", 1usize, 1u32),
+        ("gemv2x4_q4_K", 2, 2),
+        ("gemv4x4_q4_K", 4, 4),
+        // Fewer tokens than the specialisation carries, which is what a
+        // verification pass at k = 2 hands the four-token kernel.
+        ("gemv4x4_q4_K", 3, 4),
+    ] {
+        check_at(&g, "blk.0.ffn_gate.weight", kernel, 67, tokens, 4, tok_per_group, 2e-3)?;
+    }
     Ok(())
 }
 

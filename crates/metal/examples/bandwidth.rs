@@ -156,6 +156,14 @@ fn main() -> Result<()> {
             b'4' => 4,
             _ => 8,
         };
+        // The group width the host would choose for this shape, capped at 128.
+        let items = match kernel.as_bytes()[kernel.len() - 1] {
+            b'0' => k / 8,            // q8_0
+            b'K' if kernel.contains("q4") => k / 32,
+            b'K' => k / 4,            // q6_K
+            _ => k,
+        } as u32;
+        let block = items.next_multiple_of(32).clamp(32, 128);
         let t = ms(
             || {
                 let mut b = s.launch_builder(&f);
@@ -172,7 +180,7 @@ fn main() -> Result<()> {
                             (tokens as u32).div_ceil(per_block).max(1),
                             1,
                         ),
-                        block_dim: (256, 1, 1),
+                        block_dim: (block, 1, 1),
                         shared_mem_bytes: 0,
                     })?
                 };
@@ -187,6 +195,117 @@ fn main() -> Result<()> {
             gbs / best * 100.0,
             t / tokens as f64
         );
+    }
+    // ---- 3b. four output rows a threadgroup -------------------------------
+    println!("\n  one row a group vs four (Q4_K, one token)");
+    for (label, k, n_rows) in [
+        ("ffn_gate/up", 5120usize, 17408usize),
+        ("ffn_down   ", 17408, 5120),
+    ] {
+        let bytes = (k * n_rows) as f64 * 144.0 / 256.0;
+        let w = s.alloc_zeros::<u8>(bytes as usize)?;
+        let x = s.alloc_zeros::<f32>(k * 4)?;
+        let mut o = s.alloc_zeros::<f32>(n_rows * 4)?;
+        let ki = k as i32;
+        let ni = n_rows as i32;
+        let mut line = format!("  {label} ");
+        for (kernel, rows, tokens) in [
+            ("gemv1_q4_K", 1u32, 1usize),
+            ("gemv1x4_q4_K", 4, 1),
+            ("gemv2_q4_K", 1, 2),
+            ("gemv2x4_q4_K", 4, 2),
+            ("gemv4_q4_K", 1, 4),
+            ("gemv4x4_q4_K", 4, 4),
+        ] {
+            let f = dev.kernels().get("quant", &quant, kernel)?;
+            let ti = tokens as i32;
+            let per_tok = if kernel.starts_with("gemv1") { 1u32 } else if kernel.starts_with("gemv2") { 2 } else { 4 };
+            let mut best_g = 0.0f64;
+            let mut best_ms = f64::INFINITY;
+            for block in [32u32, 64, 128] {
+                let t = ms(
+                    || {
+                        let mut b = s.launch_builder(&f);
+                        b.arg(&o.as_view_mut())
+                            .arg(&w.as_view())
+                            .arg(&x.as_view())
+                            .arg(&ki)
+                            .arg(&ni)
+                            .arg(&ti);
+                        unsafe {
+                            b.launch(LaunchConfig {
+                                grid_dim: (
+                                    (n_rows as u32).div_ceil(rows),
+                                    (tokens as u32).div_ceil(per_tok).max(1),
+                                    1,
+                                ),
+                                block_dim: (block, 1, 1),
+                                shared_mem_bytes: 0,
+                            })?
+                        };
+                        s.synchronize()
+                    },
+                    5,
+                )?;
+                best_g = best_g.max(bytes / (t / 1e3) / 1e9);
+                best_ms = best_ms.min(t);
+            }
+            let _ = best_g;
+            line.push_str(&format!("  {tokens}tok x{rows}row: {best_ms:5.2}ms"));
+        }
+        println!("{line}");
+    }
+
+    // ---- 4. how much of a mat-vec is its block reduction ------------------
+    //
+    // The host sizes the threadgroup from `gemv_work_items(k)`, so a Q4_K
+    // mat-vec at k = 5120 gets 160 threads and each one handles exactly one
+    // 32-element block: no loop, and the whole kernel is a launch plus a
+    // block-wide reduction. That should be visible as a block-size sweep with a
+    // minimum well below 160 -- fewer threads, each looping, and the reduction
+    // over fewer lanes.
+    //
+    // The loop is `for (c = tid.x; c < chunks; c += tgdim.x)`, self-bounding at
+    // any width, so every row here computes the same answer.
+    println!("\n  block-size sweep (same kernel, same answer, different group width)");
+    for (label, kernel, k, n_rows, bytes_per_256) in [
+        ("ffn_gate/up  Q4_K", "gemv1_q4_K", 5120usize, 17408usize, 144.0f64),
+        ("ffn_down     Q4_K", "gemv1_q4_K", 17408, 5120, 144.0),
+        ("attn_qkv     Q8_0", "gemv1_q8_0", 5120, 10240, 34.0 * 8.0),
+        ("output.w     Q6_K", "gemv1_q6_K", 5120, 248320, 210.0),
+    ] {
+        let bytes = (k * n_rows) as f64 * bytes_per_256 / 256.0;
+        let w = s.alloc_zeros::<u8>(bytes as usize)?;
+        let x = s.alloc_zeros::<f32>(k)?;
+        let mut o = s.alloc_zeros::<f32>(n_rows)?;
+        let f = dev.kernels().get("quant", &quant, kernel)?;
+        let (ki, ni, ti) = (k as i32, n_rows as i32, 1i32);
+        let mut line = format!("  {label} ");
+        for block in [32u32, 64, 128, 160, 256] {
+            let t = ms(
+                || {
+                    let mut b = s.launch_builder(&f);
+                    b.arg(&o.as_view_mut())
+                        .arg(&w.as_view())
+                        .arg(&x.as_view())
+                        .arg(&ki)
+                        .arg(&ni)
+                        .arg(&ti);
+                    unsafe {
+                        b.launch(LaunchConfig {
+                            grid_dim: (n_rows as u32, 1, 1),
+                            block_dim: (block, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?
+                    };
+                    s.synchronize()
+                },
+                5,
+            )?;
+            let gbs = bytes / (t / 1e3) / 1e9;
+            line.push_str(&format!(" {block:>4}:{gbs:6.1}"));
+        }
+        println!("{line}  GB/s");
     }
     Ok(())
 }

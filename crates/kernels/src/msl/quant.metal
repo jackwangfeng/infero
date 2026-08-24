@@ -429,3 +429,82 @@ DEQUANT_KERNEL(dequant_f16_f16, deq_f16)
 DEQUANT_KERNEL(dequant_q8_0_f16, deq_q8_0)
 DEQUANT_KERNEL(dequant_q4_K_f16, deq_q4_K)
 DEQUANT_KERNEL(dequant_q6_K_f16, deq_q6_K)
+
+// ---- four output rows a threadgroup ----------------------------------------
+//
+// The experiment behind the rollout below it. `out[n] = W[n][k] . x[k]` reads
+// n*k*4.5/8 bytes of Q4_K weight and, one row a threadgroup, re-reads the whole
+// activation for every row: n*k*4 bytes, **7.1x the weight traffic**. The
+// activation is 20 KiB and stays in cache, so this is not DRAM -- it is load
+// issue, and it is why decoding one token sat at 36-45% of this machine's
+// streaming ceiling while reading four and a half bits a weight, why loading
+// the weights as `uint4` bought 5%, and why a second token is not free.
+//
+// Four rows in one group share one activation load, so that traffic divides by
+// four. The weight loads do not change: each weight byte is still read exactly
+// once, now by four streams instead of one.
+#define GEMV_ROWS 4
+
+#define GEMV_BODY_ROWS_Q4_K(T)                                                 \
+    BLOCK_REDUCE_SCRATCH                                                       \
+    const int row0 = int(tgid.x) * GEMV_ROWS;                                  \
+    const int token0 = int(tgid.y) * (T);                                      \
+    const int ntok = min((T), n_tokens - token0);                              \
+    const int nb = k / QK_K;                                                   \
+    float acc[GEMV_ROWS][(T)];                                                 \
+    for (int r = 0; r < GEMV_ROWS; ++r)                                        \
+        for (int t = 0; t < (T); ++t) acc[r][t] = 0.0f;                        \
+    for (int c = int(tid.x); c < nb * 8; c += int(tgdim.x)) {                   \
+        const int g = c % 8;                                                   \
+        const int base = (c / 8) * QK_K + g * 32;                              \
+        const int s0 = (g & 1) ? 4 : 0;                                        \
+        float d[GEMV_ROWS], mn[GEMV_ROWS];                                     \
+        device const uint4* q[GEMV_ROWS];                                      \
+        for (int r = 0; r < GEMV_ROWS; ++r) {                                   \
+            device const block_q4_K* blk = (device const block_q4_K*)w         \
+                + size_t(min(row0 + r, n - 1)) * nb + c / 8;                   \
+            uchar sc, m;                                                       \
+            q4k_scale_min(blk->scales, g, &sc, &m);                            \
+            d[r] = float(blk->d) * float(sc);                                  \
+            mn[r] = float(blk->dmin) * float(m);                               \
+            q[r] = (device const uint4*)(device const void*)                    \
+                (blk->qs + (g / 2) * 32);                                      \
+        }                                                                      \
+        for (int v = 0; v < 2; ++v) {                                          \
+            uint4 quad[GEMV_ROWS];                                             \
+            for (int r = 0; r < GEMV_ROWS; ++r) quad[r] = q[r][v];             \
+            for (int wi = 0; wi < 4; ++wi) {                                   \
+                const int idx = base + v * 16 + wi * 4;                        \
+                float4 wv[GEMV_ROWS];                                          \
+                for (int r = 0; r < GEMV_ROWS; ++r) {                          \
+                    const uint pk = quad[r][wi];                               \
+                    wv[r] = float4(                                            \
+                        d[r] * float((pk >> s0) & 0xF) - mn[r],                \
+                        d[r] * float((pk >> (s0 + 8)) & 0xF) - mn[r],          \
+                        d[r] * float((pk >> (s0 + 16)) & 0xF) - mn[r],         \
+                        d[r] * float((pk >> (s0 + 24)) & 0xF) - mn[r]);        \
+                }                                                              \
+                /* One activation load a token, spent on all GEMV_ROWS rows. */\
+                for (int t = 0; t < (T); ++t) {                                \
+                    if (t >= ntok) continue;                                   \
+                    const packed_float4 xv = *(device const packed_float4*)     \
+                        (x + size_t(token0 + t) * k + idx);                    \
+                    for (int r = 0; r < GEMV_ROWS; ++r) {                       \
+                        acc[r][t] += wv[r][0] * xv[0] + wv[r][1] * xv[1]        \
+                                   + wv[r][2] * xv[2] + wv[r][3] * xv[3];      \
+                    }                                                          \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+    for (int r = 0; r < GEMV_ROWS; ++r) {                                       \
+        for (int t = 0; t < (T); ++t) {                                        \
+            const float total = BLOCK_SUM(acc[r][t], tid.x, tgdim.x);          \
+            if (tid.x == 0 && t < ntok && row0 + r < n)                        \
+                out[size_t(token0 + t) * n + row0 + r] = total;                \
+        }                                                                      \
+    }
+
+kernel void gemv1x4_q4_K(GEMV_ARGS) { GEMV_BODY_ROWS_Q4_K(1) }
+kernel void gemv2x4_q4_K(GEMV_ARGS) { GEMV_BODY_ROWS_Q4_K(2) }
+kernel void gemv4x4_q4_K(GEMV_ARGS) { GEMV_BODY_ROWS_Q4_K(4) }
