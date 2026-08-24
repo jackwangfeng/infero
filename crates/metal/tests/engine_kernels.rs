@@ -23,6 +23,14 @@ fn mmvq() -> String {
 /// `RMS_REGS` in the MSL; the host sizes the block so `block * REGS >= d`.
 const RMS_REGS: usize = 8;
 
+fn grid1(n: u32, block: u32) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (n.div_ceil(block).max(1), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
 fn rms_block(d: usize) -> u32 {
     ((d as u32).div_ceil(RMS_REGS as u32))
         .next_multiple_of(32)
@@ -626,6 +634,244 @@ fn the_matvec_matches_the_host_at_many_tokens() -> Result<()> {
             2e-3,
             &format!("gemv_f16 n_tokens={n_tokens}"),
         );
+    }
+    Ok(())
+}
+
+/// Rotary over separate q and k buffers.
+///
+/// Not the packed one: the fused projection needs `has_mmvq`, which is false on
+/// this backend, so the engine takes the unfused path and this is the kernel
+/// that runs. The two differ in more than plumbing -- this one indexes each
+/// buffer by its *own* head count, where the packed one strides a shared row.
+#[test]
+fn the_unpacked_rope_matches_the_host() -> Result<()> {
+    let dev = Device::new(0)?;
+    let s = dev.stream();
+    let (n_heads, n_kv, d_head, rotary) = (14usize, 2usize, 64usize, 64usize);
+    let n_tokens = 3usize;
+    let theta = 1e6f32;
+
+    let q0 = noise(n_tokens * n_heads * d_head, 71);
+    let k0 = noise(n_tokens * n_kv * d_head, 73);
+    let positions: Vec<i32> = vec![0, 5, 11];
+    let freq = vec![1.0f32; rotary / 2];
+
+    let mut dq = s.memcpy_stod(&q0)?;
+    let mut dk = s.memcpy_stod(&k0)?;
+    let dpos = s.memcpy_stod(&positions)?;
+    let dfreq = s.memcpy_stod(&freq)?;
+
+    let f = dev.kernels().get("ops", &ops(), "rope_qk_f32")?;
+    let (nh, nkv, dh, rot) = (n_heads as i32, n_kv as i32, d_head as i32, rotary as i32);
+    let (th, fs, il) = (theta, 1.0f32, 0i32);
+    let mut b = s.launch_builder(&f);
+    b.arg(&dq.as_view_mut())
+        .arg(&dk.as_view_mut())
+        .arg(&dpos.as_view())
+        .arg(&dfreq.as_view())
+        .arg(&nh)
+        .arg(&nkv)
+        .arg(&dh)
+        .arg(&rot)
+        .arg(&th)
+        .arg(&fs)
+        .arg(&il);
+    unsafe {
+        b.launch(LaunchConfig {
+            grid_dim: (1, (n_heads + n_kv) as u32, n_tokens as u32),
+            block_dim: ((rotary / 2) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        })?
+    };
+    s.synchronize()?;
+
+    let half = rotary / 2;
+    let mut wq = q0.clone();
+    let mut wk = k0.clone();
+    for t in 0..n_tokens {
+        for y in 0..(n_heads + n_kv) {
+            let is_q = y < n_heads;
+            let head = if is_q { y } else { y - n_heads };
+            let heads = if is_q { n_heads } else { n_kv };
+            let base = (t * heads + head) * d_head;
+            for i in 0..half {
+                let inv = theta.powf(-2.0 * i as f32 / rotary as f32);
+                let ang = positions[t] as f32 * inv;
+                let (sa, ca) = (ang.sin(), ang.cos());
+                let src = if is_q { &q0 } else { &k0 };
+                let (a, bb) = (src[base + i], src[base + i + half]);
+                let dst = if is_q { &mut wq } else { &mut wk };
+                dst[base + i] = a * ca - bb * sa;
+                dst[base + i + half] = a * sa + bb * ca;
+            }
+        }
+    }
+    close(&dq.to_vec(), &wq, 2e-5, "rope_qk_f32 (q)");
+    close(&dk.to_vec(), &wk, 2e-5, "rope_qk_f32 (k)");
+    Ok(())
+}
+
+/// The unpacked KV store, which is what the unfused path uses.
+#[test]
+fn the_unpacked_kv_store_matches_the_host() -> Result<()> {
+    let dev = Device::new(0)?;
+    let s = dev.stream();
+    let (n_kv, d_head, n_slots, n_tokens) = (2usize, 64usize, 32usize, 3usize);
+    let k = noise(n_tokens * n_kv * d_head, 81);
+    let v = noise(n_tokens * n_kv * d_head, 83);
+    let slots: Vec<i32> = vec![5, 17, 30];
+
+    let dk = s.memcpy_stod(&k)?;
+    let dv = s.memcpy_stod(&v)?;
+    let dslots = s.memcpy_stod(&slots)?;
+    let mut kpool = s.alloc_zeros::<half::f16>(n_kv * n_slots * d_head)?;
+    let mut vpool = s.alloc_zeros::<half::f16>(n_kv * n_slots * d_head)?;
+
+    let f = dev.kernels().get("ops", &ops(), "store_kv2_f16")?;
+    let (nkv, dh, ns, nt) = (n_kv as i32, d_head as i32, n_slots as i32, n_tokens as i32);
+    let mut b = s.launch_builder(&f);
+    b.arg(&kpool.as_view_mut())
+        .arg(&vpool.as_view_mut())
+        .arg(&dk.as_view())
+        .arg(&dv.as_view())
+        .arg(&dslots.as_view())
+        .arg(&nkv)
+        .arg(&dh)
+        .arg(&ns)
+        .arg(&nt);
+    unsafe {
+        b.launch(LaunchConfig {
+            grid_dim: (1, (2 * n_kv) as u32, n_tokens as u32),
+            block_dim: (d_head as u32, 1, 1),
+            shared_mem_bytes: 0,
+        })?
+    };
+    s.synchronize()?;
+
+    let (gk, gv) = (kpool.to_vec(), vpool.to_vec());
+    for t in 0..n_tokens {
+        for h in 0..n_kv {
+            for i in 0..d_head {
+                let dst = (h * n_slots + slots[t] as usize) * d_head + i;
+                let src = (t * n_kv + h) * d_head + i;
+                assert_eq!(gk[dst], half::f16::from_f32(k[src]), "k {t}/{h}/{i}");
+                assert_eq!(gv[dst], half::f16::from_f32(v[src]), "v {t}/{h}/{i}");
+            }
+        }
+    }
+    eprintln!("  store_kv2_f16                     exact");
+    Ok(())
+}
+
+/// The slot table, which is what makes the paged pool addressable.
+///
+/// Never exercised before this: the paged-attention test supplied a table by
+/// hand. If this kernel writes nothing, attention gathers from a slot no
+/// sequence owns -- a zeroed one -- and contributes nothing to the residual,
+/// which reads as a *smaller* residual rather than a corrupt one.
+#[test]
+fn the_slot_table_is_written_where_attention_reads_it() -> Result<()> {
+    let dev = Device::new(0)?;
+    let s = dev.stream();
+    let stride = 64usize;
+    let n_seqs = 3usize;
+
+    let seq_of: Vec<i32> = vec![0, 0, 1, 2, 2, 2];
+    let positions: Vec<i32> = vec![0, 1, 0, 0, 1, 2];
+    let slots: Vec<i32> = vec![11, 12, 40, 5, 6, 7];
+    let n_tokens = seq_of.len();
+
+    let dseq = s.memcpy_stod(&seq_of)?;
+    let dpos = s.memcpy_stod(&positions)?;
+    let dslots = s.memcpy_stod(&slots)?;
+    // Prefilled with a sentinel, so "wrote nothing" is distinguishable from
+    // "wrote zero".
+    let mut table = s.memcpy_stod(&vec![-1i32; n_seqs * stride])?;
+
+    let f = dev.kernels().get("ops", &ops(), "write_slot_table")?;
+    let (st, nt) = (stride as i32, n_tokens as i32);
+    let mut b = s.launch_builder(&f);
+    b.arg(&table.as_view_mut())
+        .arg(&dseq.as_view())
+        .arg(&dpos.as_view())
+        .arg(&dslots.as_view())
+        .arg(&st)
+        .arg(&nt);
+    unsafe {
+        b.launch(LaunchConfig {
+            grid_dim: ((n_tokens as u32).div_ceil(256).max(1), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        })?
+    };
+    s.synchronize()?;
+
+    let got = table.to_vec();
+    for i in 0..n_tokens {
+        let at = seq_of[i] as usize * stride + positions[i] as usize;
+        assert_eq!(
+            got[at], slots[i],
+            "sequence {} position {} should hold slot {}",
+            seq_of[i], positions[i], slots[i]
+        );
+    }
+    // And nothing else moved.
+    let written: std::collections::HashSet<usize> = (0..n_tokens)
+        .map(|i| seq_of[i] as usize * stride + positions[i] as usize)
+        .collect();
+    for (i, v) in got.iter().enumerate() {
+        if !written.contains(&i) {
+            assert_eq!(*v, -1, "table[{i}] was written and should not have been");
+        }
+    }
+    eprintln!("  write_slot_table                  exact");
+    Ok(())
+}
+
+/// The elementwise adds, which nothing had checked numerically.
+///
+/// They are three lines each and therefore the last place anyone looks, which
+/// is exactly why they get a test: the residual stream is the one buffer every
+/// layer both reads and writes, and an add that covers part of a row leaves a
+/// model that runs at plausible magnitudes.
+#[test]
+fn the_elementwise_adds_cover_the_whole_row() -> Result<()> {
+    let dev = Device::new(0)?;
+    let s = dev.stream();
+    // 896 is this model's d_model and is *not* a multiple of 256, so a grid
+    // that rounds the wrong way loses the tail.
+    for &n in &[896usize, 5120, 1, 257] {
+        let a = noise(n, 91);
+        let b = noise(n, 93);
+        let da = s.memcpy_stod(&a)?;
+        let db = s.memcpy_stod(&b)?;
+        let n_i = n as i32;
+
+        let mut acc = s.memcpy_stod(&a)?;
+        let f = dev.kernels().get("ops", &ops(), "add_assign_f32")?;
+        let mut bl = s.launch_builder(&f);
+        bl.arg(&acc.as_view_mut()).arg(&db.as_view()).arg(&n_i);
+        // The grid the *host* uses, not a convenient one: `add_assign_f32`
+        // takes four elements a thread, so `Kernels::add_assign` launches
+        // `elementwise(n / 4)`. A test that sizes the grid for one element a
+        // thread passes against a kernel that does one -- and the engine then
+        // adds a quarter of every residual. Which is exactly what happened.
+        unsafe { bl.launch(grid1((n as u32).div_ceil(4), 256))? };
+
+        let mut sum = s.alloc_zeros::<f32>(n)?;
+        let f = dev.kernels().get("ops", &ops(), "add_f32")?;
+        let mut bl = s.launch_builder(&f);
+        bl.arg(&sum.as_view_mut())
+            .arg(&da.as_view())
+            .arg(&db.as_view())
+            .arg(&n_i);
+        unsafe { bl.launch(grid1(n as u32, 256))? };
+        s.synchronize()?;
+
+        let want: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x + y).collect();
+        close(&acc.to_vec(), &want, 0.0, &format!("add_assign_f32 n={n}"));
+        close(&sum.to_vec(), &want, 0.0, &format!("add_f32 n={n}"));
     }
     Ok(())
 }

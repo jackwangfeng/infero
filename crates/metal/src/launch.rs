@@ -206,6 +206,19 @@ impl LaunchBuilder {
             ));
         }
 
+        // `TUILI_METAL_TRACE=<kernel>` reports the geometry a dispatch was
+        // actually given, which is the only way to tell a wrong grid from a
+        // wrong kernel when the numbers come out partially right.
+        static TRACE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        if let Some(want) = TRACE.get_or_init(|| std::env::var("TUILI_METAL_TRACE").ok()) {
+            if want == "*" || *want == self.func.name {
+                eprintln!(
+                    "  dispatch {:<24} groups {:?} threads {:?} smem {} args {}",
+                    self.func.name, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes,
+                    self.args.len()
+                );
+            }
+        }
         enc.dispatchThreadgroups_threadsPerThreadgroup(grid, group);
         enc.endEncoding();
         cb.commit();

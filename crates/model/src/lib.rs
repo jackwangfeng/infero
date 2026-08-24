@@ -1236,6 +1236,18 @@ impl Model {
                         // the loaded weights rather than from a stride, so a
                         // model with a different interleaving needs no change
                         // here.
+                        // `TUILI_EMBED_PROBE=1` reports the residual before
+                        // any block runs -- the embedding alone. A divergence
+                        // that is already present here is a gather or a token
+                        // id, not a layer.
+                        if layer == 0 && std::env::var_os("TUILI_EMBED_PROBE").is_some() {
+                            let stream = self.kern.device().stream();
+                            let row = stream.clone_dtoh(&self.act.x.slice(..d))?;
+                            self.kern.device().synchronize()?;
+                            let rms =
+                                (row.iter().map(|v| v * v).sum::<f32>() / d as f32).sqrt();
+                            tracing::info!(rms, first = row[0], "embedding probe");
+                        }
                         if self.layer_kinds[layer] {
                             self.linear_attention(layer, n_tokens, pool, s)?;
                         } else {
@@ -2145,6 +2157,7 @@ impl Model {
                 want_h,
             )?
         };
+        probe(&self.kern, layer, "after_attn_norm", &self.act.xb.slice(..n * d));
 
         // All three read the same Q8_1 activation, so one launch covers them.
         // Two hundred and twenty-five mat-vecs back to back run at 328 GB/s
@@ -2511,6 +2524,9 @@ impl Model {
                         dims.n_slots,
                         n,
                     )?;
+                    probe(&self.kern, layer, "q_after_rope", &self.act.q.slice(..n * da));
+                    probe(&self.kern, layer, "k_after_rope", &self.act.k.slice(..n * kv_dim));
+                    probe(&self.kern, layer, "v", &self.act.v.slice(..n * kv_dim));
                 }
 
                 let table = pool.slot_table().as_view();
@@ -2602,6 +2618,7 @@ impl Model {
                         kv_len,
                         Some(&mut partial.as_view_mut()),
                     )?;
+                    probe(&self.kern, layer, "attn_out", &self.act.attn.slice(..n * da));
                 }
             }
             Some(tq) => {
@@ -2784,6 +2801,8 @@ impl Model {
             self.kern
                 .add_bias(&mut self.act.proj.slice_mut(..n * d), &b.as_view(), d, n)?;
         }
+        probe(&self.kern, layer, "o_proj_out", &self.act.proj.slice(..n * d));
+        probe(&self.kern, layer, "x_before_add", &self.act.x.slice(..n * d));
         if !self.ffn_norm_takes_residual(layer, n) {
             self.kern.add_assign(
                 &mut self.act.x.slice_mut(..n * d),
@@ -2791,6 +2810,7 @@ impl Model {
                 n * d,
             )?;
         }
+        probe(&self.kern, layer, "x_after_attn", &self.act.x.slice(..n * d));
         Ok(())
     }
 
@@ -3067,6 +3087,7 @@ impl Model {
                 n * d,
             )?;
         }
+        probe(&self.kern, layer, "after_ffn", &self.act.x.slice(..self.cfg.d_model));
         Ok(())
     }
 
@@ -3498,6 +3519,33 @@ impl Model {
             w.k,
             w.n,
         )
+    }
+}
+
+/// `TUILI_PROBE=<layer>` reports the RMS of named intermediates inside that
+/// block. Enough to bisect a block against a second implementation of the same
+/// forward pass -- which is the only way the last two composition bugs were
+/// found, and the only tool that would have found them faster.
+fn probe(kern: &Kernels, layer: usize, name: &'static str, v: &View<'_, f32>) {
+    static WANT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let want = WANT.get_or_init(|| {
+        std::env::var("TUILI_PROBE").ok().and_then(|v| v.parse().ok())
+    });
+    if *want != Some(layer) {
+        return;
+    }
+    let Ok(row) = kern.device().stream().clone_dtoh(v) else { return };
+    let _ = kern.device().synchronize();
+    let n = row.len().max(1);
+    let rms = (row.iter().map(|x| x * x).sum::<f32>() / n as f32).sqrt();
+    tracing::info!(layer, name, rms, len = row.len(), first = row.first().copied(), "probe");
+    // `TUILI_PROBE_DUMP=<dir>` also writes the raw f32, so two implementations
+    // of the same forward pass can be diffed element by element rather than
+    // through summary statistics. RMS and element zero can both agree while the
+    // vectors differ, which is how this cost an hour.
+    if let Ok(dir) = std::env::var("TUILI_PROBE_DUMP") {
+        let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let _ = std::fs::write(format!("{dir}/eng.{name}.f32"), bytes);
     }
 }
 

@@ -22,14 +22,30 @@ kernel void add_f32(device float* out           [[buffer(0)]],
     if (i < n) out[i] = a[i] + b[i];
 }
 
+/// `out += b`, **four elements a thread**.
+///
+/// The count is a contract with the host, which sizes the grid as
+/// `elementwise(n / 4)` -- so a one-element-per-thread body silently covers a
+/// quarter of the row. That is what it did: elements 0..255 of a 896-wide
+/// residual were added and 256..895 were not, which reads as a model that runs
+/// at plausible magnitudes and answers nonsense. Element zero and the RMS of
+/// the *inputs* both agreed, which is why summary statistics did not find it and
+/// an element-by-element diff did, in one look.
+///
+/// Four rather than one for the reason spelled out on `f32_to_f16`: one element
+/// a thread leaves nothing to overlap the load latency against, and the CUDA
+/// side measured 349 GB/s that way. The vectorised branch it then takes is not
+/// ported -- MSL cannot portably check a `device` pointer's alignment -- but
+/// four independent scalars already buy the latency hiding that mattered.
 kernel void add_assign_f32(device float* out          [[buffer(0)]],
                            device const float* b      [[buffer(1)]],
                            constant int& n            [[buffer(2)]],
                            uint3 tgid  [[threadgroup_position_in_grid]],
                            uint3 tid   [[thread_position_in_threadgroup]],
                            uint3 tgdim [[threads_per_threadgroup]]) {
-    const int i = int(tgid.x * tgdim.x + tid.x);
-    if (i < n) out[i] += b[i];
+    const int base = int(tgid.x * tgdim.x + tid.x) * 4;
+    if (base >= n) return;
+    for (int j = base; j < base + 4 && j < n; ++j) out[j] += b[j];
 }
 
 kernel void add_bias_f32(device float* out          [[buffer(0)]],
