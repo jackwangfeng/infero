@@ -19,7 +19,7 @@ use bpe::Bpe;
 use bytelevel::ByteLevel;
 use pretokenize::PreTokenizer;
 
-pub use chat::{ChatMessage, ChatTemplate, ContentPart};
+pub use chat::{ChatMessage, ChatTemplate, ContentPart, ToolCall, ToolCallFunction};
 
 /// GGUF token type tags.
 mod token_type {

@@ -16,6 +16,28 @@ const TEMPLATE_NAME: &str = "chat";
 pub struct ChatMessage {
     pub role: String,
     pub content: ChatContent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+}
+
+/// One function call an assistant turn made, in the shape
+/// `chat_template.jinja` reads (and the shape OpenAI's own `tool_calls`
+/// arrives in, function-wrapped).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ToolCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub function: ToolCallFunction,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ToolCallFunction {
+    pub name: String,
+    /// A JSON *object*, not the JSON *string* OpenAI's wire format uses for
+    /// this field. The template does `tool_call.arguments|items`, which needs
+    /// an actual mapping — parse the wire string into one before building
+    /// this, or minijinja has nothing to iterate.
+    pub arguments: serde_json::Value,
 }
 
 /// A message's content, either flat text or an ordered list of parts.
@@ -93,6 +115,7 @@ impl ChatMessage {
         Self {
             role: role.into(),
             content: content.into(),
+            tool_calls: None,
         }
     }
 
@@ -102,6 +125,7 @@ impl ChatMessage {
         Self {
             role: role.into(),
             content: ChatContent::Parts(parts),
+            tool_calls: None,
         }
     }
 
@@ -115,6 +139,15 @@ impl ChatMessage {
 
     pub fn assistant(content: impl Into<ChatContent>) -> Self {
         Self::new("assistant", content)
+    }
+
+    /// The function calls this (assistant) turn made, alongside whatever
+    /// natural-language content it also had. `chat_template.jinja` renders
+    /// these after `content`, matching what the model itself was told: any
+    /// reasoning comes before a call, never after.
+    pub fn with_tool_calls(mut self, calls: Vec<ToolCall>) -> Self {
+        self.tool_calls = Some(calls);
+        self
     }
 }
 
@@ -290,6 +323,32 @@ mod tests {
         let t = ChatTemplate::new(VISION).unwrap();
         let out = t.render(&[ChatMessage::user("hi")], false).unwrap();
         assert_eq!(out, "<|im_start|>user\nhi<|im_end|>\n");
+    }
+
+    /// Qwen3.5's own rendering of an assistant turn's tool calls, reduced to
+    /// what iterating `arguments` needs: `|items` requires a real mapping.
+    /// This is the property [`ToolCallFunction::arguments`] exists to
+    /// guarantee — building it from OpenAI's wire-format *string* without
+    /// parsing first would fail here, not quietly render wrong.
+    const TOOL_CALLS: &str = "{% for m in messages %}\
+        {%- if m.tool_calls %}{% for tc in m.tool_calls %}\
+        {%- if tc.function is defined %}{% set tc = tc.function %}{% endif %}\
+        <function={{ tc.name }}>{% for k, v in tc.arguments|items %}<{{ k }}={{ v }}>{% endfor %}\
+        {%- endfor %}{%- endif %}\
+        {%- endfor %}";
+
+    #[test]
+    fn tool_call_arguments_render_as_a_mapping_not_a_string() {
+        let t = ChatTemplate::new(TOOL_CALLS).unwrap();
+        let msg = ChatMessage::assistant("").with_tool_calls(vec![ToolCall {
+            id: Some("call_1".into()),
+            function: ToolCallFunction {
+                name: "get_weather".into(),
+                arguments: serde_json::json!({"city": "Beijing"}),
+            },
+        }]);
+        let out = t.render(&[msg], false).unwrap();
+        assert_eq!(out, "<function=get_weather><city=Beijing>");
     }
 
     #[test]

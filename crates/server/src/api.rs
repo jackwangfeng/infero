@@ -44,6 +44,17 @@ pub struct ChatRequest {
     /// template treats an *undefined* `enable_thinking` as on.
     #[serde(default)]
     pub chat_template_kwargs: Option<serde_json::Value>,
+    /// OpenAI-shaped function definitions, passed through to the template
+    /// untouched — `chat_template.jinja` does `tool | tojson` on each one
+    /// itself, so there is nothing to translate on the way in.
+    #[serde(default)]
+    pub tools: Option<Vec<serde_json::Value>>,
+    /// Only `"auto"`/absent and `"none"` are honoured. Qwen3.5's template has
+    /// no lever to force or forbid a specific function — it is always "if you
+    /// choose to call one" — so `"required"` or a forced-function object is
+    /// refused rather than silently treated as `"auto"`.
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,6 +130,32 @@ pub struct Message {
     /// Content may arrive as a plain string or as OpenAI's content-part array.
     #[serde(default)]
     pub content: Option<Content>,
+    /// An assistant turn's function calls, when replaying history that made
+    /// one. Absent on every other role.
+    #[serde(default)]
+    pub tool_calls: Option<Vec<InToolCall>>,
+    /// Which call a `role: "tool"` message answers. Accepted for API
+    /// compatibility; Qwen3.5's template does not read it — it matches a
+    /// tool result to its call by turn order, not by id.
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct InToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: InToolCallFunction,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct InToolCallFunction {
+    pub name: String,
+    /// A JSON string on the wire, per OpenAI's spec — `tuili_tokenizer`'s
+    /// `ToolCallFunction::arguments` wants the parsed object instead; see
+    /// `routes::to_chat_message`.
+    pub arguments: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -200,7 +237,29 @@ pub struct ChatChoice {
 #[derive(Debug, Serialize)]
 pub struct ResponseMessage {
     pub role: &'static str,
-    pub content: String,
+    /// `null` rather than `""` when a turn is nothing but tool calls — an
+    /// empty string reads as "the model said nothing" where OpenAI's own
+    /// convention is "there was nothing to say here".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<OutToolCall>>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct OutToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub function: OutToolCallFunction,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct OutToolCallFunction {
+    pub name: String,
+    /// A JSON string, matching OpenAI's own wire shape — the inverse of
+    /// `InToolCallFunction::arguments`.
+    pub arguments: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -225,6 +284,22 @@ pub struct Delta {
     pub role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Every call in one delta rather than split across chunks: this
+    /// server's own scan does not learn a call is complete until the whole
+    /// `</tool_call>` has arrived, so there is nothing to stream
+    /// incrementally the way token-by-token content is. `index` on each
+    /// entry is still the position OpenAI's shape expects.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct ToolCallDelta {
+    pub index: usize,
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub function: OutToolCallFunction,
 }
 
 #[derive(Debug, Serialize)]

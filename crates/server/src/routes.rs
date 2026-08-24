@@ -13,10 +13,14 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures::Stream;
 use tokio::sync::mpsc;
-use tuili_tokenizer::{ChatMessage, ContentPart as TplPart};
+use tuili_tokenizer::{
+    ChatMessage, ContentPart as TplPart, ToolCall as TplToolCall,
+    ToolCallFunction as TplToolCallFunction,
+};
 
 use crate::api::*;
 use crate::engine::{self, Engine, Event, FinishReason, PendingImage, Request};
+use crate::tool_call;
 
 pub fn router(engine: Arc<Engine>) -> Router {
     Router::new()
@@ -134,23 +138,74 @@ async fn models(State(engine): State<Arc<Engine>>) -> impl IntoResponse {
 /// the same request if the template sees them on the sides it rendered them
 /// on, which is why this walks `content`'s parts directly instead of
 /// flattening to text and splicing a marker back in.
-fn to_chat_message(m: &Message) -> ChatMessage {
-    if m.image_urls().is_empty() {
-        return ChatMessage::new(&m.role, m.text());
-    }
-    let Some(Content::Parts(parts)) = &m.content else {
-        // `image_urls()` only returns entries from `Content::Parts`, so
-        // reaching here means a message has neither shape it claims to.
-        unreachable!("a message with image parts has Content::Parts");
+fn to_chat_message(m: &Message) -> Result<ChatMessage, ApiError> {
+    let mut msg = if m.image_urls().is_empty() {
+        ChatMessage::new(&m.role, m.text())
+    } else {
+        let Some(Content::Parts(parts)) = &m.content else {
+            // `image_urls()` only returns entries from `Content::Parts`, so
+            // reaching here means a message has neither shape it claims to.
+            unreachable!("a message with image parts has Content::Parts");
+        };
+        let tpl_parts = parts
+            .iter()
+            .map(|p| match &p.image_url {
+                Some(u) => TplPart::image(u.url.clone()),
+                None => TplPart::text(p.text.clone().unwrap_or_default()),
+            })
+            .collect();
+        ChatMessage::with_parts(&m.role, tpl_parts)
     };
-    let tpl_parts = parts
-        .iter()
-        .map(|p| match &p.image_url {
-            Some(u) => TplPart::image(u.url.clone()),
-            None => TplPart::text(p.text.clone().unwrap_or_default()),
-        })
-        .collect();
-    ChatMessage::with_parts(&m.role, tpl_parts)
+    if let Some(calls) = &m.tool_calls {
+        let tpl_calls = calls
+            .iter()
+            .map(|tc| {
+                // The wire format has `arguments` as a JSON *string*; the
+                // template iterates it with `|items`, which needs an actual
+                // mapping — see `ToolCallFunction::arguments`'s own note.
+                let arguments: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+                    .map_err(|e| {
+                        ApiError::bad_request(format!(
+                            "message.tool_calls[].function.arguments is not valid \
+                             JSON: {e}"
+                        ))
+                    })?;
+                Ok(TplToolCall {
+                    id: Some(tc.id.clone()),
+                    function: TplToolCallFunction { name: tc.function.name.clone(), arguments },
+                })
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        msg = msg.with_tool_calls(tpl_calls);
+    }
+    Ok(msg)
+}
+
+/// Resolve `tools`/`tool_choice` into what the template wants: `None` when
+/// there is nothing to advertise, `Some(tools array)` otherwise.
+///
+/// Refuses anything that would need constrained decoding to honour —
+/// `"required"` or a forced-function object — rather than accepting it and
+/// quietly behaving like `"auto"`. Qwen3.5's template has no such lever; a
+/// caller who asked for one and got ordinary `"auto"` behaviour instead would
+/// not learn that from the response.
+fn resolve_tools(req: &ChatRequest) -> Result<Option<serde_json::Value>, ApiError> {
+    match &req.tool_choice {
+        None => {}
+        Some(v) if v.as_str() == Some("auto") => {}
+        Some(v) if v.as_str() == Some("none") => return Ok(None),
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "tool_choice only supports \"auto\" and \"none\" — this model's \
+                 template has no way to force or forbid a specific function",
+            ));
+        }
+    }
+    Ok(req
+        .tools
+        .as_ref()
+        .filter(|t| !t.is_empty())
+        .map(|t| serde_json::Value::Array(t.clone())))
 }
 
 async fn chat_completions(
@@ -189,9 +244,19 @@ async fn chat_completions(
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?
         .map(|d| PendingImage { rgb: d.rgb, height: d.height, width: d.width });
 
-    let messages: Vec<ChatMessage> = req.messages.iter().map(to_chat_message).collect();
+    let tools_value = resolve_tools(&req)?;
+    let messages: Vec<ChatMessage> = req
+        .messages
+        .iter()
+        .map(to_chat_message)
+        .collect::<Result<Vec<_>, ApiError>>()?;
     let prompt = template
-        .render_with_kwargs(&messages, true, None, req.chat_template_kwargs.as_ref())
+        .render_with_kwargs(
+            &messages,
+            true,
+            tools_value.as_ref(),
+            req.chat_template_kwargs.as_ref(),
+        )
         .map_err(|e| ApiError::bad_request(format!("chat template failed: {e:#}")))?;
 
     // parse_special = true: the template's own markers must become control
@@ -241,25 +306,63 @@ async fn chat_completions(
 
     let model = engine.info.id.clone();
     if req.stream {
-        Ok(Sse::new(chat_stream(rx, model))
+        let tools_for_stream = match &tools_value {
+            Some(serde_json::Value::Array(tools)) => Some(tools.clone()),
+            _ => None,
+        };
+        Ok(Sse::new(chat_stream(rx, model, tools_for_stream))
             .keep_alive(KeepAlive::default())
             .into_response())
     } else {
         let (text, reason, prompt_tokens, completion_tokens) =
             engine::collect(rx).await.map_err(ApiError::from)?;
+        // Only scan when tools were actually advertised this turn — a model
+        // that was never told about them has no reason to write
+        // `<tool_call>`, and scanning anyway would risk mistaking a user
+        // asking "what does a tool_call tag look like?" for one.
+        let (message, finish_reason) = match &tools_value {
+            Some(serde_json::Value::Array(tools)) => {
+                let scan = tool_call::scan(&text, tools);
+                if scan.truncated || scan.calls.is_empty() {
+                    (
+                        ResponseMessage {
+                            role: "assistant",
+                            content: Some(text),
+                            tool_calls: None,
+                        },
+                        reason.as_str(),
+                    )
+                } else {
+                    let calls = scan
+                        .calls
+                        .into_iter()
+                        .map(|c| OutToolCall {
+                            id: request_id("call"),
+                            kind: "function",
+                            function: OutToolCallFunction { name: c.name, arguments: c.arguments },
+                        })
+                        .collect();
+                    (
+                        ResponseMessage {
+                            role: "assistant",
+                            content: (!scan.leading_text.is_empty()).then_some(scan.leading_text),
+                            tool_calls: Some(calls),
+                        },
+                        "tool_calls",
+                    )
+                }
+            }
+            _ => (
+                ResponseMessage { role: "assistant", content: Some(text), tool_calls: None },
+                reason.as_str(),
+            ),
+        };
         Ok(Json(ChatResponse {
             id: request_id("chatcmpl"),
             object: "chat.completion",
             created: now_secs(),
             model,
-            choices: vec![ChatChoice {
-                index: 0,
-                message: ResponseMessage {
-                    role: "assistant",
-                    content: text,
-                },
-                finish_reason: reason.as_str(),
-            }],
+            choices: vec![ChatChoice { index: 0, message, finish_reason }],
             usage: Usage::new(prompt_tokens, completion_tokens),
         })
         .into_response())
@@ -333,9 +436,18 @@ async fn completions(
     }
 }
 
+/// `tools`: `None` for an ordinary request — every `Event::Text` streams as a
+/// content delta exactly as it always has, unchanged by this feature
+/// existing. `Some` holds back anything that could be the start of
+/// `<tool_call>` (reusing `split_at_stop`'s prefix logic against that one
+/// marker) so a client never sees the raw tag; once it is confirmed, content
+/// deltas stop and the turn ends in one `tool_calls` delta instead — there is
+/// no way to know a call is complete before its closing tag has arrived, so
+/// there is nothing to stream incrementally the way token text is.
 fn chat_stream(
     mut rx: mpsc::UnboundedReceiver<Event>,
     model: String,
+    tools: Option<Vec<serde_json::Value>>,
 ) -> impl Stream<Item = Result<SseEvent, Infallible>> {
     let id = request_id("chatcmpl");
     async_stream(move |yielder| async move {
@@ -347,27 +459,53 @@ fn chat_stream(
                 Delta {
                     role: Some("assistant"),
                     content: None,
+                    tool_calls: None,
                 },
                 None,
             ))
             .await;
 
+        let marker = ["<tool_call>".to_string()];
+        let mut pending = String::new();
+        let mut in_tool_call = false;
         let mut reason = FinishReason::Stop;
         while let Some(ev) = rx.recv().await {
             match ev {
                 Event::Text(text) if text.is_empty() => {}
                 Event::Text(text) => {
-                    yielder
-                        .send(chunk_event(
-                            &id,
-                            &model,
-                            Delta {
-                                role: None,
-                                content: Some(text),
-                            },
-                            None,
-                        ))
-                        .await;
+                    if tools.is_none() {
+                        yielder
+                            .send(chunk_event(
+                                &id,
+                                &model,
+                                Delta { role: None, content: Some(text), tool_calls: None },
+                                None,
+                            ))
+                            .await;
+                        continue;
+                    }
+                    pending.push_str(&text);
+                    if in_tool_call {
+                        continue;
+                    }
+                    let released = match crate::stop::split_at_stop(&pending, &marker) {
+                        crate::stop::StopScan::Hit(at) => {
+                            in_tool_call = true;
+                            at
+                        }
+                        crate::stop::StopScan::Release(n) => n,
+                    };
+                    if released > 0 {
+                        let content: String = pending.drain(..released).collect();
+                        yielder
+                            .send(chunk_event(
+                                &id,
+                                &model,
+                                Delta { role: None, content: Some(content), tool_calls: None },
+                                None,
+                            ))
+                            .await;
+                    }
                 }
                 Event::Done { reason: r, .. } => {
                     reason = r;
@@ -381,13 +519,66 @@ fn chat_stream(
             }
         }
 
+        // `pending` holds whatever `<tool_call>` onward looked like when
+        // generation stopped — everything before it was already flushed as
+        // content above. Scan it now that the whole thing (or as much as the
+        // model wrote) has arrived.
+        let mut finish_reason = reason.as_str();
+        if in_tool_call {
+            let tools = tools.as_deref().unwrap_or(&[]);
+            let scan = tool_call::scan(&pending, tools);
+            if !scan.truncated && !scan.calls.is_empty() {
+                if !scan.leading_text.is_empty() {
+                    yielder
+                        .send(chunk_event(
+                            &id,
+                            &model,
+                            Delta {
+                                role: None,
+                                content: Some(scan.leading_text),
+                                tool_calls: None,
+                            },
+                            None,
+                        ))
+                        .await;
+                }
+                let deltas = scan
+                    .calls
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, c)| ToolCallDelta {
+                        index,
+                        id: request_id("call"),
+                        kind: "function",
+                        function: OutToolCallFunction { name: c.name, arguments: c.arguments },
+                    })
+                    .collect();
+                yielder
+                    .send(chunk_event(
+                        &id,
+                        &model,
+                        Delta { role: None, content: None, tool_calls: Some(deltas) },
+                        None,
+                    ))
+                    .await;
+                finish_reason = "tool_calls";
+            } else {
+                // Never completed — a truncated attempt or a false match that
+                // never became a real call. Send what the model actually
+                // wrote rather than silently dropping it.
+                yielder
+                    .send(chunk_event(
+                        &id,
+                        &model,
+                        Delta { role: None, content: Some(pending), tool_calls: None },
+                        None,
+                    ))
+                    .await;
+            }
+        }
+
         yielder
-            .send(chunk_event(
-                &id,
-                &model,
-                Delta::default(),
-                Some(reason.as_str()),
-            ))
+            .send(chunk_event(&id, &model, Delta::default(), Some(finish_reason)))
             .await;
         yielder.send(done_event()).await;
     })

@@ -532,3 +532,53 @@ fn a_remote_image_url_is_refused() {
     assert_eq!(status, 400, "{body}");
     assert!(json(&body)["error"]["message"].as_str().unwrap().contains("data:"), "{body}");
 }
+
+/// `tool_choice: "required"` (or a forced-function object) needs constrained
+/// decoding this engine does not have, so it is refused with a message that
+/// says why rather than silently treated as `"auto"` — a caller who asked for
+/// a guarantee and got best-effort instead would have no way to notice from
+/// the response alone. Needs no model cooperation: this is the server's own
+/// validation, before anything reaches the template.
+#[test]
+fn tool_choice_required_is_refused() {
+    let addr = addr!();
+    let (status, body) = post(
+        addr,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "ping", "parameters": {"type": "object", "properties": {}}}}],
+            "tool_choice": "required",
+            "max_tokens": 4
+        }),
+    );
+    assert_eq!(status, 400, "{body}");
+}
+
+/// Advertising tools does not change an ordinary answer's shape: a request
+/// with nothing worth calling a function for still comes back as plain
+/// `content` with no `tool_calls`, on any model — this does not depend on the
+/// loaded checkpoint understanding Qwen3.5's specific `<tool_call>` format.
+#[test]
+fn tools_present_but_unused_still_answers_normally() {
+    let addr = addr!();
+    let (status, body) = post(
+        addr,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "Say hello in one word."}],
+            "tools": [{"type": "function", "function": {
+                "name": "get_weather",
+                "description": "Get the weather for a city",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+            }}],
+            "temperature": 0,
+            "max_tokens": 20
+        }),
+    );
+    assert_eq!(status, 200, "{body}");
+    let v = json(&body);
+    assert!(v["choices"][0]["message"]["content"].is_string(), "{body}");
+    assert!(v["choices"][0]["message"]["tool_calls"].is_null(), "{body}");
+    assert_eq!(v["choices"][0]["finish_reason"], "stop");
+}

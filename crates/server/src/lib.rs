@@ -8,6 +8,7 @@ pub mod engine;
 pub mod routes;
 pub mod prefix;
 pub mod scheduler;
+pub mod tool_call;
 pub mod vision;
 pub mod stop;
 
