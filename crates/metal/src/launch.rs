@@ -87,6 +87,13 @@ pub enum Arg {
         buf: Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>>,
         offset: usize,
     },
+    /// A null pointer, for the kernels whose second output is optional.
+    ///
+    /// CUDA spells this as a `u64` zero in the packed argument array, because
+    /// there a pointer *is* eight bytes. Metal binds buffers by index, so the
+    /// equivalent is `setBuffer(nil, ...)`, which MSL sees as a null pointer and
+    /// `if (hout)` tests exactly as the CUDA kernel does.
+    Nil,
     /// A scalar, copied into the command buffer. CUDA passes these in the
     /// packed argument array; Metal's `setBytes:` is the same idea, and both
     /// cap out well above the handful of ints and floats these kernels take.
@@ -158,6 +165,9 @@ impl LaunchBuilder {
                 Arg::Buffer { buf, offset } => unsafe {
                     enc.setBuffer_offset_atIndex(Some(buf), *offset, i);
                 },
+                Arg::Nil => unsafe {
+                    enc.setBuffer_offset_atIndex(None, 0, i);
+                },
                 Arg::Bytes(b) => unsafe {
                     let p = NonNull::new(b.as_ptr() as *mut c_void)
                         .ok_or_else(|| anyhow!("null scalar argument"))?;
@@ -227,6 +237,16 @@ impl<T: Elem> KernelArg for ViewMut<'_, T> {
             buf: self.retained_buf(),
             offset: self.byte_offset(),
         }
+    }
+}
+
+/// The marker `b_args` passes where a kernel's optional output is absent.
+#[derive(Debug, Clone, Copy)]
+pub struct NullBuffer;
+
+impl KernelArg for NullBuffer {
+    fn to_arg(&self) -> Arg {
+        Arg::Nil
     }
 }
 

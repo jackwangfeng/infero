@@ -29,6 +29,6 @@ mod profile;
 
 pub use buffer::{Buf, CopyDst, CopySrc, View, ViewMut};
 pub use device::{Caps, Device, Stream};
-pub use launch::{Function, KernelArg, LaunchBuilder, LaunchConfig};
+pub use launch::{Function, KernelArg, LaunchBuilder, LaunchConfig, NullBuffer};
 pub use profile::{Entry, Profile};
 pub use msl::Modules;

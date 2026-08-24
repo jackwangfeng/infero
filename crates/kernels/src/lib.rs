@@ -50,6 +50,7 @@ const COMMON_METAL: &str = include_str!("msl/common.metal");
 const OPS_METAL: &str = include_str!("msl/ops.metal");
 const QUANT_METAL: &str = include_str!("msl/quant.metal");
 const GDN_METAL: &str = include_str!("msl/gdn.metal");
+const MMVQ_METAL: &str = include_str!("msl/mmvq.metal");
 const UNIMPLEMENTED_METAL: &str = include_str!("msl/unimplemented.metal");
 const OPS_CU: &str = include_str!("cu/ops.cu");
 const QUANT_CU: &str = include_str!("cu/quant.cu");
@@ -186,7 +187,7 @@ fn mmvq_src() -> &'static str {
 #[cfg(not(feature = "cuda"))]
 fn mmvq_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    SRC.get_or_init(|| UNIMPLEMENTED_METAL.to_string())
+    SRC.get_or_init(|| format!("{COMMON_METAL}\n{MMVQ_METAL}"))
 }
 
 #[cfg(feature = "cuda")]
@@ -251,14 +252,18 @@ fn b_args(
     eps: f32,
     label: &'static str,
 ) -> Result<()> {
-    let null: u64 = 0;
     let mut b = k.device().stream().launch_builder(f);
     match h_out {
         Some(h) => {
             b.arg(out).arg(h).arg(x).arg(weight).arg(&d).arg(&eps);
         }
         None => {
-            b.arg(out).arg(&null).arg(x).arg(weight).arg(&d).arg(&eps);
+            b.arg(out)
+                .arg(&tuili_gpu::NULL_BUFFER)
+                .arg(x)
+                .arg(weight)
+                .arg(&d)
+                .arg(&eps);
         }
     }
     k.device().profile().time(label, k.device().stream(), || {
@@ -348,7 +353,12 @@ impl Kernels {
         ] {
             self.dev.kernels().get("tuili_gdn", gdn_src(), name)?;
         }
-        // The FP8 unit, warmed the same way and for the same reason.
+        // The FP8 unit, warmed the same way and for the same reason -- and
+        // skipped where the hardware has no FP8 matmul. That is the same fact
+        // `matmul` reads before it dispatches to these, so warming them anyway
+        // would turn a capability the engine already routes around into a
+        // startup failure.
+        if self.dev.caps().fp8 {
         for name in [
             "mmv_f8_block_f32",
             // One per token width; see `fp8::BATCH_KERNELS`, which is what
@@ -363,9 +373,16 @@ impl Kernels {
         ] {
             self.dev.kernels().get("tuili_fp8", fp8_src(), name)?;
         }
+        }
         // And the vision tower, which is its own translation unit again. A
         // multimodal request pays for these once at startup instead of stalling
         // the first image behind NVRTC.
+        //
+        // CUDA-only for now, and for a different reason than FP8: nothing about
+        // Apple hardware prevents these, `vision.cu` simply has no MSL twin
+        // yet. Gating on the feature rather than on a capability says which of
+        // the two it is.
+        #[cfg(feature = "cuda")]
         for name in [
             "vision_layer_norm_f32",
             "vision_gelu_tanh_f32",
@@ -379,6 +396,14 @@ impl Kernels {
         ] {
             self.dev.kernels().get("tuili_vision", vision_src(), name)?;
         }
+        // Every weight type's gemv, row gather and dequantisation.
+        //
+        // CUDA-only: this backend has MSL for a subset of the types, and
+        // warm-up is an optimisation -- it moves a first-token compile stall to
+        // startup. Warming a type the file will never contain would turn that
+        // optimisation into a startup failure, so the Metal path pays the stall
+        // for whichever types its checkpoint actually uses.
+        #[cfg(feature = "cuda")]
         for ty in WeightType::ALL {
             // The transposed AWQ layout is read by the tensor-core GEMM and by
             // the prefill dequantization, and by nothing else yet — the
@@ -422,28 +447,39 @@ impl Kernels {
                 self.dev.kernels().get("tuili_mmvq", mmvq_src(), &name)?;
             }
         }
-        // The tensor-core GEMM, both tile widths. Leaving these out made the
-        // first request after startup pay for NVRTC — 20 tok/s against 27 on
-        // every request after it.
-        if self.dev.caps().int_tensor_gemm {
-            for tag in ["", "2"] {
-                for ty in WeightType::ALL
-                    .iter()
-                    .filter(|t| Self::has_mmq(**t) && **t != WeightType::Q4G128T)
-                {
-                    let name = format!("mmq{tag}_{}", ty.suffix());
-                    self.dev.kernels().get("tuili_mmq", mmq_src(), &name)?;
+        // CUDA-only from here: `mmq.cu` and `turboquant.cu` have no MSL
+        // twins. The dispatch already routes around the first through
+        // `caps().int_tensor_gemm`, and the second is only reached when
+        // `--kv-quant` asks for a compressed cache.
+        #[cfg(feature = "cuda")]
+        {
+            // The tensor-core GEMM, both tile widths. CUDA-only: `mmq.cu` has no
+            // MSL twin, and `caps().int_tensor_gemm` already keeps the dispatch
+            // away from it.
+            //
+            // Leaving these out made the
+            // first request after startup pay for NVRTC — 20 tok/s against 27 on
+            // every request after it.
+            if self.dev.caps().int_tensor_gemm {
+                for tag in ["", "2"] {
+                    for ty in WeightType::ALL
+                        .iter()
+                        .filter(|t| Self::has_mmq(**t) && **t != WeightType::Q4G128T)
+                    {
+                        let name = format!("mmq{tag}_{}", ty.suffix());
+                        self.dev.kernels().get("tuili_mmq", mmq_src(), &name)?;
+                    }
                 }
             }
-        }
-        for name in [
-            "tq_matvec",
-            "tq_store_v",
-            "tq_store_k",
-            "tq_attn_scores",
-            "tq_attn_output",
-        ] {
-            self.dev.kernels().get("tuili_turboquant", tq_src(), name)?;
+            for name in [
+                "tq_matvec",
+                "tq_store_v",
+                "tq_store_k",
+                "tq_attn_scores",
+                "tq_attn_output",
+            ] {
+                self.dev.kernels().get("tuili_turboquant", tq_src(), name)?;
+            }
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "kernels compiled");
         Ok(())
@@ -739,6 +775,12 @@ impl Kernels {
     /// vocabulary rules the kernel out on a card whose limit is 48 KiB without
     /// an opt-in this does not take.
     pub fn can_sample_on_device(vocab: usize, max_top_k: usize) -> bool {
+        // `sample.cu` has no MSL twin yet, so this backend samples on the host.
+        // A shape check that said yes would fail at the kernel lookup instead,
+        // which is a worse way to learn the same thing.
+        if !cfg!(feature = "cuda") {
+            return false;
+        }
         max_top_k <= Self::SAMPLE_MAX_TOP_K && Self::sample_shared(vocab) <= 48 * 1024
     }
 
@@ -926,7 +968,6 @@ impl Kernels {
             shared_mem_bytes: (256 * 4 * 4) as u32,
         };
         let sstride = survivors.as_ref().map_or(0, |x| x.stride) as i32;
-        let null: u64 = 0;
         let mut b2 = self.dev.stream().launch_builder(&f2);
         // The candidates are read-only here; the mutable views were stage one's.
         let cv = cand_v.as_view();
@@ -943,7 +984,7 @@ impl Kernels {
                 b2.arg(x.id).arg(x.p).arg(x.len);
             }
             None => {
-                b2.arg(&null).arg(&null).arg(&null);
+                b2.arg(&tuili_gpu::NULL_BUFFER).arg(&tuili_gpu::NULL_BUFFER).arg(&tuili_gpu::NULL_BUFFER);
             }
         }
         b2.arg(&sstride);
@@ -985,7 +1026,6 @@ impl Kernels {
         let ps = pen_stride as i32;
         let mut b = self.dev.stream().launch_builder(&f);
         let sstride = survivors.as_ref().map_or(0, |v| v.stride) as i32;
-        let null: u64 = 0;
         b.arg(out)
             .arg(logits)
             .arg(params)
@@ -1000,7 +1040,7 @@ impl Kernels {
                 b.arg(v.id).arg(v.p).arg(v.len);
             }
             None => {
-                b.arg(&null).arg(&null).arg(&null);
+                b.arg(&tuili_gpu::NULL_BUFFER).arg(&tuili_gpu::NULL_BUFFER).arg(&tuili_gpu::NULL_BUFFER);
             }
         }
         b.arg(&sstride);
@@ -1621,7 +1661,13 @@ impl Kernels {
         // than one. `d_head` above 128 would not fit the four registers the
         // grouped kernel holds it in.
         let group = dims.n_heads / dims.n_kv_heads.max(1);
-        let gqa = group > 1 && dims.d_head <= 4 * 32 && dims.d_head.is_multiple_of(32);
+        // The GQA-shaped score kernels -- one warp serving a whole query group
+        // instead of one key -- are CUDA-only for now. Saying false takes the
+        // plain per-key kernel, which is ported and correct.
+        let gqa = cfg!(feature = "cuda")
+            && group > 1
+            && dims.d_head <= 4 * 32
+            && dims.d_head.is_multiple_of(32);
         let f = self.dev.kernels().get(
             "tuili_ops",
             ops_src(),
@@ -1946,6 +1992,14 @@ impl Kernels {
     pub fn flash_attention(&self, dims: &AttnDims, kv_len: usize) -> bool {
         // Read once: this is asked per layer per step, and `std::env::var`
         // takes the environment lock and allocates every time.
+        // The split flash path (`attn_flash_f32` plus its reduce) is CUDA-only
+        // for now. False takes the unsplit scores/softmax/output sequence,
+        // which is ported: one threadgroup walks a whole key range instead of
+        // several walking chunks, so a long context loses parallelism rather
+        // than correctness.
+        if !cfg!(feature = "cuda") {
+            return false;
+        }
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| !std::env::var("TUILI_NO_FLASH_ATTN").is_ok_and(|v| v != "0"))
             && self.attn_flash_split(dims, kv_len).is_some()
@@ -2009,6 +2063,14 @@ impl Kernels {
     /// It wants a real query group, a `d_head` its lanes divide evenly, and a
     /// group narrow enough that `group * 32` is a legal block.
     pub fn decode_attention(&self, dims: &AttnDims) -> bool {
+        // `attn_decode_gqa_f32` is CUDA-only for now: it is the fused
+        // three-kernels-in-one that `docs/catching-vllm.md` measured at +4.7%,
+        // and saying false here takes the unfused scores/softmax/output path
+        // instead -- which is ported, correct, and slower by about that much.
+        // Worth porting, and not worth blocking on.
+        if !cfg!(feature = "cuda") {
+            return false;
+        }
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *OFF.get_or_init(|| std::env::var("TUILI_NO_DECODE_ATTN").is_ok_and(|v| v != "0")) {
             return false;
@@ -2369,7 +2431,7 @@ impl Kernels {
             // what makes this affordable: on its own the grouped kernel is a
             // quarter of the grid, which is why the unsplit one below is off.
             let group = dims.n_heads / dims.n_kv_heads.max(1);
-            let gqa = group > 1 && group <= 8;
+            let gqa = cfg!(feature = "cuda") && group > 1 && group <= 8;
             let f = self.dev.kernels().get(
                 "tuili_ops",
                 ops_src(),
@@ -2451,7 +2513,11 @@ impl Kernels {
         // Eight halves per thread and sixteen key slices per block, which is a
         // load width and a count of loads in flight rather than a different
         // sum. `TUILI_ATTN_V1` puts the two-byte version back for A/B.
-        let wide = dims.d_head.is_multiple_of(8)
+        // `attn_output_v4_f32` -- eight halves a thread, sixteen key slices a
+        // block -- and the GQA variant are CUDA-only for now; false takes
+        // `attn_output_f32`, which is ported.
+        let wide = cfg!(feature = "cuda")
+            && dims.d_head.is_multiple_of(8)
             && dims.d_head >= 8
             && std::env::var_os("TUILI_ATTN_V1").is_none();
         let (lanes, slices) = if wide {
@@ -2639,6 +2705,20 @@ impl Kernels {
     /// absent on purpose: it exists for the batched vocab projection, and a
     /// single row never reaches it.
     pub fn has_mmvq(ty: WeightType) -> bool {
+        // The integer mat-vec is CUDA-only for now. It rests on `__dp4a` --
+        // four int8 products retired in one instruction -- and the sensible
+        // Metal equivalent is a different formulation rather than a
+        // transliteration, so `mmvq.cu`'s dot products are not ported.
+        //
+        // Saying false here is not a stub: `matmul` reads exactly this before
+        // it dispatches, and answers with the float `gemv` family, which is
+        // ported and correct. It decodes each weight to f32 instead of
+        // retiring four at a time, so a quantized decode step costs more
+        // instructions for the same bytes -- the first thing to fix when this
+        // backend's mat-vecs are worth optimising.
+        if !cfg!(feature = "cuda") {
+            return false;
+        }
         matches!(
             ty,
             WeightType::Q8_0
@@ -2777,14 +2857,13 @@ impl Kernels {
             shared_mem_bytes: 0,
         };
         let (d_i, eps_f) = (d as i32, eps);
-        let null: u64 = 0;
         let mut bl = self.dev.stream().launch_builder(&f);
         match h_out {
             Some(h) => {
                 bl.arg(out).arg(h);
             }
             None => {
-                bl.arg(out).arg(&null);
+                bl.arg(out).arg(&tuili_gpu::NULL_BUFFER);
             }
         }
         bl.arg(&mut *x).arg(b).arg(weight).arg(&d_i).arg(&eps_f);

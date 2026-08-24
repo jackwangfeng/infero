@@ -10,6 +10,13 @@ pub use cudarc::driver::{
     PushKernelArg as KernelArg,
 };
 pub use crate::nvrtc::Kernel as Function;
+
+/// What a kernel's absent optional output is bound to.
+///
+/// A pointer is eight bytes in CUDA's packed argument array, so a null one is a
+/// `u64` zero. Metal binds buffers by index and uses `setBuffer(nil, ...)`
+/// instead, which is why this is a named constant rather than a literal.
+pub const NULL_BUFFER: u64 = 0;
 pub use cudarc::driver::{CudaEvent as Event, CudaGraph as Graph, PinnedHostSlice};
 pub use cudarc::driver::CudaStream as OwnedStream;
 pub use cudarc::driver::sys::CUevent_flags as EventFlags;

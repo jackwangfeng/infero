@@ -314,7 +314,7 @@ fn store_kv_then_read_it_back() -> Result<()> {
 
     let mut kc = s.alloc_zeros::<f16>(max_pos * total)?;
     let mut vc = s.alloc_zeros::<f16>(max_pos * total)?;
-    let f = dev.kernels().get("ops", &src(), "store_kv_f16")?;
+    let f = dev.kernels().get("ops", &src(), "store_kv_contig_f16")?;
 
     let mut expect_k = vec![f16::ZERO; max_pos * total];
     for pos in 0..3usize {

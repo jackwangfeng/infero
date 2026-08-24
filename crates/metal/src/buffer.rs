@@ -123,10 +123,11 @@ impl<T: Elem> Buf<T> {
 
     /// Read the whole allocation back to the host.
     ///
-    /// Unified memory makes this a `memcpy` from a pointer the GPU also sees,
-    /// so the only thing that has to happen first is that the work which wrote
-    /// it has completed -- which is the caller's business, exactly as it is on
-    /// CUDA.
+    /// Unified memory makes this a `memcpy` from a pointer the GPU also sees.
+    /// It does **not** synchronise -- there is no stream here to synchronise on
+    /// -- so the caller must have waited. `Stream::memcpy_dtoh` is the ordered
+    /// one and is what the engine takes; this is for tests and examples that
+    /// have just called `synchronize` themselves.
     pub fn to_vec(&self) -> Vec<T> {
         let mut out = Vec::with_capacity(self.len);
         // SAFETY: `contents()` is valid for `bytes` and `len * size_of::<T>()`
@@ -369,7 +370,16 @@ impl Stream {
     }
 
     /// Device to host, into a caller-owned slice.
+    /// Device to host, into a caller-owned slice.
+    ///
+    /// Synchronises first, because cudarc's is stream-ordered: it queues behind
+    /// the launches already submitted. Reading `contents()` without waiting
+    /// looks like it works -- unified memory means the pointer is valid -- and
+    /// returns whatever the GPU had written by that instant. Which is most of
+    /// the answer, most of the time, and produced fluent nonsense from the real
+    /// engine while every kernel test passed.
     pub fn memcpy_dtoh<T: Elem, S: CopySrc<T>>(&self, src: &S, dst: &mut [T]) -> Result<()> {
+        self.synchronize()?;
         let src = src.as_src();
         if src.len() > dst.len() {
             return Err(anyhow!(
@@ -405,6 +415,7 @@ impl Stream {
         src: &S,
         dst: &mut D,
     ) -> Result<()> {
+        self.synchronize()?;
         let src = src.as_src();
         let mut dst = dst.as_dst();
         if src.len() > dst.len() {
@@ -432,6 +443,7 @@ impl Stream {
     /// Zero a window. Unified memory makes this a host `write_bytes`, which is
     /// why it takes no kernel: the pages the GPU reads are the ones written.
     pub fn memset_zeros<T: Elem, D: CopyDst<T>>(&self, dst: &mut D) -> Result<()> {
+        self.synchronize()?;
         let mut dst = dst.as_dst();
         // SAFETY: the window is within an allocation and shared storage is
         // host-visible.
@@ -453,7 +465,11 @@ impl Stream {
         Ok(b)
     }
 
+    /// Host to device. Stream-ordered for the same reason the read is: writing
+    /// a buffer a queued kernel has not finished reading would change its input
+    /// underneath it.
     pub fn copy_into<T: Elem>(&self, dst: &mut ViewMut<'_, T>, src: &[T]) -> Result<()> {
+        self.synchronize()?;
         if src.len() > dst.len() {
             return Err(anyhow!(
                 "copying {} elements into a {} element window",
@@ -470,8 +486,9 @@ impl Stream {
         Ok(())
     }
 
-    /// Device to host.
+    /// Device to host. Stream-ordered, as above.
     pub fn memcpy_dtov<T: Elem>(&self, src: &View<'_, T>) -> Result<Vec<T>> {
+        self.synchronize()?;
         let mut out = Vec::with_capacity(src.len());
         // SAFETY: as above.
         unsafe {

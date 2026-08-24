@@ -5,7 +5,10 @@
 
 pub use crate::buffer::{Buf, CopyDst, CopySrc, View, ViewMut};
 pub use crate::device::{Device, Stream};
-pub use crate::launch::{Function, KernelArg, LaunchConfig};
+pub use crate::launch::{Function, KernelArg, LaunchConfig, NullBuffer};
+
+/// What a kernel's absent optional output is bound to.
+pub const NULL_BUFFER: NullBuffer = NullBuffer;
 pub use crate::compat::{
     CaptureMode, Context, Event, EventFlags, Graph, GraphFlags, OwnedStream, PinnedHostSlice,
 };

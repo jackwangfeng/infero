@@ -590,7 +590,7 @@ impl Engine {
         let plane = sess.max_pos * kv;
         let (lo, hi) = (slot * plane, (slot + 1) * plane);
         {
-            let f = self.f("tuili_ops", "store_kv_f16")?;
+            let f = self.f("tuili_ops", "store_kv_contig_f16")?;
             let (nkv, dh, p) = (cfg.n_kv as i32, cfg.d_head as i32, pos as i32);
             let mut b = s.launch_builder(&f);
             b.arg(&sess.kcache.slice_mut(lo..hi))

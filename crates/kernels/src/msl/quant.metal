@@ -232,3 +232,98 @@ kernel void embed_row_q4_K(device float* out            [[buffer(0)]],
         }
     }
 }
+
+// ---- single-element decoders --------------------------------------------
+//
+// The row gather and the whole-matrix dequantisation are generated over these,
+// exactly as `quant.cu` generates them: one function that decodes element `i`
+// of a plane, and two macros that wrap it.
+
+inline float deq_f32(device const void* w, size_t i) {
+    return ((device const float*)w)[i];
+}
+
+inline float deq_f16(device const void* w, size_t i) {
+    return float(((device const half*)w)[i]);
+}
+
+inline float deq_q8_0(device const void* w, size_t i) {
+    device const block_q8_0* b = (device const block_q8_0*)w + i / QK8_0;
+    return float(b->d) * float(b->qs[i % QK8_0]);
+}
+
+inline float deq_q4_K(device const void* w, size_t i) {
+    device const block_q4_K* b = (device const block_q4_K*)w + i / QK_K;
+    const int within = int(i % QK_K);
+    const int group64 = within / 64;    // which pair of 32-element groups
+    const int rem = within % 64;
+    const int high = rem / 32;          // low nibbles first, then high
+    const int l = rem % 32;
+
+    uchar sc, m;
+    q4k_scale_min(b->scales, group64 * 2 + high, &sc, &m);
+
+    const uchar q = b->qs[group64 * 32 + l];
+    const int nib = high ? (q >> 4) : (q & 0xF);
+    return float(b->d) * float(sc) * float(nib) - float(b->dmin) * float(m);
+}
+
+inline float deq_q6_K(device const void* w, size_t i) {
+    device const block_q6_K* b = (device const block_q6_K*)w + i / QK_K;
+    const int within = int(i % QK_K);
+    const int n = within / 128;         // super-block half
+    const int rem = within % 128;
+    const int quarter = rem / 32;       // which of the four interleaved groups
+    const int l = rem % 32;
+
+    device const uchar* ql = b->ql + n * 64;
+    device const uchar* qh = b->qh + n * 32;
+    device const char* sc = b->scales + n * 8;
+
+    const int lo_index = (quarter & 1) ? (l + 32) : l;
+    const int shift = quarter * 2;
+    const uchar low = (quarter < 2) ? (ql[lo_index] & 0xF) : (ql[lo_index] >> 4);
+    const int q = int(low | (((qh[l] >> shift) & 3) << 4)) - 32;
+
+    return float(b->d) * float(sc[quarter * 2 + l / 16]) * float(q);
+}
+
+#define GATHER_KERNEL(NAME, DECODE)                                            \
+    kernel void NAME(device float* out             [[buffer(0)]],              \
+                     device const void* w          [[buffer(1)]],              \
+                     device const int* rows        [[buffer(2)]],              \
+                     constant int& k               [[buffer(3)]],              \
+                     uint3 tgid  [[threadgroup_position_in_grid]],             \
+                     uint3 tid   [[thread_position_in_threadgroup]],           \
+                     uint3 tgdim [[threads_per_threadgroup]]) {                \
+        const int t = int(tgid.y);                                             \
+        const int i = int(tgid.x * tgdim.x + tid.x);                           \
+        if (i >= k) return;                                                    \
+        const size_t src = size_t(rows[t]) * k + i;                           \
+        out[size_t(t) * k + i] = DECODE(w, src);                              \
+    }
+
+GATHER_KERNEL(gather_rows_f32, deq_f32)
+GATHER_KERNEL(gather_rows_f16, deq_f16)
+GATHER_KERNEL(gather_rows_q8_0, deq_q8_0)
+GATHER_KERNEL(gather_rows_q4_K, deq_q4_K)
+GATHER_KERNEL(gather_rows_q6_K, deq_q6_K)
+
+/// Whole-matrix dequantisation to f16, which feeds the prefill GEMM.
+#define DEQUANT_KERNEL(NAME, DECODE)                                           \
+    kernel void NAME(device half* out              [[buffer(0)]],              \
+                     device const void* w          [[buffer(1)]],              \
+                     constant uint& n              [[buffer(2)]],              \
+                     uint3 tgid  [[threadgroup_position_in_grid]],             \
+                     uint3 tid   [[thread_position_in_threadgroup]],           \
+                     uint3 tgdim [[threads_per_threadgroup]]) {                \
+        const uint i = tgid.x * tgdim.x + tid.x;                               \
+        if (i >= n) return;                                                    \
+        out[i] = half(DECODE(w, size_t(i)));                                   \
+    }
+
+DEQUANT_KERNEL(dequant_f32_f16, deq_f32)
+DEQUANT_KERNEL(dequant_f16_f16, deq_f16)
+DEQUANT_KERNEL(dequant_q8_0_f16, deq_q8_0)
+DEQUANT_KERNEL(dequant_q4_K_f16, deq_q4_K)
+DEQUANT_KERNEL(dequant_q6_K_f16, deq_q6_K)

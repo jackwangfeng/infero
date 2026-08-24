@@ -155,10 +155,20 @@ impl<'a> BatchItem<'a> {
     }
 }
 
-/// Above this many tokens a projection goes through cuBLAS instead of the
-/// mat-vec. The mat-vec re-reads the weights once per token, so the crossover
-/// is early.
+/// Above this many tokens a projection goes through the library GEMM instead of
+/// the mat-vec. The mat-vec re-reads the weights once per token, so on CUDA the
+/// crossover is early.
+///
+/// A backend with no GEMM has a different crossover: infinity. The float
+/// mat-vec is correct at any width -- it batches `GEMV_TOKENS` tokens per
+/// threadgroup and its grid covers the rest -- so prefill takes it and pays the
+/// re-reads rather than failing. That is the whole cost of not having
+/// `MPSMatrixMultiplication` wired up yet, and it is a prefill cost only:
+/// decode is one token and never reaches here.
+#[cfg(feature = "cuda")]
 const GEMM_THRESHOLD: usize = 4;
+#[cfg(not(feature = "cuda"))]
+const GEMM_THRESHOLD: usize = MAX_BATCH_TOKENS;
 /// Up to this many tokens, a weight type with no tensor-core GEMM repeats the
 /// integer mat-vec once per token instead of taking the float path. Measured
 /// against Llama-3.1-8B Q4_K_M, whose Q6_K matrices are the ones affected.
@@ -741,7 +751,15 @@ impl Model {
         // illegal on a stream that is capturing. The two tools answer different
         // questions anyway: a graph hides launch cost, and profiling measures
         // it, so asking for one turns the other off.
-        let use_graph = std::env::var_os("TUILI_NO_GRAPH").is_none() && !dev.profile().enabled();
+        // Graph replay needs stream capture, which is CUDA's. Metal's nearest
+        // mechanism is an indirect command buffer -- a fixed argument set
+        // encoded up front rather than a captured stream -- so the replay path
+        // is off here and every step is encoded fresh. That is where a good
+        // part of this backend's per-step overhead lives: 880 dispatches at
+        // 18.3 us of command-buffer submit each.
+        let use_graph = cfg!(feature = "cuda")
+            && std::env::var_os("TUILI_NO_GRAPH").is_none()
+            && !dev.profile().enabled();
         let use_mmq = std::env::var_os("TUILI_NO_MMQ").is_none();
         if !use_mmq {
             tracing::warn!("TUILI_NO_MMQ set: batches will use dequant + cuBLAS");

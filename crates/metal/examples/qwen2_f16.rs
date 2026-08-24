@@ -433,7 +433,7 @@ impl Engine {
             self.rope(&mut sess.k.as_view_mut(), &pos_v, &freq_v, cfg.n_kv)?;
 
             {
-                let f = self.f("store_kv_f16")?;
+                let f = self.f("store_kv_contig_f16")?;
                 let (nkv, dh, p) = (cfg.n_kv as i32, cfg.d_head as i32, pos as i32);
                 let mut b = s.launch_builder(&f);
                 b.arg(&sess.kcache.slice_mut(lo..hi))

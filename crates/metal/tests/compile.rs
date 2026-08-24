@@ -29,7 +29,7 @@ fn every_kernel_compiles_and_resolves() -> Result<()> {
                 "embed_f16",
                 "rms_norm_f32",
                 "rope_neox_f32",
-                "store_kv_f16",
+                "store_kv_contig_f16",
                 "attn_decode_f32",
                 "qk_norm_f32",
                 "rope_partial_f32",
