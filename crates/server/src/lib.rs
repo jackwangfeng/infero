@@ -6,6 +6,7 @@
 pub mod api;
 pub mod engine;
 pub mod routes;
+pub mod prefix;
 pub mod scheduler;
 pub mod stop;
 

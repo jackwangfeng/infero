@@ -347,3 +347,68 @@ fn user_content_cannot_forge_a_chat_turn() {
     let v = json(&body);
     assert!(v["choices"][0]["text"].is_string());
 }
+
+/// A prompt's KV depends only on the token ids and their positions, so a
+/// second request with a long shared leading run can reuse the first one's
+/// already-computed blocks instead of recomputing them.
+#[test]
+fn a_shared_prompt_prefix_is_served_from_the_cache() {
+    let addr = addr!();
+
+    let health = || json(&get(addr, "/health").1);
+    if health()["prefix_cache"].is_null() {
+        eprintln!("skipping: this model has recurrent state, prefix caching is off");
+        return;
+    }
+
+    // Well over `prefix::BLOCK` (32) tokens once tokenized, so the shared run
+    // spans at least one whole cacheable block regardless of exactly where the
+    // BPE merges land.
+    let shared = "In the beginning God created the heaven and the earth. \
+                  And the earth was without form, and void; and darkness was \
+                  upon the face of the deep. And the Spirit of God moved upon \
+                  the face of the waters. "
+        .repeat(3);
+    let ask = |suffix: &str| {
+        post(
+            addr,
+            "/v1/completions",
+            serde_json::json!({
+                "prompt": format!("{shared}{suffix}"),
+                "temperature": 0,
+                "max_tokens": 4,
+            }),
+        )
+    };
+
+    let before = health()["prefix_cache"].clone();
+    let (status, body) = ask("Alpha ending.");
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = ask("Beta ending, quite different from the first one.");
+    assert_eq!(status, 200, "{body}");
+
+    // `post` above only waits for the client's own HTTP response, which is
+    // produced by a task on the tokio runtime — a different thread from the
+    // one that inserts into the cache when it retires the sequence. The two
+    // happen in the right order on the scheduler thread (see
+    // `Scheduler::retire`), but crossing back to this thread has no such
+    // guarantee, so poll briefly rather than assume it already landed.
+    let mut after = before.clone();
+    for _ in 0..50 {
+        after = health()["prefix_cache"].clone();
+        if after["hits"].as_u64().unwrap() > before["hits"].as_u64().unwrap() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let hit_delta = after["hits"].as_u64().unwrap() - before["hits"].as_u64().unwrap();
+    let saved_delta =
+        after["tokens_saved"].as_u64().unwrap() - before["tokens_saved"].as_u64().unwrap();
+    assert!(hit_delta >= 1, "before={before} after={after}");
+    assert!(
+        saved_delta >= tuili_server::prefix::BLOCK as u64,
+        "expected at least one cached block ({}) reused: before={before} after={after}",
+        tuili_server::prefix::BLOCK
+    );
+}

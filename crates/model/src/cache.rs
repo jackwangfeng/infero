@@ -463,6 +463,77 @@ impl KvPool {
         }
     }
 
+    /// Point `dst` at slots computed by an earlier, already-finished sequence.
+    ///
+    /// [`Self::fork`] with the source gone: a prefix cache holds the slots, so
+    /// there is no live sequence to copy the device table from and the row is
+    /// uploaded instead. `dst` borrows them and will not return them — the cache
+    /// is the owner, and it outlives every sequence that reads it.
+    ///
+    /// The upload is `slots.len()` ints, which is why this is a per-attach copy
+    /// rather than something the batch's scatter kernel could fold in: it
+    /// happens once per admitted request, not once per step.
+    pub fn attach_prefix(&mut self, dev: &Device, dst: SeqId, slots: &[i32]) -> Result<()> {
+        anyhow::ensure!(
+            self.gdn.is_none(),
+            "this model carries recurrent state, which a shared KV prefix does \
+             not reconstruct; the caller must not offer a cached prefix here"
+        );
+        anyhow::ensure!(
+            self.len(dst) == 0,
+            "sequence {} holds {} tokens; attaching a prefix wants an empty \
+             destination",
+            dst.0,
+            self.len(dst)
+        );
+        anyhow::ensure!(
+            slots.len() <= self.max_seq,
+            "a cached prefix of {} tokens does not fit a {}-token sequence",
+            slots.len(),
+            self.max_seq
+        );
+        {
+            let d = self.seqs[dst.0]
+                .as_mut()
+                .with_context(|| format!("sequence {} is not allocated", dst.0))?;
+            d.slots = slots.to_vec();
+            d.len = slots.len();
+            d.borrowed = slots.len();
+        }
+        if !slots.is_empty() {
+            let at = dst.0 * self.max_seq;
+            let mut row = self.slot_table.slice_mut(at..at + slots.len());
+            dev.stream().memcpy_htod(slots, &mut row)?;
+        }
+        Ok(())
+    }
+
+    /// Hand this sequence's own slots up to `upto` to a longer-lived owner.
+    ///
+    /// What lets a finished sequence's KV become a cache entry: the slots stop
+    /// being the sequence's, so [`Self::free`] leaves them alone, and the caller
+    /// is responsible for returning them with [`Self::release_slots`]. Slots
+    /// already borrowed are not this sequence's to give, so only
+    /// `borrowed..upto` changes hands; the returned list is the whole prefix, so
+    /// a caller indexing blocks sees one coordinate system.
+    pub fn keep_prefix(&mut self, id: SeqId, upto: usize) -> Result<Vec<i32>> {
+        let s = self.seqs[id.0]
+            .as_mut()
+            .with_context(|| format!("sequence {} is not allocated", id.0))?;
+        anyhow::ensure!(
+            upto <= s.len,
+            "keeping {upto} tokens of a sequence that has {}",
+            s.len
+        );
+        s.borrowed = s.borrowed.max(upto);
+        Ok(s.slots[..upto].to_vec())
+    }
+
+    /// Return slots an owner outside the pool is done with.
+    pub fn release_slots(&mut self, slots: &[i32]) {
+        self.free.extend(slots.iter().rev().copied());
+    }
+
     pub fn len(&self, id: SeqId) -> usize {
         self.seqs[id.0].as_ref().map_or(0, |s| s.len)
     }

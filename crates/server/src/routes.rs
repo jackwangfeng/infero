@@ -81,8 +81,14 @@ impl IntoResponse for ApiError {
 }
 
 async fn health(State(engine): State<Arc<Engine>>) -> impl IntoResponse {
+    // `null` on a model whose recurrent state a shared prefix would not
+    // reconstruct, rather than zeros that would read as "never hit".
+    let prefix_cache = engine.prefix_cache_stats().map(|(lookups, hits, tokens_saved)| {
+        serde_json::json!({ "lookups": lookups, "hits": hits, "tokens_saved": tokens_saved })
+    });
     Json(serde_json::json!({
         "status": "ok",
+        "prefix_cache": prefix_cache,
         "model": engine.info.id,
         "path": engine.info.path,
         "quantization": engine.info.quant,

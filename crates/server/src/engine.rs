@@ -66,6 +66,10 @@ pub struct Engine {
     tokenizer: Arc<Tokenizer>,
     in_flight: Arc<AtomicU64>,
     served: Arc<AtomicU64>,
+    /// `None` when the model carries recurrent state and prefix caching is off;
+    /// otherwise the cumulative (lookups, hits, tokens served from cache) as of
+    /// the last completed step.
+    prefix_stats: Option<[Arc<AtomicU64>; 3]>,
 }
 
 #[derive(Debug, Clone)]
@@ -206,10 +210,22 @@ impl Engine {
             }
         }
 
+        // Read once, before the scheduler moves into the worker thread: whether
+        // this model can cache a prefix at all is fixed at load time, and the
+        // handle needs to know that even before the first step reports numbers.
+        let prefix_stats = scheduler.prefix_cache_stats().map(|_| {
+            [
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+            ]
+        });
+
         let worker = Worker {
             scheduler,
             in_flight: in_flight.clone(),
             served: served.clone(),
+            prefix_stats: prefix_stats.clone(),
         };
         // A dedicated OS thread, not a tokio task: the forward pass blocks on
         // CUDA and would otherwise stall the runtime.
@@ -224,6 +240,7 @@ impl Engine {
             tokenizer,
             in_flight,
             served,
+            prefix_stats,
         }))
     }
 
@@ -237,6 +254,19 @@ impl Engine {
 
     pub fn requests_served(&self) -> u64 {
         self.served.load(Ordering::Relaxed)
+    }
+
+    /// (lookups, hits, tokens served from cache) as of the last completed
+    /// step. `None` on a model whose recurrent state a shared prefix would not
+    /// reconstruct — see `crate::prefix`'s module note.
+    pub fn prefix_cache_stats(&self) -> Option<(u64, u64, u64)> {
+        self.prefix_stats.as_ref().map(|c| {
+            (
+                c[0].load(Ordering::Relaxed),
+                c[1].load(Ordering::Relaxed),
+                c[2].load(Ordering::Relaxed),
+            )
+        })
     }
 
     /// Submit a request. The returned receiver yields events until `Done` or
@@ -276,6 +306,7 @@ struct Worker {
     scheduler: Scheduler,
     in_flight: Arc<AtomicU64>,
     served: Arc<AtomicU64>,
+    prefix_stats: Option<[Arc<AtomicU64>; 3]>,
 }
 
 impl Worker {
@@ -310,6 +341,15 @@ impl Worker {
             if before > after {
                 self.served
                     .fetch_add((before - after) as u64, Ordering::Relaxed);
+            }
+            // Cumulative counters, so a plain store is right — unlike `served`,
+            // which resets are not a concern for the source `stats()` returns.
+            if let (Some(cell), Some((lookups, hits, saved))) =
+                (&self.prefix_stats, self.scheduler.prefix_cache_stats())
+            {
+                cell[0].store(lookups, Ordering::Relaxed);
+                cell[1].store(hits, Ordering::Relaxed);
+                cell[2].store(saved, Ordering::Relaxed);
             }
         }
         tracing::info!(steps = self.scheduler.steps(), "inference worker stopped");

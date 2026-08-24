@@ -31,6 +31,9 @@ struct Running {
     prompt: Vec<u32>,
     /// Prompt tokens already fed to the model.
     prefilled: usize,
+    /// The cached blocks this sequence borrows, and the references it holds on
+    /// them. Released when it retires; see `retire`.
+    prefix: crate::prefix::Prefix,
     /// The token to feed next, once the prompt is in.
     next: Option<u32>,
     generated: Vec<u32>,
@@ -116,11 +119,16 @@ pub struct Scheduler {
     spec_window: u64,
     last_end: Option<std::time::Instant>,
     window: u64,
+    /// Cross-request KV reuse. `None` on a model whose recurrent state a shared
+    /// prefix would not reconstruct — see `prefix`'s module note.
+    prefix: Option<crate::prefix::PrefixCache>,
 }
 
 impl Scheduler {
     pub fn new(model: Model, pool: KvPool, tokenizer: Arc<Tokenizer>) -> Self {
+        let prefix = crate::prefix::PrefixCache::new(&pool);
         Self {
+            prefix,
             model,
             pool,
             tokenizer,
@@ -203,6 +211,13 @@ impl Scheduler {
 
     pub fn steps(&self) -> u64 {
         self.steps
+    }
+
+    /// (lookups, hits, tokens served from cache). `None` on a model that
+    /// carries recurrent state, where prefix caching is off — see
+    /// `crate::prefix`'s module note.
+    pub fn prefix_cache_stats(&self) -> Option<(u64, u64, u64)> {
+        self.prefix.as_ref().map(crate::prefix::PrefixCache::stats)
     }
 
     pub fn pool(&self) -> &KvPool {
@@ -389,7 +404,7 @@ impl Scheduler {
         }
         if finished {
             let r = self.running.swap_remove(idx);
-            self.pool.free(r.seq);
+            self.retire(r);
             return Ok(true);
         }
         self.running[idx].spec_feed = Some(outcome.feed);
@@ -617,7 +632,7 @@ impl Scheduler {
         finished.sort_unstable();
         for idx in finished.into_iter().rev() {
             let r = self.running.swap_remove(idx);
-            self.pool.free(r.seq);
+            self.retire(r);
         }
         Ok(())
     }
@@ -632,6 +647,14 @@ impl Scheduler {
             // generate; a sequence admitted into a pool it cannot finish in
             // would deadlock against itself.
             let need = req.prompt.len() + 1;
+            // Cached blocks hold slots a waiting request could use, and a cold
+            // block is worth less than an admission. Evict before deciding the
+            // prompt does not fit; only unreferenced blocks go.
+            if need > self.pool.free_slots()
+                && let Some(c) = self.prefix.as_mut()
+            {
+                c.evict_for(&mut self.pool, need);
+            }
             if need > self.pool.free_slots() || need > self.pool.max_seq() {
                 if self.running.is_empty() {
                     // Nothing will ever free up: reject rather than spin.
@@ -649,6 +672,40 @@ impl Scheduler {
 
             let Some(seq) = self.pool.alloc() else { break };
             let req = self.waiting.pop_front().unwrap();
+
+            // Whatever of this prompt is already computed. Capped one token
+            // short of the whole prompt: a sequence with nothing left to run
+            // has no row to take logits from, and `plan` would give it no work
+            // forever.
+            let hit = match self.prefix.as_mut() {
+                Some(c) => {
+                    let p = c.lookup(&req.prompt, req.prompt.len().saturating_sub(1));
+                    if !p.is_empty() {
+                        match self.pool.attach_prefix(self.model.device(), seq, &p.slots) {
+                            Ok(()) => p,
+                            Err(e) => {
+                                // Not fatal: recompute the prompt. The slots
+                                // stay the cache's, so the references have to go
+                                // back or eviction can never reclaim them.
+                                tracing::warn!(error = %e, "attaching a cached prefix failed");
+                                c.release(&p);
+                                crate::prefix::Prefix::default()
+                            }
+                        }
+                    } else {
+                        p
+                    }
+                }
+                None => crate::prefix::Prefix::default(),
+            };
+            if !hit.is_empty() {
+                tracing::debug!(
+                    seq = seq.0,
+                    reused = hit.len(),
+                    prompt = req.prompt.len(),
+                    "prefix cache hit"
+                );
+            }
             let budget = req
                 .max_tokens
                 .min(self.pool.max_seq().saturating_sub(req.prompt.len()));
@@ -661,7 +718,8 @@ impl Scheduler {
             self.running.push(Running {
                 seq,
                 prompt: req.prompt,
-                prefilled: 0,
+                prefilled: hit.len(),
+                prefix: hit,
                 next: None,
                 sampled: 0,
                 spec_feed: None,
@@ -688,7 +746,7 @@ impl Scheduler {
             if self.running[i].events.is_closed() {
                 let r = self.running.swap_remove(i);
                 tracing::debug!(seq = r.seq.0, "client disconnected");
-                self.pool.free(r.seq);
+                self.retire(r);
             } else {
                 i += 1;
             }
@@ -853,6 +911,24 @@ impl Scheduler {
                 });
             }
         });
+    }
+
+    /// Retire a running sequence: give back the prefix blocks it borrowed,
+    /// offer the KV it just computed to the cache, and free what nobody kept.
+    ///
+    /// Not used by [`Self::fail_all`] — a failed forward pass leaves the pool
+    /// in an unknown state, and caching out of it would serve a later request
+    /// whatever went wrong here.
+    fn retire(&mut self, r: Running) {
+        if let Some(c) = self.prefix.as_mut() {
+            c.release(&r.prefix);
+            let mut tokens = r.prompt;
+            tokens.extend_from_slice(&r.generated);
+            if let Err(e) = c.insert(&mut self.pool, r.seq, &tokens) {
+                tracing::warn!(error = %e, seq = r.seq.0, "prefix cache insert failed");
+            }
+        }
+        self.pool.free(r.seq);
     }
 
     fn finish(r: &mut Running, tokenizer: &Tokenizer, reason: FinishReason) -> Result<bool> {
