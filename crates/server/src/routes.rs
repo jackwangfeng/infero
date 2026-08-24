@@ -13,10 +13,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures::Stream;
 use tokio::sync::mpsc;
-use tuili_tokenizer::ChatMessage;
+use tuili_tokenizer::{ChatMessage, ContentPart as TplPart};
 
 use crate::api::*;
-use crate::engine::{self, Engine, Event, FinishReason, Request};
+use crate::engine::{self, Engine, Event, FinishReason, PendingImage, Request};
 
 pub fn router(engine: Arc<Engine>) -> Router {
     Router::new()
@@ -101,6 +101,7 @@ async fn health(State(engine): State<Arc<Engine>>) -> impl IntoResponse {
         "offloaded_layers": engine.info.offloaded_layers,
         "max_seqs": engine.info.max_seqs,
         "kv_slots": engine.info.kv_slots,
+        "has_vision": engine.info.has_vision,
         "context_length": engine.info.context_length,
         "max_seq": engine.info.max_seq,
         "queue_depth": engine.queue_depth(),
@@ -123,6 +124,35 @@ async fn models(State(engine): State<Arc<Engine>>) -> impl IntoResponse {
     })
 }
 
+/// Build the tokenizer-facing message from a client's, keeping image and text
+/// parts in the order the client sent them.
+///
+/// A message with no image stays on the flat-text path — `m.text()`, exactly
+/// as before this existed — so nothing about a plain-text conversation
+/// changes shape because vision support exists at all. Order matters once
+/// there is an image: a caption before it and a question after it are only
+/// the same request if the template sees them on the sides it rendered them
+/// on, which is why this walks `content`'s parts directly instead of
+/// flattening to text and splicing a marker back in.
+fn to_chat_message(m: &Message) -> ChatMessage {
+    if m.image_urls().is_empty() {
+        return ChatMessage::new(&m.role, m.text());
+    }
+    let Some(Content::Parts(parts)) = &m.content else {
+        // `image_urls()` only returns entries from `Content::Parts`, so
+        // reaching here means a message has neither shape it claims to.
+        unreachable!("a message with image parts has Content::Parts");
+    };
+    let tpl_parts = parts
+        .iter()
+        .map(|p| match &p.image_url {
+            Some(u) => TplPart::image(u.url.clone()),
+            None => TplPart::text(p.text.clone().unwrap_or_default()),
+        })
+        .collect();
+    ChatMessage::with_parts(&m.role, tpl_parts)
+}
+
 async fn chat_completions(
     State(engine): State<Arc<Engine>>,
     Json(req): Json<ChatRequest>,
@@ -135,11 +165,31 @@ async fn chat_completions(
         ApiError::bad_request("this model has no chat template; use /v1/completions instead")
     })?;
 
-    let messages: Vec<ChatMessage> = req
-        .messages
-        .iter()
-        .map(|m| ChatMessage::new(&m.role, m.text()))
-        .collect();
+    // One image per request for now: `BatchItem::vision` — what actually
+    // carries a tower's output into a forward pass — takes a single
+    // `VisionFeatures`, and stitching several into one splice is a real
+    // feature this does not have yet. Refusing a second image is better than
+    // silently dropping it, which is what would happen otherwise.
+    let image_urls: Vec<&str> = req.messages.iter().flat_map(Message::image_urls).collect();
+    if image_urls.len() > 1 {
+        return Err(ApiError::bad_request(format!(
+            "this request has {} images; only one is supported per request",
+            image_urls.len()
+        )));
+    }
+    // Decoding is pure CPU work — no model needed — so it happens here rather
+    // than on the scheduler thread. What the scheduler does with the pixels
+    // (resizing to the tower's grid, running it, splicing the result into the
+    // placeholder token this prompt still has exactly one of) needs `&mut
+    // Model`, which only that thread holds; see `Scheduler::admit`.
+    let pending_image = image_urls
+        .first()
+        .map(|url| crate::vision::decode_data_url(url))
+        .transpose()
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?
+        .map(|d| PendingImage { rgb: d.rgb, height: d.height, width: d.width });
+
+    let messages: Vec<ChatMessage> = req.messages.iter().map(to_chat_message).collect();
     let prompt = template
         .render_with_kwargs(&messages, true, None, req.chat_template_kwargs.as_ref())
         .map_err(|e| ApiError::bad_request(format!("chat template failed: {e:#}")))?;
@@ -182,6 +232,7 @@ async fn chat_completions(
 
     let rx = engine.submit(Request {
         prompt: tokens,
+        pending_image,
         params,
         max_tokens,
         stop,
@@ -250,6 +301,7 @@ async fn completions(
 
     let rx = engine.submit(Request {
         prompt: tokens,
+        pending_image: None,
         params,
         max_tokens,
         stop,

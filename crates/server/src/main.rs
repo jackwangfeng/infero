@@ -51,6 +51,13 @@ struct Args {
     /// than the context limit.
     #[arg(long)]
     kv_slots: Option<usize>,
+
+    /// Patch budget for one image, when the checkpoint has a vision tower.
+    /// 4096 is a 1024x1024 image at patch 16 (~350 MiB of scratch); a single
+    /// request is separately refused if it resizes to more language-model
+    /// tokens than one prefill step can carry, regardless of this number.
+    #[arg(long, default_value_t = 4096)]
+    vision_max_patches: usize,
 }
 
 #[tokio::main]
@@ -74,6 +81,7 @@ async fn main() -> Result<()> {
         args.gpu_layers.unwrap_or(usize::MAX),
         args.max_seqs,
         args.kv_slots,
+        args.vision_max_patches,
     )
     .context("starting the inference engine")?;
 

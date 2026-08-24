@@ -34,6 +34,7 @@ fn server() -> Option<SocketAddr> {
             usize::MAX,
             4,
             None,
+            4096,
         )
         .expect("starting engine");
         let app = routes::router(engine).layer(
@@ -411,4 +412,123 @@ fn a_shared_prompt_prefix_is_served_from_the_cache() {
         "expected at least one cached block ({}) reused: before={before} after={after}",
         tuili_server::prefix::BLOCK
     );
+}
+
+/// An image reaches the model: two solid-colour images through the same
+/// prompt produce different answers, which is the property a splice that
+/// wrote nowhere could not fake — a broken splice reads as fluent text about
+/// whatever the surrounding words were, not as "the same wrong colour every
+/// time" or a crash. Mirrors `crates/model/examples/vision_end_to_end.rs`'s
+/// own check, at the HTTP layer instead of calling `Model` directly.
+#[test]
+fn an_image_url_reaches_the_vision_tower() {
+    let addr = addr!();
+    if !json(&get(addr, "/health").1)["has_vision"].as_bool().unwrap_or(false) {
+        eprintln!("skipping: this model has no vision tower");
+        return;
+    }
+
+    let data_url = |rgb: [u8; 3]| -> String {
+        let img = image::RgbImage::from_pixel(64, 64, image::Rgb(rgb));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
+        format!("data:image/png;base64,{b64}")
+    };
+
+    let ask = |rgb: [u8; 3]| {
+        post(
+            addr,
+            "/v1/chat/completions",
+            serde_json::json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What colour is this image? Reply with one word."},
+                        {"type": "image_url", "image_url": {"url": data_url(rgb)}}
+                    ]
+                }],
+                "temperature": 0,
+                // A reasoning template defaults to thinking on, and the
+                // reasoning itself can run well past a token budget picked for
+                // a plain answer — the first version of this test asked for 16
+                // and got the thinking preamble cut off before it ever named a
+                // colour, which read as "the splice did nothing" for the wrong
+                // reason. Disabling it is what makes the answer the thing this
+                // test actually measures.
+                "max_tokens": 64,
+                "chat_template_kwargs": {"enable_thinking": false}
+            }),
+        )
+    };
+
+    let (status_a, body_a) = ask([220, 30, 30]);
+    assert_eq!(status_a, 200, "{body_a}");
+    let (status_b, body_b) = ask([30, 60, 220]);
+    assert_eq!(status_b, 200, "{body_b}");
+
+    let text_a = json(&body_a)["choices"][0]["message"]["content"].as_str().unwrap().to_string();
+    let text_b = json(&body_b)["choices"][0]["message"]["content"].as_str().unwrap().to_string();
+    assert_ne!(
+        text_a, text_b,
+        "a red image and a blue image produced the same answer, which is what \
+         a splice writing to the wrong rows (or not at all) looks like"
+    );
+}
+
+/// More than one image is refused rather than silently answered from just one
+/// of them — `BatchItem::vision` carries a single `VisionFeatures`, so
+/// dropping the rest would be a quiet wrong answer instead of an error.
+#[test]
+fn more_than_one_image_is_refused() {
+    let addr = addr!();
+    if !json(&get(addr, "/health").1)["has_vision"].as_bool().unwrap_or(false) {
+        eprintln!("skipping: this model has no vision tower");
+        return;
+    }
+    let tiny = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+    let (status, body) = post(
+        addr,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": tiny}},
+                    {"type": "image_url", "image_url": {"url": tiny}}
+                ]
+            }],
+            "max_tokens": 4
+        }),
+    );
+    assert_eq!(status, 400, "{body}");
+}
+
+/// A remote URL is refused with a message naming why, not fetched — this
+/// server does not act as an SSRF proxy for whatever a caller points it at.
+#[test]
+fn a_remote_image_url_is_refused() {
+    let addr = addr!();
+    if !json(&get(addr, "/health").1)["has_vision"].as_bool().unwrap_or(false) {
+        eprintln!("skipping: this model has no vision tower");
+        return;
+    }
+    let (status, body) = post(
+        addr,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}}
+                ]
+            }],
+            "max_tokens": 4
+        }),
+    );
+    assert_eq!(status, 400, "{body}");
+    assert!(json(&body)["error"]["message"].as_str().unwrap().contains("data:"), "{body}");
 }

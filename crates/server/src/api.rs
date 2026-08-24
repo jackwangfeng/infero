@@ -134,6 +134,13 @@ pub struct ContentPart {
     pub kind: String,
     #[serde(default)]
     pub text: Option<String>,
+    #[serde(default)]
+    pub image_url: Option<ImageUrl>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ImageUrl {
+    pub url: String,
 }
 
 impl Message {
@@ -148,6 +155,25 @@ impl Message {
                 .filter_map(|p| p.text.as_deref())
                 .collect::<Vec<_>>()
                 .join(""),
+        }
+    }
+
+    /// The `image_url.url` of every image part, in the order they appear.
+    ///
+    /// Kept separate from [`Self::text`] rather than folded into one pass over
+    /// `content`, because the two callers want different things: routing
+    /// builds the model-facing message from *all* parts in order (text and
+    /// image interleaved, for a template that cares), while this is only for
+    /// deciding whether there is an image to fetch at all and what its source
+    /// is.
+    pub fn image_urls(&self) -> Vec<&str> {
+        match &self.content {
+            Some(Content::Parts(parts)) => parts
+                .iter()
+                .filter_map(|p| p.image_url.as_ref())
+                .map(|u| u.url.as_str())
+                .collect(),
+            _ => Vec::new(),
         }
     }
 }

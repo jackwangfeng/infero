@@ -15,26 +15,105 @@ const TEMPLATE_NAME: &str = "chat";
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    pub content: ChatContent,
+}
+
+/// A message's content, either flat text or an ordered list of parts.
+///
+/// Vision-capable templates — Qwen3.5's among them — branch on which shape
+/// this is: `content is string` renders it verbatim, `content is iterable`
+/// walks the list and emits `<|vision_start|><|image_pad|><|vision_end|>` for
+/// each image part in place, interleaved with the text parts around it. A
+/// plain-text conversation never needs the second shape, which is why
+/// [`ChatMessage::new`] and friends still take a string: this only grows to
+/// [`ChatContent::Parts`] when a caller actually has an image to place.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(untagged)]
+pub enum ChatContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl From<String> for ChatContent {
+    fn from(s: String) -> Self {
+        Self::Text(s)
+    }
+}
+
+impl From<&str> for ChatContent {
+    fn from(s: &str) -> Self {
+        Self::Text(s.to_string())
+    }
+}
+
+impl From<&String> for ChatContent {
+    fn from(s: &String) -> Self {
+        Self::Text(s.clone())
+    }
+}
+
+/// One item of a [`ChatContent::Parts`] list, shaped like an OpenAI content
+/// part so a template written against that convention reads it correctly.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ContentPart {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<ImageUrl>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ImageUrl {
+    pub url: String,
+}
+
+impl ContentPart {
+    pub fn text(s: impl Into<String>) -> Self {
+        Self { kind: "text", text: Some(s.into()), image_url: None }
+    }
+
+    /// A placeholder marking where an image goes. `url` is carried through for
+    /// fidelity with the OpenAI shape but is not what puts the image in the
+    /// model — the template only checks for the `image_url` *key*, the same
+    /// way Jinja2's `in` on a mapping does. The pixels reach the model as
+    /// `VisionFeatures`, spliced into the embedding after the tower runs.
+    pub fn image(url: impl Into<String>) -> Self {
+        Self {
+            kind: "image_url",
+            text: None,
+            image_url: Some(ImageUrl { url: url.into() }),
+        }
+    }
 }
 
 impl ChatMessage {
-    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+    pub fn new(role: impl Into<String>, content: impl Into<ChatContent>) -> Self {
         Self {
             role: role.into(),
             content: content.into(),
         }
     }
 
-    pub fn system(content: impl Into<String>) -> Self {
+    /// A message whose content is an ordered list of parts rather than flat
+    /// text — the shape a vision request needs.
+    pub fn with_parts(role: impl Into<String>, parts: Vec<ContentPart>) -> Self {
+        Self {
+            role: role.into(),
+            content: ChatContent::Parts(parts),
+        }
+    }
+
+    pub fn system(content: impl Into<ChatContent>) -> Self {
         Self::new("system", content)
     }
 
-    pub fn user(content: impl Into<String>) -> Self {
+    pub fn user(content: impl Into<ChatContent>) -> Self {
         Self::new("user", content)
     }
 
-    pub fn assistant(content: impl Into<String>) -> Self {
+    pub fn assistant(content: impl Into<ChatContent>) -> Self {
         Self::new("assistant", content)
     }
 }
@@ -164,6 +243,54 @@ mod tests {
     use super::*;
 
     const CHATML: &str = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+
+    /// The branch Qwen3.5's real chat_template.jinja takes on `content`,
+    /// reduced to what a splice needs: a string renders verbatim, a list walks
+    /// each item and emits a fixed placeholder for anything carrying an
+    /// `image_url` key, in the order the parts came in.
+    const VISION: &str = "{% for m in messages %}<|im_start|>{{ m.role }}\n\
+        {% if m.content is string %}{{ m.content }}\
+        {%- else %}{% for item in m.content %}\
+            {%- if 'image_url' in item %}<|vision_start|><|image_pad|><|vision_end|>\
+            {%- elif 'text' in item %}{{ item.text }}\
+            {%- endif %}\
+        {%- endfor %}{%- endif %}<|im_end|>\n{% endfor %}";
+
+    /// Locks in the shape a vision-capable template actually branches on:
+    /// `ChatContent::Text` renders as a plain string (every non-vision request,
+    /// unaffected by this feature existing at all), and `ChatContent::Parts`
+    /// is walked in order with the image placeholder landing exactly where the
+    /// image part sat — this is what lets a caption before and a question
+    /// after an image survive templating on either side of it.
+    #[test]
+    fn a_multipart_message_places_the_image_marker_between_the_text_parts() {
+        let t = ChatTemplate::new(VISION).unwrap();
+        let msg = ChatMessage::with_parts(
+            "user",
+            vec![
+                ContentPart::text("Look at this: "),
+                ContentPart::image("data:image/png;base64,AAAA"),
+                ContentPart::text(" — what colour is it?"),
+            ],
+        );
+        let out = t.render(&[msg], false).unwrap();
+        assert_eq!(
+            out,
+            "<|im_start|>user\nLook at this: \
+             <|vision_start|><|image_pad|><|vision_end|> — what colour is it?\
+             <|im_end|>\n"
+        );
+    }
+
+    /// A plain-text message must render byte-identically whether or not this
+    /// feature exists — `ChatContent::Text` is still what `ChatMessage::user`
+    /// and friends build by default.
+    #[test]
+    fn a_flat_text_message_is_unaffected_by_the_richer_content_type() {
+        let t = ChatTemplate::new(VISION).unwrap();
+        let out = t.render(&[ChatMessage::user("hi")], false).unwrap();
+        assert_eq!(out, "<|im_start|>user\nhi<|im_end|>\n");
+    }
 
     #[test]
     fn renders_chatml() {

@@ -21,9 +21,27 @@ use tuili_model::{KvCacheQuant, Model, SamplingParams};
 use crate::scheduler::{Scheduler, make_pool};
 use tuili_tokenizer::Tokenizer;
 
+/// One decoded image, waiting for the scheduler thread to run it through the
+/// tower.
+///
+/// Carried as raw pixels rather than compressed bytes: decoding a PNG/JPEG is
+/// pure CPU work with no need of the model, so it happens in the async HTTP
+/// handler; only `smart_resize`'s target and the tower's forward pass need
+/// `&mut Model`, which only the scheduler thread holds.
+pub struct PendingImage {
+    /// Interleaved `[height, width, 3]`.
+    pub rgb: Vec<u8>,
+    pub height: usize,
+    pub width: usize,
+}
+
 /// What a client asked the model to do.
 pub struct Request {
     pub prompt: Vec<u32>,
+    /// Set when the prompt carries exactly one image placeholder still
+    /// unexpanded to its real token count — see `crate::scheduler::admit`,
+    /// which is where that expansion and the tower's forward pass happen.
+    pub pending_image: Option<PendingImage>,
     pub params: SamplingParams,
     pub max_tokens: usize,
     /// Text sequences that end the generation, excluded from the output.
@@ -91,6 +109,9 @@ pub struct ModelInfo {
     pub max_seqs: usize,
     /// Token slots the pool shares between them.
     pub kv_slots: usize,
+    /// Whether this checkpoint has a vision tower, and `/v1/chat/completions`
+    /// will accept an `image_url` content part.
+    pub has_vision: bool,
 }
 
 impl Engine {
@@ -103,6 +124,7 @@ impl Engine {
         n_gpu_layers: usize,
         max_seqs: usize,
         kv_slots: Option<usize>,
+        vision_max_patches: usize,
     ) -> Result<Arc<Self>> {
         // A directory is a Hugging Face checkpoint, a file is a GGUF.
         let awq = std::path::Path::new(path).is_dir();
@@ -120,7 +142,7 @@ impl Engine {
         // every admitted sequence takes a logit row on the same pass, so a
         // fixed ceiling turns `--max-seqs 64` into a server that starts and
         // then 500s on the 33rd concurrent request.
-        let model = match &gguf {
+        let mut model = match &gguf {
             Some(f) => Model::load_full(dev, f, max_seq, kv_quant, n_gpu_layers, max_seqs)?,
             None => {
                 anyhow::ensure!(
@@ -130,6 +152,15 @@ impl Engine {
                 Model::load_awq(dev, path, max_seq, kv_quant, max_seqs)?
             }
         };
+        // No GGUF conversion of a vision tower exists yet — `load_vision`
+        // reads `model.visual.*` out of a safetensors checkpoint directly —
+        // so this is the same `awq` test the loader above used, not a new
+        // condition. Returns `false` for a checkpoint that simply has no
+        // tower, which is most of them and not an error.
+        let has_vision = awq && model.load_vision_tower(path, vision_max_patches)?;
+        if has_vision {
+            tracing::info!(vision_max_patches, "vision tower loaded");
+        }
         let pool = make_pool(&model, max_seqs, kv_slots)?;
         let kv_cache_bytes = pool.bytes();
         let pool_slots = pool.n_slots();
@@ -164,6 +195,7 @@ impl Engine {
             offloaded_layers: model.n_offloaded_layers(),
             max_seqs,
             kv_slots: pool_slots,
+            has_vision,
         };
 
         let (jobs, rx) = mpsc::unbounded_channel();
@@ -171,6 +203,7 @@ impl Engine {
         let served = Arc::new(AtomicU64::new(0));
 
         let mut scheduler = Scheduler::new(model, pool, tokenizer.clone());
+        scheduler.set_vision_max_patches(vision_max_patches);
         // Speculation, when the checkpoint has a head.
         //
         // On by default at k = 1, which is measured rather than chosen: it is

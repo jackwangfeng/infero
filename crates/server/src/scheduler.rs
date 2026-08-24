@@ -19,10 +19,10 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
-use tuili_model::{BatchItem, KvPool, MAX_BATCH_TOKENS, Model, Sampler, SeqId};
+use tuili_model::{BatchItem, KvPool, MAX_BATCH_TOKENS, Model, Sampler, SeqId, VisionFeatures};
 use tuili_tokenizer::Tokenizer;
 
-use crate::engine::{Event, FinishReason, Request};
+use crate::engine::{Event, FinishReason, PendingImage, Request};
 use crate::stop::split_at_stop;
 
 /// A sequence the scheduler is currently generating.
@@ -34,6 +34,24 @@ struct Running {
     /// The cached blocks this sequence borrows, and the references it holds on
     /// them. Released when it retires; see `retire`.
     prefix: crate::prefix::Prefix,
+    /// The tower's output for this sequence's one image, waiting for the
+    /// single unchunked prefill step that splices it in. `admit` fills this in
+    /// before the sequence starts running and `step` takes it the moment that
+    /// step's `BatchItem` is built — nothing after the prefill reads it again,
+    /// and holding the device buffer past that is a leak with no reader.
+    vision: Option<VisionFeatures>,
+    /// Whether this sequence ever carried an image, kept after `vision` above
+    /// is taken.
+    ///
+    /// The reason it outlives `vision`: prefix caching hashes token ids, and an
+    /// image's placeholder run is the same `image_token_id` repeated
+    /// regardless of which picture produced it — the pixels reach the model
+    /// through a splice the hash never sees. Two different images that resize
+    /// to the same token count would otherwise look like the same prefix, and
+    /// a hit would serve one image's computed KV for another's. `admit` and
+    /// `retire` both check this to keep such a sequence out of the cache
+    /// entirely, not just out of collisions with itself.
+    had_vision: bool,
     /// The token to feed next, once the prompt is in.
     next: Option<u32>,
     generated: Vec<u32>,
@@ -122,6 +140,11 @@ pub struct Scheduler {
     /// Cross-request KV reuse. `None` on a model whose recurrent state a shared
     /// prefix would not reconstruct — see `prefix`'s module note.
     prefix: Option<crate::prefix::PrefixCache>,
+    /// The patch budget `Model::load_vision_tower` was given. `admit` has to
+    /// pass the same number to `vision_resize`, because the tower's scratch —
+    /// allocated once, at that size — is what `encode_image` writes into; a
+    /// resize past it would overrun a buffer the loader already fixed.
+    vision_max_patches: usize,
 }
 
 impl Scheduler {
@@ -129,6 +152,7 @@ impl Scheduler {
         let prefix = crate::prefix::PrefixCache::new(&pool);
         Self {
             prefix,
+            vision_max_patches: 0,
             model,
             pool,
             tokenizer,
@@ -167,6 +191,12 @@ impl Scheduler {
     /// `k` is how many tokens a round drafts; the verification pass is `k + 1`
     /// rows wide, so the model has to have been built with at least that many
     /// logit rows.
+    /// Record the patch budget the vision tower was loaded with, so `admit`
+    /// resizes images to what the tower's scratch can actually hold.
+    pub fn set_vision_max_patches(&mut self, max_patches: usize) {
+        self.vision_max_patches = max_patches;
+    }
+
     pub fn enable_speculation(&mut self, dir: &str, k: usize) -> Result<bool> {
         if k == 0 {
             return Ok(false);
@@ -439,9 +469,7 @@ impl Scheduler {
                         seq: r.seq,
                         tokens: &r.prompt[*from..*from + *len],
                         wants_logits: *last,
-                        // No images through the HTTP layer yet; the model-level
-                        // path is `BatchItem::vision`.
-                        vision: None,
+                        vision: r.vision.as_ref(),
                     },
                     Work::Decode => BatchItem {
                         seq: r.seq,
@@ -460,6 +488,18 @@ impl Scheduler {
         let t0 = timed.then(std::time::Instant::now);
         self.model.forward_batch_device(&items, &mut self.pool)?;
         let t1 = timed.then(std::time::Instant::now);
+
+        // The tower's output is read exactly once, by the pass just above —
+        // `plan` guarantees a vision sequence's whole prompt lands in this
+        // same step, so there is no later prefill chunk left to read it.
+        // Dropping it here rather than leaving it on `Running` until the
+        // sequence retires is the difference between one splice's scratch and
+        // a device allocation held for the rest of a long conversation.
+        for (idx, work) in &plan {
+            if matches!(work, Work::Prefill { .. }) {
+                self.running[*idx].vision = None;
+            }
+        }
 
         // Sample where the logits already are.
         //
@@ -638,11 +678,109 @@ impl Scheduler {
     }
 
     /// Move waiting requests into the running set while there is room.
+    /// Turn one pending image into `VisionFeatures`, expanding the prompt's
+    /// single placeholder token into the run the tower's grid actually needs.
+    ///
+    /// The template renders exactly one `<|image_pad|>` per image — it has no
+    /// way to know the real count before the tower has seen the picture — so
+    /// this is the point that count becomes real, mirroring what Hugging
+    /// Face's own processor does between tokenizing and calling the model.
+    /// Runs on this thread because both steps need `&mut self.model`: sizing
+    /// the resize target and running the tower itself.
+    fn encode_pending_image(&mut self, prompt: &mut Vec<u32>, img: PendingImage) -> Result<VisionFeatures> {
+        anyhow::ensure!(
+            self.model.has_vision(),
+            "this request has an image but the loaded model has no vision tower"
+        );
+        let (img_tok, vid_tok) = self.model.vision_tokens().expect("has_vision checked above");
+        anyhow::ensure!(
+            !prompt.contains(&vid_tok),
+            "this checkpoint's template placed a video placeholder; video \
+             input is not supported yet"
+        );
+        let mut hits = prompt.iter().enumerate().filter(|&(_, &t)| t == img_tok);
+        let Some((at, _)) = hits.next() else {
+            anyhow::bail!(
+                "this request carries an image but the rendered prompt has no \
+                 image placeholder; the chat template may not support vision \
+                 the way this server expects"
+            );
+        };
+        anyhow::ensure!(
+            hits.next().is_none(),
+            "the rendered prompt has more than one image placeholder for a \
+             single image; this should not happen and points at a template \
+             mismatch"
+        );
+
+        let shape = *self.model.vision_shape().expect("has_vision checked above");
+        let (th, tw, tokens) = self
+            .model
+            .vision_resize(img.height, img.width, self.vision_max_patches)
+            .context("sizing the image for the vision tower")?;
+        let frame = tuili_model::qwen35_vision_image::prepare_frame(
+            &img.rgb, img.height, img.width, 3, th, tw, shape.patch, shape.merge,
+        );
+        let feats = self
+            .model
+            .encode_image(&frame)
+            .context("running the vision tower")?;
+        anyhow::ensure!(
+            feats.tokens == tokens,
+            "the tower produced {} tokens where the resize said {tokens}; a \
+             loader/config mismatch, not a request problem",
+            feats.tokens
+        );
+        // The splice that writes the tower's output runs once, over one
+        // `BatchItem`, so the whole placeholder run has to fit in a single
+        // step — `forward_batch_device` refuses more than `MAX_BATCH_TOKENS`
+        // in one pass, and that ceiling sizes fixed scratch buffers, not a
+        // preference `plan` could work around by splitting across steps the
+        // way it already does for plain text. `vision_max_patches` bounds the
+        // resize target; this is the check that turns a resize past what one
+        // step can carry into a clear refusal instead of an internal error
+        // that would otherwise surface as every *other* running request
+        // failing alongside this one, once the batch it landed in overruns
+        // the ceiling.
+        let expanded_len = prompt.len() - 1 + tokens;
+        anyhow::ensure!(
+            expanded_len <= MAX_BATCH_TOKENS,
+            "this image resizes to {tokens} language-model tokens ({th}x{tw} \
+             at patch {}), and the rest of the prompt is {} more — {expanded_len} \
+             total, over the {MAX_BATCH_TOKENS} one prefill step can carry. \
+             Send a smaller image; splitting one image's placeholder run \
+             across steps is not supported yet",
+            shape.patch,
+            prompt.len() - 1,
+        );
+        prompt.splice(at..at + 1, std::iter::repeat_n(img_tok, tokens));
+        Ok(feats)
+    }
+
     fn admit(&mut self) {
-        while let Some(req) = self.waiting.front() {
+        while !self.waiting.is_empty() {
             if self.pool.active_sequences() >= self.pool.max_seqs() {
                 break;
             }
+            // Off the queue for everything below, including the one thing
+            // that needs `&mut self.model` — encoding an image, which cannot
+            // happen while the request is still borrowed from `waiting`. One
+            // that turns out not to fit yet goes back on the front, in the
+            // same place it held before; see the `push_front` calls below.
+            let mut req = self.waiting.pop_front().unwrap();
+
+            let vision = match req.pending_image.take() {
+                Some(img) => match self.encode_pending_image(&mut req.prompt, img) {
+                    Ok(feats) => Some(feats),
+                    Err(e) => {
+                        let _ = req.events.send(Event::Failed(format!("{e:#}")));
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            let had_vision = vision.is_some();
+
             // Admit only with room for the whole prompt plus something to
             // generate; a sequence admitted into a pool it cannot finish in
             // would deadlock against itself.
@@ -658,7 +796,6 @@ impl Scheduler {
             if need > self.pool.free_slots() || need > self.pool.max_seq() {
                 if self.running.is_empty() {
                     // Nothing will ever free up: reject rather than spin.
-                    let req = self.waiting.pop_front().unwrap();
                     let _ = req.events.send(Event::Failed(format!(
                         "prompt of {} tokens does not fit: {} slots free, {} per sequence",
                         req.prompt.len(),
@@ -667,18 +804,26 @@ impl Scheduler {
                     )));
                     continue;
                 }
+                self.waiting.push_front(req);
                 break;
             }
 
-            let Some(seq) = self.pool.alloc() else { break };
-            let req = self.waiting.pop_front().unwrap();
+            let Some(seq) = self.pool.alloc() else {
+                self.waiting.push_front(req);
+                break;
+            };
 
             // Whatever of this prompt is already computed. Capped one token
             // short of the whole prompt: a sequence with nothing left to run
             // has no row to take logits from, and `plan` would give it no work
             // forever.
+            //
+            // Skipped entirely for a vision request: its placeholder run is
+            // the same `image_token_id` regardless of which picture produced
+            // it, so a hash over token ids alone cannot tell two images apart
+            // — see `Running::had_vision`.
             let hit = match self.prefix.as_mut() {
-                Some(c) => {
+                Some(c) if !had_vision => {
                     let p = c.lookup(&req.prompt, req.prompt.len().saturating_sub(1));
                     if !p.is_empty() {
                         match self.pool.attach_prefix(self.model.device(), seq, &p.slots) {
@@ -696,7 +841,7 @@ impl Scheduler {
                         p
                     }
                 }
-                None => crate::prefix::Prefix::default(),
+                _ => crate::prefix::Prefix::default(),
             };
             if !hit.is_empty() {
                 tracing::debug!(
@@ -720,6 +865,8 @@ impl Scheduler {
                 prompt: req.prompt,
                 prefilled: hit.len(),
                 prefix: hit,
+                vision,
+                had_vision,
                 next: None,
                 sampled: 0,
                 spec_feed: None,
@@ -758,6 +905,26 @@ impl Scheduler {
         let mut plan = Vec::with_capacity(self.running.len());
         let mut budget = MAX_BATCH_TOKENS;
 
+        // A fresh vision sequence's placeholder splice runs once, over one
+        // `BatchItem`, so its whole prompt has to land in a single step rather
+        // than being split the way an ordinary prefill can be — see the
+        // comment on the second loop. Reserving its length here, before
+        // decodes draw from the same budget, is what guarantees it that room:
+        // `admit`'s token-count check already bounds it to fit inside
+        // `MAX_BATCH_TOKENS` on its own, so this cannot starve every decode in
+        // the batch, only reduce how many of them fit into this one step.
+        // `encode_pending_image` also guarantees there is at most one such
+        // sequence at a time — a second one, if it were somehow admitted,
+        // would simply wait for a later step, the same as any prefill does
+        // when the budget runs out.
+        let vision_reserved = self
+            .running
+            .iter()
+            .position(|r| r.vision.is_some() && r.prefilled == 0);
+        if let Some(i) = vision_reserved {
+            budget = budget.saturating_sub(self.running[i].prompt.len());
+        }
+
         // Decodes first: one token each, and a running sequence starved by a
         // prefill is a stall the client feels.
         for (i, r) in self.running.iter().enumerate() {
@@ -770,12 +937,18 @@ impl Scheduler {
             }
         }
 
-        // Whatever is left goes to prompts, split across steps if need be.
+        if let Some(i) = vision_reserved {
+            let len = self.running[i].prompt.len();
+            plan.push((i, Work::Prefill { from: 0, len, last: true }));
+        }
+
+        // Whatever is left goes to the other prompts, split across steps if
+        // need be.
         for (i, r) in self.running.iter().enumerate() {
             if budget == 0 {
                 break;
             }
-            if r.prompt_complete() {
+            if Some(i) == vision_reserved || r.prompt_complete() {
                 continue;
             }
             let remaining = r.prompt.len() - r.prefilled;
@@ -922,10 +1095,18 @@ impl Scheduler {
     fn retire(&mut self, r: Running) {
         if let Some(c) = self.prefix.as_mut() {
             c.release(&r.prefix);
-            let mut tokens = r.prompt;
-            tokens.extend_from_slice(&r.generated);
-            if let Err(e) = c.insert(&mut self.pool, r.seq, &tokens) {
-                tracing::warn!(error = %e, seq = r.seq.0, "prefix cache insert failed");
+            // Never offer a vision sequence's blocks to the cache: its
+            // placeholder run hashes the same regardless of which image
+            // produced it, so a later request with a different picture but the
+            // same token count would hit this one's KV. `admit` applies the
+            // matching half of this — it never looks the cache up for such a
+            // request either.
+            if !r.had_vision {
+                let mut tokens = r.prompt;
+                tokens.extend_from_slice(&r.generated);
+                if let Err(e) = c.insert(&mut self.pool, r.seq, &tokens) {
+                    tracing::warn!(error = %e, seq = r.seq.0, "prefix cache insert failed");
+                }
             }
         }
         self.pool.free(r.seq);

@@ -29,6 +29,11 @@ tuili-cuda.workspace = true
 tuili-tokenizer.workspace = true
 tokio = { version = "1.53.1", features = ["full"] }
 axum = { version = "0.8.9", features = ["macros"] }
+# Decoding a `data:` image URL: base64 for the envelope, `image` for the
+# pixels. Only the formats OpenAI's own API accepts, to keep the parsing
+# surface this exposes to request bodies as small as it can be.
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 
 [dev-dependencies]
 http-body-util = "0.1.4"
