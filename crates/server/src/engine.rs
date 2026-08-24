@@ -116,14 +116,29 @@ impl Engine {
         // every admitted sequence takes a logit row on the same pass, so a
         // fixed ceiling turns `--max-seqs 64` into a server that starts and
         // then 500s on the 33rd concurrent request.
+        // Read before the model is built, because it sizes the model. The long
+        // note on what `k` means and why the default is 1 is at its use below.
+        let spec_k: usize = std::env::var("TUILI_SPEC_K")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        // A verification pass is `k + 1` rows wide and every row needs logits,
+        // so speculation raises the floor under the logits buffer. It used to be
+        // `max_seqs` alone, which meant `--max-seqs 1` -- the sensible setting
+        // for a single-user 27B -- built a one-row buffer and speculation
+        // switched itself off with "needs 2 logit rows and the model was built
+        // for 1". Asking the user to raise a concurrency limit to get a
+        // latency feature is the wrong shape; the requirement is the engine's to
+        // know. One extra row of an f32 vocab is 993 KiB here.
+        let logit_rows = max_seqs.max(spec_k + 1);
         let model = match &gguf {
-            Some(f) => Model::load_full(dev, f, max_seq, kv_quant, n_gpu_layers, max_seqs)?,
+            Some(f) => Model::load_full(dev, f, max_seq, kv_quant, n_gpu_layers, logit_rows)?,
             None => {
                 anyhow::ensure!(
                     n_gpu_layers == usize::MAX,
                     "an AWQ checkpoint has no offload path; drop --gpu-layers"
                 );
-                Model::load_awq(dev, path, max_seq, kv_quant, max_seqs)?
+                Model::load_awq(dev, path, max_seq, kv_quant, logit_rows)?
             }
         };
         let pool = make_pool(&model, max_seqs, kv_slots)?;
@@ -191,12 +206,13 @@ impl Engine {
         // token it needs to buy 0.6 to pay for itself.
         //
         // Both are fixable and neither is fixed here, so the default is the
-        // shallowest draft that still wins. `TUILI_SPEC_K=0` turns it off.
-        let spec_k: usize = std::env::var("TUILI_SPEC_K")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1);
-        if spec_k > 0 && std::path::Path::new(path).is_dir() {
+        // shallowest draft that still wins. `TUILI_SPEC_K=0` turns it off. Read
+        // above, where it sizes the logits buffer.
+        // No `is_dir()` guard any more: the head may be a sidecar GGUF beside a
+        // single-file model, and `enable_speculation` is what knows the
+        // difference. It returns `Ok(false)` for a checkpoint with no head,
+        // which is still most of them.
+        if spec_k > 0 {
             match scheduler.enable_speculation(path, spec_k) {
                 Ok(true) => {}
                 Ok(false) => {}

@@ -1333,6 +1333,39 @@ impl crate::Model {
         Ok(true)
     }
 
+    /// The same, from llama.cpp's sidecar GGUF.
+    ///
+    /// Separate from [`Self::load_mtp_head`] rather than a branch inside it
+    /// because the two take different things: that one a checkpoint *directory*
+    /// whose head sits among the text model's shards, this one the path to a
+    /// second file. llama.cpp ships the head as `mtp-<model>.gguf`, a standalone
+    /// 65-block model, and the text model's own file stops at `blk.63`.
+    ///
+    /// The head is loaded against `self.cfg`, which came from the text model:
+    /// the two files agree on every shape that matters here, and requiring them
+    /// to is the point — a sidecar built for a different `d_model` should fail
+    /// loudly at `install_mtp_head` rather than draft nonsense.
+    pub fn load_mtp_head_gguf(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+        max_draft_rows: usize,
+    ) -> anyhow::Result<bool> {
+        let f = tuili_gguf::Gguf::open(path.as_ref())?;
+        let Some(w) = crate::weights::load_mtp_gguf(&self.dev, &f, &self.cfg)? else {
+            return Ok(false);
+        };
+        let head = MtpHead::new(
+            &self.dev,
+            w,
+            HeadDims::from_config(&self.cfg),
+            max_draft_rows.max(1),
+            self.max_seq,
+            1,
+        )?;
+        self.install_mtp_head(head)?;
+        Ok(true)
+    }
+
     /// Attach a head built elsewhere — the path a test with synthetic weights
     /// takes, and the reason [`MtpHead`] does not reach into `Model` itself.
     pub fn install_mtp_head(&mut self, head: MtpHead) -> anyhow::Result<()> {
@@ -1712,7 +1745,12 @@ fn matmul(
         kern.dequant_f8_block_to_f16(&mut w16.as_view_mut(), &weights, w.k, w.n)?;
         return kern.gemm_f16(out, &x16.slice(..n_x), &w16.as_view(), n_tokens, w.k, w.n);
     }
-    if n_tokens <= 4 {
+    // A quantized head, which is what the GGUF sidecar ships: `blk.64`'s seven
+    // projections are Q8_0. There is no GEMM at that layout, and there does not
+    // need to be — `gemv` tiles its rows eight to a block along `grid.y`, so it
+    // takes a whole prime's feed as readily as one draft step's. Before this the
+    // wide path asserted f16 and a Q8_0 head could not be primed at all.
+    if n_tokens <= 4 || w.ty != WeightType::F16 {
         return kern.gemv(out, &weights, w.ty, x, w.k, w.n, n_tokens);
     }
     let n_x = n_tokens * w.k;

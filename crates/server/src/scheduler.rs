@@ -170,7 +170,22 @@ impl Scheduler {
         // an ordinary prompt is one pass, narrow enough that `scores` stays at
         // `heads * 64 * max_seq` rather than a prompt's worth of it.
         const PRIME_CHUNK: usize = 64;
-        if !self.model.load_mtp_head(dir, PRIME_CHUNK.max(k + 1))? {
+        let rows = PRIME_CHUNK.max(k + 1);
+        // Where the head lives depends on how the model was packaged. A
+        // safetensors checkpoint keeps it among its own shards, so the directory
+        // is the whole address. A GGUF keeps it in a second file — llama.cpp's
+        // conversion writes `mtp-<model>.gguf`, a standalone 65-block model, and
+        // leaves the text model's file ending at `blk.63` — so the path has to
+        // be found rather than derived.
+        let found = if std::path::Path::new(dir).is_dir() {
+            self.model.load_mtp_head(dir, rows)?
+        } else if let Some(side) = mtp_sidecar(dir) {
+            tracing::info!(path = %side.display(), "MTP sidecar");
+            self.model.load_mtp_head_gguf(&side, rows)?
+        } else {
+            false
+        };
+        if !found {
             tracing::info!("this checkpoint has no MTP head; speculation stays off");
             return Ok(false);
         }
@@ -381,6 +396,17 @@ impl Scheduler {
                     accept = format!("{:.2}", self.spec_tokens as f64 / self.spec_steps as f64),
                     "per-round timing"
                 );
+                // The per-kernel table, which the device layer has been
+                // accumulating all along and nothing was printing. Beside the
+                // draft/verify split because the two are one question: that
+                // split says *which half* the round is spent in, and this says
+                // which kernel inside it. Reset with the window so the next
+                // hundred rounds are read on their own.
+                let report = self.model.device().profile().report();
+                if !report.is_empty() {
+                    tracing::warn!("per-kernel, last {} rounds:\n{report}", self.spec_window);
+                }
+                self.model.device().profile().reset();
                 self.spec_draft_ms = 0.0;
                 self.spec_verify_ms = 0.0;
                 self.spec_after_ms = 0.0;
@@ -958,4 +984,50 @@ pub fn make_pool(model: &Model, max_seqs: usize, slots: Option<usize>) -> Result
     model
         .new_pool(lo, max_seqs)
         .context("allocating the kv pool")
+}
+
+/// The MTP sidecar beside a GGUF model, if there is one.
+///
+/// `TUILI_MTP` names it outright. Otherwise this looks in the model's own
+/// directory for a single `mtp*.gguf`, which is what llama.cpp's conversion
+/// produces and what the ggml-org repacks ship. Two of them is ambiguous rather
+/// than a reason to guess, so it takes neither and speculation stays off — a
+/// user with two heads should say which.
+fn mtp_sidecar(model: &str) -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("TUILI_MTP") {
+        let p = std::path::PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+        tracing::warn!(path = %p.display(), "TUILI_MTP does not name a file");
+        return None;
+    }
+    let path = std::path::Path::new(model);
+    if path.extension().is_none_or(|e| e != "gguf") {
+        return None;
+    }
+    let dir = path.parent()?;
+    let mut hits: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().is_some_and(|e| e == "gguf")
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("mtp"))
+        })
+        .collect();
+    hits.sort();
+    match hits.len() {
+        1 => hits.pop(),
+        0 => None,
+        n => {
+            tracing::warn!(
+                count = n,
+                "several mtp*.gguf beside the model; name one with TUILI_MTP"
+            );
+            None
+        }
+    }
 }

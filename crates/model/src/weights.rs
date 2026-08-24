@@ -1795,3 +1795,109 @@ pub fn load_vision(
     );
     Ok(Some(tower))
 }
+
+/// The MTP head out of llama.cpp's sidecar GGUF.
+///
+/// `mtp-Qwen3.8-27B-Q8_0.gguf` is a standalone file rather than a fragment: the
+/// head is `blk.64` of a 65-block model, and the file repackages `token_embd`
+/// and `output` so llama.cpp can open it alone. Those two are copies of the text
+/// model's, not dedicated ones — the head shares, which is what
+/// `mtp_use_dedicated_embeddings = false` means — so they are read past rather
+/// than loaded.
+///
+/// That is the one place this differs from [`load_mtp`]. There, the *absence* of
+/// `mtp.embed_tokens` is the evidence for sharing, and the loader refuses a
+/// checkpoint that ships one. Here the file's self-containment destroys that
+/// evidence: a repackaged copy and a dedicated head's own embedding look
+/// identical from the tensor list. So the claim has to be carried by the
+/// metadata instead, and it is the weaker of the two checks. Worth saying rather
+/// than papering over.
+///
+/// Everything else maps without interpretation. `blk.64` is shaped exactly like
+/// one of the text model's sixteen attention blocks — output gate packed into
+/// the high half of `attn_q`, q/k norms per head, `post_attention_norm` before
+/// the FFN — so the layer loads through the same names at index `n_layers`. The
+/// four tensors with no text-model counterpart are the ones under `nextn.`.
+pub fn load_mtp_gguf(dev: &Device, f: &Gguf, cfg: &Config) -> Result<Option<MtpWeights>> {
+    let t = |s: &str| format!("blk.{}.{s}", cfg.n_layers);
+    if f.get_tensor(&t("nextn.eh_proj.weight")).is_none() {
+        return Ok(None);
+    }
+    // The head's depth, from the sidecar rather than from `cfg`: the main
+    // checkpoint's metadata does not mention the head at all, so the file
+    // carrying the tensors is the only one that can say how many layers they
+    // are. `cfg.mtp_layers` stays zero on this path and is not consulted.
+    let depth = f
+        .usize(&f.akey("nextn_predict_layers")?)
+        .context(
+            "the sidecar carries `nextn.eh_proj` but no `nextn_predict_layers`; \
+             the draft loop indexes layers by it and guessing is not safe",
+        )?;
+    anyhow::ensure!(
+        depth == 1,
+        "this loader builds a one-layer MTP head, the sidecar says {depth}. The \
+         draft loop indexes `spec_step_idx % nextn_predict_layers`, which is only \
+         the identity at one layer"
+    );
+    // The head's layer is a full-attention block, which the file settles without
+    // interpretation. Same check as the safetensors path and for the same
+    // reason: a drafter that ran a GatedDeltaNet layer would advance recurrent
+    // state on every speculative token.
+    anyhow::ensure!(
+        f.get_tensor(&t("ssm_a")).is_none(),
+        "blk.{} carries `ssm_a`, so it is a linear-attention block rather than \
+         the full-attention one this drafter assumes; drafting would touch \
+         recurrent state",
+        cfg.n_layers
+    );
+
+    let started = std::time::Instant::now();
+    let mut bytes = 0usize;
+    let layer = Layer {
+        attn_norm: upload_vector(dev, f, &t("attn_norm.weight"), &mut bytes)?,
+        attn: Some(AttnWeights {
+            wq: upload_matrix(dev, f, &t("attn_q.weight"), &mut bytes)?,
+            wk: upload_matrix(dev, f, &t("attn_k.weight"), &mut bytes)?,
+            wv: upload_matrix(dev, f, &t("attn_v.weight"), &mut bytes)?,
+            wo: upload_matrix(dev, f, &t("attn_output.weight"), &mut bytes)?,
+            bq: upload_optional_vector(dev, f, &t("attn_q.bias"), &mut bytes)?,
+            bk: upload_optional_vector(dev, f, &t("attn_k.bias"), &mut bytes)?,
+            bv: upload_optional_vector(dev, f, &t("attn_v.bias"), &mut bytes)?,
+            bo: upload_optional_vector(dev, f, &t("attn_output.bias"), &mut bytes)?,
+            q_norm: upload_optional_vector(dev, f, &t("attn_q_norm.weight"), &mut bytes)?,
+            k_norm: upload_optional_vector(dev, f, &t("attn_k_norm.weight"), &mut bytes)?,
+            w_qkv: None,
+            output_gate: cfg.attn_output_gate,
+        }),
+        gdn: None,
+        ffn_norm: upload_vector(dev, f, &t("post_attention_norm.weight"), &mut bytes)?,
+        w_gate: upload_matrix(dev, f, &t("ffn_gate.weight"), &mut bytes)?,
+        w_up: upload_matrix(dev, f, &t("ffn_up.weight"), &mut bytes)?,
+        w_down: upload_matrix(dev, f, &t("ffn_down.weight"), &mut bytes)?,
+        w_gate_up: None,
+        blob: None,
+    };
+    let w = MtpWeights {
+        // `[k = 2 * d_model, n = d_model]`, embedding in the low half. The name
+        // is llama.cpp's evidence for the order: `eh_proj` projects `[e | h]`,
+        // and the conversion writes the HF `fc` through untransposed.
+        //
+        // If that order were wrong the drafts would simply stop being accepted —
+        // speculation verifies every token against the target model, so a broken
+        // head costs throughput and never correctness. The acceptance rate is
+        // the test, and it is a sharp one: near zero if this is backwards.
+        fc: upload_matrix(dev, f, &t("nextn.eh_proj.weight"), &mut bytes)?,
+        pre_fc_norm_embedding: upload_vector(dev, f, &t("nextn.enorm.weight"), &mut bytes)?,
+        pre_fc_norm_hidden: upload_vector(dev, f, &t("nextn.hnorm.weight"), &mut bytes)?,
+        norm: upload_vector(dev, f, &t("nextn.shared_head_norm.weight"), &mut bytes)?,
+        layer,
+        device_bytes: bytes,
+    };
+    dev.synchronize()?;
+    tracing::info!(
+        mib = bytes >> 20,
+        ms = started.elapsed().as_millis(),
+        "MTP head loaded from sidecar"
+    );
+    Ok(Some(w))
+}
