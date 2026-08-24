@@ -180,7 +180,7 @@ fn each_offloaded_layer_is_transferred_exactly_once_per_pass() -> Result<()> {
     let mut session = model.new_session()?;
 
     // The prompt is shorter than one prefill chunk, so this is a single pass.
-    assert!(ids.len() <= tuili_model::PREFILL_CHUNK);
+    assert!(ids.len() <= model.batch_tokens());
     model.forward(&ids, &mut session)?;
     assert_eq!(model.weight_transfers(), offloaded as u64);
 

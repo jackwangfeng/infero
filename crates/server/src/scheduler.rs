@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
-use tuili_model::{BatchItem, KvPool, MAX_BATCH_TOKENS, Model, Sampler, SeqId};
+use tuili_model::{BatchItem, KvPool, Model, Sampler, SeqId};
 use tuili_tokenizer::Tokenizer;
 
 use crate::engine::{Event, FinishReason, Request};
@@ -724,7 +724,7 @@ impl Scheduler {
     /// Decide who gets tokens this step.
     fn plan(&self) -> Vec<(usize, Work)> {
         let mut plan = Vec::with_capacity(self.running.len());
-        let mut budget = MAX_BATCH_TOKENS;
+        let mut budget = self.model.batch_tokens();
 
         // Decodes first: one token each, and a running sequence starved by a
         // prefill is a stall the client feels.

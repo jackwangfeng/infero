@@ -1382,7 +1382,7 @@ impl crate::Model {
         self.mtp_hidden = Some(
             self.dev
                 .stream()
-                .alloc_zeros::<f32>(crate::MAX_BATCH_TOKENS * self.cfg.d_model)?,
+                .alloc_zeros::<f32>(self.batch_tokens() * self.cfg.d_model)?,
         );
         Ok(())
     }

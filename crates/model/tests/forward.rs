@@ -188,7 +188,7 @@ fn chunked_prefill_is_seamless() -> Result<()> {
     let long = "The quick brown fox jumps over the lazy dog. ".repeat(40);
     let ids = tok.encode(&long, Some(false), false);
     assert!(
-        ids.len() > tuili_model::PREFILL_CHUNK,
+        ids.len() > model.batch_tokens(),
         "test needs a prompt longer than one chunk, got {}",
         ids.len()
     );

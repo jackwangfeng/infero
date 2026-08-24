@@ -52,14 +52,57 @@ pub use weights::Weights;
 
 use weights::Matrix;
 
-/// Tokens one forward pass may carry, summed over every sequence in the batch.
+/// Ceiling on the tokens one forward pass may carry, summed over the batch.
 ///
-/// Bounds the attention score buffer, which is the one activation that grows
-/// with both batch size and context length.
+/// A compile-time bound now, with [`max_batch_tokens`] the value actually used.
+/// It bounds the attention score buffer -- `n_heads * chunk * max_seq`, the one
+/// activation that grows with both batch size and context length, 201 MiB at 256
+/// tokens and a 8192 context on this model -- so raising it is a memory trade
+/// against a real number, not a free knob.
+///
+/// Higher on Metal, and for a reason that does not apply to CUDA. Prefill
+/// dequantises each weight to f16 once *per chunk*, so a 2561-token prompt in
+/// 256-token chunks does it ten times; a bigger chunk divides that. cuBLAS is
+/// reached at four tokens there and the same argument would apply, but it is
+/// untested on that hardware and 256 is what is tuned.
+#[cfg(feature = "cuda")]
 pub const MAX_BATCH_TOKENS: usize = 256;
+#[cfg(not(feature = "cuda"))]
+pub const MAX_BATCH_TOKENS: usize = 1024;
 
-/// Kept for callers that still think in terms of a single sequence's prefill.
-pub const PREFILL_CHUNK: usize = MAX_BATCH_TOKENS;
+/// What one attention score buffer is allowed to cost.
+///
+/// The buffer is `n_heads * chunk * max_seq` floats, so the chunk and the
+/// context multiply. This is the budget that decides which one gives.
+const SCORE_BUDGET: usize = 1 << 30;
+
+/// Tokens one forward pass carries, given the context it has to hold scores for.
+///
+/// Not a constant, because the two things it trades against move independently.
+/// A bigger chunk amortises prefill's per-chunk dequantisation -- measured on the
+/// 27B, a 2561-token prompt: 31.2 s at 256, 25.0 at 512, 22.7 at 1024 -- and a
+/// bigger context multiplies the score buffer by the same chunk. At 24 heads and
+/// a 8192 context, 1024 tokens is 0.75 GiB; at the 262144 context this model
+/// advertises it would be 24 GiB, which does not start at all. Raising the chunk
+/// without this bound would have quietly cut the largest usable context by four.
+///
+/// The floor is 64 rather than 1: below `GEMM_THRESHOLD` a chunk takes the
+/// mat-vec, and a chunk small enough to do that has given up the thing chunks
+/// are being enlarged for.
+///
+/// `TUILI_BATCH_TOKENS` overrides it outright, budget included, because the
+/// person measuring is entitled to a worse setting than this picks.
+pub fn batch_tokens_for(n_heads: usize, max_seq: usize) -> usize {
+    if let Some(n) = std::env::var("TUILI_BATCH_TOKENS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+    {
+        return n.min(MAX_BATCH_TOKENS);
+    }
+    let per_token = n_heads.max(1) * max_seq.max(1) * std::mem::size_of::<f32>();
+    (SCORE_BUDGET / per_token.max(1)).clamp(64, MAX_BATCH_TOKENS)
+}
 
 /// Default ceiling on sequences that may ask for logits in one pass.
 ///
@@ -441,6 +484,9 @@ pub struct Model {
     /// Cleared by `TUILI_NO_GRAPH`, for measuring what the graphs are worth.
     use_graph: bool,
     max_logit_rows: usize,
+    /// Tokens one forward pass carries, resolved once against this session's
+    /// context length. See [`batch_tokens_for`].
+    batch_tokens: usize,
     max_seq: usize,
     /// Per layer, whether it mixes with a recurrence. Cached because the pool
     /// needs it to size the state and the layer loop consults it every block.
@@ -739,6 +785,15 @@ impl Model {
                 "the block stack is not homogeneous"
             );
         }
+        // Resolved here and stored, not recomputed: the buffers below are sized
+        // from it and `forward` splits its input by it, and those two disagreeing
+        // is the kind of mismatch `add_assign` already cost a day of.
+        let batch_tokens = batch_tokens_for(cfg.n_heads, max_seq);
+        tracing::info!(
+            batch_tokens,
+            score_mib = cfg.n_heads * batch_tokens * max_seq * 4 >> 20,
+            "tokens a pass carries"
+        );
         let act = Activations::new(&dev, &cfg, max_seq, max_logit_rows)?;
         let scratch = Scratch {
             w16: dev
@@ -751,15 +806,15 @@ impl Model {
                 // output — and that last one is `d_attn` wide, which stopped
                 // being covered by `d_model` on Qwen3.8.
                 .alloc_zeros::<f16>(
-                    MAX_BATCH_TOKENS * cfg.d_ff.max(cfg.d_model).max(cfg.d_attn()),
+                    batch_tokens * cfg.d_ff.max(cfg.d_model).max(cfg.d_attn()),
                 )?,
             q8_1: dev.stream().alloc_zeros::<u8>(
-                MAX_BATCH_TOKENS * Kernels::q8_1_bytes(cfg.d_ff.max(cfg.d_model)),
+                batch_tokens * Kernels::q8_1_bytes(cfg.d_ff.max(cfg.d_model)),
             )?,
         };
 
         let tq = if kv_quant.is_quantized() {
-            let chunk = MAX_BATCH_TOKENS;
+            let chunk = batch_tokens;
             let kv_dim = cfg.d_kv();
             // These three hold rotated queries and the attention accumulator,
             // so they are `d_attn` wide, not `d_model`.
@@ -827,6 +882,7 @@ impl Model {
             graphs: std::collections::HashMap::new(),
             use_graph,
             max_logit_rows,
+            batch_tokens,
             max_seq,
             layer_kinds,
             logit_rows: 0,
@@ -854,6 +910,11 @@ impl Model {
     /// verification pass can be — and so which tree shapes are possible.
     pub fn max_logit_rows(&self) -> usize {
         self.max_logit_rows
+    }
+
+    /// Tokens one forward pass carries. See [`batch_tokens_for`].
+    pub fn batch_tokens(&self) -> usize {
+        self.batch_tokens
     }
 
     pub fn max_seq(&self) -> usize {
@@ -988,8 +1049,9 @@ impl Model {
             session.pool.max_seq()
         );
 
-        let n_chunks = tokens.len().div_ceil(MAX_BATCH_TOKENS);
-        for (i, chunk) in tokens.chunks(MAX_BATCH_TOKENS).enumerate() {
+        let chunk_len = self.batch_tokens();
+        let n_chunks = tokens.len().div_ceil(chunk_len);
+        for (i, chunk) in tokens.chunks(chunk_len).enumerate() {
             let last = i + 1 == n_chunks;
             let item = if last {
                 BatchItem::new(seq, chunk)
@@ -1046,8 +1108,9 @@ impl Model {
         let n_tokens: usize = items.iter().map(|i| i.tokens.len()).sum();
         anyhow::ensure!(n_tokens > 0, "batch carries no tokens");
         anyhow::ensure!(
-            n_tokens <= MAX_BATCH_TOKENS,
-            "batch of {n_tokens} tokens exceeds the {MAX_BATCH_TOKENS} a pass can carry"
+            n_tokens <= self.batch_tokens(),
+            "batch of {n_tokens} tokens exceeds the {} a pass can carry",
+            self.batch_tokens()
         );
         for (i, (item, want)) in items.iter().zip(tail).enumerate() {
             anyhow::ensure!(
@@ -3585,7 +3648,7 @@ impl Activations {
         max_logit_rows: usize,
     ) -> Result<Self> {
         let stream = dev.stream();
-        let chunk = MAX_BATCH_TOKENS;
+        let chunk = batch_tokens_for(cfg.n_heads, max_seq);
         let d = cfg.d_model;
         // The attention interior can be wider than the residual stream — 24
         // heads of 256 against 5120 on Qwen3.8 — so `q` and the attention
