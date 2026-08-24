@@ -154,6 +154,7 @@ fn check_at(
     tokens: usize,
     per_group: u32,
     tok_per_group: u32,
+    block: u32,
     tol: f32,
 ) -> Result<()> {
     let dev = Device::new(0)?;
@@ -187,7 +188,7 @@ fn check_at(
                 (tokens as u32).div_ceil(tok_per_group).max(1),
                 1,
             ),
-            block_dim: (128, 1, 1),
+            block_dim: (block, 1, 1),
             shared_mem_bytes: 0,
         })?
     };
@@ -213,7 +214,7 @@ fn check_at(
 }
 
 fn check(g: &Gguf, name: &str, kernel: &str, rows: usize, tol: f32) -> Result<()> {
-    check_at(g, name, kernel, rows, 1, 1, 1, tol)
+    check_at(g, name, kernel, rows, 1, 1, 1, 128, tol)
 }
 
 #[test]
@@ -244,7 +245,23 @@ fn the_multi_row_matvec_matches_a_host_dequant() -> Result<()> {
         // verification pass at k = 2 hands the four-token kernel.
         ("gemv4x4_q4_K", 3, 4),
     ] {
-        check_at(&g, "blk.0.ffn_gate.weight", kernel, 67, tokens, 4, tok_per_group, 2e-3)?;
+        check_at(&g, "blk.0.ffn_gate.weight", kernel, 67, tokens, 4, tok_per_group, 128, 2e-3)?;
+    }
+    Ok(())
+}
+
+/// The matrix-unit mat-vec, which is what a two-row verification pass wants.
+///
+/// 67 rows and 3 tokens on purpose: neither is a multiple of eight, so the last
+/// row tile and the token columns past `n_tokens` are both padding. The padding
+/// reads real weights and a real activation -- it has to, to keep the simdgroup
+/// uniform -- and must reach no output.
+#[test]
+fn the_matrix_unit_matvec_matches_a_host_dequant() -> Result<()> {
+    let Some(g) = model() else { return Ok(()) };
+    for tokens in [2usize, 3, 8] {
+        // Eight rows and eight tokens a simdgroup, one simdgroup a threadgroup.
+        check_at(&g, "blk.0.ffn_gate.weight", "gemv_mma_q4_K", 67, tokens, 8, 8, 32, 2e-3)?;
     }
     Ok(())
 }

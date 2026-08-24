@@ -508,3 +508,123 @@ DEQUANT_KERNEL(dequant_q6_K_f16, deq_q6_K)
 kernel void gemv1x4_q4_K(GEMV_ARGS) { GEMV_BODY_ROWS_Q4_K(1) }
 kernel void gemv2x4_q4_K(GEMV_ARGS) { GEMV_BODY_ROWS_Q4_K(2) }
 kernel void gemv4x4_q4_K(GEMV_ARGS) { GEMV_BODY_ROWS_Q4_K(4) }
+
+// ---- the narrow-batch matmul, on the matrix units ---------------------------
+//
+// Why this exists, and it is a number rather than a principle. A speculative
+// verification pass is `k + 1` rows, and on CUDA that pass costs 1.06x a
+// one-row step where here it costs 1.71x -- so speculation pays 27% there and
+// exactly nothing here. The difference is not the drafter, whose acceptance is
+// better here (1.85 against 1.72). It is one line in `matmul_pre`: "tensor cores
+// whenever they will take the shape, which is every token count up to eight".
+//
+// An MMA instruction multiplies an 8x8 tile. One row fills an eighth of it and
+// two rows fill a quarter, so on CUDA going from one row to two is *free* -- the
+// instruction was already issued. The mat-vec above has no tile to fill: it
+// spends one FMA per (element, token), so two tokens is two FMAs, and the
+// per-token work it cannot amortise is measured at 1.24x-1.35x a shape and
+// 1.79x in situ.
+//
+// Apple's `simdgroup_matrix` is the same instruction class. One simdgroup owns
+// an 8-row by 8-token output tile and walks `k`; each weight is dequantised
+// exactly once and that one dequantisation feeds all eight token columns. At two
+// tokens six columns are padding and cost nothing, which is the entire point --
+// the padding is what makes the second row free.
+//
+// It is worse than the scalar kernel at one token, where seven eighths of every
+// MMA is waste and the scalar version spends exactly one FMA. So this is for two
+// rows and up, and `gemv1_*` keeps the decode path.
+
+#define MMA_ROWS 8
+#define MMA_TOKS 8
+
+/// Q4_K, eight rows by eight tokens a simdgroup.
+///
+/// A whole 256-element super-block is dequantised into threadgroup memory at
+/// once and then fed to thirty-two MMAs. Staging per 8-wide sub-tile instead --
+/// the obvious loop -- measured 2.5x the scalar kernel's one-token cost, because
+/// it pays three threadgroup barriers to set up a single MMA: 1920 barriers a
+/// tile against 40. The arithmetic is identical; only the ratio of setup to work
+/// changed.
+///
+/// The dequantisation is arranged so a thread reads one contiguous span. Thread
+/// `i` takes row `i / 4` and quarter `i % 4`, which is 32 bytes of `qs` -- and
+/// those same 32 bytes carry group `2c` in their low nibbles and group `2c + 1`
+/// in their high ones, so one read produces 64 values and needs two scales.
+kernel void gemv_mma_q4_K(
+    device float* out          [[buffer(0)]],
+    device const void* w       [[buffer(1)]],
+    device const float* x      [[buffer(2)]],
+    constant int& k            [[buffer(3)]],
+    constant int& n            [[buffer(4)]],
+    constant int& n_tokens     [[buffer(5)]],
+    uint3 tgid  [[threadgroup_position_in_grid]],
+    uint3 tid   [[thread_position_in_threadgroup]]) {
+    // One super-block of dequantised weight, transposed: `stage[kk][r]`, because
+    // the MMA wants `C[t][r] = sum_kk A[t][kk] * B[kk][r]` and the weight arrives
+    // as `[r][k]`. Transposing on the write costs nothing.
+    // One 32-element group: 1 KiB, which is the only useful point on this curve.
+    // A whole super-block -- 8 KiB -- measured 4.7x the scalar kernel, because at
+    // 8 KiB a core holds four of these threadgroups and 128 threads hide nothing.
+    // A single 8-wide sub-tile fits easily and measured 2.5x, because it pays
+    // three barriers to set up one MMA. A group is four MMAs to a barrier pair
+    // at 1 KiB, with neither problem.
+    threadgroup float stage[32 * MMA_ROWS];
+    threadgroup float sout[MMA_ROWS * MMA_TOKS];
+
+    const int row0 = int(tgid.x) * MMA_ROWS;
+    const int token0 = int(tgid.y) * MMA_TOKS;
+    const int lane = int(tid.x);
+    const int nb = k / QK_K;
+
+    const int r = lane / 4;              // this thread's row within the tile
+    const int c = lane % 4;             // and which eighth of the group it reads
+    const int row = min(row0 + r, n - 1);
+
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (int b = 0; b < nb; ++b) {
+        device const block_q4_K* blk =
+            (device const block_q4_K*)w + size_t(row) * nb + b;
+        for (int g = 0; g < 8; ++g) {
+            uchar sc, m;
+            q4k_scale_min(blk->scales, g, &sc, &m);
+            const float d = float(blk->d) * float(sc);
+            const float mn = float(blk->dmin) * float(m);
+            const int s0 = (g & 1) ? 4 : 0;
+            // 32 values a row, eight a thread, from one 8-byte span.
+            device const uint2* q =
+                (device const uint2*)(device const void*)(blk->qs + (g / 2) * 32 + c * 8);
+            const uint2 pair = *q;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int u = 0; u < 2; ++u) {
+                const uint pk = pair[u];
+                for (int bi = 0; bi < 4; ++bi) {
+                    const int byte = int((pk >> (bi * 8)) & 0xFF);
+                    const int off = c * 8 + u * 4 + bi;   // 0..31
+                    stage[off * MMA_ROWS + r] = d * float((byte >> s0) & 0xF) - mn;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const int kbase = b * QK_K + g * 32;
+            for (int sub = 0; sub < 4; ++sub) {
+                simdgroup_float8x8 wt, xt;
+                simdgroup_load(wt, stage + sub * MMA_ROWS * MMA_TOKS, MMA_ROWS);
+                simdgroup_load(xt, x + size_t(token0) * k + kbase + sub * MMA_TOKS, k);
+                simdgroup_multiply_accumulate(acc, xt, wt, acc);
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_store(acc, sout, MMA_ROWS);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int flat = lane; flat < MMA_ROWS * MMA_TOKS; flat += 32) {
+        const int t = flat / MMA_ROWS;
+        const int rr = flat % MMA_ROWS;
+        if (token0 + t < n_tokens && row0 + rr < n) {
+            out[size_t(token0 + t) * n + row0 + rr] = sout[flat];
+        }
+    }
+}

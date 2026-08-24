@@ -68,6 +68,19 @@ const VISION_CU: &str = include_str!("cu/vision.cu");
 /// without pushing occupancy off a cliff on sm_86.
 const REDUCE_BLOCK: u32 = 256;
 
+/// Tokens at which the Q4_K mat-vec switches to the matrix units. See the note
+/// at the switch itself for the measurements behind the default.
+fn mma_min() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("TUILI_MMA_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(8)
+    })
+}
+
 /// Registers per thread in the fused norm; must match `RMS_REGS` in mmvq.cu.
 const RMS_REGS: u32 = 8;
 const ELEMENTWISE_BLOCK: u32 = 256;
@@ -4273,6 +4286,39 @@ impl Kernels {
     /// a few tokens and the wrong one for a long prefill — see
     /// [`Kernels::gemm_f16`].
     #[allow(clippy::too_many_arguments)]
+    /// The Q4_K mat-vec on the matrix units: eight rows and eight tokens a
+    /// simdgroup, one simdgroup a threadgroup.
+    fn gemv_mma(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
+        x: &View<'_, f32>,
+        k: usize,
+        n: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_quant", quant_src(), "gemv_mma_q4_K")?;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (n as u32).div_ceil(8),
+                (n_tokens as u32).div_ceil(8).max(1),
+                1,
+            ),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (k_i, n_i, nt_i) = (k as i32, n as i32, n_tokens as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(w).arg(x).arg(&k_i).arg(&n_i).arg(&nt_i);
+        self.dev.profile().time("gemv_mma", self.dev.stream(), || {
+            unsafe { b.launch(cfg) }.context("gemv_mma")?;
+            Ok(())
+        })
+    }
+
     pub fn gemv(
         &self,
         out: &mut ViewMut<'_, f32>,
@@ -4360,6 +4406,27 @@ impl Kernels {
                 _ => GEMV_TOKENS_PER_BLOCK as usize,
             }
         };
+        // The matrix units, for a batch wide enough to fill an 8x8 tile.
+        //
+        // Measured against the scalar kernel, Q4_K, as a multiple of the
+        // one-token scalar cost -- the MMA kernel's cost is flat in the token
+        // count, which is the whole property:
+        //
+        //   tokens   scalar        mma
+        //        2   1.30 1.26   1.73 2.12
+        //        4   1.88 2.01   1.57 2.10
+        //        8   3.66 4.20   1.66 2.33
+        //
+        // So it loses at two -- which is what a speculative verification pass
+        // is, and why speculation cannot be rescued this way -- and wins from
+        // eight, by 1.8x to 2.2x. `TUILI_MMA_MIN` moves the line.
+        let mma = !cfg!(feature = "cuda")
+            && ty == WeightType::Q4K
+            && n_tokens >= mma_min()
+            && n as u32 >= 8;
+        if mma {
+            return self.gemv_mma(out, w, x, k, n, n_tokens);
+        }
         let name = if rows > 1 {
             format!("gemv{per}x{rows}_{}", ty.suffix())
         } else if per == GEMV_TOKENS_PER_BLOCK as usize {

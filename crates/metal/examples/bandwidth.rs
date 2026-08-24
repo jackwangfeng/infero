@@ -350,6 +350,89 @@ fn main() -> Result<()> {
         println!("{line}");
     }
 
+    // ---- 3c. the matrix-unit mat-vec against the scalar one ----------------
+    //
+    // The number that decides whether speculation can pay: a two-row pass wants
+    // to cost what a one-row pass costs. The scalar kernel spends a FMA per
+    // (element, token) and cannot; the MMA kernel fills an 8x8 tile whether
+    // there are two tokens in it or eight.
+    println!("\n  scalar vs matrix unit (Q4_K), against the 1-token scalar baseline");
+    for (label, k, n_rows) in [
+        ("ffn_gate/up", 5120usize, 17408usize),
+        ("ffn_down   ", 17408, 5120),
+    ] {
+        let bytes = (k * n_rows) as f64 * 144.0 / 256.0;
+        let w = s.alloc_zeros::<u8>(bytes as usize)?;
+        let x = s.alloc_zeros::<f32>(k * 8)?;
+        let mut o = s.alloc_zeros::<f32>(n_rows * 8)?;
+        let ki = k as i32;
+        let ni = n_rows as i32;
+        let items = (k / 32) as u32;
+        let scalar_block = items.next_multiple_of(32).clamp(32, 128);
+
+        let base = {
+            let f = dev.kernels().get("quant", &quant, "gemv1_q4_K")?;
+            let ti = 1i32;
+            ms(
+                || {
+                    let mut b = s.launch_builder(&f);
+                    b.arg(&o.as_view_mut()).arg(&w.as_view()).arg(&x.as_view())
+                        .arg(&ki).arg(&ni).arg(&ti);
+                    unsafe {
+                        b.launch(LaunchConfig {
+                            grid_dim: (n_rows as u32, 1, 1),
+                            block_dim: (scalar_block, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?
+                    };
+                    s.synchronize()
+                },
+                5,
+            )?
+        };
+        print!("  {label} 1tok scalar {base:6.3}ms  |");
+        for tokens in [2usize, 4, 8] {
+            for mma in [false, true] {
+                let (name, gx, gy, block) = if mma {
+                    (
+                        "gemv_mma_q4_K".to_string(),
+                        (n_rows as u32).div_ceil(8),
+                        (tokens as u32).div_ceil(8).max(1),
+                        32u32,
+                    )
+                } else {
+                    let per = if tokens == 2 { 2 } else { 4 };
+                    (
+                        format!("gemv{per}x4_q4_K"),
+                        (n_rows as u32).div_ceil(4),
+                        (tokens as u32).div_ceil(per as u32).max(1),
+                        scalar_block,
+                    )
+                };
+                let f = dev.kernels().get("quant", &quant, &name)?;
+                let ti = tokens as i32;
+                let t = ms(
+                    || {
+                        let mut b = s.launch_builder(&f);
+                        b.arg(&o.as_view_mut()).arg(&w.as_view()).arg(&x.as_view())
+                            .arg(&ki).arg(&ni).arg(&ti);
+                        unsafe {
+                            b.launch(LaunchConfig {
+                                grid_dim: (gx, gy, 1),
+                                block_dim: (block, 1, 1),
+                                shared_mem_bytes: 0,
+                            })?
+                        };
+                        s.synchronize()
+                    },
+                    5,
+                )?;
+                print!("  {tokens}tok {}{:6.3}ms({:.2}x)", if mma { "mma" } else { "scl" }, t, t / base);
+            }
+        }
+        println!();
+    }
+
     // ---- 4. how much of a mat-vec is its block reduction ------------------
     //
     // The host sizes the threadgroup from `gemv_work_items(k)`, so a Q4_K

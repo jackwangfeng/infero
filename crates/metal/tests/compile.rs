@@ -46,6 +46,7 @@ fn every_kernel_compiles_and_resolves() -> Result<()> {
                 "gemv_q4_K",
                 "gemv_q6_K",
                 "embed_row_q4_K",
+                "gemv_mma_q4_K",
             ],
         ),
         (
