@@ -13,6 +13,8 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+memmap2.workspace = true
+libc = "0.2"
 half.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

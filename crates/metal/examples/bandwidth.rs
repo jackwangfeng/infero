@@ -204,8 +204,8 @@ fn main() -> Result<()> {
     ] {
         let bytes = (k * n_rows) as f64 * 144.0 / 256.0;
         let w = s.alloc_zeros::<u8>(bytes as usize)?;
-        let x = s.alloc_zeros::<f32>(k * 4)?;
-        let mut o = s.alloc_zeros::<f32>(n_rows * 4)?;
+        let x = s.alloc_zeros::<f32>(k * 256)?;
+        let mut o = s.alloc_zeros::<f32>(n_rows * 256)?;
         let ki = k as i32;
         let ni = n_rows as i32;
         let mut line = format!("  {label} ");
@@ -216,10 +216,22 @@ fn main() -> Result<()> {
             ("gemv2x4_q4_K", 4, 2),
             ("gemv4_q4_K", 1, 4),
             ("gemv4x4_q4_K", 4, 4),
+            // A prefill chunk. `gemv_q4_K` is what the host launched before the
+            // multi-row path existed; `gemv4x4` is what it launches now.
+            ("gemv_q4_K", 1, 256),
+            ("gemv4x4_q4_K", 4, 256),
         ] {
             let f = dev.kernels().get("quant", &quant, kernel)?;
             let ti = tokens as i32;
-            let per_tok = if kernel.starts_with("gemv1") { 1u32 } else if kernel.starts_with("gemv2") { 2 } else { 4 };
+            let per_tok = if kernel.starts_with("gemv1") {
+                1u32
+            } else if kernel.starts_with("gemv2") {
+                2
+            } else if kernel.starts_with("gemv4") {
+                4
+            } else {
+                8
+            };
             let mut best_g = 0.0f64;
             let mut best_ms = f64::INFINITY;
             for block in [32u32, 64, 128] {

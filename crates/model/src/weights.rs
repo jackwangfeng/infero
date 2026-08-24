@@ -10,6 +10,8 @@
 //! layer, and streaming them would add descriptors to the transfer without
 //! saving anything worth measuring.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use tuili_gpu::{Buf, View};
 use tuili_gpu::PinnedHostSlice;
@@ -27,6 +29,14 @@ const BLOB_ALIGN: usize = 256;
 enum Storage {
     /// In VRAM, for the process lifetime.
     Device(Buf<u8>),
+    /// A window into the checkpoint file, aliased into device memory.
+    ///
+    /// Unified memory only, and it is the difference between an 18 GiB
+    /// checkpoint taking 24 s to load and taking none: the pages the GPU reads
+    /// *are* the file's pages, so there is nothing to upload. The `Arc` is what
+    /// keeps the mapping alive -- one per checkpoint, shared by every matrix in
+    /// it.
+    Mapped { file: Arc<Buf<u8>>, offset: usize },
     /// In the owning layer's host blob, at this byte offset. The same offset
     /// addresses it inside the staging buffer once the layer is transferred.
     Streamed { offset: usize },
@@ -59,6 +69,16 @@ impl Matrix {
     pub fn view<'a>(&'a self, stage: Option<&'a Buf<u8>>) -> Result<View<'a, u8>> {
         match &self.storage {
             Storage::Device(d) => Ok(d.as_view()),
+            Storage::Mapped { file, offset } => {
+                anyhow::ensure!(
+                    offset + self.n_bytes <= file.len(),
+                    "matrix wants {}..{} of a {}-byte checkpoint",
+                    offset,
+                    offset + self.n_bytes,
+                    file.len()
+                );
+                Ok(file.slice(*offset..offset + self.n_bytes))
+            }
             Storage::Streamed { offset } => {
                 let stage =
                     stage.context("an offloaded matrix was used without its layer being staged")?;
@@ -290,12 +310,26 @@ impl Weights {
         let mut host_bytes = 0usize;
         let mut max_blob_bytes = 0usize;
 
-        let token_embd = upload_matrix(dev, f, "token_embd.weight", &mut device_bytes)?;
+        // Ask the backend whether it can alias the file instead of copying out
+        // of it. Unified memory can; a discrete card cannot, and answers `None`
+        // rather than failing. Mapped once here and shared by every matrix, so
+        // the mapping's lifetime is the weights'.
+        //
+        // The offloaded path is untouched: a streamed layer is copied into
+        // page-locked host memory by `pack_layer`, which is a different question
+        // from where the resident ones live.
+        let mapped = tuili_gpu::map_file(dev, f.path())?.map(Arc::new);
+        let mapped = mapped.as_ref();
+        if mapped.is_some() {
+            tracing::info!("checkpoint aliased into device memory; no upload");
+        }
+
+        let token_embd = upload_matrix(dev, f, mapped, "token_embd.weight", &mut device_bytes)?;
         let output_norm = upload_vector(dev, f, "output_norm.weight", &mut device_bytes)?;
         let output = if cfg.tied_embeddings {
             None
         } else {
-            Some(upload_matrix(dev, f, "output.weight", &mut device_bytes)?)
+            Some(upload_matrix(dev, f, mapped, "output.weight", &mut device_bytes)?)
         };
 
         // Llama 3.1 ships these precomputed; everything else wants no scaling.
@@ -356,7 +390,7 @@ impl Weights {
             let (matrices, blob) = if i < n_gpu_layers {
                 let mut m = Vec::with_capacity(names.len());
                 for name in &names {
-                    m.push(upload_matrix(dev, f, name, &mut device_bytes)?);
+                    m.push(upload_matrix(dev, f, mapped, name, &mut device_bytes)?);
                 }
                 (m, None)
             } else {
@@ -1436,20 +1470,38 @@ pub fn load_awq(
     })
 }
 
-fn upload_matrix(dev: &Device, f: &Gguf, name: &str, total: &mut usize) -> Result<Matrix> {
+fn upload_matrix(
+    dev: &Device,
+    f: &Gguf,
+    mapped: Option<&Arc<Buf<u8>>>,
+    name: &str,
+    total: &mut usize,
+) -> Result<Matrix> {
     let (ty, k, n, n_bytes) = describe(f, name)?;
-    let bytes = f.tensor_data(name)?;
-    *total += bytes.len();
-    let data = dev
-        .stream()
-        .clone_htod(bytes)
-        .with_context(|| format!("uploading {name} ({} MiB)", bytes.len() >> 20))?;
+    *total += n_bytes;
+    // Aliased when the backend can alias, copied when it cannot. The two
+    // produce the same `View` for every caller above this, which is why the
+    // engine does not know which one it got.
+    let storage = match mapped {
+        Some(file) => Storage::Mapped {
+            file: Arc::clone(file),
+            offset: f.file_offset(f.tensor(name)?),
+        },
+        None => {
+            let bytes = f.tensor_data(name)?;
+            Storage::Device(
+                dev.stream()
+                    .clone_htod(bytes)
+                    .with_context(|| format!("uploading {name} ({} MiB)", bytes.len() >> 20))?,
+            )
+        }
+    };
     Ok(Matrix {
         ty,
         k,
         n,
         n_bytes,
-        storage: Storage::Device(data),
+        storage,
     })
 }
 
@@ -1853,13 +1905,15 @@ pub fn load_mtp_gguf(dev: &Device, f: &Gguf, cfg: &Config) -> Result<Option<MtpW
 
     let started = std::time::Instant::now();
     let mut bytes = 0usize;
+    let mapped = tuili_gpu::map_file(dev, f.path())?.map(Arc::new);
+    let mapped = mapped.as_ref();
     let layer = Layer {
         attn_norm: upload_vector(dev, f, &t("attn_norm.weight"), &mut bytes)?,
         attn: Some(AttnWeights {
-            wq: upload_matrix(dev, f, &t("attn_q.weight"), &mut bytes)?,
-            wk: upload_matrix(dev, f, &t("attn_k.weight"), &mut bytes)?,
-            wv: upload_matrix(dev, f, &t("attn_v.weight"), &mut bytes)?,
-            wo: upload_matrix(dev, f, &t("attn_output.weight"), &mut bytes)?,
+            wq: upload_matrix(dev, f, mapped, &t("attn_q.weight"), &mut bytes)?,
+            wk: upload_matrix(dev, f, mapped, &t("attn_k.weight"), &mut bytes)?,
+            wv: upload_matrix(dev, f, mapped, &t("attn_v.weight"), &mut bytes)?,
+            wo: upload_matrix(dev, f, mapped, &t("attn_output.weight"), &mut bytes)?,
             bq: upload_optional_vector(dev, f, &t("attn_q.bias"), &mut bytes)?,
             bk: upload_optional_vector(dev, f, &t("attn_k.bias"), &mut bytes)?,
             bv: upload_optional_vector(dev, f, &t("attn_v.bias"), &mut bytes)?,
@@ -1871,9 +1925,9 @@ pub fn load_mtp_gguf(dev: &Device, f: &Gguf, cfg: &Config) -> Result<Option<MtpW
         }),
         gdn: None,
         ffn_norm: upload_vector(dev, f, &t("post_attention_norm.weight"), &mut bytes)?,
-        w_gate: upload_matrix(dev, f, &t("ffn_gate.weight"), &mut bytes)?,
-        w_up: upload_matrix(dev, f, &t("ffn_up.weight"), &mut bytes)?,
-        w_down: upload_matrix(dev, f, &t("ffn_down.weight"), &mut bytes)?,
+        w_gate: upload_matrix(dev, f, mapped, &t("ffn_gate.weight"), &mut bytes)?,
+        w_up: upload_matrix(dev, f, mapped, &t("ffn_up.weight"), &mut bytes)?,
+        w_down: upload_matrix(dev, f, mapped, &t("ffn_down.weight"), &mut bytes)?,
         w_gate_up: None,
         blob: None,
     };
@@ -1886,7 +1940,7 @@ pub fn load_mtp_gguf(dev: &Device, f: &Gguf, cfg: &Config) -> Result<Option<MtpW
         // speculation verifies every token against the target model, so a broken
         // head costs throughput and never correctness. The acceptance rate is
         // the test, and it is a sharp one: near zero if this is backwards.
-        fc: upload_matrix(dev, f, &t("nextn.eh_proj.weight"), &mut bytes)?,
+        fc: upload_matrix(dev, f, mapped, &t("nextn.eh_proj.weight"), &mut bytes)?,
         pre_fc_norm_embedding: upload_vector(dev, f, &t("nextn.enorm.weight"), &mut bytes)?,
         pre_fc_norm_hidden: upload_vector(dev, f, &t("nextn.hnorm.weight"), &mut bytes)?,
         norm: upload_vector(dev, f, &t("nextn.shared_head_norm.weight"), &mut bytes)?,

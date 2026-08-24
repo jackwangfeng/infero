@@ -27,3 +27,11 @@ pub const CAPTURE_RELAXED: CaptureMode = CaptureMode;
 pub fn set_max_dynamic_shared(_f: &Function, _bytes: u32) -> anyhow::Result<()> {
     Ok(())
 }
+
+/// Alias a file into device memory, if this backend can.
+///
+/// Unified memory can: the pages the GPU reads are the pages the file is mapped
+/// into, so a checkpoint needs no upload at all. See `buffer::map_file`.
+pub fn map_file(dev: &Device, path: &std::path::Path) -> anyhow::Result<Option<Buf<u8>>> {
+    crate::buffer::map_file(dev, path).map(Some)
+}

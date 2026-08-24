@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
@@ -29,6 +29,13 @@ unsafe impl Elem for f64 {}
 struct Raw {
     buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     bytes: usize,
+    /// Whatever owns the memory when Metal does not.
+    ///
+    /// `newBufferWithBytesNoCopy` aliases pages it did not allocate and will not
+    /// free, so the mapping has to outlive the buffer. Holding it here rather
+    /// than asking the caller to is the difference between a safe API and a
+    /// convention.
+    keep: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 // SAFETY: `MTLBuffer` is thread-safe; see `device.rs`. Unified memory means
@@ -358,7 +365,11 @@ impl Stream {
             std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, alloc);
         }
         Ok(Buf {
-            raw: Arc::new(Raw { buf, bytes: alloc }),
+            raw: Arc::new(Raw {
+                buf,
+                bytes: alloc,
+                keep: None,
+            }),
             len: n,
             _t: PhantomData,
         })
@@ -499,4 +510,72 @@ impl Stream {
         }
         Ok(out)
     }
+}
+
+/// A whole file, aliased into device memory without a copy.
+///
+/// The point of this on unified memory. A GGUF is already `mmap`ed, so
+/// `clone_htod` on each tensor reads the mapped page in and then memcpies it
+/// into a fresh `MTLBuffer` -- and the copy is not the worst of it. It leaves
+/// the file's pages in the page cache *and* the same bytes in device buffers, so
+/// an 18 GiB checkpoint commits 36 GiB on a 36 GiB machine and the OS starts
+/// evicting. Measured on the 27B: 24.1 s to load weights where the disk reads
+/// the file in 4.3 s.
+///
+/// `newBufferWithBytesNoCopy` points a buffer at pages Metal did not allocate.
+/// Two rules come with it, and both are why this maps the whole file rather than
+/// each tensor: the address must be page-aligned -- an `mmap` base is, a tensor
+/// offset inside it is not -- and so must the length. `mmap` makes
+/// `ceil(len / page) * page` bytes addressable, the tail zero-filled, so
+/// rounding the length up stays inside the mapping.
+///
+/// The `Mmap` moves into the buffer, which is what makes this safe rather than
+/// merely convenient: nothing outside can drop it while the GPU still reads it.
+pub fn map_file(dev: &crate::Device, path: &std::path::Path) -> Result<Buf<u8>> {
+    use objc2_metal::MTLDevice;
+
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("opening {} to map it", path.display()))?;
+    // SAFETY: the file is opened read-only and the mapping is owned by the
+    // buffer below for as long as the buffer lives. A concurrent truncation
+    // would be a data race, which is true of the `Gguf` mapping this replaces.
+    let map = unsafe { memmap2::Mmap::map(&file) }
+        .with_context(|| format!("mapping {}", path.display()))?;
+    let len = map.len();
+    anyhow::ensure!(len > 0, "{} is empty", path.display());
+
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let rounded = len.next_multiple_of(page);
+    let ptr = std::ptr::NonNull::new(map.as_ptr() as *mut std::ffi::c_void)
+        .context("mmap returned null")?;
+    anyhow::ensure!(
+        ptr.as_ptr() as usize % page == 0,
+        "mapping of {} is not page-aligned",
+        path.display()
+    );
+
+    // SAFETY: `ptr` addresses `rounded` bytes of the mapping (see above), and
+    // the `Mmap` that owns them is moved into the buffer's keepalive on the next
+    // lines. A nil deallocator tells Metal it does not own the pages.
+    let buf = unsafe {
+        dev.raw().newBufferWithBytesNoCopy_length_options_deallocator(
+            ptr,
+            rounded,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        )
+    }
+    .ok_or_else(|| anyhow!("aliasing {} MiB of {} failed", len >> 20, path.display()))?;
+
+    Ok(Buf {
+        raw: Arc::new(Raw {
+            buf,
+            bytes: rounded,
+            keep: Some(Box::new(map)),
+        }),
+        // The file's real length, not the rounded one: a slice past the end is a
+        // bug and should be caught rather than reading the zero-fill.
+        len,
+        _t: PhantomData,
+    })
 }

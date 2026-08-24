@@ -69,3 +69,13 @@ impl Device {
         }
     }
 }
+
+/// Alias a file into device memory, if this backend can.
+///
+/// It cannot. Device memory is a separate physical address space here, so a
+/// checkpoint has to be copied across the bus whatever the host does with the
+/// file. `None` is the answer, not an error -- the caller's other path is the
+/// one that always worked.
+pub fn map_file(_dev: &Device, _path: &std::path::Path) -> anyhow::Result<Option<Buf<u8>>> {
+    Ok(None)
+}

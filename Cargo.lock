@@ -2315,6 +2315,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "half",
+ "libc",
+ "memmap2",
  "objc2",
  "objc2-foundation",
  "objc2-metal",
