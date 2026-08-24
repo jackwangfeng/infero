@@ -11,7 +11,7 @@
 //! about selection rather than about randomness.
 
 use anyhow::Result;
-use tuili_cuda::Device;
+use tuili_gpu::Device;
 use tuili_kernels::Kernels;
 use tuili_model::{Sampler, SamplingParams};
 

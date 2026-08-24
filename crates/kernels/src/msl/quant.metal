@@ -72,9 +72,59 @@ inline void q4k_scale_min(device const uchar* q, int j,
     for (int t = 0; t < (T); ++t) acc[t] = 0.0f;
 
 /// Spend one decoded weight element on every token this group holds.
+///
+/// The weight is bound to a local *before* the token loop, and that is the whole
+/// point of the braces. These are macros, so a weight expression passed in is
+/// substituted textually -- written the obvious way, `d * float(nib) - mn` lands
+/// inside `for (int t ...)` and the dequantisation runs once per token instead of
+/// once per element. It measured: two tokens cost 1.7x one token on Q4_K, whose
+/// dequantisation is a shift, a mask, a convert and a fused multiply-add, while
+/// on Q8_0 -- one multiply -- the same two tokens cost 1.1x. A mat-vec reads its
+/// weights once at any token count, so 1.1x is the shape this should have had all
+/// along and 1.7x was the tell.
+///
+/// The compiler will not always hoist it for us: the value is used only under
+/// `if (t < ntok)`, so lifting it out of the loop means speculating a
+/// computation the source guards, and it declines.
 #define GEMV_SPREAD(T, WV, I)                                                  \
-    for (int t = 0; t < (T); ++t) {                                            \
-        if (t < ntok) acc[t] += (WV) * x[size_t(token0 + t) * k + (I)];        \
+    {                                                                          \
+        const float wv_ = (WV);                                                \
+        for (int t = 0; t < (T); ++t) {                                        \
+            if (t < ntok) acc[t] += wv_ * x[size_t(token0 + t) * k + (I)];     \
+        }                                                                      \
+    }
+
+/// The same for four consecutive weight elements, taking the activations as one
+/// 16-byte load a token instead of four 4-byte ones.
+///
+/// This is where the mat-vec's time actually goes, which took a measurement to
+/// believe. Two tokens cost 1.7x one token rather than 1.0x -- a mat-vec reads
+/// its weights once whatever the token count, so if the weight read were the
+/// cost the second token would have been nearly free. It is not: the per-token
+/// work is the activation load and the multiply-add, and at 32 scalar loads a
+/// thread a token that is the majority of the kernel. It is also why decoding
+/// one token sits at 27% of this machine's streaming ceiling on Q4_K while
+/// reading only 4.5 bits a weight, and why loading the *weights* as `uint4`
+/// bought 5%.
+///
+/// `packed_float4` rather than `float4`: the packed types carry their scalar's
+/// alignment, 4 bytes, so this is well-defined for any float-aligned `x` at any
+/// index that is a multiple of four. `float4` would require 16 and the
+/// activation is a view into a scratch buffer whose element offset this kernel
+/// cannot see. Every caller's `I` here is a multiple of four by construction --
+/// a Q4_K group starts at a multiple of 32 -- so no host-side guard is needed.
+#define GEMV_SPREAD4(T, W0, W1, W2, W3, I)                                     \
+    {                                                                          \
+        const float4 wv_ = float4((W0), (W1), (W2), (W3));                     \
+        for (int t = 0; t < (T); ++t) {                                        \
+            if (t < ntok) {                                                    \
+                device const packed_float4* xp = (device const packed_float4*)  \
+                    (x + size_t(token0 + t) * k + (I));                        \
+                const packed_float4 xv = *xp;                                  \
+                acc[t] += wv_[0] * xv[0] + wv_[1] * xv[1]                      \
+                        + wv_[2] * xv[2] + wv_[3] * xv[3];                     \
+            }                                                                  \
+        }                                                                      \
     }
 
 #define GEMV_EPILOGUE(T)                                                       \
@@ -135,8 +185,13 @@ inline void q4k_scale_min(device const uchar* q, int j,
         const int sub = (c % per_block) * Q8_0_PER_THREAD;                     \
         const int base = (c / per_block) * QK8_0 + sub;                        \
         const float d = float(blk->d);                                         \
-        for (int i = 0; i < Q8_0_PER_THREAD; ++i) {                            \
-            GEMV_SPREAD(T, d * float(blk->qs[sub + i]), base + i)              \
+        for (int i = 0; i < Q8_0_PER_THREAD; i += 4) {                         \
+            GEMV_SPREAD4(T,                                                    \
+                         d * float(blk->qs[sub + i + 0]),                      \
+                         d * float(blk->qs[sub + i + 1]),                      \
+                         d * float(blk->qs[sub + i + 2]),                      \
+                         d * float(blk->qs[sub + i + 3]),                      \
+                         base + i)                                             \
         }                                                                      \
     }                                                                          \
     GEMV_EPILOGUE(T)
@@ -163,12 +218,14 @@ inline void q4k_scale_min(device const uchar* q, int j,
             const uint4 quad = q128[v];                                        \
             for (int wi = 0; wi < 4; ++wi) {                                   \
                 const uint packed = quad[wi];                                  \
-                for (int b = 0; b < 4; ++b) {                                  \
-                    const int byte = int((packed >> (b * 8)) & 0xFF);          \
-                    const int nib = high ? (byte >> 4) : (byte & 0xF);         \
-                    GEMV_SPREAD(T, d * float(nib) - mn,                        \
-                                base + v * 16 + wi * 4 + b)                    \
-                }                                                              \
+                const int s0 = high ? 4 : 0;                                   \
+                GEMV_SPREAD4(                                                  \
+                    T,                                                         \
+                    d * float((packed >> s0) & 0xF) - mn,                      \
+                    d * float((packed >> (s0 + 8)) & 0xF) - mn,                \
+                    d * float((packed >> (s0 + 16)) & 0xF) - mn,               \
+                    d * float((packed >> (s0 + 24)) & 0xF) - mn,               \
+                    base + v * 16 + wi * 4)                                    \
             }                                                                  \
         }                                                                      \
     }                                                                          \
@@ -200,6 +257,13 @@ inline void q4k_scale_min(device const uchar* q, int j,
         const int q1 = int((ql[l + 32] & 0xF) | (((h >> 2) & 3) << 4)) - 32;   \
         const int q2 = int((ql[l] >> 4) | (((h >> 4) & 3) << 4)) - 32;         \
         const int q3 = int((ql[l + 32] >> 4) | (((h >> 6) & 3) << 4)) - 32;    \
+        /* Not `GEMV_SPREAD4`: this thread's four elements are `l`, `l + 32`,  \
+           `l + 64` and `l + 96`, which is how Q6_K packs its high bits -- one  \
+           `qh` byte carries two bits for each of four elements 32 apart. They  \
+           are 128 bytes apart in the activation, so there is no 16-byte load   \
+           that covers them and vectorising would mean changing which element   \
+           each thread owns. This is the vocabulary projection only, already at  \
+           37% of ceiling, and it is one launch a step against 448. */          \
         GEMV_SPREAD(T, d * float(sc[is + 0]) * float(q0), base + l)            \
         GEMV_SPREAD(T, d * float(sc[is + 2]) * float(q1), base + l + 32)       \
         GEMV_SPREAD(T, d * float(sc[is + 4]) * float(q2), base + l + 64)       \
@@ -214,14 +278,24 @@ inline void q4k_scale_min(device const uchar* q, int j,
 
 kernel void gemv_f32(GEMV_ARGS)  { GEMV_BODY_F32(GEMV_TOKENS) }
 kernel void gemv1_f32(GEMV_ARGS) { GEMV_BODY_F32(1) }
+kernel void gemv2_f32(GEMV_ARGS) { GEMV_BODY_F32(2) }
+kernel void gemv4_f32(GEMV_ARGS) { GEMV_BODY_F32(4) }
 kernel void gemv_f16(GEMV_ARGS)  { GEMV_BODY_F16(GEMV_TOKENS) }
 kernel void gemv1_f16(GEMV_ARGS) { GEMV_BODY_F16(1) }
+kernel void gemv2_f16(GEMV_ARGS) { GEMV_BODY_F16(2) }
+kernel void gemv4_f16(GEMV_ARGS) { GEMV_BODY_F16(4) }
 kernel void gemv_q8_0(GEMV_ARGS)  { GEMV_BODY_Q8_0(GEMV_TOKENS) }
 kernel void gemv1_q8_0(GEMV_ARGS) { GEMV_BODY_Q8_0(1) }
+kernel void gemv2_q8_0(GEMV_ARGS) { GEMV_BODY_Q8_0(2) }
+kernel void gemv4_q8_0(GEMV_ARGS) { GEMV_BODY_Q8_0(4) }
 kernel void gemv_q4_K(GEMV_ARGS)  { GEMV_BODY_Q4_K(GEMV_TOKENS) }
 kernel void gemv1_q4_K(GEMV_ARGS) { GEMV_BODY_Q4_K(1) }
+kernel void gemv2_q4_K(GEMV_ARGS) { GEMV_BODY_Q4_K(2) }
+kernel void gemv4_q4_K(GEMV_ARGS) { GEMV_BODY_Q4_K(4) }
 kernel void gemv_q6_K(GEMV_ARGS)  { GEMV_BODY_Q6_K(GEMV_TOKENS) }
 kernel void gemv1_q6_K(GEMV_ARGS) { GEMV_BODY_Q6_K(1) }
+kernel void gemv2_q6_K(GEMV_ARGS) { GEMV_BODY_Q6_K(2) }
+kernel void gemv4_q6_K(GEMV_ARGS) { GEMV_BODY_Q6_K(4) }
 
 /// Dequantize one Q4_K row into f32.
 ///

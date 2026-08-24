@@ -11,6 +11,7 @@ const COMMON: &str = include_str!("../../kernels/src/msl/common.metal");
 const OPS: &str = include_str!("../../kernels/src/msl/ops.metal");
 const QUANT: &str = include_str!("../../kernels/src/msl/quant.metal");
 const GDN: &str = include_str!("../../kernels/src/msl/gdn.metal");
+const SAMPLE: &str = include_str!("../../kernels/src/msl/sample.metal");
 
 #[test]
 fn every_kernel_compiles_and_resolves() -> Result<()> {
@@ -58,6 +59,17 @@ fn every_kernel_compiles_and_resolves() -> Result<()> {
                 "gdn_gated_rmsnorm_f32",
                 "sigmoid_gate_f32",
                 "split_interleaved_f32",
+            ],
+        ),
+        (
+            "tuili_sample",
+            format!("{COMMON}\n{SAMPLE}"),
+            &[
+                "argmax_partial_f32",
+                "argmax_combine_f32",
+                "sample_rows_f32",
+                "sample_topk_partial_f32",
+                "sample_rows_topk_f32",
             ],
         ),
     ];

@@ -117,25 +117,45 @@ fn main() -> Result<()> {
     // ---- 3. the real quantized mat-vec ------------------------------------
     // Shapes from the 27B, with the encoding each actually uses.
     let quant = format!("{COMMON}\n{QUANT}");
-    // Each shape twice: the batched kernel the host used to launch at every
-    // width, and the one-token specialisation. Decode is always one token, so
-    // the second column is the one that matters for a decode step.
-    for (label, kernel, k, n_rows, bytes_per_256) in [
-        ("output.weight     Q6_K", "gemv_q6_K", 5120usize, 248320usize, 210.0f64),
-        ("output.weight     Q6_K", "gemv1_q6_K", 5120, 248320, 210.0),
-        ("ffn_down          Q4_K", "gemv_q4_K", 17408, 5120, 144.0),
-        ("ffn_down          Q4_K", "gemv1_q4_K", 17408, 5120, 144.0),
-        ("ffn_gate/up       Q4_K", "gemv_q4_K", 5120, 17408, 144.0),
-        ("ffn_gate/up       Q4_K", "gemv1_q4_K", 5120, 17408, 144.0),
-        ("attn_qkv          Q8_0", "gemv_q8_0", 5120, 10240, 34.0 * 8.0),
-        ("attn_qkv          Q8_0", "gemv1_q8_0", 5120, 10240, 34.0 * 8.0),
+    // Each shape at the widths the engine actually launches, with the kernel it
+    // picks there. Decode is one token; speculation's verification pass is
+    // `k + 1`, so two and three are the widths that decide whether a
+    // speculative round pays for itself.
+    //
+    // The number to read is not GB/s -- it is the **wall time against the
+    // one-token row**. A mat-vec reads its weights once whatever the token
+    // count, so if two tokens cost what one token costs, the second token is
+    // free and a two-row verification pass is as cheap as the decode step it
+    // replaces. If two tokens cost twice as much, nothing is amortising and
+    // speculation cannot win no matter how good the drafter is.
+    for (label, kernel, tokens, k, n_rows, bytes_per_256) in [
+        ("output.weight     Q6_K", "gemv1_q6_K", 1usize, 5120usize, 248320usize, 210.0f64),
+        ("output.weight     Q6_K", "gemv2_q6_K", 2, 5120, 248320, 210.0),
+        ("output.weight     Q6_K", "gemv4_q6_K", 4, 5120, 248320, 210.0),
+        ("output.weight     Q6_K", "gemv_q6_K", 8, 5120, 248320, 210.0),
+        ("ffn_down          Q4_K", "gemv1_q4_K", 1, 17408, 5120, 144.0),
+        ("ffn_down          Q4_K", "gemv2_q4_K", 2, 17408, 5120, 144.0),
+        ("ffn_down          Q4_K", "gemv4_q4_K", 4, 17408, 5120, 144.0),
+        ("ffn_down          Q4_K", "gemv_q4_K", 8, 17408, 5120, 144.0),
+        ("ffn_gate/up       Q4_K", "gemv1_q4_K", 1, 5120, 17408, 144.0),
+        ("ffn_gate/up       Q4_K", "gemv2_q4_K", 2, 5120, 17408, 144.0),
+        ("attn_qkv          Q8_0", "gemv1_q8_0", 1, 5120, 10240, 34.0 * 8.0),
+        ("attn_qkv          Q8_0", "gemv2_q8_0", 2, 5120, 10240, 34.0 * 8.0),
     ] {
         let bytes = (k * n_rows) as f64 * bytes_per_256 / 256.0;
         let w = s.alloc_zeros::<u8>(bytes as usize)?;
-        let x = s.alloc_zeros::<f32>(k)?;
-        let mut o = s.alloc_zeros::<f32>(n_rows)?;
+        let x = s.alloc_zeros::<f32>(k * tokens)?;
+        let mut o = s.alloc_zeros::<f32>(n_rows * tokens)?;
         let f = dev.kernels().get("quant", &quant, kernel)?;
-        let (ki, ni, ti) = (k as i32, n_rows as i32, 1i32);
+        let (ki, ni, ti) = (k as i32, n_rows as i32, tokens as i32);
+        // `token0 = tgid.y * T` in the kernel, so the grid follows the
+        // specialisation's width rather than a constant.
+        let per_block = match kernel.as_bytes()[4] {
+            b'1' => 1u32,
+            b'2' => 2,
+            b'4' => 4,
+            _ => 8,
+        };
         let t = ms(
             || {
                 let mut b = s.launch_builder(&f);
@@ -147,7 +167,11 @@ fn main() -> Result<()> {
                     .arg(&ti);
                 unsafe {
                     b.launch(LaunchConfig {
-                        grid_dim: (n_rows as u32, 1, 1),
+                        grid_dim: (
+                            n_rows as u32,
+                            (tokens as u32).div_ceil(per_block).max(1),
+                            1,
+                        ),
                         block_dim: (256, 1, 1),
                         shared_mem_bytes: 0,
                     })?
@@ -158,9 +182,10 @@ fn main() -> Result<()> {
         )?;
         let gbs = bytes / (t / 1e3) / 1e9;
         println!(
-            "  {label}  {:>7.0} MiB  {t:8.2} ms  {gbs:7.1} GB/s  ({:.0}% of ceiling)",
+            "  {label}  {tokens} tok  {:>7.0} MiB  {t:8.2} ms  {gbs:7.1} GB/s              ({:.0}% of ceiling)  {:.2} ms/token",
             bytes / (1u64 << 20) as f64,
-            gbs / best * 100.0
+            gbs / best * 100.0,
+            t / tokens as f64
         );
     }
     Ok(())

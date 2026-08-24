@@ -51,6 +51,7 @@ const OPS_METAL: &str = include_str!("msl/ops.metal");
 const QUANT_METAL: &str = include_str!("msl/quant.metal");
 const GDN_METAL: &str = include_str!("msl/gdn.metal");
 const MMVQ_METAL: &str = include_str!("msl/mmvq.metal");
+const SAMPLE_METAL: &str = include_str!("msl/sample.metal");
 const UNIMPLEMENTED_METAL: &str = include_str!("msl/unimplemented.metal");
 const OPS_CU: &str = include_str!("cu/ops.cu");
 const QUANT_CU: &str = include_str!("cu/quant.cu");
@@ -154,7 +155,7 @@ fn sample_src() -> &'static str {
 #[cfg(not(feature = "cuda"))]
 fn sample_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    SRC.get_or_init(|| UNIMPLEMENTED_METAL.to_string())
+    SRC.get_or_init(|| format!("{COMMON_METAL}\n{SAMPLE_METAL}"))
 }
 
 #[cfg(feature = "cuda")]
@@ -775,13 +776,15 @@ impl Kernels {
     /// vocabulary rules the kernel out on a card whose limit is 48 KiB without
     /// an opt-in this does not take.
     pub fn can_sample_on_device(vocab: usize, max_top_k: usize) -> bool {
-        // `sample.cu` has no MSL twin yet, so this backend samples on the host.
-        // A shape check that said yes would fail at the kernel lookup instead,
-        // which is a worse way to learn the same thing.
-        if !cfg!(feature = "cuda") {
-            return false;
-        }
-        max_top_k <= Self::SAMPLE_MAX_TOP_K && Self::sample_shared(vocab) <= 48 * 1024
+        // The limit is the backend's threadgroup/shared budget, and Apple's is
+        // 32 KiB against a CUDA card's 48. That is not a detail: the bitset is
+        // `vocab / 32` words, so 151936 tokens fit on both and 248320 fit on
+        // neither once the reduction scratch is added -- Qwen3.8 lands in the
+        // gap. `sample_rows_split`, whose bitset covers one sixty-fourth of the
+        // vocabulary, is what serves the ones this excludes, and the caller
+        // reaching for it does not consult this.
+        let budget = if cfg!(feature = "cuda") { 48 * 1024 } else { 32 * 1024 };
+        max_top_k <= Self::SAMPLE_MAX_TOP_K && Self::sample_shared(vocab) <= budget
     }
 
     fn sample_shared(vocab: usize) -> u32 {
@@ -4301,11 +4304,32 @@ impl Kernels {
         // has no `gemv1_*`: there `#pragma unroll` on a compile-time trip count
         // already lets the compiler drop the dead iterations, which is the same
         // fix by a different mechanism.
-        let one = n_tokens == 1 && !cfg!(feature = "cuda");
-        let name = if one {
-            format!("gemv1_{}", ty.suffix())
+        //
+        // `gemv2_*` and `gemv4_*` exist for the same reason and were added for a
+        // narrower case: speculation's verification pass is `k + 1` rows, so at
+        // the default `k = 1` every round runs a two-row matmul. Sending that
+        // through the eight-token kernel cost 2.3x -- six dead iterations a
+        // weight element -- and it turned a 1.76-token acceptance into a
+        // *slowdown*, 8.4 tok/s down to 4.0. A round is only worth running if
+        // its wide pass costs about what the narrow one it replaces did.
+        //
+        // The group width is the smallest specialisation that covers the rows,
+        // and `token0 = tgid.y * T` in `GEMV_PROLOGUE` means the grid follows
+        // from it without the kernel knowing which one it is.
+        let per = if cfg!(feature = "cuda") {
+            GEMV_TOKENS_PER_BLOCK as usize
         } else {
+            match n_tokens {
+                0 | 1 => 1,
+                2 => 2,
+                3 | 4 => 4,
+                _ => GEMV_TOKENS_PER_BLOCK as usize,
+            }
+        };
+        let name = if per == GEMV_TOKENS_PER_BLOCK as usize {
             format!("gemv_{}", ty.suffix())
+        } else {
+            format!("gemv{per}_{}", ty.suffix())
         };
         let f = self.dev.kernels().get("tuili_quant", quant_src(), &name)?;
         // Size the block to the work rather than to a constant: an oversized
@@ -4318,11 +4342,7 @@ impl Kernels {
         let cfg = LaunchConfig {
             grid_dim: (
                 n as u32,
-                if one {
-                    1
-                } else {
-                    (n_tokens as u32).div_ceil(GEMV_TOKENS_PER_BLOCK).max(1)
-                },
+                (n_tokens as u32).div_ceil(per as u32).max(1),
                 1,
             ),
             block_dim: (block, 1, 1),

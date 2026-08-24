@@ -30,9 +30,21 @@ pub struct Profile {
 impl Profile {
     pub fn new() -> Self {
         Self {
-            // Same switch the CUDA side reads, so a profiling run is asked for
-            // the same way on either backend.
-            enabled: AtomicBool::new(std::env::var("TUILI_PROFILE").is_ok()),
+            // Its own switch, not the CUDA side's `TUILI_PROFILE`.
+            //
+            // There the two are the same variable because there they cost the
+            // same: CUDA brackets a launch with events and reads them later, so
+            // asking for a per-kernel table costs a few microseconds a launch
+            // and the coarse timings in the scheduler stay honest alongside it.
+            //
+            // Here a per-kernel table costs a `synchronize` a launch, and a
+            // 27B decode step runs about 500 of them. That floor -- 130 us a
+            // launch, measured -- is larger than most of the kernels it is
+            // measuring, and it inflates the scheduler's own draft-versus-verify
+            // split by 66 ms a round, which is exactly the quantity that split
+            // exists to attribute. One variable for both made the cheap
+            // measurement impossible to take.
+            enabled: AtomicBool::new(std::env::var("TUILI_METAL_PROFILE").is_ok()),
             entries: Mutex::new(HashMap::new()),
         }
     }
