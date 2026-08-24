@@ -317,15 +317,41 @@ impl Weights {
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let t = |s: &str| format!("blk.{i}.{s}");
-            let names = [
-                t("attn_q.weight"),
-                t("attn_k.weight"),
-                t("attn_v.weight"),
-                t("attn_output.weight"),
-                t("ffn_gate.weight"),
-                t("ffn_up.weight"),
-                t("ffn_down.weight"),
-            ];
+            // Which mixer this block has is read off the file rather than
+            // inferred from an interval: Qwen3.5 states an explicit 64-element
+            // `layer_types`, and a block that carries `ssm_a` is a linear one
+            // whatever a stride would say.
+            let is_linear = f.get_tensor(&t("ssm_a")).is_some();
+            let names: Vec<String> = if is_linear {
+                vec![
+                    t("attn_qkv.weight"),
+                    t("attn_gate.weight"),
+                    t("ssm_alpha.weight"),
+                    t("ssm_beta.weight"),
+                    t("ssm_out.weight"),
+                    t("ffn_gate.weight"),
+                    t("ffn_up.weight"),
+                    t("ffn_down.weight"),
+                ]
+            } else {
+                vec![
+                    t("attn_q.weight"),
+                    t("attn_k.weight"),
+                    t("attn_v.weight"),
+                    t("attn_output.weight"),
+                    t("ffn_gate.weight"),
+                    t("ffn_up.weight"),
+                    t("ffn_down.weight"),
+                ]
+            };
+            // llama.cpp names the pre-FFN norm `ffn_norm` for a llama-style
+            // block and `post_attention_norm` for Qwen3.5. The same norm in the
+            // same place; only the spelling moved.
+            let ffn_norm_name = if f.get_tensor(&t("ffn_norm.weight")).is_some() {
+                t("ffn_norm.weight")
+            } else {
+                t("post_attention_norm.weight")
+            };
 
             let (matrices, blob) = if i < n_gpu_layers {
                 let mut m = Vec::with_capacity(names.len());
@@ -342,30 +368,70 @@ impl Weights {
             };
             let mut matrices = matrices.into_iter();
 
+            let (attn, gdn) = if is_linear {
+                let qkv = matrices.next().unwrap();
+                let z = matrices.next().unwrap();
+                let a = matrices.next().unwrap();
+                let b = matrices.next().unwrap();
+                let out = matrices.next().unwrap();
+                (
+                    None,
+                    Some(GdnWeights {
+                        in_proj_qkv: qkv,
+                        in_proj_z: z,
+                        in_proj_a: a,
+                        in_proj_b: b,
+                        // Stacking `a` and `b` is a launch-count optimisation
+                        // the safetensors path takes when they share a dense
+                        // type. Not taken here: a GGUF stores them as two
+                        // tensors and concatenating quantized blocks is not a
+                        // reinterpretation.
+                        in_proj_ba: None,
+                        conv1d: upload_vector(
+                            dev, f, &t("ssm_conv1d.weight"), &mut device_bytes)?,
+                        a_log: upload_a_log(dev, f, &t("ssm_a"), &mut device_bytes)?,
+                        dt_bias: upload_vector(
+                            dev, f, &t("ssm_dt.bias"), &mut device_bytes)?,
+                        // The one norm in this architecture that is a plain
+                        // gain: `Qwen3_5RMSNormGated`. llama.cpp's converter
+                        // adds one to every *other* norm weight and leaves this
+                        // one alone, which is why nothing is undone here.
+                        norm: upload_vector(
+                            dev, f, &t("ssm_norm.weight"), &mut device_bytes)?,
+                        out_proj: out,
+                    }),
+                )
+            } else {
+                (
+                    Some(AttnWeights {
+                        wq: matrices.next().unwrap(),
+                        wk: matrices.next().unwrap(),
+                        wv: matrices.next().unwrap(),
+                        wo: matrices.next().unwrap(),
+                        // Qwen2 carries QKV biases; Llama does not.
+                        bq: upload_optional_vector(dev, f, &t("attn_q.bias"), &mut device_bytes)?,
+                        bk: upload_optional_vector(dev, f, &t("attn_k.bias"), &mut device_bytes)?,
+                        bv: upload_optional_vector(dev, f, &t("attn_v.bias"), &mut device_bytes)?,
+                        bo: upload_optional_vector(
+                            dev, f, &t("attn_output.bias"), &mut device_bytes)?,
+                        // Qwen3's per-head q/k norms; llama.cpp names them this
+                        // way.
+                        q_norm: upload_optional_vector(
+                            dev, f, &t("attn_q_norm.weight"), &mut device_bytes)?,
+                        k_norm: upload_optional_vector(
+                            dev, f, &t("attn_k_norm.weight"), &mut device_bytes)?,
+                        w_qkv: None,
+                        output_gate: cfg.attn_output_gate,
+                    }),
+                    None,
+                )
+            };
+
             layers.push(Layer {
                 attn_norm: upload_vector(dev, f, &t("attn_norm.weight"), &mut device_bytes)?,
-                // No GGUF conversion of a linear-attention model exists yet, so
-                // every block out of this path is a softmax-attention one.
-                attn: Some(AttnWeights {
-                    wq: matrices.next().unwrap(),
-                    wk: matrices.next().unwrap(),
-                    wv: matrices.next().unwrap(),
-                    wo: matrices.next().unwrap(),
-                    // Qwen2 carries QKV biases; Llama does not.
-                    bq: upload_optional_vector(dev, f, &t("attn_q.bias"), &mut device_bytes)?,
-                    bk: upload_optional_vector(dev, f, &t("attn_k.bias"), &mut device_bytes)?,
-                    bv: upload_optional_vector(dev, f, &t("attn_v.bias"), &mut device_bytes)?,
-                    bo: upload_optional_vector(dev, f, &t("attn_output.bias"), &mut device_bytes)?,
-                    // Qwen3's per-head q/k norms; llama.cpp names them this way.
-                    q_norm: upload_optional_vector(
-                        dev, f, &t("attn_q_norm.weight"), &mut device_bytes)?,
-                    k_norm: upload_optional_vector(
-                        dev, f, &t("attn_k_norm.weight"), &mut device_bytes)?,
-                    w_qkv: None,
-                    output_gate: false,
-                }),
-                gdn: None,
-                ffn_norm: upload_vector(dev, f, &t("ffn_norm.weight"), &mut device_bytes)?,
+                attn,
+                gdn,
+                ffn_norm: upload_vector(dev, f, &ffn_norm_name, &mut device_bytes)?,
                 w_gate: matrices.next().unwrap(),
                 w_up: matrices.next().unwrap(),
                 w_down: matrices.next().unwrap(),
@@ -1448,6 +1514,31 @@ fn upload_vector(dev: &Device, f: &Gguf, name: &str, total: &mut usize) -> Resul
     let info = f.tensor(name)?;
     let host =
         to_f32(f.data(info), info).with_context(|| format!("decoding {name} ({})", info.ty))?;
+    *total += host.len() * 4;
+    Ok(dev.stream().clone_htod(&host)?)
+}
+
+/// `ssm_a` back into the `A_log` the recurrence wants.
+///
+/// llama.cpp's converter stores `-exp(A_log)`, not `A_log`: this checkpoint's
+/// `blk.0.ssm_a` spans [-0.3376, -0.0038], which is exactly `-exp` of the
+/// reference's [-5.5625, -1.0859]. `gdn_gate_decay` computes
+/// `-exp(a_log) * softplus(...)`, so feeding it the file's value directly turns
+/// a decay of 0.03 into 0.97 and every linear block remembers everything.
+///
+/// Inverting here rather than adding a kernel variant keeps one gate kernel for
+/// both loaders, which is the same trade the safetensors path makes for the
+/// norm gains.
+fn upload_a_log(dev: &Device, f: &Gguf, name: &str, total: &mut usize) -> Result<Vector> {
+    let info = f.tensor(name)?;
+    let raw = to_f32(f.data(info), info).with_context(|| format!("decoding {name}"))?;
+    let host: Vec<f32> = raw
+        .iter()
+        .map(|a| {
+            debug_assert!(*a < 0.0, "{name}: {a} is not -exp(A_log)");
+            (-a).ln()
+        })
+        .collect();
     *total += host.len() * 4;
     Ok(dev.stream().clone_htod(&host)?)
 }

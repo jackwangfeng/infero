@@ -1790,6 +1790,14 @@ impl Kernels {
     /// blocks; it also costs a second pass over the partials, so it is only
     /// worth it when the grid is actually short.
     fn attn_chunks(&self, dims: &AttnDims, kv_len: usize) -> (u32, u32) {
+        // One chunk on a backend without the split kernels. They are a grid
+        // recovery for shapes where a layer's V cache has left L2 -- an
+        // optimisation, and `attn_output_f32` covers every shape without them,
+        // walking the whole key range in one threadgroup instead of several
+        // walking chunks that a third launch then reduces.
+        if !cfg!(feature = "cuda") {
+            return (1, 0);
+        }
         // Counted ungrouped on purpose. The grouped value kernel gives a block
         // to each (KV head, token) and reads each V row once for the whole
         // query group — a quarter of the traffic at Llama-3.1's 32-over-8 —

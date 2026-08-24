@@ -43,6 +43,7 @@ fn la() -> LinearAttnConfig {
         key_head_dim: 8,
         value_head_dim: 6,
         conv_kernel: 4,
+        v_heads_tiled: false,
     }
 }
 
@@ -217,6 +218,9 @@ impl Layer {
             la.key_head_dim,
             la.value_head_dim,
             (width, 0, la.key_dim(), 2 * la.key_dim()),
+            // V heads grouped by key head, as a Hugging Face checkpoint
+            // stores them.
+            false,
         )?;
         Ok(())
     }
@@ -336,6 +340,9 @@ fn verify_then_replay(
             la.key_head_dim,
             la.value_head_dim,
             (width, 0, la.key_dim(), 2 * la.key_dim()),
+            // V heads grouped by key head, as a Hugging Face checkpoint
+            // stores them.
+            false,
         )?;
     }
     let working = l.dev.stream().clone_dtoh(&r.working_state())?;
@@ -549,6 +556,7 @@ fn the_journal_is_two_orders_of_magnitude_smaller_than_the_state() -> Result<()>
         key_head_dim: 128,
         value_head_dim: 128,
         conv_kernel: 4,
+        v_heads_tiled: false,
     };
     let kinds: Vec<bool> = (0..64).map(|i| (i + 1) % 4 != 0).collect();
     let k = 2;

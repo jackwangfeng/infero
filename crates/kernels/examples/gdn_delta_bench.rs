@@ -178,6 +178,9 @@ fn main() -> Result<()> {
                         DK,
                         DV,
                         offsets,
+                        // V heads grouped by key head, as a Hugging Face
+                        // checkpoint stores them.
+                        false,
                         variant,
                     )?;
                 }

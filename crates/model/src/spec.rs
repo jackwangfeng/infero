@@ -421,6 +421,7 @@ impl GdnRollback {
             la.key_head_dim,
             la.value_head_dim,
             (width, 0, la.key_dim(), 2 * la.key_dim()),
+                    la.v_heads_tiled,
         )?;
         Ok(())
     }

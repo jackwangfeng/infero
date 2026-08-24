@@ -93,7 +93,13 @@ impl DeltaVariant {
             // 128 is what `gdn_delta_rule_reg128_f32` is instantiated for. A
             // second instantiation is a one-line change, but every one costs
             // NVRTC time on a cold cache for a shape no checkpoint here uses.
-            Self::Auto if dk == 128 && dv == 128 => Self::Reg,
+            // The register-resident kernel is CUDA-only: it rests on a
+            // per-thread state slice, `__shfl_xor_sync` partner reductions and
+            // a double-buffered shared stage that were tuned against a specific
+            // register budget. The global one is ported and is what a backend
+            // without it takes -- slower by the ratio in the note above, and
+            // correct.
+            Self::Auto if dk == 128 && dv == 128 && cfg!(feature = "cuda") => Self::Reg,
             Self::Auto => Self::Global,
             other => other,
         }
@@ -320,6 +326,7 @@ impl Kernels {
         dk: usize,
         dv: usize,
         offsets: (usize, usize, usize, usize),
+        v_tiled: bool,
     ) -> Result<()> {
         self.gdn_delta_rule_variant(
             out,
@@ -333,6 +340,7 @@ impl Kernels {
             dk,
             dv,
             offsets,
+            v_tiled,
             DeltaVariant::Auto,
         )
     }
@@ -358,6 +366,9 @@ impl Kernels {
         dk: usize,
         dv: usize,
         offsets: (usize, usize, usize, usize),
+        // Whether the checkpoint stores V heads tiled rather than grouped by
+        // key head; see `LinearAttnConfig::v_heads_tiled`.
+        v_tiled: bool,
         variant: DeltaVariant,
     ) -> Result<()> {
         let (stride, q_off, k_off, v_off) = offsets;
@@ -423,6 +434,7 @@ impl Kernels {
         let (h, kh) = (heads as i32, key_heads as i32);
         let (a, b_) = (dk as i32, dv as i32);
         let (st, qo, ko, vo) = (stride as i32, q_off as i32, k_off as i32, v_off as i32);
+        let vt = i32::from(v_tiled);
         let mut bl = self.dev.stream().launch_builder(&f);
         bl.arg(out)
             .arg(state)
@@ -438,7 +450,8 @@ impl Kernels {
             .arg(&st)
             .arg(&qo)
             .arg(&ko)
-            .arg(&vo);
+            .arg(&vo)
+            .arg(&vt);
         self.dev
             .profile()
             .time("gdn_delta_rule", self.dev.stream(), || {

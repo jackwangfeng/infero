@@ -2037,6 +2037,7 @@ impl Model {
             la.key_head_dim,
             la.value_head_dim,
             (width, 0, key_dim, 2 * key_dim),
+                    la.v_heads_tiled,
         )?;
         // `staged` borrowed the journal for the launch above; letting it fall out
         // of scope here rather than at the end of the function keeps the journal
