@@ -112,19 +112,31 @@ inline void q4k_scale_min(device const uchar* q, int j,
     }                                                                          \
     GEMV_EPILOGUE(T)
 
-/// Q8_0: one f16 scale per 32 int8 quants. One thread a block -- a row is only
-/// a handful of them, so splitting finer would leave most of the group idle.
+/// Q8_0: one f16 scale per 32 int8 quants.
+///
+/// Eight elements a thread, which is four threads to a 32-quant block rather
+/// than one. The count is the same contract `add_assign` has, read the other
+/// way: the host sizes the threadgroup from `WeightType::gemv_work_items`, which
+/// says `k / 8` for this encoding. A body that took a whole block a thread was
+/// self-bounding and therefore correct, and left 96 of 256 threads with nothing
+/// to do at this model's `k = 5120` -- 37% of the group idle on the 288 Q8_0
+/// tensors of a Qwen3.8 checkpoint.
+#define Q8_0_PER_THREAD 8
+
 #define GEMV_BODY_Q8_0(T)                                                      \
     GEMV_PROLOGUE(T)                                                           \
     const int nb = k / QK8_0;                                                  \
+    const int per_block = QK8_0 / Q8_0_PER_THREAD;                             \
+    const int chunks = nb * per_block;                                         \
     device const block_q8_0* wr =                                              \
         (device const block_q8_0*)w + size_t(row) * nb;                        \
-    for (int c = int(tid.x); c < nb; c += int(tgdim.x)) {                       \
-        device const block_q8_0* blk = wr + c;                                 \
+    for (int c = int(tid.x); c < chunks; c += int(tgdim.x)) {                   \
+        device const block_q8_0* blk = wr + c / per_block;                     \
+        const int sub = (c % per_block) * Q8_0_PER_THREAD;                     \
+        const int base = (c / per_block) * QK8_0 + sub;                        \
         const float d = float(blk->d);                                         \
-        const int base = c * QK8_0;                                            \
-        for (int i = 0; i < QK8_0; ++i) {                                      \
-            GEMV_SPREAD(T, d * float(blk->qs[i]), base + i)                    \
+        for (int i = 0; i < Q8_0_PER_THREAD; ++i) {                            \
+            GEMV_SPREAD(T, d * float(blk->qs[sub + i]), base + i)              \
         }                                                                      \
     }                                                                          \
     GEMV_EPILOGUE(T)
@@ -145,14 +157,18 @@ inline void q4k_scale_min(device const uchar* q, int j,
         const int high = g & 1;                                                \
         const float d = float(blk->d) * float(sc);                             \
         const float mn = float(blk->dmin) * float(m);                          \
-        device const uint* q32 =                                               \
-            (device const uint*)(device const void*)(blk->qs + (g / 2) * 32);   \
-        for (int wi = 0; wi < 8; ++wi) {                                       \
-            const uint packed = q32[wi];                                       \
-            for (int b = 0; b < 4; ++b) {                                      \
-                const int byte = int((packed >> (b * 8)) & 0xFF);              \
-                const int nib = high ? (byte >> 4) : (byte & 0xF);             \
-                GEMV_SPREAD(T, d * float(nib) - mn, base + wi * 4 + b)         \
+        device const uint4* q128 =                                             \
+            (device const uint4*)(device const void*)(blk->qs + (g / 2) * 32);  \
+        for (int v = 0; v < 2; ++v) {                                          \
+            const uint4 quad = q128[v];                                        \
+            for (int wi = 0; wi < 4; ++wi) {                                   \
+                const uint packed = quad[wi];                                  \
+                for (int b = 0; b < 4; ++b) {                                  \
+                    const int byte = int((packed >> (b * 8)) & 0xFF);          \
+                    const int nib = high ? (byte >> 4) : (byte & 0xF);         \
+                    GEMV_SPREAD(T, d * float(nib) - mn,                        \
+                                base + v * 16 + wi * 4 + b)                    \
+                }                                                              \
             }                                                                  \
         }                                                                      \
     }                                                                          \
