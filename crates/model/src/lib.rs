@@ -166,9 +166,42 @@ impl<'a> BatchItem<'a> {
 /// `MPSMatrixMultiplication` wired up yet, and it is a prefill cost only:
 /// decode is one token and never reaches here.
 #[cfg(feature = "cuda")]
-const GEMM_THRESHOLD: usize = 4;
+const GEMM_THRESHOLD_DEFAULT: usize = 4;
+/// Twelve times CUDA's 4, and the gap is the cost of MPS wanting one data type
+/// for all three matrices: reaching the GEMM means dequantising the weight to
+/// f16 first, 3.56x the bytes of Q4_K, plus splitting the open command encoder.
+/// A handful of tokens cannot pay that back. Measured, prompt tokens through the
+/// 27B, one chunk each:
+///
+/// ```text
+///   prompt   GEMM on   GEMM off
+///       11    147.2       42.7   ms a token
+///       31     53.5       48.9
+///       71     27.0       52.0
+///      151     15.5       52.7
+///      311     14.9       52.2
+/// ```
+///
+/// The crossing is between 31 and 71, and 48 sits in it. Erring high is the
+/// cheaper mistake in the other direction too: a short prompt is short, so
+/// paying 5 ms a token extra on 31 of them is 150 ms, while a 5-token prompt
+/// sent to the GEMM pays 500 ms for nothing -- which is what a threshold of 4
+/// did to four concurrent requests, 19.7 tok/s against 23.9.
 #[cfg(not(feature = "cuda"))]
-const GEMM_THRESHOLD: usize = MAX_BATCH_TOKENS;
+const GEMM_THRESHOLD_DEFAULT: usize = 48;
+
+/// Tokens above which a matmul takes the GEMM rather than repeating the
+/// mat-vec, overridable so the trade can be re-measured rather than argued.
+fn gemm_threshold() -> usize {
+    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("TUILI_GEMM_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(GEMM_THRESHOLD_DEFAULT)
+    })
+}
 /// Up to this many tokens, a weight type with no tensor-core GEMM repeats the
 /// integer mat-vec once per token instead of taking the float path. Measured
 /// against Llama-3.1-8B Q4_K_M, whose Q6_K matrices are the ones affected.
@@ -3482,7 +3515,7 @@ impl Model {
             return Ok(());
         }
 
-        if n_tokens <= GEMM_THRESHOLD {
+        if n_tokens <= gemm_threshold() {
             return kern.gemv(out, &weights, w.ty, x, w.k, w.n, n_tokens);
         }
 

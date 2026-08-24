@@ -4707,19 +4707,30 @@ impl Kernels {
     /// reaches it above `GEMM_THRESHOLD` tokens and a silent fallback there
     /// would look like a mysterious prefill regression.
     #[cfg(not(feature = "cuda"))]
+    /// `c = a * b^T` through `MPSMatrixMultiplication`.
+    ///
+    /// The whole implementation is in the backend, because reaching MPS needs
+    /// the raw `MTLBuffer` behind a view and that is not something a neutral
+    /// caller should be able to do. See `tuili_metal::gemm`.
+    ///
+    /// One difference from the cuBLAS path worth carrying at the call site:
+    /// cuBLAS is asked for an f32 accumulator with f16 operands, and MPS
+    /// requires all three matrices to share a type, so this accumulates in f16.
+    /// Over `k = 17408` that is a real precision difference. It is a prefill
+    /// path -- the decode mat-vec accumulates in f32 and does not come here --
+    /// and prefill feeds attention rather than a sampler, but it is not nothing.
     pub fn gemm_f16(
         &self,
-        _c: &mut ViewMut<'_, f32>,
-        _a: &View<'_, f16>,
-        _b: &View<'_, f16>,
+        c: &mut ViewMut<'_, f32>,
+        a: &View<'_, f16>,
+        b: &View<'_, f16>,
         n_tokens: usize,
         k: usize,
         n: usize,
     ) -> Result<()> {
-        anyhow::bail!(
-            "gemm_f16 ({n_tokens}x{k}x{n}) has no implementation on this backend yet; \
-             prefill above GEMM_THRESHOLD tokens needs MPSMatrixMultiplication"
-        )
+        self.dev.profile().time("gemm_f16", self.dev.stream(), || {
+            tuili_gpu::gemm_f16_to_f32(&self.dev, c, a, b, n_tokens, k, n)
+        })
     }
 
     #[cfg(feature = "cuda")]

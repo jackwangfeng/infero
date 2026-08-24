@@ -23,6 +23,7 @@ pub mod backend;
 mod compat;
 mod buffer;
 mod device;
+mod gemm;
 mod launch;
 mod msl;
 mod profile;

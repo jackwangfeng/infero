@@ -35,3 +35,9 @@ pub fn set_max_dynamic_shared(_f: &Function, _bytes: u32) -> anyhow::Result<()> 
 pub fn map_file(dev: &Device, path: &std::path::Path) -> anyhow::Result<Option<Buf<u8>>> {
     crate::buffer::map_file(dev, path).map(Some)
 }
+
+/// `c = a * b^T`, f16 operands and an f32 result. See `gemm::gemm_f16_to_f32`.
+///
+/// Metal-only: the CUDA backend answers the same question inside its own
+/// `Kernels::gemm_f16` with cuBLAS, so nothing neutral calls this.
+pub use crate::gemm::gemm_f16_to_f32;

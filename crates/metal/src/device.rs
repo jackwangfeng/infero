@@ -52,6 +52,7 @@ struct Inner {
     name: String,
     cores: u32,
     batch: Batch,
+    gemm: crate::gemm::GemmCache,
     profile: Profile,
 }
 
@@ -104,6 +105,7 @@ impl Device {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(32),
                 batch: Batch::default(),
+                gemm: Default::default(),
                 profile: Profile::new(),
             }),
         })
@@ -149,6 +151,10 @@ impl Device {
 
     pub(crate) fn batch(&self) -> &Batch {
         &self.inner.batch
+    }
+
+    pub(crate) fn gemm_cache(&self) -> &crate::gemm::GemmCache {
+        &self.inner.gemm
     }
 
     pub fn profile(&self) -> &Profile {

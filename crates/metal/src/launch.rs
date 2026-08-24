@@ -363,6 +363,46 @@ impl Batch {
         Ok(())
     }
 
+    /// Encode something that wants the *command buffer* rather than a compute
+    /// encoder -- MPS kernels, which bring their own.
+    ///
+    /// The open compute encoder is ended and a fresh one opened on the same
+    /// buffer afterwards, so the MPS pass lands between two compute passes of
+    /// one submission. Encoders within a command buffer execute in creation
+    /// order, which is the ordering guarantee the caller needs: the GEMM sees
+    /// the dequantised weights the dispatch before it wrote, and the dispatch
+    /// after it sees the GEMM's output.
+    ///
+    /// Splitting the encoder is not free -- it ends a pass and starts another --
+    /// which is a reason to reach a GEMM at a token count where it earns that,
+    /// and not below.
+    pub(crate) fn encode_on_buffer(
+        &self,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
+        f: impl FnOnce(&ProtocolObject<dyn MTLCommandBuffer>) -> Result<()>,
+    ) -> Result<()> {
+        let mut guard = self.open.lock().unwrap();
+        let cb = match guard.take() {
+            Some(open) => {
+                open.enc.endEncoding();
+                open.cb
+            }
+            None => queue
+                .commandBuffer()
+                .ok_or_else(|| anyhow!("commandBuffer() returned nil"))?,
+        };
+        f(&cb)?;
+        let enc = cb
+            .computeCommandEncoder()
+            .ok_or_else(|| anyhow!("computeCommandEncoder() returned nil"))?;
+        *guard = Some(Open {
+            cb,
+            enc,
+            dispatches: 0,
+        });
+        Ok(())
+    }
+
     /// End the open encoder and submit, without waiting.
     pub(crate) fn commit(&self) -> Result<()> {
         let Some(open) = self.open.lock().unwrap().take() else {
