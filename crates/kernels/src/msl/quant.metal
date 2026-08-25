@@ -628,3 +628,118 @@ kernel void gemv_mma_q4_K(
         }
     }
 }
+
+#define MMA_WIDE_TILES 8
+
+/// Q4_K, eight rows by up to 64 tokens (eight tiles of eight) a threadgroup.
+///
+/// `gemv_mma_q4_K` dequantises and MMAs one 8x8 tile a threadgroup, so a batch
+/// past eight tokens pays for the same weight row again for every further
+/// group of eight -- `grid.y` threadgroups sharing nothing, each re-fetching
+/// and re-decoding the identical bytes. The decode into `stage` depends only
+/// on which row this threadgroup owns, never on which tokens are being
+/// multiplied; only the multiply-accumulate step needs the token index. This
+/// keeps the identical decode and MMAs it against up to eight token-tiles
+/// before moving to the next weight chunk, hoping a batch of 64 would pay the
+/// weight stream once instead of eight times.
+///
+/// Measured on an M4 Max against the deployed kernel (`examples/
+/// gemv_mma_wide_check.rs`), same answer to the bit at every token count:
+/// 0.64x at eight tokens, falling to 0.51x by sixty-four -- *slower*, and
+/// increasingly so. The "redundant" re-fetch this was written to remove was
+/// evidently not costing much: eight `grid.y` threadgroups sharing one row
+/// read the same few KiB of weight close together in time, which is exactly
+/// what an L2 sized in MiB is for. What this version actually changed was
+/// concurrency -- an 8x narrower `grid.y` is 8x fewer threadgroups in flight,
+/// and eight live `simdgroup_float8x8` accumulators a thread is real register
+/// pressure that likely caps how many of this fatter threadgroup fit on a
+/// core at once. Trading real occupancy for a memory saving the cache had
+/// already made this a net loss. Kept as the record of why: the next
+/// idea for this range needs a different mechanism, not a wider tile.
+kernel void gemv_mma_wide_q4_K(
+        device float* out          [[buffer(0)]],
+        device const void* w       [[buffer(1)]],
+        device const float* x      [[buffer(2)]],
+        constant int& k            [[buffer(3)]],
+        constant int& n            [[buffer(4)]],
+        constant int& n_tokens     [[buffer(5)]],
+        uint3 tgid  [[threadgroup_position_in_grid]],
+        uint3 tid   [[thread_position_in_threadgroup]]) {
+    threadgroup float stage[32 * MMA_ROWS];
+
+    const int row0 = int(tgid.x) * MMA_ROWS;
+    const int token0 = int(tgid.y) * MMA_WIDE_TILES * MMA_TOKS;
+    const int lane = int(tid.x);
+    const int nb = k / QK_K;
+
+    const int r = lane / 4;
+    const int c = lane % 4;
+    const int row = min(row0 + r, n - 1);
+
+    // How many of this group's eight tiles hold a real token. Fewer only in
+    // the last group of a batch that is not a multiple of 64; the decode
+    // below runs the same either way, since it does not know about tokens.
+    int n_tiles = 0;
+    for (int i = 0; i < MMA_WIDE_TILES; ++i) {
+        if (token0 + i * MMA_TOKS < n_tokens) n_tiles = i + 1;
+    }
+
+    simdgroup_float8x8 acc[MMA_WIDE_TILES];
+    for (int i = 0; i < MMA_WIDE_TILES; ++i) {
+        acc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (int b = 0; b < nb; ++b) {
+        device const block_q4_K* blk =
+            (device const block_q4_K*)w + size_t(row) * nb + b;
+        for (int g = 0; g < 8; ++g) {
+            uchar sc, m;
+            q4k_scale_min(blk->scales, g, &sc, &m);
+            const float d = float(blk->d) * float(sc);
+            const float mn = float(blk->dmin) * float(m);
+            const int s0 = (g & 1) ? 4 : 0;
+            device const uint2* q =
+                (device const uint2*)(device const void*)(blk->qs + (g / 2) * 32 + c * 8);
+            const uint2 pair = *q;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int u = 0; u < 2; ++u) {
+                const uint pk = pair[u];
+                for (int bi = 0; bi < 4; ++bi) {
+                    const int byte = int((pk >> (bi * 8)) & 0xFF);
+                    const int off = c * 8 + u * 4 + bi;
+                    stage[off * MMA_ROWS + r] = d * float((byte >> s0) & 0xF) - mn;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const int kbase = b * QK_K + g * 32;
+            for (int sub = 0; sub < 4; ++sub) {
+                simdgroup_float8x8 wt;
+                simdgroup_load(wt, stage + sub * MMA_ROWS * MMA_TOKS, MMA_ROWS);
+                for (int tile = 0; tile < n_tiles; ++tile) {
+                    simdgroup_float8x8 xt;
+                    simdgroup_load(
+                        xt,
+                        x + size_t(token0 + tile * MMA_TOKS) * k + kbase + sub * MMA_TOKS,
+                        k);
+                    simdgroup_multiply_accumulate(acc[tile], xt, wt, acc[tile]);
+                }
+            }
+        }
+    }
+
+    threadgroup float sout[MMA_ROWS * MMA_TOKS];
+    for (int tile = 0; tile < n_tiles; ++tile) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_store(acc[tile], sout, MMA_ROWS);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int flat = lane; flat < MMA_ROWS * MMA_TOKS; flat += 32) {
+            const int t = flat / MMA_ROWS;
+            const int rr = flat % MMA_ROWS;
+            const int tcol = token0 + tile * MMA_TOKS + t;
+            if (tcol < n_tokens && row0 + rr < n) {
+                out[size_t(tcol) * n + row0 + rr] = sout[flat];
+            }
+        }
+    }
+}

@@ -56,3 +56,7 @@ path = "examples/bandwidth.rs"
 [[example]]
 name = "launch_overhead"
 path = "examples/launch_overhead.rs"
+
+[[example]]
+name = "gemv_mma_wide_check"
+path = "examples/gemv_mma_wide_check.rs"
