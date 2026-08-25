@@ -290,6 +290,154 @@ kernel void gemv2_q8_0(GEMV_ARGS) { GEMV_BODY_Q8_0(2) }
 kernel void gemv4_q8_0(GEMV_ARGS) { GEMV_BODY_Q8_0(4) }
 kernel void gemv_q4_K(GEMV_ARGS)  { GEMV_BODY_Q4_K(GEMV_TOKENS) }
 kernel void gemv1_q4_K(GEMV_ARGS) { GEMV_BODY_Q4_K(1) }
+
+// ---- decode-only, llama.cpp-style row-per-simdgroup gemv ------------------
+//
+// `gemv1_q4_K` above puts one output row on a whole threadgroup (up to 128
+// threads, `GEMV_BLOCK_MAX` in kernels/src/lib.rs) and reduces it with
+// `BLOCK_SUM`, which is barrier-based: every one of a decode step's ~190
+// Q4_K launches pays a threadgroup-wide rendezvous even though nothing but
+// that one row's own threads ever needs combining. Measured at 92-145 GB/s
+// against this machine's 546 GB/s peak -- 17-27% -- which is most of the
+// remaining gap to llama.cpp's own decode speed on the same checkpoint.
+//
+// llama.cpp's Metal `kernel_mul_mv_q4_K_f32` (ggml-metal.metal) does not
+// have this cost: each 32-lane simdgroup owns a handful of independent
+// output rows outright -- no other simdgroup ever touches them -- and
+// reduces with a bare `simd_sum`, so the kernel never issues a
+// `threadgroup_barrier` at all. Ported here as its own kernel rather than
+// folded into `GEMV_BODY_Q4_K`, which still wants its multi-token batching
+// and the barrier that requires; this one is `n_tokens == 1` only.
+//
+// Row-major means each simdgroup's `GEMV1_SIMD_ROWS` rows share nothing but
+// the activation vector, which is why they can be decoded independently and
+// reduced independently. What *is* shared is the read of `x`: for a fixed
+// 32-element group, every row wants the same four `packed_float4`s, so they
+// are read once into registers and spent on all four rows -- the batch=1
+// analogue of what `GEMV_SPREAD4` does across tokens at batch>1, applied
+// across rows instead since there is only one token to amortise weight
+// reads against here.
+//
+// A negative result, kept for the record rather than deleted. In isolation
+// (`examples/gemv1_simd_check.rs`, this kernel run back-to-back against
+// itself thirty times, synchronised after each launch) it beats `gemv1_q4_K`
+// on both of this model's real Q4_K decode shapes: 1.07x on ffn_gate/up,
+// 1.12x on ffn_down, at `ROWS = 2, SGS = 4` -- the best of a `(rows, sgs)`
+// sweep over `{2,4,8} x {2,4}`. Wired into the live `gemv` dispatch and
+// measured end to end with `TUILI_STEP_TIMING=1`, it made every decode step
+// *slower*: advance_ms 70.83ms on the first post-warmup sample against
+// 67.93ms for the deployed kernel, reproduced by reverting the dispatch,
+// rebuilding, and re-measuring on the same running server. The isolated
+// benchmark cannot see this because it never interleaves this kernel with
+// the ~490 *other* launches a real decode step issues; the leading
+// suspect is register pressure -- this kernel holds eight `packed_float4`
+// (32 live floats) plus a `block_q4_K` pointer, scale, min and two `uint4`s
+// a row simultaneously, which is a much heavier per-thread footprint than
+// `gemv1_q4_K`'s one-row-a-threadgroup design, and fewer threadgroups
+// resident at once on a GPU core would show up as exactly this kind of
+// gap between a kernel measured alone and the same kernel measured inside
+// the pipeline it actually has to share. Not wired into `gemv`; not deleted,
+// because the isolated-win-vs-real-loss gap is itself worth a future
+// session not re-discovering the hard way.
+#define GEMV1_SIMD_ROWS 2
+#define GEMV1_SIMD_GROUPS 4
+
+kernel void gemv1_simd_q4_K(
+        device float* out          [[buffer(0)]],
+        device const void* w       [[buffer(1)]],
+        device const float* x      [[buffer(2)]],
+        constant int& k            [[buffer(3)]],
+        constant int& n            [[buffer(4)]],
+        constant int& n_tokens     [[buffer(5)]],
+        uint3 tgid    [[threadgroup_position_in_grid]],
+        ushort sg     [[simdgroup_index_in_threadgroup]],
+        ushort lane_u [[thread_index_in_simdgroup]]) {
+    const int lane = int(lane_u);
+    const int nb = k / QK_K;
+    const int row0 = (int(tgid.x) * GEMV1_SIMD_GROUPS + int(sg)) * GEMV1_SIMD_ROWS;
+
+    device const block_q4_K* wr[GEMV1_SIMD_ROWS];
+    for (int r = 0; r < GEMV1_SIMD_ROWS; ++r) {
+        const int row = min(row0 + r, n - 1);
+        wr[r] = (device const block_q4_K*)w + size_t(row) * nb;
+    }
+
+    float acc[GEMV1_SIMD_ROWS];
+    for (int r = 0; r < GEMV1_SIMD_ROWS; ++r) acc[r] = 0.0f;
+
+    for (int c = lane; c < nb * 8; c += WARP_SIZE) {
+        const int b = c / 8;
+        const int g = c % 8;
+        const int base = b * QK_K + g * 32;
+        const int high = g & 1;
+        const int s0 = high ? 4 : 0;
+
+        device const packed_float4* xp = (device const packed_float4*)(x + base);
+        const packed_float4 xv0 = xp[0];
+        const packed_float4 xv1 = xp[1];
+        const packed_float4 xv2 = xp[2];
+        const packed_float4 xv3 = xp[3];
+        const packed_float4 xv4 = xp[4];
+        const packed_float4 xv5 = xp[5];
+        const packed_float4 xv6 = xp[6];
+        const packed_float4 xv7 = xp[7];
+
+        for (int r = 0; r < GEMV1_SIMD_ROWS; ++r) {
+            device const block_q4_K* blk = wr[r] + b;
+            uchar sc, m;
+            q4k_scale_min(blk->scales, g, &sc, &m);
+            const float dd = float(blk->d) * float(sc);
+            const float mn = float(blk->dmin) * float(m);
+            device const uint4* q128 =
+                (device const uint4*)(device const void*)(blk->qs + (g / 2) * 32);
+            const uint4 quad0 = q128[0];
+            const uint4 quad1 = q128[1];
+            float dot = 0.0f;
+            dot += (dd * float((quad0[0] >> s0) & 0xF) - mn) * xv0[0]
+                 + (dd * float((quad0[0] >> (s0 + 8)) & 0xF) - mn) * xv0[1]
+                 + (dd * float((quad0[0] >> (s0 + 16)) & 0xF) - mn) * xv0[2]
+                 + (dd * float((quad0[0] >> (s0 + 24)) & 0xF) - mn) * xv0[3];
+            dot += (dd * float((quad0[1] >> s0) & 0xF) - mn) * xv1[0]
+                 + (dd * float((quad0[1] >> (s0 + 8)) & 0xF) - mn) * xv1[1]
+                 + (dd * float((quad0[1] >> (s0 + 16)) & 0xF) - mn) * xv1[2]
+                 + (dd * float((quad0[1] >> (s0 + 24)) & 0xF) - mn) * xv1[3];
+            dot += (dd * float((quad0[2] >> s0) & 0xF) - mn) * xv2[0]
+                 + (dd * float((quad0[2] >> (s0 + 8)) & 0xF) - mn) * xv2[1]
+                 + (dd * float((quad0[2] >> (s0 + 16)) & 0xF) - mn) * xv2[2]
+                 + (dd * float((quad0[2] >> (s0 + 24)) & 0xF) - mn) * xv2[3];
+            dot += (dd * float((quad0[3] >> s0) & 0xF) - mn) * xv3[0]
+                 + (dd * float((quad0[3] >> (s0 + 8)) & 0xF) - mn) * xv3[1]
+                 + (dd * float((quad0[3] >> (s0 + 16)) & 0xF) - mn) * xv3[2]
+                 + (dd * float((quad0[3] >> (s0 + 24)) & 0xF) - mn) * xv3[3];
+            dot += (dd * float((quad1[0] >> s0) & 0xF) - mn) * xv4[0]
+                 + (dd * float((quad1[0] >> (s0 + 8)) & 0xF) - mn) * xv4[1]
+                 + (dd * float((quad1[0] >> (s0 + 16)) & 0xF) - mn) * xv4[2]
+                 + (dd * float((quad1[0] >> (s0 + 24)) & 0xF) - mn) * xv4[3];
+            dot += (dd * float((quad1[1] >> s0) & 0xF) - mn) * xv5[0]
+                 + (dd * float((quad1[1] >> (s0 + 8)) & 0xF) - mn) * xv5[1]
+                 + (dd * float((quad1[1] >> (s0 + 16)) & 0xF) - mn) * xv5[2]
+                 + (dd * float((quad1[1] >> (s0 + 24)) & 0xF) - mn) * xv5[3];
+            dot += (dd * float((quad1[2] >> s0) & 0xF) - mn) * xv6[0]
+                 + (dd * float((quad1[2] >> (s0 + 8)) & 0xF) - mn) * xv6[1]
+                 + (dd * float((quad1[2] >> (s0 + 16)) & 0xF) - mn) * xv6[2]
+                 + (dd * float((quad1[2] >> (s0 + 24)) & 0xF) - mn) * xv6[3];
+            dot += (dd * float((quad1[3] >> s0) & 0xF) - mn) * xv7[0]
+                 + (dd * float((quad1[3] >> (s0 + 8)) & 0xF) - mn) * xv7[1]
+                 + (dd * float((quad1[3] >> (s0 + 16)) & 0xF) - mn) * xv7[2]
+                 + (dd * float((quad1[3] >> (s0 + 24)) & 0xF) - mn) * xv7[3];
+            acc[r] += dot;
+        }
+    }
+
+    for (int r = 0; r < GEMV1_SIMD_ROWS; ++r) {
+        const float total = simd_sum(acc[r]);
+        if (lane == 0) {
+            const int row = row0 + r;
+            if (row < n) out[row] = total;
+        }
+    }
+}
+
 kernel void gemv2_q4_K(GEMV_ARGS) { GEMV_BODY_Q4_K(2) }
 kernel void gemv4_q4_K(GEMV_ARGS) { GEMV_BODY_Q4_K(4) }
 kernel void gemv_q6_K(GEMV_ARGS)  { GEMV_BODY_Q6_K(GEMV_TOKENS) }
