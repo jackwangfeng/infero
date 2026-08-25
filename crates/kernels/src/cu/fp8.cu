@@ -382,6 +382,85 @@ extern "C" __global__ void fp8_repack_rows(unsigned char* __restrict__ dst,
                             + (size_t)c * (FP8_ROW_GROUP * 4) + (size_t)r * 4) = w;
 }
 
+// ---- activation quantization --------------------------------------------
+//
+// `mma_e4m3` (`mma.cuh`) wants both operands in e4m3, not one; this is what
+// puts the activation there. `QUANT_GROUP` matches vLLM's own dynamic
+// activation quantizer (`QuantFP8(group_shape=(1,128))`, which is what its
+// FP8 linear kernels — `cutlass_scaled_mm`, DeepGEMM — both feed into a
+// native e4m3xe4m3 MMA) rather than being independently chosen: reusing the
+// weight's own 128-wide scale block means one `it * SCALES` index already in
+// the GEMM's inner loop picks out both scales, with no separate stride for
+// the activation side to carry.
+#define QUANT_GROUP 128
+
+// One scalar through the paired hardware converter, both lanes fed the same
+// value. `cvt.rn.satfinite.e4m3x2.f32` takes two `f32`s and packs two e4m3
+// results into one 16-bit register; feeding it the same float twice makes
+// both output bytes identical, which sidesteps needing to know which one the
+// instruction calls "low" — either is the answer, and duplicating the work is
+// cheaper than a shuffle to pair two different lanes' values for a quantizer
+// this far from the kernel's own bottleneck.
+__device__ __forceinline__ unsigned char f32_to_e4m3(float f) {
+#if __CUDA_ARCH__ >= 890
+    unsigned short packed;
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;"
+        : "=h"(packed)
+        : "f"(f), "f"(f));
+    return (unsigned char)(packed & 0xFFu);
+#else
+    (void)f;
+    return 0;
+#endif
+}
+
+// One block per (token, 128-wide k-group): `QUANT_GROUP` threads read their
+// element, an amax reduction picks the group's scale, and every thread writes
+// its own quantized byte back out. `xs` is `[n_tokens, k / QUANT_GROUP]`.
+//
+// The floor under `amax` keeps an all-zero group's scale finite (`0/eps` is
+// `0`, not the `NaN` `0/0` would produce) without pulling on anything a real
+// group encodes: normalized activations routinely run below 1.0, which a
+// floor anywhere near that would clip, so this one is far enough under any
+// magnitude that could reach `x` to only ever bind on a literal all-zero
+// group.
+extern "C" __global__ void quantize_act_e4m3_f32(unsigned char* __restrict__ xq,
+                                                 float* __restrict__ xs,
+                                                 const float* __restrict__ x,
+                                                 int k) {
+    const int tok = blockIdx.x;
+    const int group = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int idx = group * QUANT_GROUP + tid;
+    const float v = x[(size_t)tok * k + idx];
+
+    __shared__ float red[QUANT_GROUP / WARP_SIZE];
+    float amax = fabsf(v);
+#pragma unroll
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
+    }
+    const int warp = tid / WARP_SIZE;
+    if (tid % WARP_SIZE == 0) red[warp] = amax;
+    __syncthreads();
+    if (warp == 0) {
+        float m = (tid < QUANT_GROUP / WARP_SIZE) ? red[tid] : 0.0f;
+#pragma unroll
+        for (int off = (QUANT_GROUP / WARP_SIZE) / 2; off > 0; off >>= 1) {
+            m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFFu, m, off));
+        }
+        if (tid == 0) red[0] = fmaxf(m, 1e-30f);
+    }
+    __syncthreads();
+    const float scale = red[0] / 448.0f;
+
+    xq[(size_t)tok * k + idx] = f32_to_e4m3(v / scale);
+    if (tid == 0) {
+        const int groups = k / QUANT_GROUP;
+        xs[(size_t)tok * groups + group] = scale;
+    }
+}
+
 // ---- tensor cores ------------------------------------------------------------
 //
 // The batched mat-vec's marginal row is 81% per-token multiply-accumulate

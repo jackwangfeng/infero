@@ -516,6 +516,12 @@ fn concat(parts: &[(&[u8], usize)], k: usize) -> Vec<u8> {
     out
 }
 
+/// The activation quantizer's group width — must match `QUANT_GROUP` in
+/// `fp8.cu`. Chosen to equal [`FP8_BLOCK`] rather than independently, so the
+/// GEMM's own `it * SCALES` index into the weight's scale grid also indexes
+/// the activation's, with no second stride to carry.
+pub const ACT_QUANT_GROUP: usize = 128;
+
 impl Kernels {
     /// [`repack_rows`], on the device.
     ///
@@ -555,6 +561,50 @@ impl Kernels {
             .profile()
             .time("fp8_repack_rows", self.dev.stream(), || {
                 unsafe { b.launch(cfg) }.context("fp8_repack_rows")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// Dynamic per-token, per-[`ACT_QUANT_GROUP`] e4m3 quantization of an
+    /// activation, the operand `mma_e4m3` (`mma.cuh`) wants in place of the
+    /// f32 `mma_f8_block` reads directly. `xq` is `[n_tokens, k]`, `xs` is
+    /// `[n_tokens, k / ACT_QUANT_GROUP]`.
+    ///
+    /// `caps().fp8` gates this the same as the MMA itself — the conversion
+    /// inside has no software fallback, unlike `e4m3_to_f32`'s decode side,
+    /// because a quantizer with no hardware path to feed is not worth having.
+    pub fn quantize_act_e4m3(
+        &self,
+        xq: &mut ViewMut<'_, u8>,
+        xs: &mut ViewMut<'_, f32>,
+        x: &View<'_, f32>,
+        k: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            k.is_multiple_of(ACT_QUANT_GROUP),
+            "the activation quantizer's groups are {ACT_QUANT_GROUP} wide; k is {k}"
+        );
+        debug_assert!(x.len() >= n_tokens * k);
+        debug_assert!(xq.len() >= n_tokens * k);
+        debug_assert!(xs.len() >= n_tokens * (k / ACT_QUANT_GROUP));
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_fp8", fp8_src(), "quantize_act_e4m3_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_tokens as u32, (k / ACT_QUANT_GROUP) as u32, 1),
+            block_dim: (ACT_QUANT_GROUP as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let ki = k as i32;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(xq).arg(xs).arg(x).arg(&ki);
+        self.dev
+            .profile()
+            .time("quantize_act_e4m3", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("quantize_act_e4m3")?;
                 Ok(())
             })?;
         Ok(())
