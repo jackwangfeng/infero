@@ -3257,6 +3257,12 @@ impl Model {
     /// on purpose: there is no stacked `gate_up` because the checkpoint ships
     /// experts separately, and no residual-fusing `down` because the combine,
     /// not a matmul, is what writes the output.
+    #[cfg(not(feature = "cuda"))]
+    fn feed_forward_moe(&mut self, _layer: usize, _n: usize, _slot: Option<usize>) -> Result<()> {
+        anyhow::bail!("this checkpoint has sparse (MoE) layers, which this backend has no kernels for yet")
+    }
+
+    #[cfg(feature = "cuda")]
     fn feed_forward_moe(&mut self, layer: usize, n: usize, slot: Option<usize>) -> Result<()> {
         let stage = slot.map(|s| &self.offload.as_ref().unwrap().stage[s]);
         let d = self.cfg.d_model;
