@@ -704,3 +704,191 @@ FP8_MMA_ENTRY(8, 4, mma_f8_block_g4_f32)
 FP8_MMA_ENTRY(8, 8, mma_f8_block_g8_f32)
 FP8_MMA_ENTRY(32, 1, mma_f8_block_w32_f32)
 FP8_MMA_ENTRY(32, 2, mma_f8_block_w32_g2_f32)
+
+// ---- native e4m3 tensor cores --------------------------------------------
+//
+// `mma_f8_body` above widens the weight to f16 and spends an `mma.m16n8k16.f16`;
+// this instead reads both operands as e4m3 and spends `mma_e4m3`'s
+// `mma.m16n8k32`, which Ada/Hopper/Blackwell rate at roughly double the f16
+// instruction's throughput. `xq`/`xs` are `quantize_act_e4m3_f32`'s output —
+// this kernel has no f32 activation input at all, unlike `mma_f8_body`'s `x`.
+//
+// Same staging shape as `mma_f8_body`, minus the reason it needs one: nothing
+// here converts e4m3 to anything else, so the tile is raw bytes copied out of
+// the repacked weight verbatim, at half `mma_f8_body`'s bytes a row for the
+// same 16 rows. `K_TILE` is `WARPS * 32` rather than `* 16` because `m16n8k32`
+// covers twice the k of `m16n8k16` per instruction — four warps span one
+// 128-wide scale block here (`WARPS_PER_SCALE`) where eight did in the f16
+// body, because each warp's own slice is twice as wide.
+//
+// The weight's scale is one lookup a warp a tile, as before. The
+// activation's is not: `xs` is per token, and `GROUPS` tokens share a tile,
+// so it has to be read inside the `GROUPS` loop rather than hoisted above it
+// the way `mma_f8_body` hoists its single (weight-only) scale.
+template <int WARPS, int GROUPS>
+__device__ __forceinline__ void mma_e4m3_body(
+        float* __restrict__ out, const unsigned char* __restrict__ w,
+        const unsigned char* __restrict__ xq, const float* __restrict__ xs,
+        int k, int n, int scale_cols, int n_tokens, int accum) {
+#if __CUDA_ARCH__ >= 890
+    constexpr int K_TILE = WARPS * 32;
+    constexpr int BSTRIDE = K_TILE + 16;       // tile row stride, in bytes
+    constexpr int CHUNKS = K_TILE / 4;         // 4-byte chunks a group a tile
+    constexpr int SCALES = K_TILE / 128;       // scale blocks a tile
+    constexpr int WARPS_PER_SCALE = 4;         // 4 warps * 32 k = one 128 block
+
+    const int row0 = blockIdx.x * 16;
+    if (row0 >= n) return;
+    const int tok0 = blockIdx.y * (GROUPS * 8);
+    if (tok0 >= n_tokens) return;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+
+    // Same two-lives allocation as `mma_f8_body`: the weight tile while the k
+    // loop runs, the cross-warp partials once it is done.
+    extern __shared__ char e4m3_smem[];
+    unsigned char* tile = (unsigned char*)e4m3_smem;   // 2 * 16 * BSTRIDE bytes
+    float* red = (float*)e4m3_smem;                    // WARPS * GROUPS * 128
+
+    const int padded = ((n + FP8_ROW_GROUP - 1) / FP8_ROW_GROUP) * FP8_ROW_GROUP;
+    const float* scales = (const float*)(w + (size_t)padded * k);
+    const float* srow = scales + (size_t)(row0 / 128) * scale_cols;
+
+    // `s8`'s fragment coordinates, not `f16`'s — e4m3 is the same one byte a
+    // lane `mma_s8` already speaks.
+    const int ar = mma_a_row(lane);
+    const int bc = mma_b_col(lane);
+    const int k0 = mma_k0(lane);
+    const int cr = mma_c_row(lane);
+    const int cc = mma_c_col(lane);
+
+    mma_c_f32 acc[GROUPS];
+#pragma unroll
+    for (int g = 0; g < GROUPS; ++g) acc[g] = mma_c_f32{{0.0f, 0.0f, 0.0f, 0.0f}};
+
+    // One thread a (group, chunk) pair, not `mma_f8_body`'s two: that split
+    // exists because its `K_TILE` (`WARPS * 16`) makes `4 * CHUNKS` half of
+    // `blockDim.x`, leaving half the block idle at one thread a pair. Here
+    // `K_TILE` is `WARPS * 32` — twice `mma_f8_body`'s, for the same
+    // `blockDim.x` — so `4 * CHUNKS` already equals `blockDim.x` exactly and
+    // every thread already gets exactly one pair with nothing to split.
+    // Copying the split in anyway made `half` always zero (`PAIRS ==
+    // blockDim.x`, so `threadIdx.x / PAIRS` never reaches 1) and silently
+    // dropped half of every row group's bytes — the bug the numbers in
+    // `tests/mma_e4m3_gemm.rs` first caught, every 16-row block correct in
+    // its first row and zero everywhere else.
+    constexpr int PAIRS = 4 * CHUNKS;
+    static_assert(PAIRS == WARPS * 32, "one thread a pair needs PAIRS == blockDim.x exactly");
+    const int gl = threadIdx.x / CHUNKS;
+    const int sc = threadIdx.x % CHUNKS;
+    const unsigned char* ssrc = w
+        + (size_t)(row0 / FP8_ROW_GROUP + gl) * FP8_ROW_GROUP * k
+        + (size_t)sc * 16;
+
+    const int tiles = k / K_TILE;
+    uint4 q = *(const uint4*)(const void*)ssrc;
+
+    for (int it = 0; it < tiles; ++it) {
+        const int cur = it & 1;
+        unsigned char* tl = tile + (size_t)cur * 16 * BSTRIDE;
+        {
+            const unsigned int word[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                *(unsigned int*)(void*)&tl[(4 * gl + r) * BSTRIDE + 4 * sc] = word[r];
+            }
+        }
+        __syncthreads();
+
+        if (it + 1 < tiles) {
+            q = *(const uint4*)(const void*)(ssrc + (size_t)(it + 1) * K_TILE * 4);
+        }
+
+        // Warp `warp` takes k [it*K_TILE + warp*32, +32), whose scale block is
+        // `warp / WARPS_PER_SCALE` of the `SCALES` this tile spans.
+        const int ko = it * K_TILE + warp * 32;
+        const int sblk = it * SCALES + warp / WARPS_PER_SCALE;
+        const float sw = srow[sblk];
+        const int t0 = warp * 32 + k0;
+        mma_a_s8 a;
+        a.x[0] = *(const int*)(const void*)&tl[ar * BSTRIDE + t0];
+        a.x[1] = *(const int*)(const void*)&tl[(ar + 8) * BSTRIDE + t0];
+        a.x[2] = *(const int*)(const void*)&tl[ar * BSTRIDE + t0 + 16];
+        a.x[3] = *(const int*)(const void*)&tl[(ar + 8) * BSTRIDE + t0 + 16];
+
+#pragma unroll
+        for (int g = 0; g < GROUPS; ++g) {
+            const int tok = tok0 + g * 8 + bc;
+            mma_b_s8 b = {{0, 0}};
+            if (tok < n_tokens) {
+                const unsigned char* bp = xq + (size_t)tok * k + ko + k0;
+                b.x[0] = *(const int*)(const void*)bp;
+                b.x[1] = *(const int*)(const void*)(bp + 16);
+            }
+            mma_c_f32 c_local = {{0.0f, 0.0f, 0.0f, 0.0f}};
+            mma_e4m3(c_local, a, b);
+            // `c_local` is this lane's own, distinct 2x2 output block: rows
+            // (cr, cr+8) by columns (cc, cc+1) -- fixed by the MMA's fragment
+            // layout, unrelated to which column `bc` this lane fed in as a B
+            // operand (`bc` and `cc` are different functions of `lane`). The
+            // scale has to key off the columns this lane actually *produces*,
+            // not the one it fed: using `bc`'s scale here zeroed out every
+            // lane whose `bc` was padding (>= n_tokens) even though the MMA,
+            // being a warp-collective op, had already combined in the real
+            // data from the lanes that fed the valid column.
+            const int tok_lo = tok0 + g * 8 + cc;
+            const int tok_hi = tok_lo + 1;
+            const float sx_lo = tok_lo < n_tokens ? xs[(size_t)tok_lo * scale_cols + sblk] : 0.0f;
+            const float sx_hi = tok_hi < n_tokens ? xs[(size_t)tok_hi * scale_cols + sblk] : 0.0f;
+            acc[g].x[0] += sw * sx_lo * c_local.x[0];
+            acc[g].x[1] += sw * sx_hi * c_local.x[1];
+            acc[g].x[2] += sw * sx_lo * c_local.x[2];
+            acc[g].x[3] += sw * sx_hi * c_local.x[3];
+        }
+    }
+
+    __syncthreads();
+#pragma unroll
+    for (int g = 0; g < GROUPS; ++g) {
+        float* rg = red + (size_t)warp * GROUPS * 128 + g * 128;
+        rg[cr * 8 + cc + 0] = acc[g].x[0];
+        rg[cr * 8 + cc + 1] = acc[g].x[1];
+        rg[(cr + 8) * 8 + cc + 0] = acc[g].x[2];
+        rg[(cr + 8) * 8 + cc + 1] = acc[g].x[3];
+    }
+    __syncthreads();
+
+    // Same row-major-out reordering as `mma_f8_body`'s epilogue.
+    for (int i = threadIdx.x; i < GROUPS * 128; i += blockDim.x) {
+        const int g = i / 128;
+        const int rem = i % 128;
+        const int r = rem % 16;
+        const int col = rem / 16;
+        const int t = tok0 + g * 8 + col;
+        if (t >= n_tokens || row0 + r >= n) continue;
+        const int slot = g * 128 + r * 8 + col;
+        float sum = 0.0f;
+#pragma unroll
+        for (int wi = 0; wi < WARPS; ++wi) sum += red[(size_t)wi * GROUPS * 128 + slot];
+        float* o = out + (size_t)t * n + row0 + r;
+        *o = accum ? *o + sum : sum;
+    }
+#else
+    (void)out; (void)w; (void)xq; (void)xs; (void)k; (void)n; (void)scale_cols;
+    (void)n_tokens; (void)accum;
+#endif
+}
+
+#define E4M3_MMA_ENTRY(WARPS, GROUPS, NAME)                                    \
+    extern "C" __global__ void NAME(                                          \
+            float* __restrict__ out, const unsigned char* __restrict__ w,     \
+            const unsigned char* __restrict__ xq, const float* __restrict__ xs, \
+            int k, int n, int scale_cols, int n_tokens, int accum) {          \
+        mma_e4m3_body<WARPS, GROUPS>(out, w, xq, xs, k, n, scale_cols,        \
+                                     n_tokens, accum);                        \
+    }
+
+E4M3_MMA_ENTRY(8, 1, mma_e4m3_block_f32)
+E4M3_MMA_ENTRY(8, 2, mma_e4m3_block_g2_f32)
+E4M3_MMA_ENTRY(8, 4, mma_e4m3_block_g4_f32)
+E4M3_MMA_ENTRY(8, 8, mma_e4m3_block_g8_f32)

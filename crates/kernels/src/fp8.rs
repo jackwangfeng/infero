@@ -522,6 +522,17 @@ fn concat(parts: &[(&[u8], usize)], k: usize) -> Vec<u8> {
 /// the activation's, with no second stride to carry.
 pub const ACT_QUANT_GROUP: usize = 128;
 
+/// `MMA_GROUPS`' entries, for `mma_e4m3_block`. A separate table because the
+/// kernel names differ, not because the group counts do — `m16n8k32`'s N is
+/// the same 8 `m16n8k16`'s is, so up to `8 * groups` tokens a pass means the
+/// same thing here it does there.
+pub const MMA_E4M3_GROUPS: [(usize, &str); 4] = [
+    (1, "mma_e4m3_block_f32"),
+    (2, "mma_e4m3_block_g2_f32"),
+    (4, "mma_e4m3_block_g4_f32"),
+    (8, "mma_e4m3_block_g8_f32"),
+];
+
 impl Kernels {
     /// [`repack_rows`], on the device.
     ///
@@ -765,6 +776,88 @@ impl Kernels {
             .profile()
             .time("mma_f8_block", self.dev.stream(), || {
                 unsafe { b.launch(cfg) }.context("mma_f8_block")?;
+                Ok(())
+            })?;
+        Ok(true)
+    }
+
+    /// [`Self::mma_f8_block`], with both operands in e4m3 instead of widening
+    /// the weight to f16 — `mma_e4m3` (`mma.cuh`) against `mma_f16`. `xq`/`xs`
+    /// are `quantize_act_e4m3`'s output, not `mma_f8_block`'s f32 `x`.
+    ///
+    /// Only the `WARPS = 8` tier: this model's actual shapes (`d_model`,
+    /// `d_ff`, `value_dim`, `d_attn`'s widths) all clear the eligibility check
+    /// below at that tier already, so the wide variant `mma_f8_block` adds for
+    /// narrow matrices at low occupancy is not yet built for this path — the
+    /// same graceful decline that stands in for it (falling back to
+    /// `mma_f8_block`) is safe, only unoptimized, for whatever shape does
+    /// need it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mma_e4m3_block(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
+        xq: &View<'_, u8>,
+        xs: &View<'_, f32>,
+        k: usize,
+        n: usize,
+        n_tokens: usize,
+        accum: bool,
+    ) -> Result<bool> {
+        const WARPS: usize = 8;
+        const K_TILE: usize = WARPS * 32;
+        if !self.dev.caps().fp8
+            || !k.is_multiple_of(K_TILE)
+            || n_tokens > 4 * MMA_E4M3_GROUPS.last().unwrap().0 * MMA_TOKENS
+        {
+            return Ok(false);
+        }
+        let scale_cols = k.div_ceil(FP8_BLOCK);
+        debug_assert!(out.len() >= n_tokens * n);
+        debug_assert!(xq.len() >= n_tokens * k);
+        debug_assert!(xs.len() >= n_tokens * scale_cols);
+        debug_assert!(w.len() >= fp8_bytes(k, n));
+
+        let blocks = n.div_ceil(MMA_ROWS);
+        let want = n_tokens.div_ceil(MMA_TOKENS);
+        let &(groups, name) = MMA_E4M3_GROUPS
+            .iter()
+            .find(|(g, _)| want <= *g)
+            .unwrap_or(MMA_E4M3_GROUPS.last().unwrap());
+        let f = self.dev.kernels().get("tuili_fp8", fp8_src(), name)?;
+        // Byte tile, not halves — no unpack means no reason to double it —
+        // and `+16` bytes of pad plays `mma_f8_block`'s `+8` halves' role:
+        // both add one `int4`'s worth of stride so a 16-row gather's banks
+        // permute instead of lining up.
+        let bstride = K_TILE + 16;
+        let shared = (2 * MMA_ROWS * bstride).max(WARPS * groups * 128 * 4);
+        let cfg = LaunchConfig {
+            grid_dim: (
+                blocks as u32,
+                n_tokens.div_ceil(groups * MMA_TOKENS) as u32,
+                1,
+            ),
+            block_dim: (WARPS as u32 * 32, 1, 1),
+            shared_mem_bytes: shared as u32,
+        };
+        let (ki, ni) = (k as i32, n as i32);
+        let scols = scale_cols as i32;
+        let toks = n_tokens as i32;
+        let acc = i32::from(accum);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out)
+            .arg(w)
+            .arg(xq)
+            .arg(xs)
+            .arg(&ki)
+            .arg(&ni)
+            .arg(&scols)
+            .arg(&toks)
+            .arg(&acc);
+        self.dev
+            .profile()
+            .time("mma_e4m3_block", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("mma_e4m3_block")?;
                 Ok(())
             })?;
         Ok(true)
