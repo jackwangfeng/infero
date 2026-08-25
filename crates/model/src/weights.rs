@@ -543,15 +543,17 @@ impl Weights {
                         in_proj_z: z,
                         in_proj_a: a,
                         in_proj_b: b,
-                        // Stacking `a` and `b` is a launch-count optimisation
-                        // the safetensors path takes when they share a dense
-                        // type. Not taken here: a GGUF stores them as two
-                        // tensors and concatenating quantized blocks is not a
-                        // reinterpretation.
-                        in_proj_ba: None,
-                        // Same reasoning as `in_proj_ba` above: a GGUF's own
-                        // quantized blocks are not bytes this loader can
-                        // concatenate into a wider matrix.
+                        // `a` and `b` are `value_heads` rows each -- 48 against
+                        // a 5120 contraction -- so unstacked they are two
+                        // gemv launches whose bytes are a rounding error next
+                        // to their dispatch cost. See `stacked2_gguf`.
+                        in_proj_ba: stacked2_gguf(
+                            dev, f, &t("ssm_alpha.weight"), &t("ssm_beta.weight"),
+                            &mut device_bytes)?,
+                        // `qkv` and `z` are wide enough (10240 and 6144 rows
+                        // in the Qwen3.8-27B checkpoint) that launch count is
+                        // a smaller fraction of their cost, and stacking them
+                        // has not been measured, so left unfused for now.
                         in_proj_qz: None,
                         conv1d: upload_vector(
                             dev, f, &t("ssm_conv1d.weight"), &mut device_bytes)?,
@@ -1105,6 +1107,35 @@ fn describe(f: &Gguf, name: &str) -> Result<(WeightType, usize, usize, usize)> {
         ty.block_size()
     );
     Ok((ty, k, n, info.n_bytes))
+}
+
+/// Two same-shaped GGUF tensors, stacked along the output the way `load_awq`'s
+/// `stacked2` stacks a safetensors pair — one launch instead of two wherever
+/// the model code finds this `Some`.
+///
+/// `stacked2` only takes F16/F32 because it assumes nothing about a block's
+/// layout; here the two tensors are read straight off the mapped file, so any
+/// encoding works as long as its blocks are row-scoped, which every ggml type
+/// this loader supports is (a block never spans two rows) — row-major means
+/// the stack is byte concatenation and nothing has to be interleaved. Returns
+/// `None` when the two are not the same type over the same `k`, in which case
+/// the caller keeps its two launches.
+fn stacked2_gguf(dev: &Device, f: &Gguf, a: &str, b: &str, total: &mut usize) -> Result<Option<Matrix>> {
+    let (ty, k, n_a, _) = describe(f, a)?;
+    let (ty_b, k_b, n_b, _) = describe(f, b)?;
+    if ty != ty_b || k != k_b {
+        return Ok(None);
+    }
+    let mut bytes = f.tensor_data(a)?.to_vec();
+    bytes.extend_from_slice(f.tensor_data(b)?);
+    *total += bytes.len();
+    Ok(Some(Matrix {
+        ty,
+        k,
+        n: n_a + n_b,
+        n_bytes: bytes.len(),
+        storage: Storage::Device(dev.stream().clone_htod(&bytes)?),
+    }))
 }
 
 /// Load an AWQ checkpoint, repacking every quantized matrix on the way in.
