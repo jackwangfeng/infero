@@ -4552,6 +4552,44 @@ impl Kernels {
         })
     }
 
+    /// `gemv_mma_q4_K`, but four simdgroups a threadgroup share one row-
+    /// tile's weight decode (done once, by simdgroup 0) across four token-
+    /// tiles run concurrently. See the kernel's own doc comment for what it
+    /// measures and the correctness trail that got it here.
+    fn gemv_mma_shared(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
+        x: &View<'_, f32>,
+        k: usize,
+        n: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        const TOKGROUPS: u32 = 4;
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_quant", quant_src(), "gemv_mma_shared_q4_K")?;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (n as u32).div_ceil(8),
+                (n_tokens as u32).div_ceil(8 * TOKGROUPS).max(1),
+                1,
+            ),
+            block_dim: (32, TOKGROUPS, 1),
+            shared_mem_bytes: 0,
+        };
+        let (k_i, n_i, nt_i) = (k as i32, n as i32, n_tokens as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(w).arg(x).arg(&k_i).arg(&n_i).arg(&nt_i);
+        self.dev
+            .profile()
+            .time("gemv_mma_shared", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("gemv_mma_shared")?;
+                Ok(())
+            })
+    }
+
     pub fn gemv(
         &self,
         out: &mut ViewMut<'_, f32>,
@@ -4658,6 +4696,21 @@ impl Kernels {
             && n_tokens >= mma_min()
             && n as u32 >= 8;
         if mma {
+            // Below 32 tokens, most of a gemv_mma_shared threadgroup's four
+            // simdgroups have no real tokens to work on and it loses to the
+            // single-simdgroup kernel (0.40-0.91x, examples/
+            // gemv_mma_multisg_check.rs); from 32 up it wins, 1.06-1.19x in
+            // that same isolated measurement. Overridable for re-measuring
+            // the crossover rather than arguing about it, same as
+            // `TUILI_MMA_MIN` above.
+            let shared_min: usize = std::env::var("TUILI_MMA_SHARED_MIN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(32);
+            if n_tokens >= shared_min {
+                return self.gemv_mma_shared(out, w, x, k, n, n_tokens);
+            }
             return self.gemv_mma(out, w, x, k, n, n_tokens);
         }
         let name = if rows > 1 {

@@ -4028,7 +4028,28 @@ impl Model {
             return Ok(());
         }
 
-        if n_tokens <= gemm_threshold() {
+        // Q4_K gets its own, much higher ceiling on Metal: gemv_mma_shared
+        // (see its doc comment) turned the MMA path from a loss against
+        // GEMM into a clear win, so raising the crossover point specifically
+        // for this weight type is worth it in a way it was not before that
+        // kernel existed. Measured end to end (real 27B, real prompts,
+        // TUILI_GEMM_THRESHOLD's own methodology): a 20-120 token prompt's
+        // queued_ms is 33-50% lower through this path than through GEMM at
+        // the same size. No measurement past 120 yet, so 200 is a margin on
+        // top of what is actually verified, not a re-measured crossing.
+        // TUILI_Q4K_MMA_MAX overrides it for finding the real one.
+        const Q4K_MMA_MAX_DEFAULT: usize = 200;
+        let q4k_mma_max: usize = std::env::var("TUILI_Q4K_MMA_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(Q4K_MMA_MAX_DEFAULT);
+        let use_gemv = if !cfg!(feature = "cuda") && w.ty == tuili_kernels::WeightType::Q4K {
+            n_tokens <= q4k_mma_max
+        } else {
+            n_tokens <= gemm_threshold()
+        };
+        if use_gemv {
             return kern.gemv(out, &weights, w.ty, x, w.k, w.n, n_tokens);
         }
 

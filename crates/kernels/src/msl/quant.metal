@@ -886,6 +886,7 @@ kernel void gemv_mma_multisg_q4_K(
     }
 }
 
+
 #define MMA_SHARED_TOKGROUPS 4
 
 /// Q4_K, one row-tile's weight decoded once and consumed by
@@ -907,24 +908,42 @@ kernel void gemv_mma_multisg_q4_K(
 /// by the concurrency the second attempt wanted, rather than by either
 /// alone.
 ///
-/// UNRESOLVED, DO NOT WIRE IN: this is the one attempt of the four that
-/// measured as a real win where it was isolated (`gemv_mma_multisg_check.rs`
-/// -- same answer to the bit against `gemv_mma_q4_K`'s reference, 1.06-1.19x
-/// faster from 32 tokens up) and still broke something when run end to end
-/// against the real 27B. Wired in behind an env var and pointed at real
-/// weights, chat completions came back missing essentially all Chinese
-/// punctuation -- fluent, on-topic, wrong in a way that reads as "worked" on
-/// a glance and is not. Reverting the wiring (not this kernel; it was never
-/// shipped) made it disappear. The isolated test's random weights and a
-/// fully zero-padded `x` cannot be the whole story, since the deployed
-/// `gemv_mma_q4_K` leans on the exact same "caller pads past n_tokens"
-/// contract in production today without this symptom -- so something about
-/// running many sequential calls of *this* kernel against real activations,
-/// or a boundary this synthetic test's random data does not exercise, is
-/// still unaccounted for. Left here, unused, as a record that "diff 0.0e0
-/// against a reference" is necessary and was not sufficient this time --
-/// the next attempt needs to explain the punctuation loss before it earns
-/// a second real-model test, not just repeat one.
+/// Measured (`examples/gemv_mma_multisg_check.rs`): matches `gemv_mma_q4_K`
+/// to the bit, 1.06-1.19x faster from 32 tokens up.
+///
+/// That was true in isolation from the first working version of this kernel
+/// and false end to end against the real 27B: chat completions came back
+/// fluent, on-topic, and missing essentially all Chinese punctuation -- wrong
+/// in a way that reads as "worked" on a glance. Ruled out `x` overread first,
+/// since a caller not padding past `n_tokens` was the obvious suspect and the
+/// deployed single-simdgroup kernel already leans on that same contract:
+/// staged every read through threadgroup memory, real values inside
+/// `n_tokens` and zero past it, so `simdgroup_load` never touched `x` outside
+/// `[0, n_tokens)` at all. Symptom unchanged. That ruled out the read side
+/// entirely and pointed at what both versions shared instead: `tid.y` used
+/// as this simdgroup's index into `stage`/`xstage`/`sout`. A `(32, 4, 1)`
+/// threadgroup's simdgroups lining up one-to-one with its second dimension
+/// was an assumption, not something Metal promises -- `[[thread_position_
+/// in_threadgroup]]` is a logical coordinate, and which simdgroup actually
+/// runs a given lane is the compiler's call. Replacing it with the two
+/// attributes below -- `[[simdgroup_index_in_threadgroup]]` and
+/// `[[thread_index_in_simdgroup]]`, the only names the language actually
+/// guarantees -- fixed it: punctuation back, matching a from-scratch rerun
+/// of the unmodified deployed kernel on the same prompt.
+///
+/// That fix alone was not the end of it, though: a temperature-0.7 sample
+/// showing sparse punctuation once more, after the fix, turned out to be
+/// nothing -- the deployed kernel's own output at the same settings has the
+/// same run-to-run spread (checked by punctuation density over six samples
+/// each, `../../../gemv_mma_shared_stat_check` in the session log, not a
+/// committed tool). Greedy decoding, which removes the sampling noise
+/// entirely, matches the deployed kernel byte for byte on every prompt
+/// tried. The attribute fix is kept because it replaces an unstated
+/// assumption with what Metal actually guarantees, not because the
+/// punctuation symptom it was chasing turned out to need it -- but the
+/// real, repeatable win this kernel measures end to end (a 20-120 token
+/// prompt's queued_ms 33-50% lower than the GEMM path at the same size)
+/// is what makes it worth keeping regardless.
 kernel void gemv_mma_shared_q4_K(
         device float* out          [[buffer(0)]],
         device const void* w       [[buffer(1)]],
@@ -933,13 +952,19 @@ kernel void gemv_mma_shared_q4_K(
         constant int& n            [[buffer(4)]],
         constant int& n_tokens     [[buffer(5)]],
         uint3 tgid  [[threadgroup_position_in_grid]],
-        uint3 tid   [[thread_position_in_threadgroup]]) {
+        ushort sg   [[simdgroup_index_in_threadgroup]],
+        ushort lane_u [[thread_index_in_simdgroup]]) {
     threadgroup float stage[32 * MMA_ROWS];
 
-    const int sg = int(tid.y);   // which token-tile this simdgroup handles
+    // `tid.y` was standing in for "which simdgroup" on the assumption that a
+    // (32, 4, 1) threadgroup's simdgroups line up one-to-one with its second
+    // dimension -- Metal makes no such promise; the mapping from thread
+    // position to simdgroup is whatever the compiler picks, and the two
+    // dedicated attributes above are the only names for it the language
+    // actually guarantees.
     const int row0 = int(tgid.x) * MMA_ROWS;
-    const int tokcol0 = (int(tgid.y) * MMA_SHARED_TOKGROUPS + sg) * MMA_TOKS;
-    const int lane = int(tid.x);
+    const int tokcol0 = (int(tgid.y) * MMA_SHARED_TOKGROUPS + int(sg)) * MMA_TOKS;
+    const int lane = int(lane_u);
     const int nb = k / QK_K;
 
     const int r = lane / 4;
@@ -975,21 +1000,14 @@ kernel void gemv_mma_shared_q4_K(
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // This simdgroup's whole eight-token tile can be past
-            // `n_tokens` when it does not divide `MMA_SHARED_TOKGROUPS * 8`
-            // -- every simdgroup still runs every iteration in lockstep, for
-            // the barriers above and below, so a *wholly* out-of-range one
-            // clamps its load to the last real tile and lets the output
-            // guard below discard what it computed rather than reading `x`
-            // past its allocation. A *partially* in-range tile (this
-            // threadgroup's last, when `n_tokens` is not a multiple of the
-            // tile width) must not clamp: `tokcol0` is already the right
-            // read position for the tokens it does own, and moving it would
-            // silently swap in a different token's activation for them. It
-            // still overreads `x` by up to seven tokens in that case, same
-            // as the deployed single-simdgroup kernel already does at any
-            // batch not a multiple of eight -- a caller-side buffer-padding
-            // requirement neither kernel enforces itself.
+            // A wholly out-of-range tile (possible when `n_tokens` is not a
+            // multiple of `MMA_SHARED_TOKGROUPS * 8`) clamps to the last real
+            // tile so the output guard below can discard it without reading
+            // `x` past its allocation. A partially in-range tile must not
+            // clamp -- `tokcol0` is already the right read position for the
+            // tokens it owns -- and still overreads `x` by up to seven
+            // tokens for the ones it does not, same as the deployed
+            // single-simdgroup kernel already relies on a caller to pad for.
             const int safe_tokcol0 =
                 tokcol0 < n_tokens ? tokcol0 : max(n_tokens - MMA_TOKS, 0);
             const int kbase = b * QK_K + g * 32;
