@@ -485,32 +485,43 @@ __device__ __forceinline__ void mma_f8_body(
 #pragma unroll
     for (int g = 0; g < GROUPS; ++g) acc[g] = mma_c_f32{{0.0f, 0.0f, 0.0f, 0.0f}};
 
-    // Which slice of a staged tile this lane moves: one `uint4` is four rows of
-    // a group at four k, and a group's k-window is `CHUNKS` of them.
-    const bool stages = threadIdx.x < 4 * CHUNKS;
-    const int gl = threadIdx.x / CHUNKS;        // group within the 16-row tile
-    const int sc = threadIdx.x % CHUNKS;        // chunk within the k window
+    // Which slice of a staged tile this lane moves. A `uint4` is four rows of
+    // a group at four k; `half` splits it into two `uint2`s of two rows each,
+    // so a pair of threads moves what one thread used to. `ncu` found the old
+    // single-thread-a-pair design idle exactly half the block during this
+    // section, then paying for it below: every warp spent 17.8 of the 55
+    // cycles between issued instructions stalled at the barrier waiting for
+    // the working half to finish. Splitting the pair keeps the bytes moved
+    // and their layout in `tile` identical to before -- `repack_rows` is
+    // unchanged, and so is what ends up at `tl[(4*gl+half*2+r)*STRIDE+4*sc]`
+    // for a given source byte -- it only changes which thread carries which
+    // half of a `uint4`.
+    constexpr int PAIRS = 4 * CHUNKS;
+    const int half = threadIdx.x / PAIRS;
+    const int idx = threadIdx.x % PAIRS;
+    const int gl = idx / CHUNKS;                // group within the 16-row tile
+    const int sc = idx % CHUNKS;                // chunk within the k window
     const unsigned char* ssrc = w
-        + (size_t)(row0 / FP8_ROW_GROUP + (stages ? gl : 0)) * FP8_ROW_GROUP * k
-        + (size_t)sc * 16;
+        + (size_t)(row0 / FP8_ROW_GROUP + gl) * FP8_ROW_GROUP * k
+        + (size_t)sc * 16 + (size_t)half * 8;
 
     const int tiles = k / K_TILE;
     // Prologue, so the loop is always load-next-then-compute-this.
-    uint4 q = stages ? *(const uint4*)(const void*)ssrc : make_uint4(0, 0, 0, 0);
+    uint2 q = *(const uint2*)(const void*)ssrc;
 
     for (int it = 0; it < tiles; ++it) {
         const int cur = it & 1;
         __half* tl = tile + (size_t)cur * 16 * STRIDE;
         // Unpack what was loaded last iteration. The scale is not applied here:
         // e4m3 values are exact in f16, and folding a scale in could overflow.
-        if (stages) {
-            const unsigned int word[4] = {q.x, q.y, q.z, q.w};
+        {
+            const unsigned int word[2] = {q.x, q.y};
 #pragma unroll
-            for (int r = 0; r < 4; ++r) {
+            for (int r = 0; r < 2; ++r) {
                 const uint2 h = make_uint2(
                     e4m3x2_to_half2((unsigned short)(word[r] & 0xFFFFu)),
                     e4m3x2_to_half2((unsigned short)(word[r] >> 16)));
-                *(uint2*)(void*)&tl[(4 * gl + r) * STRIDE + 4 * sc] = h;
+                *(uint2*)(void*)&tl[(4 * gl + half * 2 + r) * STRIDE + 4 * sc] = h;
             }
         }
         __syncthreads();
@@ -519,8 +530,8 @@ __device__ __forceinline__ void mma_f8_body(
         // latency is spent under arithmetic rather than under a barrier. They
         // land in registers and are not written to shared memory until the top
         // of the next iteration, which is what makes one barrier enough.
-        if (stages && it + 1 < tiles) {
-            q = *(const uint4*)(const void*)(ssrc + (size_t)(it + 1) * K_TILE * 4);
+        if (it + 1 < tiles) {
+            q = *(const uint2*)(const void*)(ssrc + (size_t)(it + 1) * K_TILE * 4);
         }
 
         // Warp `w` takes k [it*K_TILE + w*16, +16), whose scale block is
@@ -568,15 +579,28 @@ __device__ __forceinline__ void mma_f8_body(
     }
     __syncthreads();
 
+    // `red` is row-major by output row (`rg[row * 8 + col]` above), and
+    // reading it in that order is what the write already made cheap. `out`
+    // is `[token][row]`, the opposite: consecutive rows of the same token are
+    // the contiguous addresses, not consecutive tokens of the same row. The
+    // original loop walked `red` in its own order and let the store fall
+    // where it may -- one sector a thread, 16 of 32 bytes used, `ncu` put a
+    // fifth of the kernel's stall cycles on exactly this. `r` is the
+    // fast-varying half of the thread index below so 16 consecutive threads
+    // land on 16 consecutive `out` addresses; `slot` still computes the same
+    // row-major position into `red` that the write used, independent of the
+    // order threads visit it in.
     for (int i = threadIdx.x; i < GROUPS * 128; i += blockDim.x) {
         const int g = i / 128;
         const int rem = i % 128;
-        const int r = rem / 8;
-        const int t = tok0 + g * 8 + (rem % 8);
+        const int r = rem % 16;
+        const int col = rem / 16;
+        const int t = tok0 + g * 8 + col;
         if (t >= n_tokens || row0 + r >= n) continue;
+        const int slot = g * 128 + r * 8 + col;
         float sum = 0.0f;
 #pragma unroll
-        for (int wi = 0; wi < WARPS; ++wi) sum += red[(size_t)wi * GROUPS * 128 + i];
+        for (int wi = 0; wi < WARPS; ++wi) sum += red[(size_t)wi * GROUPS * 128 + slot];
         float* o = out + (size_t)t * n + row0 + r;
         *o = accum ? *o + sum : sum;
     }
