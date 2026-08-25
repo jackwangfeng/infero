@@ -2651,6 +2651,33 @@ impl Kernels {
         n_tokens: usize,
         k: usize,
     ) -> Result<()> {
+        // Q4_K only, on Metal: `embed_row_q4_K` unpacks a 32-element group's
+        // `q4k_scale_min` once and spends it on the whole group, the same fix
+        // `dequant_q4_K_f16_vec` made for the whole-matrix dequant -- the
+        // generic `gather_rows_q4_K` below re-reads and re-unpacks it fresh
+        // for every element, since it is one instantiation of a macro shared
+        // with every other weight type and has no per-type specialisation.
+        // Every token this engine embeds takes this path: `token_embd.weight`
+        // is Q4_K on a Q4_K_M checkpoint, and every step -- prefill or decode
+        // -- starts by gathering one row a token. Measured byte-exact against
+        // `gather_rows_q4_K` at the real embedding shape (k = 5120,
+        // vocab = 248320), 1.0-2.9x depending on token count, never a
+        // regression (`examples/embed_row_check.rs`).
+        if !cfg!(feature = "cuda") && ty == WeightType::Q4K {
+            let f = self.dev.kernels().get("tuili_quant", quant_src(), "embed_row_q4_K")?;
+            let cfg = LaunchConfig {
+                grid_dim: (1, n_tokens as u32, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let k_i = k as i32;
+            let mut b = self.dev.stream().launch_builder(&f);
+            b.arg(out).arg(w).arg(rows).arg(&k_i);
+            return self.dev.profile().time("gather_rows", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("gather_rows")?;
+                Ok(())
+            });
+        }
         let name = format!("gather_rows_{}", ty.suffix());
         let f = self.dev.kernels().get("tuili_quant", quant_src(), &name)?;
         let cfg = LaunchConfig {

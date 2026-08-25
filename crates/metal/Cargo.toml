@@ -84,3 +84,7 @@ path = "examples/gemv1_simd_check.rs"
 [[example]]
 name = "gemv_q8_0_threshold_check"
 path = "examples/gemv_q8_0_threshold_check.rs"
+
+[[example]]
+name = "embed_row_check"
+path = "examples/embed_row_check.rs"
