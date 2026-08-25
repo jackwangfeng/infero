@@ -26,6 +26,23 @@ pub struct Modules {
     /// but the pipeline built from the old library would still be served, so
     /// a recompiled kernel silently ran the previous code.
     pipelines: Mutex<HashMap<(&'static str, String, u64), Retained<ProtocolObject<dyn MTLComputePipelineState>>>>,
+    /// Fast path for `get`'s hot call, keyed by `src`'s address and length
+    /// instead of its content.
+    ///
+    /// Every real caller is one of `tuili-kernels`'s `*_src()` functions, each
+    /// a `OnceLock<String>` -- so the `&str` `get` receives is the same
+    /// backing allocation, at the same address, for the rest of the process,
+    /// and hashing its ~20-45 KiB of MSL text to prove that on every one of a
+    /// decode step's ~880 dispatches was the majority of this crate's CPU
+    /// launch overhead (measured: `examples/launch_overhead.rs`). Address
+    /// identity is exactly as sound as content identity when the content
+    /// never moves, and cheaper than reading it. A miss here (the
+    /// `TUILI_METAL_TRACE`-style `#define`-prepended source used for a
+    /// stripped-down measurement build is a *different* `String`, not the
+    /// cached one) falls through to the slow, hash-verified path below and
+    /// repopulates this one -- so a real content change is still caught, just
+    /// not on the fast path.
+    by_addr: Mutex<HashMap<(&'static str, String, usize, usize), Retained<ProtocolObject<dyn MTLComputePipelineState>>>>,
 }
 
 struct Lib {
@@ -53,6 +70,7 @@ impl Modules {
             dev,
             libs: Mutex::new(HashMap::new()),
             pipelines: Mutex::new(HashMap::new()),
+            by_addr: Mutex::new(HashMap::new()),
         }
     }
 
@@ -60,8 +78,14 @@ impl Modules {
     ///
     /// Signature matches the CUDA side's `kernels().get(module, src, name)`.
     pub fn get(&self, module: &'static str, src: &str, name: &str) -> Result<Function> {
+        let addr_key = (module, name.to_string(), src.as_ptr() as usize, src.len());
+        if let Some(p) = self.by_addr.lock().unwrap().get(&addr_key) {
+            return Ok(Function::new(p.clone(), name.to_string()));
+        }
+
         let key = (module, name.to_string(), hash_of(src));
         if let Some(p) = self.pipelines.lock().unwrap().get(&key) {
+            self.by_addr.lock().unwrap().insert(addr_key, p.clone());
             return Ok(Function::new(p.clone(), name.to_string()));
         }
 
@@ -76,6 +100,7 @@ impl Modules {
             .newComputePipelineStateWithFunction_error(&func)
             .map_err(|e| anyhow!("{module}::{name}: pipeline: {e}"))?;
 
+        self.by_addr.lock().unwrap().insert(addr_key, pipeline.clone());
         self.pipelines
             .lock()
             .unwrap()

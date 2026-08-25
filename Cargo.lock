@@ -2500,6 +2500,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tuili-gguf",
+ "tuili-kernels",
  "tuili-tokenizer",
 ]
 

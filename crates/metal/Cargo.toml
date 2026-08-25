@@ -35,6 +35,11 @@ tracing-subscriber.workspace = true
 tuili-gguf.workspace = true
 tuili-tokenizer.workspace = true
 serde_json = "1"
+# Dev-only and therefore fine to depend "backwards" on the crate that depends
+# on this one: `launch_overhead.rs` wants the real `Kernels::add`/`rms_norm`
+# call path, not a hand-rolled launch, to measure what production code
+# actually pays per dispatch.
+tuili-kernels = { workspace = true, features = ["metal"] }
 
 [[example]]
 name = "qwen2_f16"
@@ -47,3 +52,7 @@ path = "examples/qwen38_27b.rs"
 [[example]]
 name = "bandwidth"
 path = "examples/bandwidth.rs"
+
+[[example]]
+name = "launch_overhead"
+path = "examples/launch_overhead.rs"
