@@ -2697,10 +2697,13 @@ impl Kernels {
         // on a 53-token prompt, `TUILI_METAL_PROFILE=1`), so this is not a
         // rounding error on that number.
         let vectorized = !cfg!(feature = "cuda")
-            && ty == WeightType::Q4K
+            && matches!(ty, WeightType::Q4K | WeightType::Q8_0)
             && n_elements.is_multiple_of(32);
         let name = if vectorized {
-            "dequant_q4_K_f16_vec".to_string()
+            match ty {
+                WeightType::Q4K => "dequant_q4_K_f16_vec".to_string(),
+                _ => "dequant_q8_0_f16_vec".to_string(),
+            }
         } else {
             format!("dequant_{}_f16", ty.suffix())
         };

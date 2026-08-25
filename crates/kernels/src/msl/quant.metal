@@ -623,6 +623,47 @@ kernel void dequant_q4_K_f16_vec(
     }
 }
 
+/// `dequant_q8_0_f16`, one thread a 32-element block instead of one a
+/// element -- the same fix `dequant_q4_K_f16_vec` made, applied to the
+/// simpler encoding. `deq_q8_0` re-reads `blk->d` fresh for every element the
+/// generic `DEQUANT_KERNEL` macro asks it to decode, thirty-two redundant
+/// reads of one `half` a block; a Q8_0 block has no scale/min pair to unpack
+/// (just the one scale), so there is less to amortise than Q4_K had, but the
+/// same one-thread-a-group idea still removes the whole redundancy.
+///
+/// `qs` reads stay scalar rather than `char4`, unlike `dequant_q4_K_f16_vec`'s
+/// `uint4` weight reads: `block_q8_0` is 34 bytes, not a multiple of four, so
+/// `blk->qs`'s address alternates between 2- and 4-byte aligned across
+/// consecutive blocks and a `char4` cast is only well-defined on the aligned
+/// half of them. First version used it anyway and measured a real but wrong
+/// answer -- max abs diff 15.3 against the scalar kernel on random input,
+/// not the 1e-3-ish rounding noise a correct reformulation should show. The
+/// `half4` *write* has no such problem: `base` is always a multiple of 32
+/// mid-block-loop, so `out`'s write offset is always a multiple of four
+/// `half`s regardless of this block's position in the buffer.
+kernel void dequant_q8_0_f16_vec(
+        device half* out           [[buffer(0)]],
+        device const void* w       [[buffer(1)]],
+        constant uint& n           [[buffer(2)]],
+        uint3 tgid  [[threadgroup_position_in_grid]],
+        uint3 tid   [[thread_position_in_threadgroup]],
+        uint3 tgdim [[threads_per_threadgroup]]) {
+    const uint group = tgid.x * tgdim.x + tid.x;
+    if (group * 32 >= n) return;
+    device const block_q8_0* blk = (device const block_q8_0*)w + group;
+    const float d = float(blk->d);
+    const uint base = group * 32;
+    for (int i = 0; i < 8; ++i) {
+        half4 vals;
+        vals[0] = half(d * float(blk->qs[i * 4 + 0]));
+        vals[1] = half(d * float(blk->qs[i * 4 + 1]));
+        vals[2] = half(d * float(blk->qs[i * 4 + 2]));
+        vals[3] = half(d * float(blk->qs[i * 4 + 3]));
+        device half4* dst = (device half4*)(out + base + i * 4);
+        *dst = vals;
+    }
+}
+
 // ---- four output rows a threadgroup ----------------------------------------
 //
 // The experiment behind the rollout below it. `out[n] = W[n][k] . x[k]` reads

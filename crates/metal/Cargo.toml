@@ -80,3 +80,7 @@ path = "examples/gdn_reg128_check.rs"
 [[example]]
 name = "gemv1_simd_check"
 path = "examples/gemv1_simd_check.rs"
+
+[[example]]
+name = "gemv_q8_0_threshold_check"
+path = "examples/gemv_q8_0_threshold_check.rs"
