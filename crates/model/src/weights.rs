@@ -1580,11 +1580,21 @@ pub fn load_awq(
         Ok(DenseFfn {
             w_gate: projection(&format!("{p}.mlp.gate_proj"), total)?,
             w_up: projection(&format!("{p}.mlp.up_proj"), total)?,
-            w_gate_up: stacked(
+            // `stacked` only takes dense F16/F32; FP8's disjoint quant+scale
+            // layout is `stacked_fp8_2`'s case instead. Exactly one of the two
+            // can match a given `ty`, so trying both in order is safe.
+            w_gate_up: match stacked(
                 &format!("{p}.mlp.gate_proj"),
                 &format!("{p}.mlp.up_proj"),
                 total,
-            )?,
+            )? {
+                Some(m) => Some(m),
+                None => stacked_fp8_2(
+                    &format!("{p}.mlp.gate_proj"),
+                    &format!("{p}.mlp.up_proj"),
+                    total,
+                )?,
+            },
             w_down: projection(&format!("{p}.mlp.down_proj"), total)?,
         })
     };

@@ -799,8 +799,23 @@ impl Config {
 
     /// Elements in one layer's largest weight matrix, which sizes the
     /// dequantization scratch buffer used during prefill.
+    ///
+    /// The loader may stack a layer's same-input projections into one wider
+    /// matrix — gate+up, q/k/v, GatedDeltaNet's `in_proj_qkv`+`in_proj_z` —
+    /// and this has to cover whichever stack is widest, not just the biggest
+    /// *unstacked* projection: gate+up alone is twice `d_model * d_ff`, and a
+    /// buffer sized for one of the pair undersizes by exactly that factor the
+    /// moment the loader fuses them. `Weights::load` decides fusion at load
+    /// time from the checkpoint's actual dtype and free memory, which this
+    /// runs before either is known, so it has to size for every stack this
+    /// architecture could produce rather than the one it will.
     pub fn max_layer_weight_elements(&self) -> usize {
-        (self.d_model * self.d_ff).max(self.d_model * self.d_model)
+        let ffn = 2 * self.d_model * self.d_ff;
+        let qkv = self.d_model * (2 * self.d_attn() + 2 * self.d_kv());
+        let gdn = self
+            .linear_attn
+            .map_or(0, |la| self.d_model * (la.conv_channels() + la.value_dim()));
+        ffn.max(qkv).max(gdn).max(self.d_model * self.d_model)
     }
 }
 

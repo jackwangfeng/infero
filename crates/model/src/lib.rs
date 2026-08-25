@@ -3238,7 +3238,13 @@ impl Model {
         // cannot fill the device — `attn_k` reaches 261 GB/s against
         // `gate_up`'s 1368. This is the FFN half of what vLLM gets from
         // `MergedColumnParallelLinear`.
-        let stacked = l.dense().w_gate_up.as_ref().filter(|_| n > 1 && want_h);
+        // `want_h` is the AWQ mmq case specifically; see the matching comment
+        // on the attention side. FP8 dispatches inside `matmul_pre` on its
+        // own and falls back past its own batching limit there, so the fused
+        // buffer is worth taking at any `n`.
+        let stacked = l.dense().w_gate_up.as_ref().filter(|w| {
+            n > 1 && (want_h || w.ty == tuili_kernels::WeightType::F8E4M3)
+        });
         // Whether `down` will read its activation as f16, which is the only
         // case where writing that copy early is worth anything. Mirrors what
         // `matmul_pre` decides for itself; claiming it when the buffer was not
