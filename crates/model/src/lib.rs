@@ -499,6 +499,10 @@ struct Scratch {
     x16: Buf<f16>,
     /// The activation row in Q8_1, for the integer mat-vec.
     q8_1: Buf<u8>,
+    /// The activation, dynamically quantized to e4m3 for `mma_e4m3_block`'s
+    /// native W8A8 GEMM — `quantize_act_e4m3`'s `xq`/`xs` outputs.
+    xq_e4m3: Buf<u8>,
+    xs_e4m3: Buf<f32>,
 }
 
 /// One row's sampling parameters plus its own uniform draw.
@@ -872,6 +876,19 @@ impl Model {
                         batch_tokens * m.n_active * Kernels::q8_1_bytes(m.d_ff_expert)
                     }),
                 ),
+            )?,
+            // Same width bound as `x16`: whichever activation feeds the next
+            // FP8 projection, quantized a byte a value instead of a half.
+            xq_e4m3: dev
+                .stream()
+                .alloc_zeros::<u8>(batch_tokens * cfg.d_ff.max(cfg.d_model).max(cfg.d_attn()))?,
+            xs_e4m3: dev.stream().alloc_zeros::<f32>(
+                batch_tokens
+                    * cfg
+                        .d_ff
+                        .max(cfg.d_model)
+                        .max(cfg.d_attn())
+                        .div_ceil(tuili_kernels::fp8::ACT_QUANT_GROUP),
             )?,
         };
 
@@ -3748,6 +3765,39 @@ impl Model {
             //
             // Flat in tokens, because eight is the fragment's own N — and ahead
             // even at one token, where it wastes seven of those eight columns.
+            // W8A8 first, at more than one token: two native e4m3 tensor-core
+            // operands instead of widening the weight to f16 for `mma_f16`,
+            // doubling the throughput `mma_f8_block` gets out of the same
+            // instruction issue rate. Declines by itself below `K_TILE = 256`
+            // or off this GPU's tensor cores (`caps().fp8`); the extra
+            // activation-quantize launch is not worth it at one token, where
+            // `mma_f8_block` already sits near the weight-load floor.
+            if n_tokens >= 2 {
+                let scale_cols = w.k.div_ceil(tuili_kernels::fp8::ACT_QUANT_GROUP);
+                let xq_len = n_tokens * w.k;
+                let xs_len = n_tokens * scale_cols;
+                if scratch.xq_e4m3.len() >= xq_len && scratch.xs_e4m3.len() >= xs_len {
+                    kern.quantize_act_e4m3(
+                        &mut scratch.xq_e4m3.slice_mut(..xq_len),
+                        &mut scratch.xs_e4m3.slice_mut(..xs_len),
+                        x,
+                        w.k,
+                        n_tokens,
+                    )?;
+                    if kern.mma_e4m3_block(
+                        out,
+                        &weights,
+                        &scratch.xq_e4m3.slice(..xq_len),
+                        &scratch.xs_e4m3.slice(..xs_len),
+                        w.k,
+                        w.n,
+                        n_tokens,
+                        false,
+                    )? {
+                        return Ok(());
+                    }
+                }
+            }
             if kern.mma_f8_block(out, &weights, x, w.k, w.n, n_tokens, false)? {
                 return Ok(());
             }
