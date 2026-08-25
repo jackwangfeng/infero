@@ -484,5 +484,148 @@ fn main() -> Result<()> {
         }
         println!("{line}  GB/s");
     }
+
+    // ---- 5. staging the activation vector in threadgroup memory -----------
+    //
+    // `output.weight` is the worst-efficiency tensor in the sweep above (39%
+    // against 47-58% for everything else), and `GEMV_SPREAD4`'s own doc says
+    // why for Q4_K/Q8_0: the per-token activation load and multiply-add is the
+    // majority of the kernel, not the weight stream. Q6_K cannot use
+    // `GEMV_SPREAD4` -- its four elements a thread are 32 apart, not 4 -- so it
+    // pays that cost as four separate scalar `device` loads instead of one
+    // vectorised one. `x` is only 5120 floats (20 KiB) at this shape, comfortably
+    // under the 32 KiB threadgroup memory limit, and every thread in the group
+    // reads the same 5120 floats, which reads like free money: stage it once,
+    // cooperatively, with vectorised float4 loads, and 128 threads' worth of
+    // repeated `device` reads become one `threadgroup` read each.
+    //
+    // Measured on an M4 Max: 1.85x *slower* (6.9ms baseline vs 12.8ms staged),
+    // answers identical. The activation was already cache-resident -- every one
+    // of 248320 threadgroups reads the same 20 KiB, which does not survive one
+    // pass through this GPU's cache hierarchy to fall out of it -- so the
+    // `device` reads GEMV_BODY_Q6_K already does were hitting L2, not DRAM.
+    // What staging actually pays for is the cooperative copy itself (1280
+    // `threadgroup` writes and a barrier, serialised across the group, before
+    // any real work starts) and a second barrier before the reduction can
+    // trust it. Q6_K's four elements a thread are read exactly once each
+    // either way; there was no redundant traffic to remove, only new
+    // synchronisation to add. Left in as the record of why nobody should try
+    // this again without a different hypothesis.
+    println!("\n  output.weight Q6_K: activation staged in threadgroup memory");
+    {
+        const STAGED: &str = r#"
+kernel void gemv1_q6_K_staged(
+        device float* out          [[buffer(0)]],
+        device const void* w       [[buffer(1)]],
+        device const float* x      [[buffer(2)]],
+        constant int& k            [[buffer(3)]],
+        constant int& n            [[buffer(4)]],
+        constant int& n_tokens     [[buffer(5)]],
+        threadgroup float* xs      [[threadgroup(0)]],
+        uint3 tgid  [[threadgroup_position_in_grid]],
+        uint3 tid   [[thread_position_in_threadgroup]],
+        uint3 tgdim [[threads_per_threadgroup]]) {
+    BLOCK_REDUCE_SCRATCH
+    const int row = int(tgid.x);
+    if (row >= n) return;
+
+    const int k4 = k / 4;
+    device const packed_float4* xp4 = (device const packed_float4*)x;
+    threadgroup float4* xs4 = (threadgroup float4*)xs;
+    for (int i = int(tid.x); i < k4; i += int(tgdim.x)) xs4[i] = float4(xp4[i]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float acc = 0.0f;
+    const int nb = k / QK_K;
+    device const block_q6_K* wr = (device const block_q6_K*)w + size_t(row) * nb;
+    const int chunks = nb * 64;
+    for (int c = int(tid.x); c < chunks; c += int(tgdim.x)) {
+        const int b = c / 64;
+        const int rem = c % 64;
+        const int n2 = rem / 32;
+        const int l = rem % 32;
+        device const block_q6_K* blk = wr + b;
+        device const uchar* ql = blk->ql + n2 * 64;
+        device const uchar* qh = blk->qh + n2 * 32;
+        device const char* sc = blk->scales + n2 * 8;
+        const int base = b * QK_K + n2 * 128;
+        const float d = float(blk->d);
+        const uchar h = qh[l];
+        const int is = l / 16;
+        const int q0 = int((ql[l] & 0xF) | (((h >> 0) & 3) << 4)) - 32;
+        const int q1 = int((ql[l + 32] & 0xF) | (((h >> 2) & 3) << 4)) - 32;
+        const int q2 = int((ql[l] >> 4) | (((h >> 4) & 3) << 4)) - 32;
+        const int q3 = int((ql[l + 32] >> 4) | (((h >> 6) & 3) << 4)) - 32;
+        acc += d * float(sc[is + 0]) * float(q0) * xs[base + l];
+        acc += d * float(sc[is + 2]) * float(q1) * xs[base + l + 32];
+        acc += d * float(sc[is + 4]) * float(q2) * xs[base + l + 64];
+        acc += d * float(sc[is + 6]) * float(q3) * xs[base + l + 96];
+    }
+    const float total = BLOCK_SUM(acc, tid.x, tgdim.x);
+    if (tid.x == 0) out[row] = total;
+}
+"#;
+        let k = 5120usize;
+        let n_rows = 248320usize;
+        let bytes = (k * n_rows) as f64 * 210.0 / 256.0;
+        let w = s.alloc_zeros::<u8>(bytes as usize)?;
+        let x = s.alloc_zeros::<f32>(k)?;
+        let mut o_base = s.alloc_zeros::<f32>(n_rows)?;
+        let mut o_staged = s.alloc_zeros::<f32>(n_rows)?;
+        let (ki, ni, ti) = (k as i32, n_rows as i32, 1i32);
+
+        let base_f = dev.kernels().get("quant", &quant, "gemv1_q6_K")?;
+        let t_base = ms(
+            || {
+                let mut b = s.launch_builder(&base_f);
+                b.arg(&o_base.as_view_mut()).arg(&w.as_view()).arg(&x.as_view())
+                    .arg(&ki).arg(&ni).arg(&ti);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (n_rows as u32, 1, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?
+                };
+                s.synchronize()
+            },
+            5,
+        )?;
+        let gbs_base = bytes / (t_base / 1e3) / 1e9;
+
+        let staged_src = format!("{COMMON}\n{QUANT}\n{STAGED}");
+        let staged_f = dev.kernels().get("quant_staged", &staged_src, "gemv1_q6_K_staged")?;
+        let smem = (k * 4) as u32;
+        let t_staged = ms(
+            || {
+                let mut b = s.launch_builder(&staged_f);
+                b.arg(&o_staged.as_view_mut()).arg(&w.as_view()).arg(&x.as_view())
+                    .arg(&ki).arg(&ni).arg(&ti);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (n_rows as u32, 1, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: smem,
+                    })?
+                };
+                s.synchronize()
+            },
+            5,
+        )?;
+        let gbs_staged = bytes / (t_staged / 1e3) / 1e9;
+
+        let got_base = s.clone_dtoh(&o_base)?;
+        let got_staged = s.clone_dtoh(&o_staged)?;
+        let max_diff = got_base
+            .iter()
+            .zip(&got_staged)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        println!(
+            "  baseline {t_base:6.3}ms {gbs_base:6.1} GB/s   staged {t_staged:6.3}ms {gbs_staged:6.1} GB/s   speedup {:.2}x   max|diff| {max_diff:.3e}",
+            t_base / t_staged
+        );
+    }
     Ok(())
 }
