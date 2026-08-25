@@ -126,8 +126,32 @@ pub struct Scheduler {
     /// between steps, and only measuring both tells you which.
     t_step: f64,
     t_gap: f64,
-    /// How many tokens a speculative round drafts. Zero when off.
+    /// How many tokens a speculative round drafts. Zero when off, and this is
+    /// the round-to-round value under `TUILI_ADAPTIVE_SPEC` -- see
+    /// `spec_k_max` for the ceiling `enable_speculation` actually provisioned.
     spec_k: usize,
+    /// What `enable_speculation` sized the GDN rollback journal for.
+    /// `spec_k` may sit anywhere in `1..=spec_k_max` under adaptive mode
+    /// without a reallocation; going higher would need one, which is why
+    /// this is a ceiling rather than something adaptive mode also moves.
+    spec_k_max: usize,
+    /// On when `TUILI_ADAPTIVE_SPEC` asks for it. Off leaves `spec_k` at
+    /// whatever `TUILI_SPEC_K` set, which is the behaviour every measurement
+    /// in this file's history was taken against.
+    adaptive_spec: bool,
+    /// Exponential moving average of a round's emitted tokens (`1..=k+1`),
+    /// the signal `speculative_step` adjusts `spec_k` from. `None` before the
+    /// first round, so the first sample sets it rather than being blended
+    /// against an arbitrary starting guess.
+    spec_ema_accept: Option<f64>,
+    /// Rounds left before `spec_k` may move again. The thresholds it moves
+    /// on are relative to the *current* `spec_k`, which is what makes a
+    /// cooldown necessary rather than a tuning nicety: dropping a level
+    /// lowers the bar for climbing back, in absolute EMA terms, so an
+    /// undamped controller measured flipping every few rounds — the ceiling
+    /// getting easier to clear is exactly what a level change should not do
+    /// to the next decision.
+    spec_k_cooldown: u64,
     spec_steps: u64,
     spec_tokens: u64,
     /// A round's three parts, summed over a window; see `speculative_step`.
@@ -176,6 +200,10 @@ impl Scheduler {
             // asks for it. Zero means off, which is also what a checkpoint
             // without an MTP head leaves it at.
             spec_k: 0,
+            spec_k_max: 0,
+            adaptive_spec: std::env::var_os("TUILI_ADAPTIVE_SPEC").is_some(),
+            spec_ema_accept: None,
+            spec_k_cooldown: 0,
             spec_steps: 0,
             spec_tokens: 0,
             spec_draft_ms: 0.0,
@@ -229,7 +257,10 @@ impl Scheduler {
         }
         self.model.enable_speculation(k, &self.pool)?;
         self.spec_k = k;
-        tracing::info!(k, "speculative decoding on");
+        self.spec_k_max = k;
+        self.spec_ema_accept = None;
+        self.spec_k_cooldown = 0;
+        tracing::info!(k, adaptive = self.adaptive_spec, "speculative decoding on");
         Ok(true)
     }
 
@@ -413,6 +444,49 @@ impl Scheduler {
         self.spec_tokens += outcome.tokens.len() as u64;
         self.running[idx].spec_rounds += 1;
         self.running[idx].spec_emitted += outcome.tokens.len() as u64;
+
+        // `TUILI_ADAPTIVE_SPEC`: fold this round's yield into the running
+        // average and let it move `spec_k` toward whatever the average says a
+        // draft this deep is worth — up to `spec_k_max`, never past it, since
+        // that is what `enable_speculation` sized the GDN rollback journal
+        // for and going higher would need a reallocation this is not one.
+        // Going lower needs nothing: the journal already holds `k_max + 1`
+        // rows and a smaller round just uses fewer of them.
+        //
+        // The two thresholds are a band, not a line, on purpose — a value
+        // that decided every round by comparing the same average to the same
+        // single cutoff would flip `spec_k` back and forth across it as the
+        // average drifted a few hundredths either side.
+        if self.adaptive_spec {
+            let yielded = outcome.tokens.len() as f64;
+            const ALPHA: f64 = 0.15;
+            self.spec_ema_accept = Some(match self.spec_ema_accept {
+                Some(prev) => prev * (1.0 - ALPHA) + yielded * ALPHA,
+                None => yielded,
+            });
+            let ema = self.spec_ema_accept.expect("just set above");
+            self.spec_k_cooldown = self.spec_k_cooldown.saturating_sub(1);
+            // Rounds, not seconds: a round is the unit both the EMA and the
+            // thresholds are already in, so this stays the same number of
+            // *decisions* apart whatever the round rate a request happens to
+            // run at. 20 measured as 0.7 s at this model's round rate — under
+            // one exchange's length, so it still flipped inside a single
+            // short reply. 80 is closer to a short reply's whole round count,
+            // which is the granularity a change should default to.
+            const COOLDOWN: u64 = 80;
+            if self.spec_k_cooldown == 0 {
+                let k = self.spec_k as f64;
+                if ema > k * 0.85 + 0.15 && self.spec_k < self.spec_k_max {
+                    self.spec_k += 1;
+                    self.spec_k_cooldown = COOLDOWN;
+                    tracing::debug!(k = self.spec_k, ema, "adaptive spec: deeper draft");
+                } else if ema < k * 0.4 && self.spec_k > 1 {
+                    self.spec_k -= 1;
+                    self.spec_k_cooldown = COOLDOWN;
+                    tracing::debug!(k = self.spec_k, ema, "adaptive spec: shallower draft");
+                }
+            }
+        }
 
         // Every emitted token goes through the same bookkeeping a plain step's
         // single token does, in order, and the first one that ends the sequence
