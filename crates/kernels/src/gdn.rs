@@ -93,13 +93,16 @@ impl DeltaVariant {
             // 128 is what `gdn_delta_rule_reg128_f32` is instantiated for. A
             // second instantiation is a one-line change, but every one costs
             // NVRTC time on a cold cache for a shape no checkpoint here uses.
-            // The register-resident kernel is CUDA-only: it rests on a
-            // per-thread state slice, `__shfl_xor_sync` partner reductions and
-            // a double-buffered shared stage that were tuned against a specific
-            // register budget. The global one is ported and is what a backend
-            // without it takes -- slower by the ratio in the note above, and
-            // correct.
-            Self::Auto if dk == 128 && dv == 128 && cfg!(feature = "cuda") => Self::Reg,
+            // Ported to Metal too now: `simd_shuffle_xor` for the partner
+            // reduction is the direct analogue of `__shfl_xor_sync`, R = 2
+            // keeps the same register count viable there, and
+            // `gdn_reg128_check.rs` matches the global kernel to f32 noise
+            // (1e-7 to 1e-9) at every token count checked while running
+            // 2.3-4.2x faster from eight tokens up -- on an M4 Max, which is
+            // a different register budget than either CUDA card the note
+            // above was tuned against, so the win was re-measured rather than
+            // assumed to carry over.
+            Self::Auto if dk == 128 && dv == 128 => Self::Reg,
             Self::Auto => Self::Global,
             other => other,
         }

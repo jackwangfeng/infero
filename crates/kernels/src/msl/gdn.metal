@@ -373,3 +373,147 @@ kernel void gdn_rollback_record4_f32(device float* dst0        [[buffer(0)]],
         dst3[i] = src3[i];
     }
 }
+
+// Register-resident gated delta rule, ported from `cu/gdn.cu`'s
+// `gdn_delta_rule_reg_body<128, 128, 2, 4>` (see that file for the full
+// derivation and the four measured design decisions this mirrors).
+//
+// `gdn_delta_rule_f32` streams the whole `dk x dv` state to and from device
+// memory every token -- 128 KiB a head a token at this checkpoint's shape,
+// which the traffic table in `cu/gdn.cu` shows is 2x what a register-
+// resident version needs to move. This is that version for Metal: one
+// simdgroup pair of lanes owns a column of `S` for the whole chunk, loaded
+// once on entry and stored once on exit, and what actually crosses to device
+// memory each token is q, k, v and the output -- about 1.5 KiB a head instead
+// of 128 KiB.
+//
+// R = 2 threads a column, matching the CUDA kernel: a single thread holding
+// all 128 rows of its column spills (documented on the CUDA side at 255
+// registers with 88 bytes of spill for that shape), and splitting the column
+// across two lanes of one simdgroup -- adjacent lanes, so `simd_shuffle_xor`
+// finishes the reduction without a barrier -- is what keeps it register-
+// resident instead. This is the load-bearing part of the port, not a
+// refinement on top of it.
+#define REG_DK 128
+#define REG_DV 128
+#define REG_R 2
+#define REG_RB (REG_DK / REG_R)   // rows of S a thread owns
+#define REG_ACC 4
+
+kernel void gdn_delta_rule_reg128_f32(
+        device float* out             [[buffer(0)]],
+        device float* state           [[buffer(1)]],
+        device const float* qkv       [[buffer(2)]],
+        device const float* g         [[buffer(3)]],
+        device const float* beta      [[buffer(4)]],
+        device const int* first_token [[buffer(5)]],
+        device const int* n_tok       [[buffer(6)]],
+        constant int& heads           [[buffer(7)]],
+        constant int& key_heads       [[buffer(8)]],
+        constant int& dk_unused       [[buffer(9)]],
+        constant int& dv_unused       [[buffer(10)]],
+        constant int& stride          [[buffer(11)]],
+        constant int& q_off           [[buffer(12)]],
+        constant int& k_off           [[buffer(13)]],
+        constant int& v_off           [[buffer(14)]],
+        constant int& v_tiled         [[buffer(15)]],
+        threadgroup float* smem       [[threadgroup(0)]],
+        uint3 tgid  [[threadgroup_position_in_grid]],
+        uint3 tid   [[thread_position_in_threadgroup]]) {
+    (void)dk_unused;
+    (void)dv_unused;
+
+    const int head = int(tgid.x);
+    const int seq = int(tgid.y);
+    const int nt = n_tok[seq];
+    if (nt <= 0) return;
+    const int t0 = first_token[seq];
+    const int lane = int(tid.x);
+    const int j = lane / REG_R;
+    const int part = lane % REG_R;
+    const int i0 = part * REG_RB;
+    const int khead = v_tiled != 0 ? (head % key_heads)
+                                   : (head / (heads / key_heads));
+
+    threadgroup float* qs = smem;                    // 2 * REG_DK
+    threadgroup float* ks = smem + 2 * REG_DK;        // 2 * REG_DK
+    device float* S = state + (size_t(seq) * heads + head) * size_t(REG_DK) * REG_DV;
+
+    float sc[REG_RB];
+#pragma unroll
+    for (int r = 0; r < REG_RB; ++r) sc[r] = S[size_t(i0 + r) * REG_DV + j];
+
+    device const float* row0 = qkv + size_t(t0) * stride;
+    float qn = 0.0f, kn = 0.0f;
+    if (lane < REG_DK) {
+        qn = row0[q_off + size_t(khead) * REG_DK + lane];
+        kn = row0[k_off + size_t(khead) * REG_DK + lane];
+        qs[lane] = qn;
+        ks[lane] = kn;
+    }
+    float vn = row0[v_off + size_t(head) * REG_DV + j];
+    float gn = g[size_t(t0) * heads + head];
+    float bn = beta[size_t(t0) * heads + head];
+
+    for (int n = 0; n < nt; ++n) {
+        const int t = t0 + n;
+        const int cur = n & 1;
+        const float v_tj = vn;
+        const float decay = exp(gn);
+        const float b = bn;
+
+        if (n + 1 < nt) {
+            device const float* rn = qkv + size_t(t + 1) * stride;
+            if (lane < REG_DK) {
+                qn = rn[q_off + size_t(khead) * REG_DK + lane];
+                kn = rn[k_off + size_t(khead) * REG_DK + lane];
+            }
+            vn = rn[v_off + size_t(head) * REG_DV + j];
+            gn = g[size_t(t + 1) * heads + head];
+            bn = beta[size_t(t + 1) * heads + head];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup float* qc = qs + cur * REG_DK;
+        threadgroup float* kc = ks + cur * REG_DK;
+
+        float kv[REG_ACC];
+#pragma unroll
+        for (int a = 0; a < REG_ACC; ++a) kv[a] = 0.0f;
+#pragma unroll
+        for (int r = 0; r < REG_RB; ++r) {
+            sc[r] *= decay;
+            kv[r % REG_ACC] += sc[r] * kc[i0 + r];
+        }
+#pragma unroll
+        for (int a = 1; a < REG_ACC; ++a) kv[0] += kv[a];
+        float kvt = kv[0];
+#pragma unroll
+        for (int m = 1; m < REG_R; m <<= 1) kvt += simd_shuffle_xor(kvt, uint(m));
+
+        const float delta = (v_tj - kvt) * b;
+
+        float o[REG_ACC];
+#pragma unroll
+        for (int a = 0; a < REG_ACC; ++a) o[a] = 0.0f;
+#pragma unroll
+        for (int r = 0; r < REG_RB; ++r) {
+            sc[r] += kc[i0 + r] * delta;
+            o[r % REG_ACC] += sc[r] * qc[i0 + r];
+        }
+#pragma unroll
+        for (int a = 1; a < REG_ACC; ++a) o[0] += o[a];
+        float ot = o[0];
+#pragma unroll
+        for (int m = 1; m < REG_R; m <<= 1) ot += simd_shuffle_xor(ot, uint(m));
+        if (part == 0) out[(size_t(t) * heads + head) * REG_DV + j] = ot;
+
+        if (n + 1 < nt && lane < REG_DK) {
+            qs[(cur ^ 1) * REG_DK + lane] = qn;
+            ks[(cur ^ 1) * REG_DK + lane] = kn;
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < REG_RB; ++r) S[size_t(i0 + r) * REG_DV + j] = sc[r];
+}

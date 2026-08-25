@@ -4,13 +4,16 @@
 #![allow(dead_code)]
 
 use anyhow::Result;
-use tuili_cuda::Device;
+use tuili_gpu::Device;
 use tuili_kernels::Kernels;
 
 pub fn kernels() -> Result<Kernels> {
     // cudarc hands out the device's primary context, so tests running in
     // parallel share one context and one stream rather than fighting over
-    // separate ones.
+    // separate ones. `tuili_gpu::Device` is whichever backend's feature is
+    // active -- unchanged on CUDA, since that is what it re-exports there --
+    // so this scaffolding runs on Metal too rather than only ever compiling
+    // against one backend.
     Ok(Kernels::new(Device::new(0)?))
 }
 
