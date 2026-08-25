@@ -1217,13 +1217,25 @@ pub fn load_awq(
                     scales.len(),
                     tuili_kernels::fp8::FP8_BLOCK,
                 );
-                let mut bytes = Vec::with_capacity(tuili_kernels::fp8::fp8_bytes(k, n));
                 // Permuted, not copied: every FP8 kernel reads four interleaved
                 // rows as one 16-byte load, which is what took the batched
                 // mat-vec off a request-per-row-per-token. The permutation lives
                 // in `fp8::repack_rows` so that this and `tests/fp8_matvec.rs`
                 // cannot drift apart.
-                bytes.extend_from_slice(&tuili_kernels::fp8::repack_rows(t.data, k, n)?);
+                //
+                // `repack_rows` already hands back a `padded * k`-byte `Vec`,
+                // filled in parallel — appending it into a second, freshly
+                // `with_capacity`'d buffer instead of just using it looked
+                // harmless but wasn't: that second buffer's pages are unmapped
+                // until this exact `extend_from_slice` first touches them, so
+                // the copy pays for every one of the 43 GB checkpoint's page
+                // faults on a single thread. `repack_rows`'s own allocation
+                // pays the same fault cost already, just spread over sixteen
+                // threads — 3.6 s measured against this copy's 25.7 s of the
+                // 27B's ~60 s load. Reusing it and only growing it for the
+                // scale tail turns that second full pass into nothing.
+                let mut bytes = tuili_kernels::fp8::repack_rows(t.data, k, n)?;
+                bytes.reserve_exact(scales.len() * 4);
                 for v in &scales {
                     bytes.extend_from_slice(&v.to_le_bytes());
                 }
