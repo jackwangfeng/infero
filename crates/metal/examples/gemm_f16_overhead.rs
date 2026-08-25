@@ -41,6 +41,14 @@ fn main() -> Result<()> {
     let dev = Device::new(0)?;
     let s = dev.stream();
 
+    // `ffn_down` (transposed shape) and `output.weight` (vocab, Q6_K) are
+    // here for completeness, not because either turned out to matter:
+    // output.weight only ever runs at n_tokens = 1 in production --
+    // `wants_logits` limits it to the row a chunk's last position wants,
+    // never every prefill position -- so its 20/53-token numbers below,
+    // 34-40ms, describe a shape this engine never actually dispatches.
+    // Included so the next person chasing this gap does not have to
+    // re-measure it to find that out.
     for &(label, k, n, n_tokens) in &[
         ("tiny 32x32, 20tok", 32usize, 32usize, 20usize),
         ("tiny 32x32, 53tok", 32, 32, 53),
@@ -51,6 +59,10 @@ fn main() -> Result<()> {
         ("ffn_gate/up shape, 512tok", 5120, 17408, 512),
         ("gate+up STACKED (2n), 20tok", 5120, 17408 * 2, 20),
         ("gate+up STACKED (2n), 53tok", 5120, 17408 * 2, 53),
+        ("ffn_down shape, 20tok", 17408, 5120, 20),
+        ("ffn_down shape, 53tok", 17408, 5120, 53),
+        ("output.weight shape, 20tok", 5120, 248320, 20),
+        ("output.weight shape, 53tok", 5120, 248320, 53),
     ] {
         let a = s.alloc_zeros::<half::f16>(n_tokens * k)?;
         let b = s.alloc_zeros::<half::f16>(n * k)?;
