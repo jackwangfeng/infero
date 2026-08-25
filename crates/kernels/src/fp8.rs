@@ -472,6 +472,50 @@ pub fn scale_grid(k: usize, n: usize) -> usize {
     n.div_ceil(FP8_BLOCK) * k.div_ceil(FP8_BLOCK)
 }
 
+/// Stack three already-packed FP8 matrices — each the `fp8_bytes` layout
+/// [`projection_bytes`][crate] produces — along the output dimension, the way
+/// `q_proj`/`k_proj`/`v_proj` become one launch instead of three.
+///
+/// A packed matrix is quants (`n.next_multiple_of(ROW_GROUP) * k` bytes) then
+/// its scale grid (`scale_grid(k, n)` `f32`s), which is two disjoint regions —
+/// concatenating the three whole buffers end to end would interleave them
+/// wrong, quants-a, scales-a, quants-b, scales-b, ..., where a reader wants
+/// all the quants first and then all the scales. This reassembles them.
+///
+/// Requires every `n` to be a multiple of [`FP8_BLOCK`] as well as
+/// `ROW_GROUP`, so no matrix's scale grid or row-group padding falls in the
+/// middle of another's rows; the caller checks this before calling in and
+/// takes the unfused path when it does not hold, the same as the transposed
+/// AWQ stack does for its own alignment case.
+pub fn concat3(a: &[u8], n_a: usize, b: &[u8], n_b: usize, c: &[u8], n_c: usize, k: usize) -> Vec<u8> {
+    concat(&[(a, n_a), (b, n_b), (c, n_c)], k)
+}
+
+/// [`concat3`] for two matrices — GatedDeltaNet's `in_proj_qkv` and
+/// `in_proj_z`, which share `k` the same way q/k/v do.
+pub fn concat2(a: &[u8], n_a: usize, b: &[u8], n_b: usize, k: usize) -> Vec<u8> {
+    concat(&[(a, n_a), (b, n_b)], k)
+}
+
+fn concat(parts: &[(&[u8], usize)], k: usize) -> Vec<u8> {
+    let scale_cols = k.div_ceil(FP8_BLOCK);
+    let quant_len = |n: usize| n * k;
+    let scale_len = |n: usize| (n / FP8_BLOCK) * scale_cols;
+    for &(bytes, n) in parts {
+        debug_assert!(n.is_multiple_of(FP8_BLOCK));
+        debug_assert_eq!(bytes.len(), quant_len(n) + scale_len(n) * 4);
+    }
+    let mut out = Vec::with_capacity(parts.iter().map(|(b, _)| b.len()).sum());
+    for &(bytes, n) in parts {
+        out.extend_from_slice(&bytes[..quant_len(n)]);
+    }
+    for &(bytes, n) in parts {
+        out.extend_from_slice(&bytes[quant_len(n)..]);
+        debug_assert_eq!(bytes.len() - quant_len(n), scale_len(n) * 4);
+    }
+    out
+}
+
 impl Kernels {
     /// [`repack_rows`], on the device.
     ///

@@ -729,6 +729,32 @@ impl Kernels {
         Ok(())
     }
 
+    /// Scatter a fused `a ++ b` result into two tensors — [`Kernels::split_qkv`]
+    /// with two outputs instead of three.
+    ///
+    /// `fused` is `[tokens][width_a + width_b]`, what one matmul against a
+    /// stacked weight produces.
+    pub fn split2(
+        &self,
+        a: &mut ViewMut<'_, f32>,
+        b: &mut ViewMut<'_, f32>,
+        fused: &View<'_, f32>,
+        width_a: usize,
+        width_b: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        let f = self.dev.kernels().get("tuili_ops", ops_src(), "split2_f32")?;
+        let total = n_tokens * (width_a + width_b);
+        let (a_i, b_i, t_i) = (width_a as i32, width_b as i32, total as i32);
+        let mut bld = self.dev.stream().launch_builder(&f);
+        bld.arg(a).arg(b).arg(fused).arg(&a_i).arg(&b_i).arg(&t_i);
+        self.dev.profile().time("split2", self.dev.stream(), || {
+            unsafe { bld.launch(elementwise(total as u32)) }.context("split2")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     /// [`Kernels::silu_mul`] over one fused `gate ++ up` row.
     ///
     /// `xy` is `[tokens][2 * d_ff]`, which is what a single matmul against the

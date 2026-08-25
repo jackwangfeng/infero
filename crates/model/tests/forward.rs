@@ -183,7 +183,20 @@ fn incremental_decode_equals_batch_prefill() -> Result<()> {
 #[test]
 fn chunked_prefill_is_seamless() -> Result<()> {
     let _gpu = gpu_lock();
-    let (mut model, tok) = setup!();
+    // `batch_tokens()` now scales with the caller's concurrency (see
+    // `batch_tokens_for`), and `setup!()`'s default concurrency makes it wide
+    // enough to cover this whole model's context — nothing this test could
+    // hand `forward` would ever need chunking. Forcing a small chunk here is
+    // what the override exists for: the person testing chunking is entitled
+    // to a worse setting than the loader would otherwise pick. Set before
+    // `setup!()`, which is where it is read, and cleared after so it does not
+    // leak into a later test in this binary.
+    // Safety: this test's `_gpu` lock keeps every other test in this file
+    // from loading a model, hence from reading this var, while it is set.
+    unsafe { std::env::set_var("TUILI_BATCH_TOKENS", "128") };
+    let loaded = setup!();
+    unsafe { std::env::remove_var("TUILI_BATCH_TOKENS") };
+    let (mut model, tok) = loaded;
 
     let long = "The quick brown fox jumps over the lazy dog. ".repeat(40);
     let ids = tok.encode(&long, Some(false), false);

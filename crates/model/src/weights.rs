@@ -280,6 +280,15 @@ pub struct GdnWeights {
     pub in_proj_a: Matrix,
     /// `[d_model, value_heads]` — the per-head write strength.
     pub in_proj_b: Matrix,
+    /// `in_proj_qkv` and `in_proj_z` stacked along the output, when both are
+    /// FP8 over the same `k` and land on a whole [`tuili_kernels::fp8::FP8_BLOCK`]
+    /// each — every GQA shape seen so far. One launch instead of two on a pair
+    /// that, run separately, are 640 and 384 blocks against 188 SMs: 56% and
+    /// 34% achieved occupancy by `ncu`, neither register- nor shared-memory-
+    /// limited (`ncu --set full` put both at 100% theoretical) — just not
+    /// enough blocks to fill the device for the kernel's whole duration.
+    /// Stacked, the pair is 1024 blocks, matching the FFN's own ~82-84%.
+    pub in_proj_qz: Option<Matrix>,
     /// `in_proj_a` and `in_proj_b` stacked along the output, when they are the
     /// same dense type. One launch instead of two on matrices whose cost is all
     /// launch. `a` occupies columns `[0, value_heads)` of each row and `b` the
@@ -540,6 +549,10 @@ impl Weights {
                         // tensors and concatenating quantized blocks is not a
                         // reinterpretation.
                         in_proj_ba: None,
+                        // Same reasoning as `in_proj_ba` above: a GGUF's own
+                        // quantized blocks are not bytes this loader can
+                        // concatenate into a wider matrix.
+                        in_proj_qz: None,
                         conv1d: upload_vector(
                             dev, f, &t("ssm_conv1d.weight"), &mut device_bytes)?,
                         a_log: upload_a_log(dev, f, &t("ssm_a"), &mut device_bytes)?,
@@ -1354,12 +1367,52 @@ pub fn load_awq(
         let (ba, ty, k, n_a) = projection_bytes(a)?;
         let (bb, ty_b, k_b, n_b) = projection_bytes(b)?;
         let (bc, ty_c, k_c, n_c) = projection_bytes(cc)?;
-        if ty != WeightType::Q4G128T || ty_b != ty || ty_c != ty || k_b != k || k_c != k {
+        if ty_b != ty || ty_c != ty || k_b != k || k_c != k {
+            return Ok(None);
+        }
+        // FP8's per-block scale grid means a stack is only free of interior
+        // padding when every piece's row count already lands on a scale
+        // block; q/k/v pass this on every GQA shape seen so far (head_dim a
+        // divisor of `FP8_BLOCK`), but a checkpoint that does not still gets
+        // a correct, merely unfused, load rather than a wrong one.
+        if ty == WeightType::F8E4M3 {
+            if !n_a.is_multiple_of(tuili_kernels::fp8::FP8_BLOCK)
+                || !n_b.is_multiple_of(tuili_kernels::fp8::FP8_BLOCK)
+                || !n_c.is_multiple_of(tuili_kernels::fp8::FP8_BLOCK)
+            {
+                return Ok(None);
+            }
+            let abc = tuili_kernels::fp8::concat3(&ba, n_a, &bb, n_b, &bc, n_c, k);
+            return Ok(Some(upload(&abc, ty, k, n_a + n_b + n_c, total)?));
+        }
+        if ty != WeightType::Q4G128T {
             return Ok(None);
         }
         let ab = tuili_kernels::awq::concat_t(&ba, n_a, &bb, n_b, k);
         let abc = tuili_kernels::awq::concat_t(&ab, n_a + n_b, &bc, n_c, k);
         Ok(Some(upload(&abc, ty, k, n_a + n_b + n_c, total)?))
+    };
+    // Two FP8 matrices over the same `k`, stacked the way `stacked3` stacks
+    // three. GatedDeltaNet's `in_proj_qkv`/`in_proj_z` pair is not the
+    // Q4G128T-only shape `stacked` (the two-input closure above) expects, and
+    // is FP8 where that closure only takes dense F16/F32 — hence its own
+    // closure rather than a third case bolted onto either.
+    let stacked_fp8_2 = |a: &str, b: &str, total: &mut usize| -> Result<Option<Matrix>> {
+        if !fuse_ffn {
+            return Ok(None);
+        }
+        let (ba, ty, k, n_a) = projection_bytes(a)?;
+        let (bb, ty_b, k_b, n_b) = projection_bytes(b)?;
+        if ty != WeightType::F8E4M3
+            || ty_b != ty
+            || k_b != k
+            || !n_a.is_multiple_of(tuili_kernels::fp8::FP8_BLOCK)
+            || !n_b.is_multiple_of(tuili_kernels::fp8::FP8_BLOCK)
+        {
+            return Ok(None);
+        }
+        let ab = tuili_kernels::fp8::concat2(&ba, n_a, &bb, n_b, k);
+        Ok(Some(upload(&ab, ty, k, n_a + n_b, total)?))
     };
 
     // Two same-shaped projections of one input, stacked along the output.
@@ -1706,6 +1759,11 @@ pub fn load_awq(
                 in_proj_ba: stacked2(
                     &format!("{l}.in_proj_a"),
                     &format!("{l}.in_proj_b"),
+                    &mut device_bytes,
+                )?,
+                in_proj_qz: stacked_fp8_2(
+                    &format!("{l}.in_proj_qkv"),
+                    &format!("{l}.in_proj_z"),
                     &mut device_bytes,
                 )?,
                 conv1d: vector(&format!("{l}.conv1d.weight"), &mut device_bytes)?,

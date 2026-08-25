@@ -113,8 +113,10 @@ fn synthetic_model(dev: &Device, cfg: &Config) -> Result<Model> {
                     in_proj_a: m(d, la.value_heads, 0.2)?,
                     in_proj_b: m(d, la.value_heads, 0.2)?,
                     // The test builds its weights by hand and exercises the
-                    // unstacked path; `stacked2` only fires in the real loader.
+                    // unstacked path; `stacked2`/`stacked_fp8_2` only fire in
+                    // the real loader.
                     in_proj_ba: None,
+                    in_proj_qz: None,
                     conv1d: vec_at(la.conv_channels() * la.conv_kernel, 0.3, 0.3)?,
                     // The decay: `g = -exp(A_log) * softplus(a + dt_bias)`.
                     a_log: vec_at(la.value_heads, -2.0, 0.2)?,

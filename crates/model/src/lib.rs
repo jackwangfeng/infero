@@ -52,9 +52,9 @@ pub use weights::Weights;
 
 use weights::Matrix;
 
-/// Ceiling on the tokens one forward pass may carry, summed over the batch.
+/// Baseline ceiling on the tokens one forward pass may carry, summed over the
+/// batch -- a floor under [`batch_ceiling`], not the final number.
 ///
-/// A compile-time bound now, with [`max_batch_tokens`] the value actually used.
 /// It bounds the attention score buffer -- `n_heads * chunk * max_seq`, the one
 /// activation that grows with both batch size and context length, 201 MiB at 256
 /// tokens and a 8192 context on this model -- so raising it is a memory trade
@@ -76,6 +76,30 @@ pub const MAX_BATCH_TOKENS: usize = 1024;
 /// context multiply. This is the budget that decides which one gives.
 const SCORE_BUDGET: usize = 1 << 30;
 
+/// The ceiling `batch_tokens_for` clamps to, raised for a server that has to
+/// admit many sequences at once.
+///
+/// `MAX_BATCH_TOKENS` alone was measured against one long prompt, and a flat
+/// 256 starves concurrent short ones instead: sixteen 60-token chat prompts
+/// admitted in the same instant, on a small `--ctx` where the score budget
+/// would happily allow thousands, still only fit four to a pass, so the other
+/// twelve queue through three extra prefill-sized steps before their first
+/// token -- 1.2 s of pure admission latency that has nothing to do with
+/// decoding. `max_logit_rows` is what the caller's `--max-seqs` (and
+/// speculation's row count) already resolved to, so multiplying it by the
+/// same 64-token GEMM floor `batch_tokens_for` clamps down to says: give every
+/// concurrent sequence room for at least one GEMM-sized chunk in the same
+/// pass, rather than assume the one-long-prompt number covers it.
+///
+/// This only ever raises the ceiling, never lowers it, and the score budget in
+/// `batch_tokens_for` still clamps the result on top -- a large `max_seq`
+/// shrinks that budget's own number well below either ceiling regardless, so
+/// a big `--max-seqs` cannot reopen the OOM `MAX_BATCH_TOKENS` was tuned to
+/// avoid.
+fn batch_ceiling(max_logit_rows: usize) -> usize {
+    MAX_BATCH_TOKENS.max(max_logit_rows.max(1) * 64)
+}
+
 /// Tokens one forward pass carries, given the context it has to hold scores for.
 ///
 /// Not a constant, because the two things it trades against move independently.
@@ -92,16 +116,17 @@ const SCORE_BUDGET: usize = 1 << 30;
 ///
 /// `TUILI_BATCH_TOKENS` overrides it outright, budget included, because the
 /// person measuring is entitled to a worse setting than this picks.
-pub fn batch_tokens_for(n_heads: usize, max_seq: usize) -> usize {
+pub fn batch_tokens_for(n_heads: usize, max_seq: usize, max_logit_rows: usize) -> usize {
+    let ceiling = batch_ceiling(max_logit_rows);
     if let Some(n) = std::env::var("TUILI_BATCH_TOKENS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
     {
-        return n.min(MAX_BATCH_TOKENS);
+        return n.min(ceiling);
     }
     let per_token = n_heads.max(1) * max_seq.max(1) * std::mem::size_of::<f32>();
-    (SCORE_BUDGET / per_token.max(1)).clamp(64, MAX_BATCH_TOKENS)
+    (SCORE_BUDGET / per_token.max(1)).clamp(64, ceiling)
 }
 
 /// Default ceiling on sequences that may ask for logits in one pass.
@@ -387,6 +412,12 @@ struct MoeActs {
 /// is dead weight, and on Qwen3.8-27B they are not small: the packed row alone
 /// is 40 KiB a token.
 struct GdnActs {
+    /// `[chunk, conv_channels + value_dim]` — `in_proj_qkv` and `in_proj_z`'s
+    /// output in one row, when the loader could stack them; see
+    /// [`GdnWeights::in_proj_qz`]. `split2` scatters this into `qkv` and `z`
+    /// right after the matmul, the same shape `split_qkv` already handles for
+    /// attention.
+    qz: Buf<f32>,
     /// `[chunk, conv_channels]` — the input projection's output.
     qkv: Buf<f32>,
     /// The same after the convolution and SiLU. A separate buffer because the
@@ -811,7 +842,7 @@ impl Model {
         // Resolved here and stored, not recomputed: the buffers below are sized
         // from it and `forward` splits its input by it, and those two disagreeing
         // is the kind of mismatch `add_assign` already cost a day of.
-        let batch_tokens = batch_tokens_for(cfg.n_heads, max_seq);
+        let batch_tokens = batch_tokens_for(cfg.n_heads, max_seq, max_logit_rows);
         tracing::info!(
             batch_tokens,
             score_mib = cfg.n_heads * batch_tokens * max_seq * 4 >> 20,
@@ -1834,6 +1865,10 @@ impl Model {
             b.rnd.slice(..n),
         );
         let mut out_v = b.out.slice_mut(..n);
+        // Escape hatch for the same reason `TUILI_NO_MMQ` and its neighbours
+        // exist: the person measuring a change here is entitled to the old
+        // kernel to compare against.
+        let no_split = std::env::var_os("TUILI_NO_SAMPLE_SPLIT").is_some();
         if all_greedy {
             let (mut av, mut ai) = (
                 b.arg_v.slice_mut(..n * Kernels::ARGMAX_SPLITS),
@@ -1852,7 +1887,7 @@ impl Model {
                 vocab,
                 stride,
             )?;
-        } else {
+        } else if no_split {
             self.kern.sample_rows(
                 &mut out_v,
                 &self.act.logits.slice(..n * vocab),
@@ -1864,7 +1899,39 @@ impl Model {
                 n,
                 vocab,
                 stride,
-            
+                // The main decode path needs the token, not the distribution.
+                None,
+            )?;
+        } else {
+            // `sample_rows` scans the vocabulary in one block a row — 16 rows
+            // is 16 blocks on 188 SMs, and it measured 4.37 ms of a ~6 ms
+            // step, worse than the layers that produced the logits it is
+            // sampling from. `sample_rows_split` is the same distribution,
+            // `SAMPLE_SPLITS` blocks a row instead of one; `survivors_on_device`
+            // already takes it for the speculative path, this is the same
+            // buffers for the plain-decode one.
+            // `top_k = 0` means unlimited, not zero candidates — the same
+            // floor `prepare_sample_bufs` already applied when it sized these
+            // buffers, and what the kernel's own `cand_k` falls back to.
+            let cand_k = max_k.max(1);
+            let (mut cav, mut cai) = (
+                b.cand_v.slice_mut(..n * Kernels::SAMPLE_SPLITS * cand_k),
+                b.cand_i.slice_mut(..n * Kernels::SAMPLE_SPLITS * cand_k),
+            );
+            self.kern.sample_rows_split(
+                &mut out_v,
+                &mut cav,
+                &mut cai,
+                &self.act.logits.slice(..n * vocab),
+                &params_v,
+                &tok_v,
+                &cnt_v,
+                &len_v,
+                &rnd_v,
+                n,
+                vocab,
+                stride,
+                cand_k,
                 // The main decode path needs the token, not the distribution.
                 None,
             )?;
@@ -2032,13 +2099,21 @@ impl Model {
                 (&gw.in_proj_b, &mut acts.b, heads),
             ],
         };
-        for (m, out, cols) in [
-            (&gw.in_proj_qkv, &mut acts.qkv, width),
-            (&gw.in_proj_z, &mut acts.z, val_dim),
-        ]
-        .into_iter()
-        .chain(gate)
-        {
+        // `in_proj_qkv` and `in_proj_z` run separately, 640 and 384 blocks
+        // against 188 SMs, whenever the loader could not stack them: `ncu`
+        // put those at 56% and 34% achieved occupancy despite 100% theoretical
+        // — not enough blocks to fill the device for the launch's whole
+        // duration, the same shape as the gated q projection's own underfill.
+        // Stacked, the pair is 1024 blocks. See `GdnWeights::in_proj_qz`.
+        let qz: Vec<(&Matrix, &mut Buf<f32>, usize)> = match gw.in_proj_qz.as_ref() {
+            Some(fused) => vec![(fused, &mut acts.qz, width + val_dim)],
+            None => vec![
+                (&gw.in_proj_qkv, &mut acts.qkv, width),
+                (&gw.in_proj_z, &mut acts.z, val_dim),
+            ],
+        };
+        let fused_qz = gw.in_proj_qz.is_some();
+        for (m, out, cols) in qz.into_iter().chain(gate) {
             Self::matmul_pre(
                 &self.kern,
                 &mut self.scratch,
@@ -2051,6 +2126,16 @@ impl Model {
                 self.use_mmq,
                 shared,
                 shared_f16,
+            )?;
+        }
+        if fused_qz {
+            self.kern.split2(
+                &mut acts.qkv.slice_mut(..n * width),
+                &mut acts.z.slice_mut(..n * val_dim),
+                &acts.qz.slice(..n * (width + val_dim)),
+                width,
+                val_dim,
+                n,
             )?;
         }
 
@@ -2320,7 +2405,15 @@ impl Model {
                         .add_bias(&mut out.slice_mut(..n * cols), &b.as_view(), cols, n)?;
                 }
             }
-        } else if let Some(w) = l.attn().w_qkv.as_ref().filter(|_| n > 1 && want_h) {
+        } else if let Some(w) = l.attn().w_qkv.as_ref().filter(|w| {
+            // `want_h` is the AWQ mmq case specifically -- capped at
+            // `MMQ_MAX_TOKENS` because that is where its kernel stops
+            // applying. FP8's own dispatch inside `matmul_pre` already falls
+            // back past its own batching limit, so the fused buffer is worth
+            // taking at any `n` there; `w_qkv` only exists at all when
+            // `stacked3` found it safe to build.
+            n > 1 && (want_h || w.ty == tuili_kernels::WeightType::F8E4M3)
+        }) {
             // One matmul for all three, then a scatter. Separately they cost
             // 14.7 + 8.5 + 8.5 us a layer at a batch of 32 because the two
             // narrow ones cannot fill the device; stacked they cost 16.7. The
@@ -3919,7 +4012,7 @@ impl Activations {
         max_logit_rows: usize,
     ) -> Result<Self> {
         let stream = dev.stream();
-        let chunk = batch_tokens_for(cfg.n_heads, max_seq);
+        let chunk = batch_tokens_for(cfg.n_heads, max_seq, max_logit_rows);
         let d = cfg.d_model;
         // The attention interior can be wider than the residual stream — 24
         // heads of 256 against 5120 on Qwen3.8 — so `q` and the attention
@@ -3978,6 +4071,10 @@ impl Activations {
             },
             gdn: match cfg.linear_attn {
                 Some(la) => Some(GdnActs {
+                    qz: alloc_f32(
+                        chunk * (la.conv_channels() + la.value_dim()),
+                        "gdn qkv+z fused",
+                    )?,
                     qkv: alloc_f32(chunk * la.conv_channels(), "gdn qkv")?,
                     qkv_conv: alloc_f32(chunk * la.conv_channels(), "gdn qkv post-conv")?,
                     z: alloc_f32(chunk * la.value_dim(), "gdn gate")?,

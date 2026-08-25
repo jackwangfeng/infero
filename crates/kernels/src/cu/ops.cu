@@ -139,6 +139,27 @@ extern "C" __global__ void split_qkv_f32(float* __restrict__ q,
     }
 }
 
+// The two-way version: `fused` is `[tokens][width_a + width_b]`, from one
+// matmul against a weight stacked the same way `split_qkv_f32` unstacks
+// three. GatedDeltaNet's `in_proj_qkv` and `in_proj_z` are the pair this
+// scatters — see `GdnWeights::in_proj_qz`.
+extern "C" __global__ void split2_f32(float* __restrict__ a,
+                                       float* __restrict__ b,
+                                       const float* __restrict__ fused,
+                                       int width_a, int width_b, int total) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int row_w = width_a + width_b;
+    const int row = i / row_w;
+    const int col = i - row * row_w;
+    const float x = fused[i];
+    if (col < width_a) {
+        a[(size_t)row * width_a + col] = x;
+    } else {
+        b[(size_t)row * width_b + (col - width_a)] = x;
+    }
+}
+
 // `silu_mul_f32` over the two halves of one fused row.
 //
 // Running gate and up as one matmul makes a row `2 * d_ff` wide with gate in
