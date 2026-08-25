@@ -235,11 +235,10 @@ impl<'a> BatchItem<'a> {
 /// decode is one token and never reaches here.
 #[cfg(feature = "cuda")]
 const GEMM_THRESHOLD_DEFAULT: usize = 4;
-/// Twelve times CUDA's 4, and the gap is the cost of MPS wanting one data type
-/// for all three matrices: reaching the GEMM means dequantising the weight to
-/// f16 first, 3.56x the bytes of Q4_K, plus splitting the open command encoder.
-/// A handful of tokens cannot pay that back. Measured, prompt tokens through the
-/// 27B, one chunk each:
+/// Was twelve times CUDA's 4, because reaching the GEMM means dequantising the
+/// weight to f16 first -- 3.56x the bytes of Q4_K -- plus splitting the open
+/// command encoder, and a handful of tokens could not pay that back. Measured,
+/// prompt tokens through the 27B, one chunk each:
 ///
 /// ```text
 ///   prompt   GEMM on   GEMM off
@@ -250,13 +249,29 @@ const GEMM_THRESHOLD_DEFAULT: usize = 4;
 ///      311     14.9       52.2
 /// ```
 ///
-/// The crossing is between 31 and 71, and 48 sits in it. Erring high is the
-/// cheaper mistake in the other direction too: a short prompt is short, so
-/// paying 5 ms a token extra on 31 of them is 150 ms, while a 5-token prompt
-/// sent to the GEMM pays 500 ms for nothing -- which is what a threshold of 4
-/// did to four concurrent requests, 19.7 tok/s against 23.9.
+/// The crossing was between 31 and 71, and 48 sat in it.
+///
+/// That table is stale: it dated from before the whole-matrix dequant kernel
+/// was one thread a 32-element group instead of one a element (see
+/// `dequant_q4_K_f16_vec`), and the fixed cost this threshold exists to weigh
+/// against the mat-vec's re-reads was most of what that fix removed.
+/// Re-measured after, same method:
+///
+/// ```text
+///   prompt   GEMM on   GEMM off
+///       16     38.3       28.1   ms a token
+///       20     33.7       41.9
+///       30     23.0       31.2
+///       70     15.4       32.9
+///       90     12.7       33.4
+/// ```
+///
+/// The crossing moved to between 16 and 20. Erring high is still the cheaper
+/// mistake -- a short prompt is short, so a few ms a token extra on twenty of
+/// them is a rounding error next to what a threshold four times too high did
+/// to every longer one -- so 16 rather than 20.
 #[cfg(not(feature = "cuda"))]
-const GEMM_THRESHOLD_DEFAULT: usize = 48;
+const GEMM_THRESHOLD_DEFAULT: usize = 16;
 
 /// Tokens above which a matmul takes the GEMM rather than repeating the
 /// mat-vec, overridable so the trade can be re-measured rather than argued.
