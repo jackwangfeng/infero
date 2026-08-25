@@ -56,10 +56,17 @@ fn bench(dev: &Device, quant: &str, label: &str, k: usize, n: usize, rng: &mut R
     let d_w = s.clone_htod(&w_bytes_host)?;
 
     for &n_tokens in &[8usize, 16, 24, 32, 48, 63, 90, 128] {
-        let x_host: Vec<f32> = (0..n_tokens * k).map(|_| rng.next_f32()).collect();
+        // Padded to a multiple of eight tokens: gemv_mma_q8_0's 8x8 tiling
+        // may read up to seven tokens past n_tokens on its last tile, same
+        // as gemv_mma_q4_K already does -- the buffer padding a real caller
+        // is expected to provide.
+        let x_host: Vec<f32> = (0..n_tokens.next_multiple_of(8) * k)
+            .map(|i| if i < n_tokens * k { rng.next_f32() } else { 0.0 })
+            .collect();
         let d_x = s.clone_htod(&x_host)?;
         let mut out_gemv = s.alloc_zeros::<f32>(n * n_tokens)?;
         let mut out_gemm = s.alloc_zeros::<f32>(n * n_tokens)?;
+        let mut out_mma = s.alloc_zeros::<f32>(n * n_tokens)?;
         let (ki, ni, nti) = (k as i32, n as i32, n_tokens as i32);
 
         // The batched gemv, GEMV_TOKENS = 8 a threadgroup, grid.y covers the rest.
@@ -122,20 +129,47 @@ fn bench(dev: &Device, quant: &str, label: &str, k: usize, n: usize, rng: &mut R
             15,
         )?;
 
+        let f_mma = dev.kernels().get("quant", quant, "gemv_mma_q8_0")?;
+        let t_mma = ms(
+            || {
+                let mut b = s.launch_builder(&f_mma);
+                b.arg(&out_mma.as_view_mut())
+                    .arg(&d_w.as_view())
+                    .arg(&d_x.as_view())
+                    .arg(&ki)
+                    .arg(&ni)
+                    .arg(&nti);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: ((n as u32).div_ceil(8), (n_tokens as u32).div_ceil(8), 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?
+                };
+                s.synchronize()
+            },
+            15,
+        )?;
+
         // Random +-0.5 activations dot a random-signed-byte weight row average
         // out near zero over k = 5120 terms, so a relative-error metric here
         // blows up on plain rounding noise around that cancellation; absolute
         // error is the meaningful check for this random fixture.
         let a = s.clone_dtoh(&out_gemv)?;
         let b = s.clone_dtoh(&out_gemm)?;
-        let mut max_abs = 0.0f32;
+        let c = s.clone_dtoh(&out_mma)?;
+        let mut max_abs_gemm = 0.0f32;
+        let mut max_abs_mma = 0.0f32;
         for i in 0..n * n_tokens {
-            max_abs = max_abs.max((a[i] - b[i]).abs());
+            max_abs_gemm = max_abs_gemm.max((a[i] - b[i]).abs());
+            max_abs_mma = max_abs_mma.max((a[i] - c[i]).abs());
         }
         println!(
             "{label:16} n_tokens={n_tokens:4}  gemv {t_gemv:7.3}ms  gemm(dequant+mps) {t_total:7.3}ms  \
-             gemv/gemm {:.2}x  max_abs_diff {max_abs:.2e}",
-            t_total / t_gemv,
+             mma {t_mma:7.3}ms  mma-vs-gemm {:.2}x  mma-vs-gemv {:.2}x  \
+             diff(gemm) {max_abs_gemm:.2e}  diff(mma) {max_abs_mma:.2e}",
+            t_total / t_mma,
+            t_gemv / t_mma,
         );
     }
     Ok(())

@@ -4582,6 +4582,41 @@ impl Kernels {
         })
     }
 
+    /// `gemv_mma_q4_K`'s tiling, for Q8_0. See the kernel's own doc comment
+    /// in quant.metal for why Q8_0 had no matrix-unit path before this.
+    fn gemv_mma_q8(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
+        x: &View<'_, f32>,
+        k: usize,
+        n: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_quant", quant_src(), "gemv_mma_q8_0")?;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (n as u32).div_ceil(8),
+                (n_tokens as u32).div_ceil(8).max(1),
+                1,
+            ),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (k_i, n_i, nt_i) = (k as i32, n as i32, n_tokens as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(w).arg(x).arg(&k_i).arg(&n_i).arg(&nt_i);
+        self.dev
+            .profile()
+            .time("gemv_mma_q8", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("gemv_mma_q8")?;
+                Ok(())
+            })
+    }
+
     /// `gemv_mma_q4_K`, but four simdgroups a threadgroup share one row-
     /// tile's weight decode (done once, by simdgroup 0) across four token-
     /// tiles run concurrently. See the kernel's own doc comment for what it
@@ -4742,6 +4777,17 @@ impl Kernels {
                 return self.gemv_mma_shared(out, w, x, k, n, n_tokens);
             }
             return self.gemv_mma(out, w, x, k, n, n_tokens);
+        }
+        // Q8_0's matrix-unit path. Unlike Q4_K's, this one has no crossover
+        // to weigh against the scalar kernel: `gemv_mma_q8_0` beats
+        // `gemv_q8_0` at every token count measured, 3.4x at eight tokens
+        // widening to 8.3x at 128 (`gemv_q8_0_threshold_check.rs`), because
+        // the scalar kernel re-reads the whole activation once a token with
+        // no batching to amortise it against, the same shape the Q4_K
+        // scalar kernel has -- so there is no "loses below N" regime here to
+        // give the scalar path back.
+        if !cfg!(feature = "cuda") && ty == WeightType::Q8_0 && n_tokens >= 8 && n as u32 >= 8 {
+            return self.gemv_mma_q8(out, w, x, k, n, n_tokens);
         }
         let name = if rows > 1 {
             format!("gemv{per}x{rows}_{}", ty.suffix())

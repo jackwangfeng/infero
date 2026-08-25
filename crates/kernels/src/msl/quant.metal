@@ -863,6 +863,76 @@ kernel void gemv_mma_q4_K(
     }
 }
 
+/// Q8_0, eight rows by eight tokens a threadgroup -- `gemv_mma_q4_K`'s tiling,
+/// applied to a block with no scale/min pair to unpack. Q8_0's own real
+/// prefill cost is not the scalar gemv (`gemv_q8_0_threshold_check.rs`: MPS
+/// beats it 6-9x from 63 tokens up already), it is that MPS is itself only
+/// 15% of this GPU's peak GFLOPS at the token counts a prefill chunk
+/// actually is (`gemm_f16_overhead.rs`). Q4_K sidesteps that with its own
+/// MMA path; Q8_0, every GDN and attention projection in this checkpoint,
+/// never had one.
+///
+/// A Q8_0 block is 32 elements, so it needs none of `gemv_mma_q4_K`'s inner
+/// `g` loop over eight groups a super-block -- the block *is* the group here
+/// -- and no `q4k_scale_min` unpack, just the block's one `d`. `blk->qs` is
+/// `char`, signed, matching `deq_q8_0`; a `uchar` read here would silently
+/// flip every quant past 127 to a negative-looking value that decodes wrong
+/// in the opposite direction from what an unsigned assumption would predict.
+kernel void gemv_mma_q8_0(
+    device float* out          [[buffer(0)]],
+    device const void* w       [[buffer(1)]],
+    device const float* x      [[buffer(2)]],
+    constant int& k            [[buffer(3)]],
+    constant int& n            [[buffer(4)]],
+    constant int& n_tokens     [[buffer(5)]],
+    uint3 tgid  [[threadgroup_position_in_grid]],
+    uint3 tid   [[thread_position_in_threadgroup]]) {
+    threadgroup float stage[32 * MMA_ROWS];
+    threadgroup float sout[MMA_ROWS * MMA_TOKS];
+
+    const int row0 = int(tgid.x) * MMA_ROWS;
+    const int token0 = int(tgid.y) * MMA_TOKS;
+    const int lane = int(tid.x);
+    const int nb = k / 32;
+
+    const int r = lane / 4;
+    const int c = lane % 4;
+    const int row = min(row0 + r, n - 1);
+
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (int b = 0; b < nb; ++b) {
+        device const block_q8_0* blk =
+            (device const block_q8_0*)w + size_t(row) * nb + b;
+        const float d = float(blk->d);
+        device const char* q = blk->qs + c * 8;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int j = 0; j < 8; ++j) {
+            stage[(c * 8 + j) * MMA_ROWS + r] = d * float(q[j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const int kbase = b * 32;
+        for (int sub = 0; sub < 4; ++sub) {
+            simdgroup_float8x8 wt, xt;
+            simdgroup_load(wt, stage + sub * MMA_ROWS * MMA_TOKS, MMA_ROWS);
+            simdgroup_load(xt, x + size_t(token0) * k + kbase + sub * MMA_TOKS, k);
+            simdgroup_multiply_accumulate(acc, xt, wt, acc);
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_store(acc, sout, MMA_ROWS);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int flat = lane; flat < MMA_ROWS * MMA_TOKS; flat += 32) {
+        const int t = flat / MMA_ROWS;
+        const int rr = flat % MMA_ROWS;
+        if (token0 + t < n_tokens && row0 + rr < n) {
+            out[size_t(token0 + t) * n + row0 + rr] = sout[flat];
+        }
+    }
+}
+
 #define MMA_WIDE_TILES 8
 
 /// Q4_K, eight rows by up to 64 tokens (eight tiles of eight) a threadgroup.

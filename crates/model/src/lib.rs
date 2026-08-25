@@ -4044,8 +4044,26 @@ impl Model {
             .and_then(|v| v.parse().ok())
             .filter(|v| *v > 0)
             .unwrap_or(Q4K_MMA_MAX_DEFAULT);
+        // Q8_0 gets the same treatment for the same reason: `gemv_mma_q8_0`
+        // beats both the scalar `gemv_q8_0` (which loses to GEMM itself past
+        // sixteen tokens, the same measurement `gemm_threshold()` is based
+        // on) and MPS's own GEMM from eight tokens up, by 1.2-3.4x depending
+        // on token count (`gemv_q8_0_threshold_check.rs`). It crosses back
+        // to GEMM winning somewhere between 90 and 128 (0.93-1.17x there),
+        // so 100 rather than Q4_K's 200 -- this is every GDN and attention
+        // projection in a GGUF checkpoint, not one weight type among several,
+        // so erring low costs more of them if wrong. TUILI_Q8_0_MMA_MAX
+        // overrides it for re-measuring the real crossing.
+        const Q8_0_MMA_MAX_DEFAULT: usize = 100;
+        let q8_0_mma_max: usize = std::env::var("TUILI_Q8_0_MMA_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(Q8_0_MMA_MAX_DEFAULT);
         let use_gemv = if !cfg!(feature = "cuda") && w.ty == tuili_kernels::WeightType::Q4K {
             n_tokens <= q4k_mma_max
+        } else if !cfg!(feature = "cuda") && w.ty == tuili_kernels::WeightType::Q8_0 {
+            n_tokens <= q8_0_mma_max
         } else {
             n_tokens <= gemm_threshold()
         };
