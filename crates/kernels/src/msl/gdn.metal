@@ -312,3 +312,64 @@ kernel void split_interleaved_f32(device float* q            [[buffer(0)]],
     q[i] = src[row + lane];
     gate[i] = src[row + head_dim + lane];
 }
+
+/// A verification pass's rollback bookkeeping, staged/recorded in one launch
+/// a group instead of two/four separate copies. See the note on
+/// `gdn_rollback_stage2_f32` in `crates/kernels/src/cu/gdn.cu` for why this
+/// exists and why it is not where the real fix (`GdnRollback::stage` only
+/// copying the armed sequence's own slot) lives.
+
+/// Two segments: the conv window, then the recurrent state.
+kernel void gdn_rollback_stage2_f32(device float* dst0        [[buffer(0)]],
+                                    device const float* src0  [[buffer(1)]],
+                                    constant long& n0         [[buffer(2)]],
+                                    device float* dst1        [[buffer(3)]],
+                                    device const float* src1  [[buffer(4)]],
+                                    constant long& n1         [[buffer(5)]],
+                                    uint3 tgid  [[threadgroup_position_in_grid]],
+                                    uint3 tid   [[thread_position_in_threadgroup]],
+                                    uint3 tgdim [[threads_per_threadgroup]]) {
+    const long i = long(tgid.x) * tgdim.x + tid.x;
+    if (i < n0) {
+        dst0[i] = src0[i];
+    } else if (i < n0 + n1) {
+        dst1[i - n0] = src1[i - n0];
+    }
+}
+
+/// Four segments: the journal's pre-conv, post-conv, gate and beta taps.
+kernel void gdn_rollback_record4_f32(device float* dst0        [[buffer(0)]],
+                                     device const float* src0  [[buffer(1)]],
+                                     constant long& n0         [[buffer(2)]],
+                                     device float* dst1        [[buffer(3)]],
+                                     device const float* src1  [[buffer(4)]],
+                                     constant long& n1         [[buffer(5)]],
+                                     device float* dst2        [[buffer(6)]],
+                                     device const float* src2  [[buffer(7)]],
+                                     constant long& n2         [[buffer(8)]],
+                                     device float* dst3        [[buffer(9)]],
+                                     device const float* src3  [[buffer(10)]],
+                                     constant long& n3         [[buffer(11)]],
+                                     uint3 tgid  [[threadgroup_position_in_grid]],
+                                     uint3 tid   [[thread_position_in_threadgroup]],
+                                     uint3 tgdim [[threads_per_threadgroup]]) {
+    long i = long(tgid.x) * tgdim.x + tid.x;
+    if (i < n0) {
+        dst0[i] = src0[i];
+        return;
+    }
+    i -= n0;
+    if (i < n1) {
+        dst1[i] = src1[i];
+        return;
+    }
+    i -= n1;
+    if (i < n2) {
+        dst2[i] = src2[i];
+        return;
+    }
+    i -= n2;
+    if (i < n3) {
+        dst3[i] = src3[i];
+    }
+}
