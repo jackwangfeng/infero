@@ -2063,9 +2063,6 @@ impl Model {
             .and_then(|g| g.ordinal_of(layer))
             .context("no recurrent state slot for a linear-attention layer")?;
         let n_seqs = pool.max_seqs();
-        // Cloned rather than borrowed: the journal copies below want a device
-        // while `self.act` and `self.gdn_rollback` are borrowed apart.
-        let dev = self.dev.clone();
 
         // Normalize the residual stream. No fused f16 variant here: its point is
         // to hand an f16 activation to an MMQ q/k/v group, and this block has
@@ -2171,8 +2168,7 @@ impl Model {
         let armed = self.gdn_rollback.as_ref().is_some_and(|r| r.is_armed());
         if armed {
             let r = self.gdn_rollback.as_mut().unwrap();
-            r.save_conv(&dev, ordinal, &conv.as_view())?;
-            r.stage_state(&dev, &recurrent.as_view())?;
+            r.stage(&self.kern, ordinal, &conv.as_view(), &recurrent.as_view())?;
         }
 
         // The convolution needs a separate output: it reads three tokens back,
@@ -2233,7 +2229,7 @@ impl Model {
         if armed {
             let r = self.gdn_rollback.as_mut().unwrap();
             r.record(
-                &dev,
+                &self.kern,
                 ordinal,
                 crate::spec::GdnTap {
                     pre_conv: acts.qkv.slice(..n * width),

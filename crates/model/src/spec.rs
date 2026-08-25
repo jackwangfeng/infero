@@ -52,6 +52,7 @@
 use anyhow::{Context, Result};
 use tuili_gpu::{Buf, View};
 use tuili_gpu::Device;
+use tuili_kernels::Kernels;
 use tuili_kernels::gdn::SeqLayout;
 
 use crate::config::LinearAttnConfig;
@@ -298,6 +299,33 @@ impl GdnRollback {
         ordinal * n..(ordinal + 1) * n
     }
 
+    /// This armed pass's own slice of `self.conv_pre`'s `[n_linear, max_seqs,
+    /// conv]` layout — `conv_span(ordinal)` narrowed to one sequence slot.
+    /// See the note on `stage` for why only this slice, and not the whole
+    /// span, needs a working copy at all.
+    fn conv_pre_slot_span(&self, ordinal: usize) -> std::ops::Range<usize> {
+        let per_seq = self.la.conv_channels() * (self.la.conv_kernel - 1);
+        let base = ordinal * per_seq * self.max_seqs + self.slot * per_seq;
+        base..base + per_seq
+    }
+
+    /// The same slot, but within a single layer's own `[max_seqs, conv]`
+    /// view — the pool's `conv`/`conv_w` argument, which carries no
+    /// `ordinal` stride of its own.
+    fn conv_layer_slot_span(&self) -> std::ops::Range<usize> {
+        let per_seq = self.la.conv_channels() * (self.la.conv_kernel - 1);
+        self.slot * per_seq..(self.slot + 1) * per_seq
+    }
+
+    /// This armed pass's own slice of `state_scratch`, which — unlike
+    /// `conv_pre` — holds only one layer at a time (`linear_attention` reuses
+    /// it across the layer loop), so there is no `ordinal` term.
+    fn state_slot_span(&self) -> std::ops::Range<usize> {
+        let per_seq = self.la.value_heads * self.la.key_head_dim * self.la.value_head_dim;
+        let base = self.slot * per_seq;
+        base..base + per_seq
+    }
+
     fn row_span(&self, ordinal: usize, width: usize, rows: usize) -> std::ops::Range<usize> {
         let base = ordinal * self.cap * width;
         base..base + rows * width
@@ -317,42 +345,57 @@ pub struct GdnTap<'a> {
 }
 
 impl GdnRollback {
-    /// Copy this layer's convolution taps out before anything overwrites them.
-    pub fn save_conv(
+    /// Copy this layer's convolution taps and recurrent state out before
+    /// anything overwrites them — but only this armed pass's own sequence
+    /// slot, not the whole `max_seqs`-wide buffer both live in.
+    ///
+    /// `forward_batch_rows` zeroes every slot's token count except the ones
+    /// in this call's own batch before this pass runs (see its own comment,
+    /// `pool.set_gdn_layout`), and `verify_draft_sampled` batches exactly one
+    /// sequence. So every other slot's `n_tok` is already `<= 0` for the
+    /// whole armed pass, and `gdn_conv`/`gdn_delta_rule` — which check that
+    /// before touching a slot's state at all — never read or write them.
+    /// Copying all `max_seqs` of them anyway moved thirty-one sequences'
+    /// worth of state nobody was going to look at: one sequence's share is 3
+    /// MiB a layer on the 27B, the whole pool's is 96 MiB, and 48 layers a
+    /// round turns that difference into 147 MiB against 4.5 GiB.
+    ///
+    /// One launch for both buffers rather than two `memcpy_dtod`s, on top of
+    /// that: see the note on `Kernels::gdn_rollback_stage2`.
+    pub fn stage(
         &mut self,
-        dev: &Device,
+        kern: &Kernels,
         ordinal: usize,
         conv: &View<'_, f32>,
-    ) -> Result<()> {
-        let span = self.conv_span(ordinal);
-        anyhow::ensure!(
-            conv.len() == span.len(),
-            "layer {ordinal}'s conv window is {} floats, the journal reserves {}",
-            conv.len(),
-            span.len()
-        );
-        dev.stream()
-            .memcpy_dtod(conv, &mut self.conv_pre.slice_mut(span))?;
-        Ok(())
-    }
-
-    /// Copy this layer's recurrent state into the working buffer the pass will
-    /// advance, leaving the persistent one at its pre-step value.
-    pub fn stage_state(
-        &mut self,
-        dev: &Device,
         state: &View<'_, f32>,
     ) -> Result<()> {
+        anyhow::ensure!(
+            conv.len() == self.conv_span(ordinal).len(),
+            "layer {ordinal}'s conv window is {} floats, the journal reserves {}",
+            conv.len(),
+            self.conv_span(ordinal).len()
+        );
         anyhow::ensure!(
             state.len() == self.state_scratch.len(),
             "a layer's state is {} floats, the working copy holds {}",
             state.len(),
             self.state_scratch.len()
         );
-        dev.stream()
-            .memcpy_dtod(state, &mut self.state_scratch.as_view_mut())?;
         self.state_copies += 1;
-        Ok(())
+        let (conv_pre_slot, conv_layer_slot, state_slot) = (
+            self.conv_pre_slot_span(ordinal),
+            self.conv_layer_slot_span(),
+            self.state_slot_span(),
+        );
+        // Disjoint fields, borrowed independently so both destinations are
+        // live at once for the one kernel call below.
+        let GdnRollback { conv_pre, state_scratch, .. } = self;
+        kern.gdn_rollback_stage2(
+            &mut conv_pre.slice_mut(conv_pre_slot),
+            &conv.slice(conv_layer_slot),
+            &mut state_scratch.slice_mut(state_slot.clone()),
+            &state.slice(state_slot),
+        )
     }
 
     pub fn state_scratch_mut(&mut self) -> tuili_gpu::ViewMut<'_, f32> {
@@ -393,8 +436,14 @@ impl GdnRollback {
         let la = self.la;
         let width = la.conv_channels();
         let heads = la.value_heads;
-        let span = self.conv_span(ordinal);
-        dev.stream().memcpy_dtod(&self.conv_pre.slice(span), conv)?;
+        // Only this pass's own slot needs rewinding: every other slot's
+        // `n_tok` was `<= 0` for the whole armed pass (see `stage`), so its
+        // persistent conv window was never touched and there is nothing to
+        // put back.
+        dev.stream().memcpy_dtod(
+            &self.conv_pre.slice(self.conv_pre_slot_span(ordinal)),
+            &mut conv.slice_mut(self.conv_layer_slot_span()),
+        )?;
         if keep == 0 {
             return Ok(());
         }
@@ -427,7 +476,7 @@ impl GdnRollback {
     }
 
     /// Record one layer's candidate rows.
-    pub fn record(&mut self, dev: &Device, ordinal: usize, tap: GdnTap<'_>) -> Result<()> {
+    pub fn record(&mut self, kern: &Kernels, ordinal: usize, tap: GdnTap<'_>) -> Result<()> {
         let rows = self.rows;
         let width = self.la.conv_channels();
         let heads = self.la.value_heads;
@@ -447,24 +496,25 @@ impl GdnRollback {
             tap.g.len(),
             tap.beta.len(),
         );
-        let stream = dev.stream();
-        stream.memcpy_dtod(
+        let (qkv_span, g_span) = (
+            self.row_span(ordinal, width, rows),
+            self.row_span(ordinal, heads, rows),
+        );
+        // Disjoint fields, borrowed independently so all four destinations
+        // are live at once for the one kernel call below — one launch
+        // instead of the four `memcpy_dtod`s this used to be. See the note
+        // on `Kernels::gdn_rollback_record4`.
+        let GdnRollback { qkv_pre, qkv, g, beta, .. } = self;
+        kern.gdn_rollback_record4(
+            &mut qkv_pre.slice_mut(qkv_span.clone()),
             &tap.pre_conv,
-            &mut self.qkv_pre.slice_mut(self.row_span(ordinal, width, rows)),
-        )?;
-        stream.memcpy_dtod(
+            &mut qkv.slice_mut(qkv_span),
             &tap.post_conv,
-            &mut self.qkv.slice_mut(self.row_span(ordinal, width, rows)),
-        )?;
-        stream.memcpy_dtod(
+            &mut g.slice_mut(g_span.clone()),
             &tap.g,
-            &mut self.g.slice_mut(self.row_span(ordinal, heads, rows)),
-        )?;
-        stream.memcpy_dtod(
+            &mut beta.slice_mut(g_span),
             &tap.beta,
-            &mut self.beta.slice_mut(self.row_span(ordinal, heads, rows)),
-        )?;
-        Ok(())
+        )
     }
 }
 

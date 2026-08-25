@@ -264,8 +264,7 @@ fn verify_then_replay(
     let mut conv = l.fresh_conv()?;
     let mut r = GdnRollback::new(&l.dev, la, &[true], 1, CANDIDATES)?;
     r.arm(0, CANDIDATES)?;
-    r.save_conv(&l.dev, 0, &conv.as_view())?;
-    r.stage_state(&l.dev, &state.as_view())?;
+    r.stage(&l.kern, 0, &conv.as_view(), &state.as_view())?;
 
     // The pass itself: the convolution and the gates run against the persistent
     // window, the recurrence against the working copy of the state.
@@ -315,7 +314,7 @@ fn verify_then_replay(
             1e-6,
         )?;
         r.record(
-            &l.dev,
+            &l.kern,
             0,
             GdnTap {
                 pre_conv: l.qkv_in.slice(..n * width),

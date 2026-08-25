@@ -573,4 +573,93 @@ impl Kernels {
             })?;
         Ok(())
     }
+
+    /// Two `memcpy_dtod`s as one launch — a verification pass's conv window
+    /// and recurrent-state working copy, staged before it runs. See the note
+    /// on `gdn_rollback_stage2_f32` for why this exists.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_rollback_stage2(
+        &self,
+        dst0: &mut ViewMut<'_, f32>,
+        src0: &View<'_, f32>,
+        dst1: &mut ViewMut<'_, f32>,
+        src1: &View<'_, f32>,
+    ) -> Result<()> {
+        let (n0, n1) = (src0.len(), src1.len());
+        debug_assert!(dst0.len() >= n0 && dst1.len() >= n1);
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_gdn", gdn_src(), "gdn_rollback_stage2_f32")?;
+        const BLOCK: u32 = 256;
+        let total = (n0 + n1) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (total.div_ceil(BLOCK).max(1), 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (c0, c1) = (n0 as i64, n1 as i64);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(dst0).arg(src0).arg(&c0).arg(dst1).arg(src1).arg(&c1);
+        self.dev
+            .profile()
+            .time("gdn_rollback_stage2", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("gdn_rollback_stage2")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// Four `memcpy_dtod`s as one launch — a verification pass's journal tap
+    /// (pre-conv, post-conv, gate, beta), recorded after it runs. See the
+    /// note on `gdn_rollback_stage2_f32` for why this exists.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_rollback_record4(
+        &self,
+        dst0: &mut ViewMut<'_, f32>,
+        src0: &View<'_, f32>,
+        dst1: &mut ViewMut<'_, f32>,
+        src1: &View<'_, f32>,
+        dst2: &mut ViewMut<'_, f32>,
+        src2: &View<'_, f32>,
+        dst3: &mut ViewMut<'_, f32>,
+        src3: &View<'_, f32>,
+    ) -> Result<()> {
+        let (n0, n1, n2, n3) = (src0.len(), src1.len(), src2.len(), src3.len());
+        debug_assert!(
+            dst0.len() >= n0 && dst1.len() >= n1 && dst2.len() >= n2 && dst3.len() >= n3
+        );
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_gdn", gdn_src(), "gdn_rollback_record4_f32")?;
+        const BLOCK: u32 = 256;
+        let total = (n0 + n1 + n2 + n3) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (total.div_ceil(BLOCK).max(1), 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (c0, c1, c2, c3) = (n0 as i64, n1 as i64, n2 as i64, n3 as i64);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(dst0)
+            .arg(src0)
+            .arg(&c0)
+            .arg(dst1)
+            .arg(src1)
+            .arg(&c1)
+            .arg(dst2)
+            .arg(src2)
+            .arg(&c2)
+            .arg(dst3)
+            .arg(src3)
+            .arg(&c3);
+        self.dev
+            .profile()
+            .time("gdn_rollback_record4", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("gdn_rollback_record4")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
 }

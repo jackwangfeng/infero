@@ -652,3 +652,53 @@ extern "C" __global__ void split_interleaved_f32(float* __restrict__ q,
     q[i] = src[row + lane];
     gate[i] = src[row + head_dim + lane];
 }
+
+// A verification pass's rollback bookkeeping (`crates::spec::GdnRollback`)
+// used to be two and four independent `memcpy_dtod` calls a layer — one to
+// stage the conv window and recurrent state before the pass runs, another
+// four to tap its inputs for the journal after. Merging each group into one
+// launch turned out not to be where the round's missing milliseconds were —
+// that was `stage` copying all `max_seqs` sequences' state instead of just
+// the armed one, a 31x-narrower fix that lives on `GdnRollback::stage`
+// itself. This is kept anyway: fewer nodes in the captured graph, and one
+// thread a destination element across every segment in the group is no
+// slower than the memcpy it replaces.
+
+// Two segments: the conv window, then the recurrent state.
+extern "C" __global__ void gdn_rollback_stage2_f32(
+        float* __restrict__ dst0, const float* __restrict__ src0, long long n0,
+        float* __restrict__ dst1, const float* __restrict__ src1, long long n1) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n0) {
+        dst0[i] = src0[i];
+    } else if (i < n0 + n1) {
+        dst1[i - n0] = src1[i - n0];
+    }
+}
+
+// Four segments: the journal's pre-conv, post-conv, gate and beta taps.
+extern "C" __global__ void gdn_rollback_record4_f32(
+        float* __restrict__ dst0, const float* __restrict__ src0, long long n0,
+        float* __restrict__ dst1, const float* __restrict__ src1, long long n1,
+        float* __restrict__ dst2, const float* __restrict__ src2, long long n2,
+        float* __restrict__ dst3, const float* __restrict__ src3, long long n3) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n0) {
+        dst0[i] = src0[i];
+        return;
+    }
+    i -= n0;
+    if (i < n1) {
+        dst1[i] = src1[i];
+        return;
+    }
+    i -= n1;
+    if (i < n2) {
+        dst2[i] = src2[i];
+        return;
+    }
+    i -= n2;
+    if (i < n3) {
+        dst3[i] = src3[i];
+    }
+}
