@@ -143,11 +143,17 @@ impl Engine {
         // fixed ceiling turns `--max-seqs 64` into a server that starts and
         // then 500s on the 33rd concurrent request.
         // Read before the model is built, because it sizes the model. The long
-        // note on what `k` means and why the default is 1 is at its use below.
+        // note on what `k` means and why the default is 1 on CUDA is at its
+        // use below. That measurement is CUDA-specific: the GDN recurrence's
+        // verification pass is two sequential rows of one sequence, not two
+        // independent rows, and Metal's `simdgroup_matrix` has no cheap way to
+        // make the second row nearly free the way CUDA's MMA does (see
+        // `dcbcdf4`, `f9fdd31`) — there, k=1 is break-even to negative, so it
+        // defaults off instead.
         let spec_k: usize = std::env::var("TUILI_SPEC_K")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1);
+            .unwrap_or(if cfg!(feature = "metal") { 0 } else { 1 });
         // A verification pass is `k + 1` rows wide and every row needs logits,
         // so speculation raises the floor under the logits buffer. It used to be
         // `max_seqs` alone, which meant `--max-seqs 1` -- the sensible setting
