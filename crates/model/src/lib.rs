@@ -3338,6 +3338,25 @@ impl Model {
                 l.dense().w_up.n,
             )?;
         } else {
+            // Gate and up read the same activation, and past `gemm_threshold`
+            // each would otherwise run its own `to_f16` over it -- the second
+            // one entirely redundant, since `matmul_pre`'s generic GEMM branch
+            // writes the whole conversion into the same `scratch.x16` either
+            // call would use. Converting it once here and marking both calls
+            // `pre_f16` saves that second launch; gated on `WeightType::Q4K`
+            // specifically because that is the shape whose GEMM branch this
+            // targets, and on `gemm_threshold` because below it neither call
+            // reaches `to_f16` at all.
+            let gemm_shared = n > gemm_threshold()
+                && l.dense().w_gate.ty == tuili_kernels::WeightType::Q4K
+                && l.dense().w_up.ty == tuili_kernels::WeightType::Q4K;
+            if gemm_shared {
+                self.kern.to_f16(
+                    &mut self.scratch.x16.slice_mut(..n * d),
+                    &self.act.xb.slice(..n * d),
+                    n * d,
+                )?;
+            }
             Self::matmul_pre(
                 &self.kern,
                 &mut self.scratch,
@@ -3349,7 +3368,7 @@ impl Model {
                 self.use_mmvq,
                 self.use_mmq,
                 shared,
-                shared_f16,
+                shared_f16 || gemm_shared,
             )?;
             Self::matmul_pre(
                 &self.kern,
@@ -3362,7 +3381,7 @@ impl Model {
                 self.use_mmvq,
                 self.use_mmq,
                 shared,
-                shared_f16,
+                shared_f16 || gemm_shared,
             )?;
         }
         // The stacked branch already applied it, over the two halves of one
@@ -4014,7 +4033,13 @@ impl Model {
         }
 
         let n_x = n_tokens * w.k;
-        kern.to_f16(&mut scratch.x16.slice_mut(..n_x), x, n_x)?;
+        // Unlike the FP8 branch above, this one used to convert unconditionally
+        // -- so a caller passing `pre_f16` to say "I already wrote `x16`" (gate
+        // and up read the same activation) was ignored, and gate's own
+        // `to_f16` clobbered what it just wrote before up ever read it.
+        if !pre_f16 {
+            kern.to_f16(&mut scratch.x16.slice_mut(..n_x), x, n_x)?;
+        }
 
         if w.ty == tuili_kernels::WeightType::F16 {
             // Already f16 on the device: reinterpret rather than copy.
