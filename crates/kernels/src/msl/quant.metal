@@ -430,6 +430,51 @@ DEQUANT_KERNEL(dequant_q8_0_f16, deq_q8_0)
 DEQUANT_KERNEL(dequant_q4_K_f16, deq_q4_K)
 DEQUANT_KERNEL(dequant_q6_K_f16, deq_q6_K)
 
+/// `dequant_q4_K_f16`, one thread a 32-element group instead of one a element.
+///
+/// `deq_q4_K` unpacks `q4k_scale_min` and reads the block's `d`/`dmin` fresh
+/// for every element it is asked for, and the generic `DEQUANT_KERNEL` macro
+/// asks for one element a thread -- so a 32-wide group pays for that unpacking
+/// thirty-two times over for values every thread in the group shares. This is
+/// the same fix `GEMV_BODY_Q4_K` already made for the mat-vec, applied to the
+/// pass that materialises the same weights as a flat f16 array: one thread
+/// unpacks a group's scale and min once, reads its sixty-four packed nibbles
+/// as two `uint4`s, and writes each four-value span as one `half4` store
+/// instead of four scalar ones.
+kernel void dequant_q4_K_f16_vec(
+        device half* out           [[buffer(0)]],
+        device const void* w       [[buffer(1)]],
+        constant uint& n           [[buffer(2)]],
+        uint3 tgid  [[threadgroup_position_in_grid]],
+        uint3 tid   [[thread_position_in_threadgroup]],
+        uint3 tgdim [[threads_per_threadgroup]]) {
+    const uint group = tgid.x * tgdim.x + tid.x;
+    if (group * 32 >= n) return;
+    device const block_q4_K* blk = (device const block_q4_K*)w + group / 8;
+    const int g = int(group % 8);
+    uchar sc, m;
+    q4k_scale_min(blk->scales, g, &sc, &m);
+    const float d = float(blk->d) * float(sc);
+    const float mn = float(blk->dmin) * float(m);
+    const int s0 = (g & 1) ? 4 : 0;
+    device const uint4* q128 =
+        (device const uint4*)(device const void*)(blk->qs + (g / 2) * 32);
+    const uint base = group * 32;
+    for (int v = 0; v < 2; ++v) {
+        const uint4 quad = q128[v];
+        for (int wi = 0; wi < 4; ++wi) {
+            const uint packed = quad[wi];
+            half4 vals;
+            vals[0] = half(d * float((packed >> s0) & 0xF) - mn);
+            vals[1] = half(d * float((packed >> (s0 + 8)) & 0xF) - mn);
+            vals[2] = half(d * float((packed >> (s0 + 16)) & 0xF) - mn);
+            vals[3] = half(d * float((packed >> (s0 + 24)) & 0xF) - mn);
+            device half4* dst = (device half4*)(out + base + v * 16 + wi * 4);
+            *dst = vals;
+        }
+    }
+}
+
 // ---- four output rows a threadgroup ----------------------------------------
 //
 // The experiment behind the rollout below it. `out[n] = W[n][k] . x[k]` reads

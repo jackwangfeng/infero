@@ -60,3 +60,7 @@ path = "examples/launch_overhead.rs"
 [[example]]
 name = "gemv_mma_wide_check"
 path = "examples/gemv_mma_wide_check.rs"
+
+[[example]]
+name = "dequant_q4k_vec_check"
+path = "examples/dequant_q4k_vec_check.rs"

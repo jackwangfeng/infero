@@ -2687,11 +2687,32 @@ impl Kernels {
             "dequant scratch holds {} elements, need {n_elements}",
             out.len()
         );
-        let name = format!("dequant_{}_f16", ty.suffix());
+        // Metal only: one thread a 32-element group instead of one a element,
+        // so the group's `q4k_scale_min` unpack happens once instead of
+        // thirty-two times and the writes go out as `half4`s. Measured on an
+        // M4 Max (`examples/dequant_q4k_vec_check.rs`): identical output,
+        // 5.6-5.9x faster, 40 GB/s to 235 -- this kernel was compute-bound on
+        // redundant scalar work, not the memory traffic it looks like on
+        // paper. `dequant_to_f16` is ~half of a prefill call's cost (measured
+        // on a 53-token prompt, `TUILI_METAL_PROFILE=1`), so this is not a
+        // rounding error on that number.
+        let vectorized = !cfg!(feature = "cuda")
+            && ty == WeightType::Q4K
+            && n_elements.is_multiple_of(32);
+        let name = if vectorized {
+            "dequant_q4_K_f16_vec".to_string()
+        } else {
+            format!("dequant_{}_f16", ty.suffix())
+        };
         let f = self.dev.kernels().get("tuili_quant", quant_src(), &name)?;
+        let work_items = if vectorized {
+            (n_elements / 32) as u64
+        } else {
+            n_elements as u64
+        };
         let cfg = LaunchConfig {
             grid_dim: (
-                (n_elements as u64).div_ceil(ELEMENTWISE_BLOCK as u64) as u32,
+                work_items.div_ceil(ELEMENTWISE_BLOCK as u64) as u32,
                 1,
                 1,
             ),
