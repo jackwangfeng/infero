@@ -68,12 +68,21 @@ fn main() -> Result<()> {
 
     let f_old = dev.kernels().get("quant", &quant, "gemv_mma_q4_K")?;
     let f_multisg = dev.kernels().get("quant", &quant, "gemv_mma_multisg_q4_K")?;
+    let f_shared = dev.kernels().get("quant", &quant, "gemv_mma_shared_q4_K")?;
+    const MMA_SHARED_TOKGROUPS: u32 = 4;
 
-    for &n_tokens in &[8usize, 20, 53, 61, 90, 128] {
-        let x_host: Vec<f32> = (0..n_tokens * k).map(|_| rng.next_f32()).collect();
+    for &n_tokens in &[8usize, 20, 32, 53, 61, 90, 128] {
+        // Padded to a multiple of eight tokens: every kernel here may
+        // overread its last (possibly partial) tile by up to seven tokens,
+        // same as the deployed single-simdgroup kernel already does, and
+        // this is the buffer-padding a real caller is expected to provide.
+        let x_host: Vec<f32> = (0..n_tokens.next_multiple_of(8) * k)
+            .map(|i| if i < n_tokens * k { rng.next_f32() } else { 0.0 })
+            .collect();
         let d_x = s.clone_htod(&x_host)?;
         let mut out_old = s.alloc_zeros::<f32>(n * n_tokens)?;
         let mut out_multisg = s.alloc_zeros::<f32>(n * n_tokens)?;
+        let mut out_shared = s.alloc_zeros::<f32>(n * n_tokens)?;
         let (ki, ni, nti) = (k as i32, n as i32, n_tokens as i32);
 
         let t_old = ms(
@@ -118,15 +127,44 @@ fn main() -> Result<()> {
             10,
         )?;
 
+        let t_shared = ms(
+            || {
+                let mut b = s.launch_builder(&f_shared);
+                b.arg(&out_shared.as_view_mut())
+                    .arg(&d_w.as_view())
+                    .arg(&d_x.as_view())
+                    .arg(&ki)
+                    .arg(&ni)
+                    .arg(&nti);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (
+                            (n as u32).div_ceil(8),
+                            (n_tokens as u32).div_ceil(8 * MMA_SHARED_TOKGROUPS),
+                            1,
+                        ),
+                        block_dim: (32, MMA_SHARED_TOKGROUPS, 1),
+                        shared_mem_bytes: 0,
+                    })?
+                };
+                s.synchronize()
+            },
+            10,
+        )?;
+
         let a = s.clone_dtoh(&out_old)?;
         let b = s.clone_dtoh(&out_multisg)?;
+        let c = s.clone_dtoh(&out_shared)?;
         let mut max_abs = 0.0f32;
+        let mut max_abs_shared = 0.0f32;
         for i in 0..n * n_tokens {
             max_abs = max_abs.max((a[i] - b[i]).abs());
+            max_abs_shared = max_abs_shared.max((a[i] - c[i]).abs());
         }
         println!(
-            "n_tokens={n_tokens:4}  single-sg {t_old:7.3}ms  multi-sg(4) {t_multisg:7.3}ms  speedup {:.2}x  max_abs_diff {max_abs:.3e}",
+            "n_tokens={n_tokens:4}  single-sg {t_old:7.3}ms  multi-sg(4) {t_multisg:7.3}ms ({:.2}x, diff {max_abs:.1e})  shared(4) {t_shared:7.3}ms ({:.2}x, diff {max_abs_shared:.1e})",
             t_old / t_multisg,
+            t_old / t_shared,
         );
     }
     Ok(())
