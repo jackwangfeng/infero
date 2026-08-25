@@ -788,3 +788,100 @@ kernel void gemv_mma_wide_q4_K(
         }
     }
 }
+
+#define MMA_SIMDGROUPS 4
+
+/// Q4_K, `MMA_SIMDGROUPS` independent 8-row-by-8-token tiles a threadgroup,
+/// one a simdgroup, covering `MMA_SIMDGROUPS * 8` consecutive rows for the
+/// same eight tokens `gemv_mma_q4_K` covers with one.
+///
+/// `gemv_mma_q4_K` is one simdgroup, 32 threads, a threadgroup -- correct but
+/// leaving the other simdgroup slots an Apple GPU core can run concurrently
+/// idle every dispatch, and the deployed GEMM (`gemm_f16`, MPS) beats it at
+/// prefill's actual token counts (measured end to end: forcing every Q4_K
+/// matmul onto `gemv_mma_q4_K` instead of GEMM cost 908ms against 850 for a
+/// 61-token request) despite MPS's own GFLOPS on this shape climbing from
+/// 15% of the GPU's peak at 20 tokens to only 76% by 512
+/// (`gemm_f16_overhead.rs`) -- so MPS is not merely acceptable here, it wins
+/// while leaving real throughput on the table too. The occupancy story
+/// seemed obvious: one simdgroup a threadgroup versus MPS keeping many tiles
+/// in flight, so four simdgroups a threadgroup, each an independent row-tile
+/// with no data sharing between them, looked like the fix.
+///
+/// Measured against `gemv_mma_q4_K` (`gemv_mma_multisg_check.rs`), same
+/// answer to the bit: 0.87-0.90x at every token count that matters for
+/// prefill, one noisy win at eight tokens aside. Slower, on top of a kernel
+/// that was already losing to GEMM. Two different remedies for "not enough
+/// concurrent work" -- this one, and `gemv_mma_wide_q4_K`'s sequential
+/// tiling -- have now both made the deployed kernel worse rather than better,
+/// which says the bottleneck this pair of attempts assumed is not the one
+/// that is actually there. Kept as the second half of that record; the next
+/// idea needs a different diagnosis, not a third shape of "more tiles."
+kernel void gemv_mma_multisg_q4_K(
+        device float* out          [[buffer(0)]],
+        device const void* w       [[buffer(1)]],
+        device const float* x      [[buffer(2)]],
+        constant int& k            [[buffer(3)]],
+        constant int& n            [[buffer(4)]],
+        constant int& n_tokens     [[buffer(5)]],
+        uint3 tgid  [[threadgroup_position_in_grid]],
+        uint3 tid   [[thread_position_in_threadgroup]]) {
+    threadgroup float stage[MMA_SIMDGROUPS][32 * MMA_ROWS];
+
+    const int sg = int(tid.y);
+    const int row0 = int(tgid.x) * (MMA_SIMDGROUPS * MMA_ROWS) + sg * MMA_ROWS;
+    const int token0 = int(tgid.y) * MMA_TOKS;
+    const int lane = int(tid.x);
+    const int nb = k / QK_K;
+
+    const int r = lane / 4;
+    const int c = lane % 4;
+    const int row = min(row0 + r, n - 1);
+
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (int b = 0; b < nb; ++b) {
+        device const block_q4_K* blk =
+            (device const block_q4_K*)w + size_t(row) * nb + b;
+        for (int g = 0; g < 8; ++g) {
+            uchar sc, m;
+            q4k_scale_min(blk->scales, g, &sc, &m);
+            const float d = float(blk->d) * float(sc);
+            const float mn = float(blk->dmin) * float(m);
+            const int s0 = (g & 1) ? 4 : 0;
+            device const uint2* q =
+                (device const uint2*)(device const void*)(blk->qs + (g / 2) * 32 + c * 8);
+            const uint2 pair = *q;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int u = 0; u < 2; ++u) {
+                const uint pk = pair[u];
+                for (int bi = 0; bi < 4; ++bi) {
+                    const int byte = int((pk >> (bi * 8)) & 0xFF);
+                    const int off = c * 8 + u * 4 + bi;
+                    stage[sg][off * MMA_ROWS + r] = d * float((byte >> s0) & 0xF) - mn;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const int kbase = b * QK_K + g * 32;
+            for (int sub = 0; sub < 4; ++sub) {
+                simdgroup_float8x8 wt, xt;
+                simdgroup_load(wt, stage[sg] + sub * MMA_ROWS * MMA_TOKS, MMA_ROWS);
+                simdgroup_load(xt, x + size_t(token0) * k + kbase + sub * MMA_TOKS, k);
+                simdgroup_multiply_accumulate(acc, xt, wt, acc);
+            }
+        }
+    }
+
+    threadgroup float sout[MMA_SIMDGROUPS][MMA_ROWS * MMA_TOKS];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_store(acc, sout[sg], MMA_ROWS);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int flat = lane; flat < MMA_ROWS * MMA_TOKS; flat += 32) {
+        const int t = flat / MMA_ROWS;
+        const int rr = flat % MMA_ROWS;
+        if (token0 + t < n_tokens && row0 + rr < n) {
+            out[size_t(token0 + t) * n + row0 + rr] = sout[sg][flat];
+        }
+    }
+}

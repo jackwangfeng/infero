@@ -68,3 +68,7 @@ path = "examples/dequant_q4k_vec_check.rs"
 [[example]]
 name = "gemm_f16_overhead"
 path = "examples/gemm_f16_overhead.rs"
+
+[[example]]
+name = "gemv_mma_multisg_check"
+path = "examples/gemv_mma_multisg_check.rs"
