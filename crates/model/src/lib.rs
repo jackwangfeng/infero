@@ -845,6 +845,11 @@ impl Model {
         };
 
         let tq = if kv_quant.is_quantized() {
+            anyhow::ensure!(
+                cfg!(feature = "cuda"),
+                "KV cache quantization ({kv_quant:?}) has no kernels on this backend yet; \
+                 pass --kv-quant f16 or drop the flag"
+            );
             let chunk = batch_tokens;
             let kv_dim = cfg.d_kv();
             // These three hold rotated queries and the attention accumulator,
@@ -2834,44 +2839,81 @@ impl Model {
                     slot_table: &table,
                     table_stride,
                 };
+                // Fused, the same way `attn_decode` fuses the dense path's
+                // three kernels and for the same reason: the unfused path
+                // below writes the whole score row to HBM and reads it back
+                // twice, and at a batch of one that round trip is latency
+                // rather than bytes. `TUILI_TQ_DECODE_ATTN=0` restores the
+                // three-kernel path this replaces.
+                let group = n_heads / n_kv_heads.max(1);
+                if !std::env::var("TUILI_TQ_DECODE_ATTN").is_ok_and(|v| v == "0")
+                    && group >= 1
+                    && group <= 8
+                    && n_heads == group * n_kv_heads
                 {
-                    let (codes, signs, scale, gamma) = pool.tq_key(layer);
-                    self.kern.tq_attn_scores(
-                        &mut self.act.scores.slice_mut(..score_len),
+                    let (kcodes, ksigns, kscale, kgamma) = pool.tq_key(layer);
+                    let (vcodes, vscale) = pool.tq_value(layer);
+                    self.kern.tq_attn_decode(
+                        &mut tq.acc_rot.slice_mut(..n * da),
                         &tq.q_rot.slice(..n * da),
                         &tq.q_qjl.slice(..n * da),
-                        &codes.as_view(),
-                        &signs.as_view(),
-                        &scale.as_view(),
-                        &gamma.as_view(),
+                        &kcodes.as_view(),
+                        &ksigns.as_view(),
+                        &kscale.as_view(),
+                        &kgamma.as_view(),
+                        &vcodes.as_view(),
+                        &vscale.as_view(),
                         batch,
                         &tq.tables.k_levels.as_view(),
                         k_bits,
-                        dims,
-                        kv_len,
-                        attn_scale,
-                        quant.qjl_scale(),
-                    )?;
-                }
-                self.kern.attn_softmax(
-                    &mut self.act.scores.slice_mut(..score_len),
-                    n_heads,
-                    n,
-                    kv_len,
-                )?;
-                {
-                    let (codes, scale) = pool.tq_value(layer);
-                    self.kern.tq_attn_output(
-                        &mut tq.acc_rot.slice_mut(..n * da),
-                        &self.act.scores.slice(..score_len),
-                        &codes.as_view(),
-                        &scale.as_view(),
-                        batch,
                         &tq.tables.v_levels.as_view(),
                         v_bits,
                         dims,
                         kv_len,
+                        attn_scale,
+                        quant.qjl_scale(),
+                        &mut self.act.attn_partial.as_view_mut(),
                     )?;
+                } else {
+                    {
+                        let (codes, signs, scale, gamma) = pool.tq_key(layer);
+                        self.kern.tq_attn_scores(
+                            &mut self.act.scores.slice_mut(..score_len),
+                            &tq.q_rot.slice(..n * da),
+                            &tq.q_qjl.slice(..n * da),
+                            &codes.as_view(),
+                            &signs.as_view(),
+                            &scale.as_view(),
+                            &gamma.as_view(),
+                            batch,
+                            &tq.tables.k_levels.as_view(),
+                            k_bits,
+                            dims,
+                            kv_len,
+                            attn_scale,
+                            quant.qjl_scale(),
+                        )?;
+                    }
+                    self.kern.attn_softmax(
+                        &mut self.act.scores.slice_mut(..score_len),
+                        n_heads,
+                        n,
+                        kv_len,
+                    )?;
+                    {
+                        let (codes, scale) = pool.tq_value(layer);
+                        self.kern.tq_attn_output(
+                            &mut tq.acc_rot.slice_mut(..n * da),
+                            &self.act.scores.slice(..score_len),
+                            &codes.as_view(),
+                            &scale.as_view(),
+                            batch,
+                            &tq.tables.v_levels.as_view(),
+                            v_bits,
+                            dims,
+                            kv_len,
+                        )?;
+                    }
                 }
                 // Back out of the rotated basis, once, on the output.
                 self.kern.tq_matvec(

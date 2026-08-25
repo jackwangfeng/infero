@@ -274,6 +274,180 @@ extern "C" __global__ void tq_attn_scores(
     }
 }
 
+// Scores, softmax and the weighted value sum in one pass -- the quantized
+// twin of `attn_decode_gqa_f32`. The three-kernel path above writes the whole
+// score row to HBM, reads it back to normalize, and reads it a third time to
+// weight the values; at a batch of one that round trip is latency the way
+// three dependent launches a layer are, which is the same argument the dense
+// fused kernel's comment makes. Folding it here removes it the same way.
+//
+// One block per (kv_head, token, chunk); its query group shares one key's
+// unpacking per tile rather than paying for it once a head, which this
+// encoding needs more than the dense kernel does — a key is a bit-unpack and
+// a codebook lookup, not a read. Keys are visited a warp's-width tile at a
+// time: each warp scores one key for every head in the group, the tile's
+// scores land in shared, and a `d`-wide fold rescales the running softmax
+// state and spends the tile's values before the next tile overwrites shared.
+// No cached vector is ever rotated back — see the file comment.
+//
+// Chunked over the key range like `attn_decode_gqa_f32`, and for the reason
+// its own comment gives: this model's four KV heads at one token is four
+// blocks, and a device with 188 SMs runs 184 of them idle for the whole
+// kernel otherwise -- `ncu` measured 0.74% compute and 16.7% occupancy
+// before this was added. A chunk writes its unnormalized sum and its
+// `{max, denominator}` pair to `partial`, in exactly the layout
+// `attn_flash_reduce_f32` already combines for the dense path -- the combine
+// arithmetic does not care how a chunk's floats were produced, so this reuses
+// it rather than writing a second copy.
+#define TQ_DECODE_MAX_GROUP 8
+
+extern "C" __global__ void tq_attn_decode_f32(
+    float* __restrict__ partial, int ms_off, const float* __restrict__ q_rot,
+    const float* __restrict__ q_qjl, const uint8_t* __restrict__ k_codes,
+    const uint8_t* __restrict__ k_signs, const __half* __restrict__ k_scale,
+    const __half* __restrict__ k_gamma, const uint8_t* __restrict__ v_codes,
+    const __half* __restrict__ v_scale, const int* __restrict__ seq_of,
+    const int* __restrict__ positions, const int* __restrict__ slot_table,
+    int table_stride, const float* __restrict__ cb_k, int k_bits,
+    const float* __restrict__ cb_v, int v_bits, int n_heads, int n_kv_heads,
+    int d, int n_slots, int kv_len, float attn_scale, float qjl_scale,
+    int group, int chunk_width) {
+    extern __shared__ float s_scores[];  // [TILE][group]
+    __shared__ float tile_max[TQ_DECODE_MAX_GROUP];
+
+    const int kv_head = blockIdx.x;
+    const int token = blockIdx.y;
+    const int c = blockIdx.z;
+    const int n_tokens = gridDim.y;
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    const int tile = blockDim.x / 32;
+
+    const int last = positions[token];
+    int kv_count = last + 1;
+    if (kv_count > kv_len) kv_count = kv_len;
+    const int chunk_begin = c * chunk_width;
+    // A block whose whole chunk is past this token's own length still has to
+    // record that, or the combine pass reads whatever was in `partial`.
+    const int chunk_end = min(chunk_begin + chunk_width, kv_count);
+    const int* table = slot_table + (size_t)seq_of[token] * table_stride;
+
+    const float* qr = q_rot + (size_t)token * n_heads * d;
+    const float* qs = q_qjl + (size_t)token * n_heads * d;
+
+    const int per_byte_k = 8 / k_bits;
+    const int per_byte_v = 8 / v_bits;
+    const uint8_t* kcodes = k_codes + (size_t)kv_head * n_slots * (d / per_byte_k);
+    const uint8_t* ksigns = k_signs + (size_t)kv_head * n_slots * (d / 8);
+    const __half* kscale = k_scale + (size_t)kv_head * n_slots;
+    const __half* kgamma = k_gamma + (size_t)kv_head * n_slots;
+    const uint8_t* vcodes = v_codes + (size_t)kv_head * n_slots * (d / per_byte_v);
+    const __half* vscale = v_scale + (size_t)kv_head * n_slots;
+
+    float m_run[TQ_DECODE_MAX_GROUP], l_run[TQ_DECODE_MAX_GROUP], acc[TQ_DECODE_MAX_GROUP];
+#pragma unroll
+    for (int g = 0; g < TQ_DECODE_MAX_GROUP; ++g) {
+        m_run[g] = -INFINITY;
+        l_run[g] = 0.0f;
+        acc[g] = 0.0f;
+    }
+
+    for (int base = chunk_begin; base < chunk_end; base += tile) {
+        const int n_this = min(tile, chunk_end - base);
+
+        // One warp, one key, every head in the group -- the code and sign
+        // bytes are read and unpacked once and spent `group` times, same
+        // trick `GEMV_SPREAD` uses for tokens.
+        if (warp < n_this) {
+            const int physical = table[base + warp];
+            const uint8_t* code = kcodes + (size_t)physical * (d / per_byte_k);
+            const uint8_t* sign = ksigns + (size_t)physical * (d / 8);
+            float mse[TQ_DECODE_MAX_GROUP], qjl[TQ_DECODE_MAX_GROUP];
+#pragma unroll
+            for (int g = 0; g < TQ_DECODE_MAX_GROUP; ++g) {
+                mse[g] = 0.0f;
+                qjl[g] = 0.0f;
+            }
+            for (int i = lane; i < d; i += 32) {
+                const float cval = cb_k[tq_unpack(code, i, k_bits)];
+                const float sval = tq_sign_of(sign, i);
+                for (int g = 0; g < group; ++g) {
+                    const int head = kv_head * group + g;
+                    mse[g] += qr[(size_t)head * d + i] * cval;
+                    qjl[g] += qs[(size_t)head * d + i] * sval;
+                }
+            }
+            for (int g = 0; g < group; ++g) {
+                mse[g] = warp_reduce_sum(mse[g]);
+                qjl[g] = warp_reduce_sum(qjl[g]);
+            }
+            if (lane == 0) {
+                const float sc = __half2float(kscale[physical]);
+                const float ga = __half2float(kgamma[physical]);
+                for (int g = 0; g < group; ++g) {
+                    const float est = sc * mse[g] + qjl_scale * (TQ_SQRT_HALF_PI / (float)d) * ga * qjl[g];
+                    s_scores[warp * group + g] = est * attn_scale;
+                }
+            }
+        }
+        __syncthreads();
+
+        if (threadIdx.x < group) {
+            float mx = -INFINITY;
+            for (int t = 0; t < n_this; ++t) mx = fmaxf(mx, s_scores[t * group + threadIdx.x]);
+            tile_max[threadIdx.x] = mx;
+        }
+        __syncthreads();
+
+        // The fold: rescale what a wider max invalidates, then spend this
+        // tile's values at the new one. Every thread with a real `d` lane
+        // computes the same `l_run` update redundantly rather than one
+        // thread computing it and broadcasting, which would cost a barrier
+        // this loop is trying to have only one of.
+        if (threadIdx.x < d) {
+            for (int g = 0; g < group; ++g) {
+                const float new_m = fmaxf(m_run[g], tile_max[g]);
+                const float resc = __expf(m_run[g] - new_m);
+                acc[g] *= resc;
+                l_run[g] *= resc;
+                m_run[g] = new_m;
+            }
+            for (int t = 0; t < n_this; ++t) {
+                const int physical = table[base + t];
+                const uint8_t* vcode = vcodes + (size_t)physical * (d / per_byte_v);
+                const float vval = cb_v[tq_unpack(vcode, threadIdx.x, v_bits)]
+                                  * __half2float(vscale[physical]);
+                for (int g = 0; g < group; ++g) {
+                    const float w = __expf(s_scores[t * group + g] - m_run[g]);
+                    acc[g] += w * vval;
+                    l_run[g] += w;
+                }
+            }
+        }
+        __syncthreads();  // before the next tile overwrites s_scores/tile_max
+    }
+
+    // Unnormalized: `attn_flash_reduce_f32` divides after it has combined
+    // every chunk's denominator, not before.
+    const size_t total = (size_t)n_tokens * n_heads * d;
+    float* partial_ms = partial + ms_off;
+    if (threadIdx.x < d) {
+        for (int g = 0; g < group; ++g) {
+            const int head = kv_head * group + g;
+            partial[(size_t)c * total + ((size_t)token * n_heads + head) * d + threadIdx.x] = acc[g];
+        }
+    }
+    if (threadIdx.x < group) {
+        const int head = kv_head * group + threadIdx.x;
+        float* ms = partial_ms + (((size_t)c * n_tokens + token) * n_heads + head) * 2;
+        // An empty chunk (this token's own length ends before it starts)
+        // never touched `m_run`, which is still its `-INFINITY` initializer
+        // -- exactly the sentinel the combine pass skips on.
+        ms[0] = m_run[threadIdx.x];
+        ms[1] = l_run[threadIdx.x];
+    }
+}
+
 // out[t, h, :] = sum_j p_j * v~_j, still in the rotated basis. The caller
 // applies Pi^T once afterwards.
 extern "C" __global__ void tq_attn_output(

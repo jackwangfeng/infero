@@ -4919,6 +4919,135 @@ impl Kernels {
         Ok(())
     }
 
+    /// Scores, softmax and the weighted value sum over a quantized cache in
+    /// one launch — [`Kernels::tq_attn_scores`], [`Kernels::attn_softmax`] and
+    /// [`Kernels::tq_attn_output`] fused the way [`Kernels::attn_decode`]
+    /// fuses their dense counterparts, and for the same reason: the
+    /// three-kernel path writes the whole score row to HBM and reads it back
+    /// twice. Still in the rotated basis; the caller applies `Πᵀ` afterwards,
+    /// same as the unfused path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tq_attn_decode(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        q_rot: &View<'_, f32>,
+        q_qjl: &View<'_, f32>,
+        k_codes: &View<'_, u8>,
+        k_signs: &View<'_, u8>,
+        k_scale: &View<'_, f16>,
+        k_gamma: &View<'_, f16>,
+        v_codes: &View<'_, u8>,
+        v_scale: &View<'_, f16>,
+        batch: BatchLayout<'_>,
+        k_levels: &View<'_, f32>,
+        k_bits: u8,
+        v_levels: &View<'_, f32>,
+        v_bits: u8,
+        dims: AttnDims,
+        kv_len: usize,
+        attn_scale: f32,
+        qjl_scale: f32,
+        partial: &mut ViewMut<'_, f32>,
+    ) -> Result<()> {
+        let group = dims.n_heads / dims.n_kv_heads.max(1);
+        anyhow::ensure!(
+            group >= 1 && group <= 8 && dims.n_heads == group * dims.n_kv_heads,
+            "tq_attn_decode: group {group} out of the fixed-array range this kernel unrolls"
+        );
+        // Chunked over the key range for the same reason `attn_decode` is:
+        // `n_kv_heads * n_tokens` blocks is four at this model's shape, and a
+        // device with 188 SMs runs the other 184 idle for the kernel's whole
+        // duration otherwise -- `ncu` measured 0.74% compute throughput and
+        // 16.7% occupancy before this was added, on a grid `ncu` itself
+        // flagged as sized for four SMs. `attn_partial_floats` is enough
+        // scratch either way; the caller already sizes `partial` for it.
+        let (n_chunks, chunk) = self.decode_chunks(&dims, kv_len);
+        let ms_off = (32 * dims.n_heads * dims.n_tokens * dims.d_head) as i32;
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_turboquant", tq_src(), "tq_attn_decode_f32")?;
+        let block = (SCORE_WARPS * 32).max(per_vector_block(dims.d_head));
+        let tile = block / 32;
+        let cfg = LaunchConfig {
+            grid_dim: (dims.n_kv_heads as u32, dims.n_tokens as u32, n_chunks),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: tile * group as u32 * 4,
+        };
+        let (kb, vb, stride, h, kh, dh, ms, kl, g, cw) = (
+            k_bits as i32,
+            v_bits as i32,
+            batch.table_stride as i32,
+            dims.n_heads as i32,
+            dims.n_kv_heads as i32,
+            dims.d_head as i32,
+            dims.n_slots as i32,
+            kv_len as i32,
+            group as i32,
+            chunk as i32,
+        );
+        // `partial` is only borrowed as a view for the decode kernel, so the
+        // combine pass below can still take it as `&mut` afterwards.
+        let part_ro = partial.as_view();
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(&part_ro)
+            .arg(&ms_off)
+            .arg(q_rot)
+            .arg(q_qjl)
+            .arg(k_codes)
+            .arg(k_signs)
+            .arg(k_scale)
+            .arg(k_gamma)
+            .arg(v_codes)
+            .arg(v_scale)
+            .arg(batch.seq_of)
+            .arg(batch.positions)
+            .arg(batch.slot_table)
+            .arg(&stride)
+            .arg(k_levels)
+            .arg(&kb)
+            .arg(v_levels)
+            .arg(&vb)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ms)
+            .arg(&kl)
+            .arg(&attn_scale)
+            .arg(&qjl_scale)
+            .arg(&g)
+            .arg(&cw);
+        self.dev
+            .profile()
+            .time("tq_attn_decode", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("tq_attn_decode")?;
+                Ok(())
+            })?;
+        drop(part_ro);
+
+        // The combine pass is `attn_flash_reduce_f32` itself: a chunk's
+        // unnormalized sum and `{max, denominator}` pair mean the same thing
+        // whether the values behind them came from an `f16` read or a
+        // TurboQuant unpack, so the arithmetic that reduces them across
+        // chunks does not need a second copy.
+        let r = self
+            .dev
+            .kernels()
+            .get("tuili_ops", ops_src(), "attn_flash_reduce_f32")?;
+        let part = partial.as_view();
+        let total = (dims.n_tokens * dims.n_heads * dims.d_head) as u32;
+        let (nt, nc) = (dims.n_tokens as i32, n_chunks as i32);
+        let mut rb = self.dev.stream().launch_builder(&r);
+        rb.arg(out).arg(&part).arg(&ms_off).arg(&h).arg(&dh).arg(&nt).arg(&nc);
+        self.dev
+            .profile()
+            .time("tq_attn_decode_reduce", self.dev.stream(), || {
+                unsafe { rb.launch(elementwise(total)) }.context("tq_attn_decode_reduce")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     /// `c[n_tokens, n] = a[n_tokens, k] · bᵀ` with f16 inputs and f32 output,
     /// accumulating in f32.
     ///
