@@ -123,6 +123,76 @@ __device__ __forceinline__ void mma_f16(mma_c_f32& d, const mma_a_f16& a,
 #endif
 }
 
+// ---- the e4m3 tensor cores -----------------------------------------------
+//
+// `mma.m16n8k32` with e4m3 operands and an f32 accumulator: native FP8 on both
+// sides, where `mma_f8_block` (see `fp8.cu`) keeps the weight in e4m3 but
+// widens it to f16 before the MMA, spending an `mma.m16n8k16.f16` on it
+// instead. Ada/Hopper/Blackwell's FP8 tensor cores are rated roughly double
+// the f16 ones, so that widening was leaving the other factor of two on the
+// table -- vLLM's own FP8 linear kernels (`cutlass_scaled_mm`, DeepGEMM) both
+// quantize the activation too and run this MMA directly, not `mma_f16`.
+//
+// e4m3 is one byte, the same as the `s8` operand `mma_s8` above already
+// speaks, and `m16n8k32` is the same shape -- so this reuses `mma_a_s8` and
+// `mma_b_s8` verbatim: what changes is the instruction's element and
+// accumulator type, not the fragment layout or the register count. Whatever
+// `mma_a_row`/`mma_b_col`/`mma_k0`/`ldmatrix_a_s8`/`ldmatrix_b_s8` produce for
+// an `s8` operand is bit-for-bit the fragment an `e4m3` operand needs too.
+//
+// Requires sm_89+ (Ada) — `caps().fp8` gates the callers, the same flag
+// `fp8.cu`'s per-block dequant already uses.
+__device__ __forceinline__ void mma_e4m3(mma_c_f32& d, const mma_a_s8& a,
+                                         const mma_b_s8& b) {
+#if __CUDA_ARCH__ >= 890
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(d.x[0]), "+f"(d.x[1]), "+f"(d.x[2]), "+f"(d.x[3])
+        : "r"(a.x[0]), "r"(a.x[1]), "r"(a.x[2]), "r"(a.x[3]), "r"(b.x[0]),
+          "r"(b.x[1]));
+#else
+    (void)d; (void)a; (void)b;
+#endif
+}
+
+// Same question as `mma_s8_probe`: does the hand-transcribed fragment layout
+// actually match what the instruction wants? e4m3 encode/decode is
+// `f32_to_e4m3`/`e4m3_to_f32` (`fp8.cu`), so the inputs and the expected
+// output are built in plain float and only the operands cross into e4m3.
+extern "C" __global__ void mma_e4m3_probe(const unsigned char* __restrict__ A,  // 16x32
+                                          const unsigned char* __restrict__ B,  //  8x32
+                                          float* __restrict__ D) {              // 16x8
+    const int lane = threadIdx.x;
+    const int ar = mma_a_row(lane);
+    const int bc = mma_b_col(lane);
+    const int k0 = mma_k0(lane);
+
+    mma_a_s8 a;
+    mma_b_s8 b;
+    mma_c_f32 d = {{0.0f, 0.0f, 0.0f, 0.0f}};
+
+    const unsigned char* a_lo = A + ar * 32 + k0;
+    const unsigned char* a_hi = A + (ar + 8) * 32 + k0;
+    a.x[0] = *(const int*)(const void*)a_lo;
+    a.x[1] = *(const int*)(const void*)a_hi;
+    a.x[2] = *(const int*)(const void*)(a_lo + 16);
+    a.x[3] = *(const int*)(const void*)(a_hi + 16);
+
+    const unsigned char* bp = B + bc * 32 + k0;
+    b.x[0] = *(const int*)(const void*)bp;
+    b.x[1] = *(const int*)(const void*)(bp + 16);
+
+    mma_e4m3(d, a, b);
+
+    const int cr = mma_c_row(lane);
+    const int cc = mma_c_col(lane);
+    D[cr * 8 + cc + 0] = d.x[0];
+    D[cr * 8 + cc + 1] = d.x[1];
+    D[(cr + 8) * 8 + cc + 0] = d.x[2];
+    D[(cr + 8) * 8 + cc + 1] = d.x[3];
+}
+
 // The f16 counterpart of `mma_s8_probe`, and it exists for the same reason: the
 // real kernel builds these fragments by hand, and a wrong index produces a
 // plausible matrix rather than a loud failure.

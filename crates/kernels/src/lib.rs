@@ -4245,6 +4245,32 @@ impl Kernels {
         Ok(())
     }
 
+    /// One `mma.m16n8k32.e4m3` on a 16x32 by 8x32 pair of e4m3 tiles.
+    ///
+    /// The e4m3 counterpart of [`Self::mma_s8_probe`]: same fragment layout,
+    /// same register counts, an `s8` operand's byte reinterpreted as `e4m3`.
+    /// See `mma_e4m3` in `mma.cuh`.
+    pub fn mma_e4m3_probe(
+        &self,
+        d: &mut ViewMut<'_, f32>,
+        a: &View<'_, u8>,
+        b_in: &View<'_, u8>,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_mmq", mmq_src(), "mma_e4m3_probe")?;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut bb = self.dev.stream().launch_builder(&f);
+        bb.arg(a).arg(b_in).arg(d);
+        unsafe { bb.launch(cfg) }.context("mma_e4m3_probe")?;
+        Ok(())
+    }
+
     /// One 128-weight Q4_G128 block through the `lop3` dequantization, laid
     /// out by logical k. Tests only; see `mmq_deq4_f16_probe` in `mmq.cu`.
     pub fn deq4_f16_probe(
