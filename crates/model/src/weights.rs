@@ -560,22 +560,30 @@ impl Weights {
                         // trick `in_proj_ba` uses -- `qkv` and `z` are the
                         // same Q8_0 type over the same `k`, and `split2`
                         // does not require equal widths. Produced complete
-                        // garbage output (not a subtle drift; unusable
-                        // tokens from the first response), reverted without
-                        // root-causing it: the AWQ/FP8 loader's own
-                        // `in_proj_qz` consumer path this was meant to
-                        // reuse assumes something about ordering, width, or
-                        // the FP8-specific per-block scale grid
-                        // (`stacked3`'s own comment: "FP8's per-block scale
-                        // grid means a stack is only free of interior
-                        // padding when every piece's row count already
-                        // lands on a scale block") that this dense Q8_0
-                        // pair does not satisfy, or does not satisfy the
-                        // way `stacked2_gguf`'s plain byte-concat assumes.
-                        // `in_proj_ba` is the same mechanism at a smaller
-                        // scale and is verified correct; this is not, and
-                        // is not worth re-attempting without finding out
-                        // why first.
+                        // garbage output and, root-caused after also hitting
+                        // it on `w_gate_up` (see its own comment in this
+                        // file): not a logic bug in the stacking or the
+                        // split at all, but VRAM. `stacked2_gguf` copies the
+                        // two tensors' bytes host-side and re-uploads the
+                        // concatenation as a new `Storage::Device` buffer --
+                        // real, additional VRAM, unlike the checkpoint's own
+                        // `Storage::Mapped` aliasing, which costs nothing
+                        // because the GPU reads the file's own pages. `a`/`b`
+                        // are 48 rows each and the fused pair across all
+                        // forty-eight GDN layers is under 300 KiB total, so
+                        // this never mattered there. `qkv`/`z` are 10240 and
+                        // 6144 rows: 89 MiB a layer, 4.3 GiB across the
+                        // model. This machine had 6.4 GiB free after the
+                        // checkpoint's own mapping; that allocation nearly
+                        // exhausted it, and the pool sizer that runs next
+                        // shrank the KV cache to fit what was left -- 4096
+                        // slots, kv_mib=1024, against the unmodified
+                        // baseline's 19968 slots and kv_mib=4992 -- small
+                        // enough to wrap or starve mid-generation, which is
+                        // what actually produced the garbage. Not a mechanism
+                        // this loader can use for anything wider than a few
+                        // hundred rows without giving the VRAM back some
+                        // other way first.
                         in_proj_qz: None,
                         conv1d: upload_vector(
                             dev, f, &t("ssm_conv1d.weight"), &mut device_bytes)?,
@@ -629,6 +637,30 @@ impl Weights {
                     w_gate: matrices.next().unwrap(),
                     w_up: matrices.next().unwrap(),
                     w_down: matrices.next().unwrap(),
+                    // Tried this with `stacked2_gguf`, the same trick
+                    // `w_kv` uses two fields up -- gate and up are the same
+                    // Q4_K type over the same `k`, and would have been the
+                    // single biggest launch-count cut this session found,
+                    // one pair a layer on all sixty-four rather than forty-
+                    // eight or sixteen of them. VRAM, not logic, is why it
+                    // is not here: `stacked2_gguf` re-uploads its
+                    // concatenation as a new `Storage::Device` buffer,
+                    // real VRAM on top of the checkpoint's own zero-cost
+                    // `Storage::Mapped` aliasing, and gate+up fused across
+                    // every layer is 6.4 GiB -- this machine's entire free
+                    // VRAM after the checkpoint's own mapping. The pool
+                    // sizer that runs after weight loading shrank the KV
+                    // cache to fit what was left (4096 slots against the
+                    // unmodified baseline's 19968), small enough to wrap or
+                    // starve mid-generation and produce exactly the
+                    // complete-garbage-output symptom that gave this away.
+                    // See `in_proj_qz`'s own comment above for the same
+                    // finding at GDN's smaller (4.3 GiB) scale. Not a
+                    // mechanism this loader can use above a few hundred
+                    // rows without giving the VRAM back some other way
+                    // first -- freeing it from elsewhere, or aliasing
+                    // instead of copying, neither of which this session
+                    // attempted.
                     w_gate_up: None,
                 }),
                 // No GGUF reader for `*_exps` yet; `Config::from_gguf` records
