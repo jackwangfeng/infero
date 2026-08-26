@@ -4977,7 +4977,7 @@ impl Kernels {
         //
         // A thread looping four or five times over its own chunk hides the
         // reduction behind real work. One doing a single chunk cannot.
-        const GEMV_BLOCK_MAX: u32 = 128;
+        const GEMV_BLOCK_MAX: u32 = 64;
         let block = (ty.gemv_work_items(k) as u32)
             .next_multiple_of(32)
             .clamp(32, GEMV_BLOCK_MAX);
