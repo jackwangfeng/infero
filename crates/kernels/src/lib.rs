@@ -2723,22 +2723,31 @@ impl Kernels {
         // paper. `dequant_to_f16` is ~half of a prefill call's cost (measured
         // on a 53-token prompt, `TUILI_METAL_PROFILE=1`), so this is not a
         // rounding error on that number.
-        let vectorized = !cfg!(feature = "cuda")
-            && matches!(ty, WeightType::Q4K | WeightType::Q8_0)
-            && n_elements.is_multiple_of(32);
-        let name = if vectorized {
-            match ty {
-                WeightType::Q4K => "dequant_q4_K_f16_vec".to_string(),
-                _ => "dequant_q8_0_f16_vec".to_string(),
-            }
+        // `Q6_K` earns a smaller multiple: `dequant_q6_K_f16_vec` gives one
+        // thread the same four elements `GEMV_BODY_Q6_K` already gives one
+        // thread (see its doc comment for why four rather than a clean
+        // thirty-two -- a Q6_K block has no single contiguous group the way
+        // Q4_K and Q8_0 do), so its group size is four, not thirty-two.
+        let vec_group: Option<u64> = if cfg!(feature = "cuda") {
+            None
         } else {
-            format!("dequant_{}_f16", ty.suffix())
+            match ty {
+                WeightType::Q4K if n_elements.is_multiple_of(32) => Some(32),
+                WeightType::Q8_0 if n_elements.is_multiple_of(32) => Some(32),
+                WeightType::Q6K if n_elements.is_multiple_of(256) => Some(4),
+                _ => None,
+            }
+        };
+        let name = match (ty, vec_group.is_some()) {
+            (WeightType::Q4K, true) => "dequant_q4_K_f16_vec".to_string(),
+            (WeightType::Q8_0, true) => "dequant_q8_0_f16_vec".to_string(),
+            (WeightType::Q6K, true) => "dequant_q6_K_f16_vec".to_string(),
+            _ => format!("dequant_{}_f16", ty.suffix()),
         };
         let f = self.dev.kernels().get("tuili_quant", quant_src(), &name)?;
-        let work_items = if vectorized {
-            (n_elements / 32) as u64
-        } else {
-            n_elements as u64
+        let work_items = match vec_group {
+            Some(g) => (n_elements as u64) / g,
+            None => n_elements as u64,
         };
         let cfg = LaunchConfig {
             grid_dim: (

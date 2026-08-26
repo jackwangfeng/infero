@@ -664,6 +664,52 @@ kernel void dequant_q8_0_f16_vec(
     }
 }
 
+/// `dequant_q6_K_f16`, one thread computing the same four elements
+/// `GEMV_BODY_Q6_K` already gives one thread, instead of one thread an
+/// element.
+///
+/// A Q6_K block has no clean 32-element group the way Q4_K and Q8_0 do:
+/// `deq_q6_K`'s four elements for a given `l` (`l`, `l + 32`, `l + 64`,
+/// `l + 96`) are 32 apart, not adjacent, because that is how Q6_K packs its
+/// two high bits -- one `qh` byte carries a pair of bits for each of those
+/// four. There is no vectorized write here the way `half4` stores gave the
+/// other two: four separate scalar writes, 32 apart, is what the layout
+/// allows. The win is entirely in not re-deriving `qh[l]`, `is` and the two
+/// nibble reads four times over across four different threads the way the
+/// generic per-element macro does.
+kernel void dequant_q6_K_f16_vec(
+        device half* out           [[buffer(0)]],
+        device const void* w       [[buffer(1)]],
+        constant uint& n           [[buffer(2)]],
+        uint3 tgid  [[threadgroup_position_in_grid]],
+        uint3 tid   [[thread_position_in_threadgroup]],
+        uint3 tgdim [[threads_per_threadgroup]]) {
+    const uint c = tgid.x * tgdim.x + tid.x;
+    if (c * 4 >= n) return;
+    const uint blk_half = c / 32;
+    const int l = int(c % 32);
+    const uint block_idx = blk_half / 2;
+    const int half_idx = int(blk_half % 2);
+
+    device const block_q6_K* blk = (device const block_q6_K*)w + block_idx;
+    device const uchar* ql = blk->ql + half_idx * 64;
+    device const uchar* qh = blk->qh + half_idx * 32;
+    device const char* sc = blk->scales + half_idx * 8;
+    const uint base = block_idx * 256 + uint(half_idx) * 128;
+    const float d = float(blk->d);
+
+    const uchar h = qh[l];
+    const int is = l / 16;
+    const int q0 = int((ql[l] & 0xF) | (((h >> 0) & 3) << 4)) - 32;
+    const int q1 = int((ql[l + 32] & 0xF) | (((h >> 2) & 3) << 4)) - 32;
+    const int q2 = int((ql[l] >> 4) | (((h >> 4) & 3) << 4)) - 32;
+    const int q3 = int((ql[l + 32] >> 4) | (((h >> 6) & 3) << 4)) - 32;
+    out[base + l] = half(d * float(sc[is + 0]) * float(q0));
+    out[base + l + 32] = half(d * float(sc[is + 2]) * float(q1));
+    out[base + l + 64] = half(d * float(sc[is + 4]) * float(q2));
+    out[base + l + 96] = half(d * float(sc[is + 6]) * float(q3));
+}
+
 // ---- four output rows a threadgroup ----------------------------------------
 //
 // The experiment behind the rollout below it. `out[n] = W[n][k] . x[k]` reads

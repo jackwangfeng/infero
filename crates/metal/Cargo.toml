@@ -88,3 +88,7 @@ path = "examples/gemv_q8_0_threshold_check.rs"
 [[example]]
 name = "embed_row_check"
 path = "examples/embed_row_check.rs"
+
+[[example]]
+name = "dequant_q6k_vec_check"
+path = "examples/dequant_q6k_vec_check.rs"
