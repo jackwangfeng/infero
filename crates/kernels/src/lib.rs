@@ -2218,7 +2218,7 @@ impl Kernels {
                 .dev
                 .kernels()
                 .get("tuili_ops", ops_src(), "attn_decode_fused_f32")?;
-            let sg_for_scores = (kv_len as u32).div_ceil(8).max(1);
+            let sg_for_scores = (kv_len as u32).div_ceil(2).max(1);
             let block = (sg_for_scores * 32)
                 .max((dims.d_head as u32).next_multiple_of(32))
                 .min(1024);
