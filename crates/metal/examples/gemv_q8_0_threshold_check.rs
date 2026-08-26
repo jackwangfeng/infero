@@ -151,6 +151,29 @@ fn bench(dev: &Device, quant: &str, label: &str, k: usize, n: usize, rng: &mut R
             15,
         )?;
 
+        let f_coop = dev.kernels().get("quant", quant, "gemv_mma_coop_q8_0")?;
+        let mut out_coop = s.alloc_zeros::<f32>(n * n_tokens)?;
+        let t_coop = ms(
+            || {
+                let mut b = s.launch_builder(&f_coop);
+                b.arg(&out_coop.as_view_mut())
+                    .arg(&d_w.as_view())
+                    .arg(&d_x.as_view())
+                    .arg(&ki)
+                    .arg(&ni)
+                    .arg(&nti);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: ((n as u32).div_ceil(32), (n_tokens as u32).div_ceil(32), 1),
+                        block_dim: (32, 4, 1),
+                        shared_mem_bytes: 0,
+                    })?
+                };
+                s.synchronize()
+            },
+            15,
+        )?;
+
         // Random +-0.5 activations dot a random-signed-byte weight row average
         // out near zero over k = 5120 terms, so a relative-error metric here
         // blows up on plain rounding noise around that cancellation; absolute
@@ -158,18 +181,21 @@ fn bench(dev: &Device, quant: &str, label: &str, k: usize, n: usize, rng: &mut R
         let a = s.clone_dtoh(&out_gemv)?;
         let b = s.clone_dtoh(&out_gemm)?;
         let c = s.clone_dtoh(&out_mma)?;
+        let d = s.clone_dtoh(&out_coop)?;
         let mut max_abs_gemm = 0.0f32;
         let mut max_abs_mma = 0.0f32;
+        let mut max_abs_coop = 0.0f32;
         for i in 0..n * n_tokens {
             max_abs_gemm = max_abs_gemm.max((a[i] - b[i]).abs());
             max_abs_mma = max_abs_mma.max((a[i] - c[i]).abs());
+            max_abs_coop = max_abs_coop.max((a[i] - d[i]).abs());
         }
         println!(
-            "{label:16} n_tokens={n_tokens:4}  gemv {t_gemv:7.3}ms  gemm(dequant+mps) {t_total:7.3}ms  \
-             mma {t_mma:7.3}ms  mma-vs-gemm {:.2}x  mma-vs-gemv {:.2}x  \
-             diff(gemm) {max_abs_gemm:.2e}  diff(mma) {max_abs_mma:.2e}",
-            t_total / t_mma,
-            t_gemv / t_mma,
+            "{label:16} n_tokens={n_tokens:4}  gemv {t_gemv:7.3}ms  gemm {t_total:7.3}ms  \
+             mma {t_mma:7.3}ms  coop {t_coop:7.3}ms  coop-vs-gemm {:.2}x  coop-vs-mma {:.2}x  \
+             diff(gemm) {max_abs_gemm:.1e}  diff(mma) {max_abs_mma:.1e}  diff(coop) {max_abs_coop:.1e}",
+            t_total / t_coop,
+            t_mma / t_coop,
         );
     }
     Ok(())

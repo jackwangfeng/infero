@@ -4626,6 +4626,48 @@ impl Kernels {
             })
     }
 
+    /// `gemv_mma_q8_0` widened to 32 rows a threadgroup with cooperative
+    /// decode across all 128 threads, the same fix
+    /// `gemv_mma_coop32_q4_K`'s doc comment traces for Q4_K, applied here
+    /// directly rather than through an intermediate serial-decode widening
+    /// step -- `gemv_mma_q8_0` never had one to begin with. Loses to
+    /// `gemv_mma_q8_0` below 24 tokens (0.75-0.92x, `examples/
+    /// gemv_q8_0_threshold_check.rs`): a 32-token-wide tile mostly empty of
+    /// real tokens is the same underfill `gemv_mma_shared_q4_K` loses to
+    /// below 32; wins from 24 up, 1.14-1.62x, growing with token count.
+    fn gemv_mma_coop_q8(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
+        x: &View<'_, f32>,
+        k: usize,
+        n: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("tuili_quant", quant_src(), "gemv_mma_coop_q8_0")?;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (n as u32).div_ceil(32),
+                (n_tokens as u32).div_ceil(32).max(1),
+                1,
+            ),
+            block_dim: (32, 4, 1),
+            shared_mem_bytes: 0,
+        };
+        let (k_i, n_i, nt_i) = (k as i32, n as i32, n_tokens as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(w).arg(x).arg(&k_i).arg(&n_i).arg(&nt_i);
+        self.dev
+            .profile()
+            .time("gemv_mma_coop_q8", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("gemv_mma_coop_q8")?;
+                Ok(())
+            })
+    }
+
     /// `gemv_mma_shared_q4_K`'s tiling widened to 32 rows a threadgroup,
     /// with the fix a naive widening needs to actually pay off: all 128
     /// threads decode cooperatively (one row a group of four lanes, no
@@ -4801,14 +4843,29 @@ impl Kernels {
             }
             return self.gemv_mma(out, w, x, k, n, n_tokens);
         }
-        // Q8_0's matrix-unit path. Unlike Q4_K's, this one has no crossover
-        // to weigh against the scalar kernel: `gemv_mma_q8_0` beats
+        // Q8_0's matrix-unit path. Unlike Q4_K's, there is no crossover
+        // against the scalar kernel to weigh: `gemv_mma_q8_0` beats
         // `gemv_q8_0` at every token count measured, 3.4x at eight tokens
         // widening to 8.3x at 128 (`gemv_q8_0_threshold_check.rs`), because
         // the scalar kernel re-reads the whole activation once a token with
         // no batching to amortise it against, the same shape the Q4_K
-        // scalar kernel has -- so there is no "loses below N" regime here to
-        // give the scalar path back.
+        // scalar kernel has. There is a crossover between the two MMA
+        // kernels, though, the same shape `gemv_mma_shared_q4_K`'s own
+        // 32-token floor has: `gemv_mma_coop_q8_0`'s 32-token-wide tile
+        // loses to the single-tile `gemv_mma_q8_0` below 24 tokens
+        // (0.75-0.92x, mostly-empty tile) and wins from 24 up
+        // (1.14-1.62x). `TUILI_Q8_0_COOP_MIN` moves the line.
+        if !cfg!(feature = "cuda") && ty == WeightType::Q8_0 && n_tokens >= 8 && n as u32 >= 32 {
+            let coop_min: usize = std::env::var("TUILI_Q8_0_COOP_MIN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(24);
+            if n_tokens >= coop_min {
+                return self.gemv_mma_coop_q8(out, w, x, k, n, n_tokens);
+            }
+            return self.gemv_mma_q8(out, w, x, k, n, n_tokens);
+        }
         if !cfg!(feature = "cuda") && ty == WeightType::Q8_0 && n_tokens >= 8 && n as u32 >= 8 {
             return self.gemv_mma_q8(out, w, x, k, n, n_tokens);
         }
