@@ -259,6 +259,12 @@ pub struct AttnWeights {
     /// `q`, `k` and `v` stacked along `n`, under `TUILI_FUSE_FFN`. One matmul
     /// and a scatter instead of three; see `stacked` in `load_awq`.
     pub w_qkv: Option<Matrix>,
+    /// `k` and `v` stacked along `n`, GGUF-only: `w_qkv` needs `wq` the same
+    /// width as `wk`/`wv`, which a gated `wq` (`output_gate`, Qwen3.5) never
+    /// is, but `wk` and `wv` are always the same shape as each other
+    /// regardless. One matmul instead of two on the pair `output_gate`
+    /// otherwise leaves fully unfused. See `stacked2_gguf`.
+    pub w_kv: Option<Matrix>,
     /// True when `wq` produces `2 * d_attn` columns: a query and a gate
     /// interleaved per head, which Qwen3.5's attention blocks carry and
     /// nothing before them did.
@@ -550,10 +556,26 @@ impl Weights {
                         in_proj_ba: stacked2_gguf(
                             dev, f, &t("ssm_alpha.weight"), &t("ssm_beta.weight"),
                             &mut device_bytes)?,
-                        // `qkv` and `z` are wide enough (10240 and 6144 rows
-                        // in the Qwen3.8-27B checkpoint) that launch count is
-                        // a smaller fraction of their cost, and stacking them
-                        // has not been measured, so left unfused for now.
+                        // Tried stacking these with `stacked2_gguf`, the same
+                        // trick `in_proj_ba` uses -- `qkv` and `z` are the
+                        // same Q8_0 type over the same `k`, and `split2`
+                        // does not require equal widths. Produced complete
+                        // garbage output (not a subtle drift; unusable
+                        // tokens from the first response), reverted without
+                        // root-causing it: the AWQ/FP8 loader's own
+                        // `in_proj_qz` consumer path this was meant to
+                        // reuse assumes something about ordering, width, or
+                        // the FP8-specific per-block scale grid
+                        // (`stacked3`'s own comment: "FP8's per-block scale
+                        // grid means a stack is only free of interior
+                        // padding when every piece's row count already
+                        // lands on a scale block") that this dense Q8_0
+                        // pair does not satisfy, or does not satisfy the
+                        // way `stacked2_gguf`'s plain byte-concat assumes.
+                        // `in_proj_ba` is the same mechanism at a smaller
+                        // scale and is verified correct; this is not, and
+                        // is not worth re-attempting without finding out
+                        // why first.
                         in_proj_qz: None,
                         conv1d: upload_vector(
                             dev, f, &t("ssm_conv1d.weight"), &mut device_bytes)?,
@@ -589,6 +611,9 @@ impl Weights {
                         k_norm: upload_optional_vector(
                             dev, f, &t("attn_k_norm.weight"), &mut device_bytes)?,
                         w_qkv: None,
+                        w_kv: stacked2_gguf(
+                            dev, f, &t("attn_k.weight"), &t("attn_v.weight"),
+                            &mut device_bytes)?,
                         output_gate: cfg.attn_output_gate,
                     }),
                     None,
@@ -1045,6 +1070,7 @@ pub fn load_mtp(
             q_norm: Some(vector(&format!("{l}.self_attn.q_norm.weight"), &mut bytes)?),
             k_norm: Some(vector(&format!("{l}.self_attn.k_norm.weight"), &mut bytes)?),
             w_qkv: None,
+            w_kv: None,
             output_gate,
         }),
         gdn: None,
@@ -1798,6 +1824,13 @@ pub fn load_awq(
                         &mut device_bytes,
                     )?
                 },
+                // The GGUF loader's narrower fallback for a gated `wq`
+                // (`stacked2_gguf` on `wk`/`wv` alone) is GGUF-specific --
+                // AWQ's `stacked2` only takes F16/F32, and an AWQ
+                // checkpoint's `k_proj`/`v_proj` are typically quantized, so
+                // it would return `None` here regardless. Left unattempted
+                // rather than adding an unused code path.
+                w_kv: None,
                 output_gate,
             })
         };
@@ -2317,6 +2350,7 @@ pub fn load_mtp_gguf(dev: &Device, f: &Gguf, cfg: &Config) -> Result<Option<MtpW
             q_norm: upload_optional_vector(dev, f, &t("attn_q_norm.weight"), &mut bytes)?,
             k_norm: upload_optional_vector(dev, f, &t("attn_k_norm.weight"), &mut bytes)?,
             w_qkv: None,
+            w_kv: None,
             output_gate: cfg.attn_output_gate,
         }),
         gdn: None,

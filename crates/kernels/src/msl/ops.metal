@@ -78,6 +78,31 @@ kernel void silu_mul_split_f32(device float* out         [[buffer(0)]],
     out[i] = (g / (1.0f + exp(-g))) * r[d_ff + col];
 }
 
+/// Split one `[width_a + width_b]`-wide fused row into two, `ops.cu`'s
+/// `split2_f32` ported: never had a Metal twin because nothing on Metal
+/// reached it until `w_kv`'s fused k/v projection.
+kernel void split2_f32(device float* a                  [[buffer(0)]],
+                       device float* b                  [[buffer(1)]],
+                       device const float* fused         [[buffer(2)]],
+                       constant int& width_a             [[buffer(3)]],
+                       constant int& width_b             [[buffer(4)]],
+                       constant int& total                [[buffer(5)]],
+                       uint3 tgid  [[threadgroup_position_in_grid]],
+                       uint3 tid   [[thread_position_in_threadgroup]],
+                       uint3 tgdim [[threads_per_threadgroup]]) {
+    const int i = int(tgid.x * tgdim.x + tid.x);
+    if (i >= total) return;
+    const int row_w = width_a + width_b;
+    const int row = i / row_w;
+    const int col = i - row * row_w;
+    const float x = fused[i];
+    if (col < width_a) {
+        a[size_t(row) * width_a + col] = x;
+    } else {
+        b[size_t(row) * width_b + (col - width_a)] = x;
+    }
+}
+
 /// Embedding lookup out of an f16 table. The CUDA path dequantises the table
 /// first and then uses `take_rows_f32`; folding the conversion in here saves a
 /// full-vocab copy that a batch of one token would never read.

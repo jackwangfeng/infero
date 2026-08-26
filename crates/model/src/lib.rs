@@ -2538,13 +2538,53 @@ impl Model {
                 cfg.d_head,
             )?;
         }
+        // `wk`/`wv` fused into one matmul when the loader found it safe to
+        // build (GGUF: always same shape, so `w_kv` is `Some` whenever this
+        // is a GGUF checkpoint's non-linear-attention layer). One launch
+        // instead of two on a pair that, run separately, are most of a
+        // decode step's `gemv` launch count next to their bytes -- the same
+        // shape `in_proj_ba`'s fusion already paid off on. `act.gate` is
+        // free here: nothing in this branch has written it yet, and the
+        // gated-q branch above already finished with it if it ran.
+        let fused_kv = l.attn().bk.is_none() && l.attn().bv.is_none();
+        if let Some(w_kv) = l.attn().w_kv.as_ref().filter(|_| fused_kv) {
+            Self::matmul_pre(
+                &self.kern,
+                &mut self.scratch,
+                &mut self.act.gate.slice_mut(..n * 2 * kv_dim),
+                w_kv,
+                stage,
+                &self.act.xb.slice(..n * d),
+                n,
+                self.use_mmvq,
+                self.use_mmq,
+                shared,
+                shared_f16,
+            )?;
+            let Activations { k, v, gate, .. } = &mut self.act;
+            self.kern.split2(
+                &mut k.slice_mut(..n * kv_dim),
+                &mut v.slice_mut(..n * kv_dim),
+                &gate.slice(..n * 2 * kv_dim),
+                kv_dim,
+                kv_dim,
+                n,
+            )?;
+        }
         for (w, bias, out, cols) in [
             (&l.attn().wq, &l.attn().bq, &mut self.act.q, da),
             (&l.attn().wk, &l.attn().bk, &mut self.act.k, kv_dim),
             (&l.attn().wv, &l.attn().bv, &mut self.act.v, kv_dim),
         ] {
-            // q is already done when it was gated.
+            // q is already done when it was gated; k and v are already done
+            // when the fused pair above ran.
             if std::ptr::eq(w, &l.attn().wq) && l.attn().output_gate {
+                continue;
+            }
+            if (std::ptr::eq(w, &l.attn().wk) || std::ptr::eq(w, &l.attn().wv))
+                && l.attn().w_kv.is_some()
+                && fused_kv
+            {
                 continue;
             }
             Self::matmul_pre(
