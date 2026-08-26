@@ -1337,3 +1337,131 @@ kernel void gemv_mma_shared_q4_K(
         }
     }
 }
+
+/// A cheap experiment, not (yet) a shipped kernel: does doubling
+/// `gemv_mma_shared_q4_K`'s row tile from 8 to 16 help at all, given the
+/// weight decode stays serial on simdgroup 0 either way?
+///
+/// llama.cpp's Metal `kernel_mul_mm` (its Q4_K prefill path, not the
+/// batch=1 `kernel_mul_mv`) uses a 64-row-by-32-token tile against tuili's
+/// 8-by-32, and cooperatively dequantizes with all 128 threads in a
+/// threadgroup rather than one simdgroup decoding for the other three to
+/// consume. Before committing to reproducing that whole design -- a much
+/// larger rewrite, and this session already shipped one kernel that won an
+/// isolated benchmark and lost in the real pipeline (`gemv1_simd_q4_K`) --
+/// this checks the cheaper half of the hypothesis first: if simdgroup 0
+/// simply decodes twice as many rows before the other three simdgroups can
+/// start consuming them, does the wider tile still win, or does the now-
+/// longer serial decode already eat the gain? A negative result here is
+/// itself the answer: it would mean the *cooperative* decode is not an
+/// optional refinement of a wider tile, it is the precondition for one.
+///
+/// Two full 8x8 sub-tiles and two independent stage buffers rather than one
+/// 16-wide buffer with cleverer indexing, deliberately: `gemv_mma_shared_q4_K`'s
+/// own offset arithmetic for wiring a 32-element k-group into a `[32][ROWS]`
+/// staging buffer is already dense enough that getting it right once and
+/// duplicating it verbatim for a second row-slice is a smaller risk of a
+/// silent indexing bug than generalising it for a use this experiment may
+/// not keep.
+kernel void gemv_mma_shared16_q4_K(
+        device float* out          [[buffer(0)]],
+        device const void* w       [[buffer(1)]],
+        device const float* x      [[buffer(2)]],
+        constant int& k            [[buffer(3)]],
+        constant int& n            [[buffer(4)]],
+        constant int& n_tokens     [[buffer(5)]],
+        uint3 tgid  [[threadgroup_position_in_grid]],
+        ushort sg   [[simdgroup_index_in_threadgroup]],
+        ushort lane_u [[thread_index_in_simdgroup]]) {
+    threadgroup float stageA[32 * MMA_ROWS];
+    threadgroup float stageB[32 * MMA_ROWS];
+
+    const int row0 = int(tgid.x) * (MMA_ROWS * 2);
+    const int tokcol0 = (int(tgid.y) * MMA_SHARED_TOKGROUPS + int(sg)) * MMA_TOKS;
+    const int lane = int(lane_u);
+    const int nb = k / QK_K;
+
+    const int r = lane / 4;
+    const int c = lane % 4;
+    const int rowA = min(row0 + r, n - 1);
+    const int rowB = min(row0 + MMA_ROWS + r, n - 1);
+
+    simdgroup_float8x8 accA = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 accB = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (int b = 0; b < nb; ++b) {
+        device const block_q4_K* blkA =
+            (device const block_q4_K*)w + size_t(rowA) * nb + b;
+        device const block_q4_K* blkB =
+            (device const block_q4_K*)w + size_t(rowB) * nb + b;
+        for (int g = 0; g < 8; ++g) {
+            if (sg == 0) {
+                uchar sc, m;
+                q4k_scale_min(blkA->scales, g, &sc, &m);
+                const float d = float(blkA->d) * float(sc);
+                const float mn = float(blkA->dmin) * float(m);
+                const int s0 = (g & 1) ? 4 : 0;
+                device const uint2* qA =
+                    (device const uint2*)(device const void*)(blkA->qs + (g / 2) * 32 + c * 8);
+                const uint2 pairA = *qA;
+                for (int u = 0; u < 2; ++u) {
+                    const uint pk = pairA[u];
+                    for (int bi = 0; bi < 4; ++bi) {
+                        const int byte = int((pk >> (bi * 8)) & 0xFF);
+                        const int off = c * 8 + u * 4 + bi;
+                        stageA[off * MMA_ROWS + r] = d * float((byte >> s0) & 0xF) - mn;
+                    }
+                }
+
+                uchar sc2, m2;
+                q4k_scale_min(blkB->scales, g, &sc2, &m2);
+                const float d2 = float(blkB->d) * float(sc2);
+                const float mn2 = float(blkB->dmin) * float(m2);
+                device const uint2* qB =
+                    (device const uint2*)(device const void*)(blkB->qs + (g / 2) * 32 + c * 8);
+                const uint2 pairB = *qB;
+                for (int u = 0; u < 2; ++u) {
+                    const uint pk = pairB[u];
+                    for (int bi = 0; bi < 4; ++bi) {
+                        const int byte = int((pk >> (bi * 8)) & 0xFF);
+                        const int off = c * 8 + u * 4 + bi;
+                        stageB[off * MMA_ROWS + r] = d2 * float((byte >> s0) & 0xF) - mn2;
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const int safe_tokcol0 =
+                tokcol0 < n_tokens ? tokcol0 : max(n_tokens - MMA_TOKS, 0);
+            const int kbase = b * QK_K + g * 32;
+            for (int sub = 0; sub < 4; ++sub) {
+                simdgroup_float8x8 wtA, wtB, xt;
+                simdgroup_load(wtA, stageA + sub * MMA_ROWS * MMA_TOKS, MMA_ROWS);
+                simdgroup_load(wtB, stageB + sub * MMA_ROWS * MMA_TOKS, MMA_ROWS);
+                simdgroup_load(xt, x + size_t(safe_tokcol0) * k + kbase + sub * MMA_TOKS, k);
+                simdgroup_multiply_accumulate(accA, xt, wtA, accA);
+                simdgroup_multiply_accumulate(accB, xt, wtB, accB);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    threadgroup float soutA[MMA_SHARED_TOKGROUPS][MMA_ROWS * MMA_TOKS];
+    threadgroup float soutB[MMA_SHARED_TOKGROUPS][MMA_ROWS * MMA_TOKS];
+    simdgroup_store(accA, soutA[sg], MMA_ROWS);
+    simdgroup_store(accB, soutB[sg], MMA_ROWS);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int flat = lane; flat < MMA_ROWS * MMA_TOKS; flat += 32) {
+        const int t = flat / MMA_ROWS;
+        const int rr = flat % MMA_ROWS;
+        if (tokcol0 + t < n_tokens) {
+            if (row0 + rr < n) {
+                out[size_t(tokcol0 + t) * n + row0 + rr] = soutA[sg][flat];
+            }
+            if (row0 + MMA_ROWS + rr < n) {
+                out[size_t(tokcol0 + t) * n + row0 + MMA_ROWS + rr] = soutB[sg][flat];
+            }
+        }
+    }
+}
+

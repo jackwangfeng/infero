@@ -92,3 +92,7 @@ path = "examples/embed_row_check.rs"
 [[example]]
 name = "dequant_q6k_vec_check"
 path = "examples/dequant_q6k_vec_check.rs"
+
+[[example]]
+name = "gemv_mma_shared16_check"
+path = "examples/gemv_mma_shared16_check.rs"
