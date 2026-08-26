@@ -438,6 +438,81 @@ kernel void gemv1_simd_q4_K(
     }
 }
 
+/// `gemv1_q4_K`, two weight matrices at once, one dispatch instead of two.
+///
+/// `stacked2_gguf`-style fusion (`in_proj_ba`, `w_kv`, shipped; `in_proj_qz`,
+/// `w_gate_up`, reverted -- see the doc comments on both in weights.rs) has
+/// to physically concatenate its two source tensors into one new
+/// `Storage::Device` buffer, real VRAM on top of a mapped checkpoint's
+/// otherwise-free aliasing. That is fine for a pair whose combined bytes
+/// are trivial and ruinous for one whose combined bytes are gigabytes --
+/// gate and up fused across every layer would have been 6.4 GiB on a
+/// machine that had 6.4 GiB free. This sidesteps that entirely: the two
+/// matrices stay exactly where they are, `Storage::Mapped` or
+/// `Storage::Device`, whichever the loader already gave them, and this
+/// kernel just takes both pointers. One dispatch covers rows `[0, n1)` from
+/// `w1` and `[n1, n1 + n2)` from `w2`, writing `out1`/`out2` directly rather
+/// than a fused row a downstream split has to undo -- decode's `n_tokens`
+/// is always one, so there is no batching dimension a fused-row layout like
+/// `silu_mul_split` would be amortising here anyway. `k` is shared because
+/// every candidate pair this session found (gate/up, wk/wv, qkv/z) reads
+/// the same activation; a caller whose two matrices genuinely differ in `k`
+/// cannot use this kernel and was never going to reach it.
+kernel void gemv1_dual_q4_K(
+        device float* out1         [[buffer(0)]],
+        device float* out2         [[buffer(1)]],
+        device const void* w1      [[buffer(2)]],
+        device const void* w2      [[buffer(3)]],
+        device const float* x      [[buffer(4)]],
+        constant int& k            [[buffer(5)]],
+        constant int& n1           [[buffer(6)]],
+        constant int& n2           [[buffer(7)]],
+        uint3 tgid  [[threadgroup_position_in_grid]],
+        uint3 tid   [[thread_position_in_threadgroup]],
+        uint3 tgdim [[threads_per_threadgroup]]) {
+    BLOCK_REDUCE_SCRATCH
+    const int row_global = int(tgid.x);
+    if (row_global >= n1 + n2) return;
+    const bool second = row_global >= n1;
+    device const void* w = second ? w2 : w1;
+    const int row = second ? row_global - n1 : row_global;
+    device float* out = second ? out2 : out1;
+
+    const int nb = k / QK_K;
+    device const block_q4_K* wr = (device const block_q4_K*)w + size_t(row) * nb;
+    float acc = 0.0f;
+    for (int c = int(tid.x); c < nb * 8; c += int(tgdim.x)) {
+        device const block_q4_K* blk = wr + c / 8;
+        const int g = c % 8;
+        const int base = (c / 8) * QK_K + g * 32;
+        uchar sc, m;
+        q4k_scale_min(blk->scales, g, &sc, &m);
+        const int high = g & 1;
+        const float d = float(blk->d) * float(sc);
+        const float mn = float(blk->dmin) * float(m);
+        device const uint4* q128 =
+            (device const uint4*)(device const void*)(blk->qs + (g / 2) * 32);
+        const int s0 = high ? 4 : 0;
+        for (int v = 0; v < 2; ++v) {
+            const uint4 quad = q128[v];
+            for (int wi = 0; wi < 4; ++wi) {
+                const uint packed = quad[wi];
+                const float4 wv = float4(
+                    d * float((packed >> s0) & 0xF) - mn,
+                    d * float((packed >> (s0 + 8)) & 0xF) - mn,
+                    d * float((packed >> (s0 + 16)) & 0xF) - mn,
+                    d * float((packed >> (s0 + 24)) & 0xF) - mn);
+                device const packed_float4* xp = (device const packed_float4*)
+                    (x + base + v * 16 + wi * 4);
+                const packed_float4 xv = *xp;
+                acc += wv[0] * xv[0] + wv[1] * xv[1] + wv[2] * xv[2] + wv[3] * xv[3];
+            }
+        }
+    }
+    const float total = BLOCK_SUM(acc, tid.x, tgdim.x);
+    if (tid.x == 0) out[row] = total;
+}
+
 kernel void gemv2_q4_K(GEMV_ARGS) { GEMV_BODY_Q4_K(2) }
 kernel void gemv4_q4_K(GEMV_ARGS) { GEMV_BODY_Q4_K(4) }
 kernel void gemv_q6_K(GEMV_ARGS)  { GEMV_BODY_Q6_K(GEMV_TOKENS) }

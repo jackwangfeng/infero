@@ -96,3 +96,7 @@ path = "examples/dequant_q6k_vec_check.rs"
 [[example]]
 name = "gemv_mma_shared16_check"
 path = "examples/gemv_mma_shared16_check.rs"
+
+[[example]]
+name = "gemv1_dual_check"
+path = "examples/gemv1_dual_check.rs"
