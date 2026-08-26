@@ -100,3 +100,7 @@ path = "examples/gemv_mma_shared16_check.rs"
 [[example]]
 name = "gemv1_dual_check"
 path = "examples/gemv1_dual_check.rs"
+
+[[example]]
+name = "attn_decode_fused_check"
+path = "examples/attn_decode_fused_check.rs"

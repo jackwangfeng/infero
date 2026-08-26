@@ -2125,20 +2125,32 @@ impl Kernels {
 
     /// Whether [`Self::attn_decode`] takes this shape.
     ///
-    /// It wants a real query group, a `d_head` its lanes divide evenly, and a
-    /// group narrow enough that `group * 32` is a legal block.
-    pub fn decode_attention(&self, dims: &AttnDims) -> bool {
-        // `attn_decode_gqa_f32` is CUDA-only for now: it is the fused
-        // three-kernels-in-one that `docs/catching-vllm.md` measured at +4.7%,
-        // and saying false here takes the unfused scores/softmax/output path
-        // instead -- which is ported, correct, and slower by about that much.
-        // Worth porting, and not worth blocking on.
-        if !cfg!(feature = "cuda") {
-            return false;
-        }
+    /// On CUDA: a real query group, a `d_head` its lanes divide evenly, and
+    /// a group narrow enough that `group * 32` is a legal block.
+    ///
+    /// On Metal: `attn_decode_fused_f32` -- scores, softmax and the V-weighted
+    /// sum in one dispatch instead of `attn_decode_gqa_f32`'s heavily tuned
+    /// CUDA original (register-pipelined K/V prefetch, chunked occupancy, an
+    /// MMA variant -- see its own "worth porting, and not worth blocking on"
+    /// comment, which this is not that port of). It stages the whole score
+    /// row in threadgroup memory rather than chunking, so `kv_len` is capped
+    /// at what fits: `ATTN_DECODE_FUSED_MAX_KV` in ops.metal. Measured
+    /// (`examples/attn_decode_fused_check.rs`): byte-exact against the
+    /// unfused path at every `kv_len` tried, 0.95-2.21x, a clean win at the
+    /// short end and roughly parity by 256 -- never a regression in that
+    /// range, so this is not gated any tighter than the memory cap itself.
+    pub fn decode_attention(&self, dims: &AttnDims, kv_len: usize) -> bool {
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *OFF.get_or_init(|| std::env::var("TUILI_NO_DECODE_ATTN").is_ok_and(|v| v != "0")) {
             return false;
+        }
+        if !cfg!(feature = "cuda") {
+            const ATTN_DECODE_FUSED_MAX_KV: usize = 8192;
+            return dims.n_heads > 0
+                && dims.n_kv_heads > 0
+                && dims.n_heads.is_multiple_of(dims.n_kv_heads)
+                && dims.d_head > 0
+                && kv_len <= ATTN_DECODE_FUSED_MAX_KV;
         }
         let group = dims.n_heads / dims.n_kv_heads.max(1);
         group > 1
@@ -2196,7 +2208,61 @@ impl Kernels {
         scale: f32,
         partial: &mut ViewMut<'_, f32>,
     ) -> Result<bool> {
-        anyhow::ensure!(self.decode_attention(&dims), "attn_decode: unsupported shape");
+        anyhow::ensure!(
+            self.decode_attention(&dims, kv_len),
+            "attn_decode: unsupported shape"
+        );
+
+        if !cfg!(feature = "cuda") {
+            let f = self
+                .dev
+                .kernels()
+                .get("tuili_ops", ops_src(), "attn_decode_fused_f32")?;
+            let sg_for_scores = (kv_len as u32).div_ceil(8).max(1);
+            let block = (sg_for_scores * 32)
+                .max((dims.d_head as u32).next_multiple_of(32))
+                .min(1024);
+            let cfg = LaunchConfig {
+                grid_dim: (dims.n_heads as u32, dims.n_tokens as u32, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: (kv_len as u32) * 4,
+            };
+            let (stride, h, kh, dh, ns, kl) = (
+                batch.table_stride as i32,
+                dims.n_heads as i32,
+                dims.n_kv_heads as i32,
+                dims.d_head as i32,
+                dims.n_slots as i32,
+                kv_len as i32,
+            );
+            let mut b = self.dev.stream().launch_builder(&f);
+            b.arg(&mut *out)
+                .arg(q)
+                .arg(k_cache)
+                .arg(v_cache)
+                .arg(batch.seq_of)
+                .arg(batch.positions)
+                .arg(batch.slot_table)
+                .arg(&stride)
+                .arg(&h)
+                .arg(&kh)
+                .arg(&dh)
+                .arg(&ns)
+                .arg(&kl)
+                .arg(&scale);
+            self.dev
+                .profile()
+                .time("attn_decode_fused", self.dev.stream(), || {
+                    unsafe { b.launch(cfg) }.context("attn_decode_fused")?;
+                    Ok(())
+                })?;
+            // `hout` (the f16 output copy) is CUDA-only here: decode is
+            // always one token, and `wo_f16`'s own condition at the call
+            // site requires `n > 1`, so this path never actually needs to
+            // write one -- there is nothing to test by adding it.
+            return Ok(false);
+        }
+
         let group = dims.n_heads / dims.n_kv_heads;
         let (n_chunks, chunk) = self.decode_chunks(&dims, kv_len);
         let ms_off = (32 * dims.n_heads * dims.n_tokens * dims.d_head) as i32;

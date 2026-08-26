@@ -733,6 +733,112 @@ kernel void attn_output_f32(device float* out                [[buffer(0)]],
     out[(size_t(token) * n_heads + head) * d_head + i] = acc;
 }
 
+/// One threadgroup, one (head, token) pair: `attn_scores_f32` +
+/// `attn_softmax_f32` + `attn_output_f32` fused into a single dispatch, the
+/// same three operations in the same order rather than a re-derivation --
+/// `decode_attention` gates a much more heavily hand-tuned CUDA kernel
+/// (`attn_decode_gqa_f32` in ops.cu: register-pipelined K/V prefetch, a
+/// chunked partial-buffer/combine pass for occupancy on many-SM cards, an
+/// MMA variant) that was never ported, with its own comment saying so
+/// ("worth porting, and not worth blocking on"). This is not that port: it
+/// is the simplest fusion that removes the thing a microbenchmark cannot
+/// see -- writing the score row to device memory and reading it back twice
+/// more, 5.4 MB a layer at this model's shape -- by keeping it in
+/// threadgroup memory instead, without replicating any of the CUDA
+/// kernel's occupancy or prefetch tuning. Reusing each stage's exact math
+/// (masked-future scores never computed rather than written `-INFINITY`
+/// and later softmaxed to zero -- `attn_output_f32`'s own comment already
+/// makes this argument for stopping the V-weighted-sum loop at the token's
+/// own position, applied here to the score loop too) is what keeps this
+/// low-risk rather than a new derivation of flash attention's algebra.
+///
+/// Threadgroup memory holds the whole score row, so `kv_len` is bounded by
+/// `ATTN_DECODE_FUSED_MAX_KV` -- unlike the CUDA kernel's chunking, which
+/// has no such limit. `decode_attention_fused` is where that cap is
+/// enforced; this kernel trusts its caller rather than checking again.
+#define ATTN_DECODE_FUSED_MAX_KV 8192
+
+kernel void attn_decode_fused_f32(
+        device float* out                [[buffer(0)]],
+        device const float* q            [[buffer(1)]],
+        device const half* k_cache       [[buffer(2)]],
+        device const half* v_cache       [[buffer(3)]],
+        device const int* seq_of         [[buffer(4)]],
+        device const int* positions      [[buffer(5)]],
+        device const int* slot_table     [[buffer(6)]],
+        constant int& table_stride       [[buffer(7)]],
+        constant int& n_heads            [[buffer(8)]],
+        constant int& n_kv_heads         [[buffer(9)]],
+        constant int& d_head             [[buffer(10)]],
+        constant int& n_slots            [[buffer(11)]],
+        constant int& kv_len             [[buffer(12)]],
+        constant float& scale            [[buffer(13)]],
+        threadgroup float* scores        [[threadgroup(0)]],
+        uint3 tgid  [[threadgroup_position_in_grid]],
+        uint3 tid   [[thread_position_in_threadgroup]],
+        uint3 tgdim [[threads_per_threadgroup]]) {
+    BLOCK_REDUCE_SCRATCH
+
+    const int head = int(tgid.x);
+    const int token = int(tgid.y);
+    const int kv_head = head / (n_heads / n_kv_heads);
+    const int last = positions[token];
+    const int len = min(last + 1, kv_len);
+
+    device const int* table = slot_table + size_t(seq_of[token]) * table_stride;
+    device const float* qr = q + (size_t(token) * n_heads + head) * d_head;
+    device const half* kbase = k_cache + size_t(kv_head) * n_slots * d_head;
+    device const half* vbase = v_cache + size_t(kv_head) * n_slots * d_head;
+
+    // Phase 1: scores. One SIMD group a key, exactly as `attn_scores_f32`
+    // assigns it, just looped across keys within one threadgroup instead of
+    // spread across many threadgroups.
+    const int lane = int(tid.x % WARP_SIZE);
+    const int sg = int(tid.x / WARP_SIZE);
+    const int n_sg = max(int(tgdim.x / WARP_SIZE), 1);
+    for (int j = sg; j < len; j += n_sg) {
+        device const half* kr = kbase + size_t(table[j]) * d_head;
+        float acc = 0.0f;
+        for (int i = lane; i < d_head; i += WARP_SIZE) {
+            acc += qr[i] * float(kr[i]);
+        }
+        acc = simd_sum(acc);
+        if (lane == 0) scores[j] = acc * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 2: softmax over scores[0, len) -- `attn_softmax_f32`'s exact
+    // three passes (max, exp+sum, normalize), on the threadgroup-local row
+    // instead of a device-memory one.
+    float local_max = -INFINITY;
+    for (int j = int(tid.x); j < len; j += int(tgdim.x)) {
+        local_max = fmax(local_max, scores[j]);
+    }
+    const float m = BLOCK_MAX(local_max, tid.x, tgdim.x);
+
+    float local_sum = 0.0f;
+    for (int j = int(tid.x); j < len; j += int(tgdim.x)) {
+        const float e = exp(scores[j] - m);
+        scores[j] = e;
+        local_sum += e;
+    }
+    const float inv = 1.0f / BLOCK_SUM(local_sum, tid.x, tgdim.x);
+    for (int j = int(tid.x); j < len; j += int(tgdim.x)) {
+        scores[j] *= inv;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 3: weighted sum over V, one thread a `d_head` dimension --
+    // `attn_output_f32`'s exact assignment and loop bound.
+    for (int i = int(tid.x); i < d_head; i += int(tgdim.x)) {
+        float acc = 0.0f;
+        for (int j = 0; j < len; ++j) {
+            acc += scores[j] * float(vbase[size_t(table[j]) * d_head + i]);
+        }
+        out[(size_t(token) * n_heads + head) * d_head + i] = acc;
+    }
+}
+
 kernel void silu_mul_split_f16_f32(device float* out          [[buffer(0)]],
                                    device half* hout          [[buffer(1)]],
                                    device const float* xy     [[buffer(2)]],

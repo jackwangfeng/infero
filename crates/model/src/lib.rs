@@ -2868,7 +2868,7 @@ impl Model {
                 // number here was wrong. `TUILI_DECODE_ATTN=0` restores the
                 // three.
                 if !std::env::var("TUILI_DECODE_ATTN").is_ok_and(|v| v == "0")
-                    && self.kern.decode_attention(&dims)
+                    && self.kern.decode_attention(&dims, kv_len)
                 {
                     let mut h16 = self.scratch.x16.slice_mut(..n * da);
                     attn_f16 = self.kern.attn_decode(
