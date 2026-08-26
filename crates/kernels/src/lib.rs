@@ -4826,18 +4826,26 @@ impl Kernels {
             && n_tokens >= mma_min()
             && n as u32 >= 8;
         if mma {
-            // Below 32 tokens, most of a gemv_mma_shared threadgroup's four
-            // simdgroups have no real tokens to work on and it loses to the
-            // single-simdgroup kernel (0.40-0.91x, examples/
-            // gemv_mma_multisg_check.rs); from 32 up it wins, 1.06-1.19x in
-            // that same isolated measurement. Overridable for re-measuring
-            // the crossover rather than arguing about it, same as
+            // This threshold used to be 32: `gemv_mma_shared_q4_K`'s four
+            // simdgroups sat mostly idle below it (0.40-0.91x, examples/
+            // gemv_mma_multisg_check.rs) because its decode was serial on
+            // one of them regardless of token count, so a mostly-empty
+            // token tile bought nothing to offset that fixed cost.
+            // `gemv_mma_coop32_q4_K`'s decode is cooperative across all 128
+            // threads instead, and that changes the shape of this trade
+            // completely: measured down to eight tokens (examples/
+            // gemv_mma_shared16_check.rs), it beats the single-simdgroup
+            // `gemv_mma_q4_K` everywhere in that range too, 1.29-2.05x
+            // instead of losing. Lowered to match `mma_min()`'s own floor
+            // rather than re-guessing a new one -- there is no token count
+            // left where the plain kernel wins back. Overridable for
+            // re-measuring rather than arguing about it, same as
             // `TUILI_MMA_MIN` above.
             let shared_min: usize = std::env::var("TUILI_MMA_SHARED_MIN")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|v| *v > 0)
-                .unwrap_or(32);
+                .unwrap_or(8);
             if n_tokens >= shared_min {
                 return self.gemv_mma_coop32(out, w, x, k, n, n_tokens);
             }

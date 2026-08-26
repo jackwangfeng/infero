@@ -64,7 +64,7 @@ fn bench(dev: &Device, quant: &str, label: &str, k: usize, n: usize, rng: &mut R
     let f_coop = dev.kernels().get("quant", quant, "gemv_mma_coop32_q4_K")?;
     let f_coop64 = dev.kernels().get("quant", quant, "gemv_mma_coop64_q4_K")?;
 
-    for &n_tokens in &[32usize, 48, 63, 90, 128] {
+    for &n_tokens in &[8usize, 16, 24, 32, 48, 63, 90, 128] {
         let x_host: Vec<f32> = (0..n_tokens.next_multiple_of(8) * k)
             .map(|i| if i < n_tokens * k { rng.next_f32() } else { 0.0 })
             .collect();
