@@ -1581,3 +1581,110 @@ kernel void gemv_mma_shared32_q4_K(
     }
 }
 
+/// `gemv_mma_shared32_q4_K` with the fix its own doc comment named: instead
+/// of simdgroup 0 alone decoding 32 rows for the other three to wait on,
+/// all 128 threads in the threadgroup decode cooperatively, one row a
+/// group of four lanes, the same way `gemv_mma_shared_q4_K` already lets
+/// one lane group own one row -- just no longer confined to lanes 0-31.
+/// `global_id = sg * 32 + lane` replaces `lane` as the thing `row_idx` and
+/// `c` are derived from, and every lane that used to sit idle at the
+/// barrier during decode (96 of 128, in the shared/shared16/shared32
+/// kernels) now does exactly the same per-thread decode work a lane in
+/// simdgroup 0 always did, just for a different row.
+///
+/// This is what actually reproduces llama.cpp's `kernel_mul_mm`
+/// structurally, not `gemv_mma_shared32_q4_K`'s serial-decode version of a
+/// wider tile: cooperative dequant is the thing its own doc comment (and
+/// `gemv_mma_shared16_q4_K`'s before it) identified as the missing half of
+/// that design, tried here rather than assumed.
+///
+/// The compute phase does not change from `gemv_mma_shared32_q4_K`: each
+/// simdgroup still owns one 8-token tile and now MMAs it against all four
+/// 8-row slices of the 32-row tile, four `simdgroup_multiply_accumulate`
+/// calls a K-sub-chunk instead of one. What changes is that the decode this
+/// compute phase waits on no longer scales with row count -- 128 threads
+/// decoding 32 rows do the same per-thread work as 32 threads decoding 8 --
+/// so the extra compute from a wider tile should no longer be paid for with
+/// four times the barrier-stalled decode time the way it was in
+/// `gemv_mma_shared32_q4_K`.
+kernel void gemv_mma_coop32_q4_K(
+        device float* out          [[buffer(0)]],
+        device const void* w       [[buffer(1)]],
+        device const float* x      [[buffer(2)]],
+        constant int& k            [[buffer(3)]],
+        constant int& n            [[buffer(4)]],
+        constant int& n_tokens     [[buffer(5)]],
+        uint3 tgid  [[threadgroup_position_in_grid]],
+        ushort sg   [[simdgroup_index_in_threadgroup]],
+        ushort lane_u [[thread_index_in_simdgroup]]) {
+    threadgroup float stage[32 * 32];
+
+    const int row0 = int(tgid.x) * 32;
+    const int tokcol0 = (int(tgid.y) * MMA_SHARED_TOKGROUPS + int(sg)) * MMA_TOKS;
+    const int lane = int(lane_u);
+    const int nb = k / QK_K;
+
+    const int global_id = int(sg) * 32 + lane;
+    const int row_idx = global_id / 4;
+    const int c = global_id % 4;
+    const int row = min(row0 + row_idx, n - 1);
+
+    simdgroup_float8x8 acc[4];
+    for (int s = 0; s < 4; ++s) {
+        acc[s] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (int b = 0; b < nb; ++b) {
+        device const block_q4_K* blk =
+            (device const block_q4_K*)w + size_t(row) * nb + b;
+        for (int g = 0; g < 8; ++g) {
+            uchar sc, m;
+            q4k_scale_min(blk->scales, g, &sc, &m);
+            const float d = float(blk->d) * float(sc);
+            const float mn = float(blk->dmin) * float(m);
+            const int s0 = (g & 1) ? 4 : 0;
+            device const uint2* q =
+                (device const uint2*)(device const void*)(blk->qs + (g / 2) * 32 + c * 8);
+            const uint2 pair = *q;
+            for (int u = 0; u < 2; ++u) {
+                const uint pk = pair[u];
+                for (int bi = 0; bi < 4; ++bi) {
+                    const int byte = int((pk >> (bi * 8)) & 0xFF);
+                    const int off = c * 8 + u * 4 + bi;
+                    stage[off * 32 + row_idx] = d * float((byte >> s0) & 0xF) - mn;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const int safe_tokcol0 =
+                tokcol0 < n_tokens ? tokcol0 : max(n_tokens - MMA_TOKS, 0);
+            const int kbase = b * QK_K + g * 32;
+            for (int sub = 0; sub < 4; ++sub) {
+                simdgroup_float8x8 xt;
+                simdgroup_load(xt, x + size_t(safe_tokcol0) * k + kbase + sub * MMA_TOKS, k);
+                for (int s = 0; s < 4; ++s) {
+                    simdgroup_float8x8 wt;
+                    simdgroup_load(wt, stage + sub * 8 * 32 + s * 8, 32);
+                    simdgroup_multiply_accumulate(acc[s], xt, wt, acc[s]);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    threadgroup float sout[MMA_SHARED_TOKGROUPS][4][8 * 8];
+    for (int s = 0; s < 4; ++s) {
+        simdgroup_store(acc[s], sout[sg][s], 8);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int s = 0; s < 4; ++s) {
+        for (int flat = lane; flat < 8 * 8; flat += 32) {
+            const int t = flat / 8;
+            const int rr = flat % 8;
+            if (tokcol0 + t < n_tokens && row0 + s * 8 + rr < n) {
+                out[size_t(tokcol0 + t) * n + row0 + s * 8 + rr] = sout[sg][s][flat];
+            }
+        }
+    }
+}
+

@@ -61,6 +61,7 @@ fn bench(dev: &Device, quant: &str, label: &str, k: usize, n: usize, rng: &mut R
     let f_old = dev.kernels().get("quant", quant, "gemv_mma_shared_q4_K")?;
     let f_new = dev.kernels().get("quant", quant, "gemv_mma_shared16_q4_K")?;
     let f_32 = dev.kernels().get("quant", quant, "gemv_mma_shared32_q4_K")?;
+    let f_coop = dev.kernels().get("quant", quant, "gemv_mma_coop32_q4_K")?;
 
     for &n_tokens in &[32usize, 48, 63, 90, 128] {
         let x_host: Vec<f32> = (0..n_tokens.next_multiple_of(8) * k)
@@ -147,21 +148,51 @@ fn bench(dev: &Device, quant: &str, label: &str, k: usize, n: usize, rng: &mut R
             15,
         )?;
 
+        let mut out_coop = s.alloc_zeros::<f32>(n * n_tokens)?;
+        let t_coop = ms(
+            || {
+                let mut b = s.launch_builder(&f_coop);
+                b.arg(&out_coop.as_view_mut())
+                    .arg(&d_w.as_view())
+                    .arg(&d_x.as_view())
+                    .arg(&ki)
+                    .arg(&ni)
+                    .arg(&nti);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (
+                            (n as u32).div_ceil(32),
+                            (n_tokens as u32).div_ceil(8 * MMA_SHARED_TOKGROUPS),
+                            1,
+                        ),
+                        block_dim: (32, MMA_SHARED_TOKGROUPS, 1),
+                        shared_mem_bytes: 0,
+                    })?
+                };
+                s.synchronize()
+            },
+            15,
+        )?;
+
         let a = s.clone_dtoh(&out_old)?;
         let b = s.clone_dtoh(&out_new)?;
         let c = s.clone_dtoh(&out_32)?;
+        let d = s.clone_dtoh(&out_coop)?;
         let mut max_abs = 0.0f32;
         let mut max_abs_32 = 0.0f32;
+        let mut max_abs_coop = 0.0f32;
         for i in 0..n * n_tokens {
             max_abs = max_abs.max((a[i] - b[i]).abs());
             max_abs_32 = max_abs_32.max((a[i] - c[i]).abs());
+            max_abs_coop = max_abs_coop.max((a[i] - d[i]).abs());
         }
         println!(
             "{label:16} n_tokens={n_tokens:4}  8-row {t_old:7.3}ms  16-row {t_new:7.3}ms  \
-             32-row {t_32:7.3}ms  16-speedup {:.2}x  32-speedup {:.2}x  \
-             diff16 {max_abs:.3e}  diff32 {max_abs_32:.3e}",
+             32-row {t_32:7.3}ms  coop32 {t_coop:7.3}ms  16x {:.2}  32x {:.2}  coopx {:.2}  \
+             diff16 {max_abs:.1e}  diff32 {max_abs_32:.1e}  diffcoop {max_abs_coop:.1e}",
             t_old / t_new,
             t_old / t_32,
+            t_old / t_coop,
         );
     }
     Ok(())

@@ -4626,23 +4626,25 @@ impl Kernels {
             })
     }
 
-    /// `gemv_mma_shared_q4_K`'s tiling, doubled: 16 output rows a
-    /// threadgroup instead of 8, decode still serial on simdgroup 0.
+    /// `gemv_mma_shared_q4_K`'s tiling widened to 32 rows a threadgroup,
+    /// with the fix a naive widening needs to actually pay off: all 128
+    /// threads decode cooperatively (one row a group of four lanes, no
+    /// longer confined to simdgroup 0's 32) instead of one simdgroup
+    /// decoding for the other three to wait on. See the kernel's own doc
+    /// comment in quant.metal, and the two it supersedes
+    /// (`gemv_mma_shared16_q4_K`, which found that widening to 16 rows wins
+    /// even with the old serial decode; `gemv_mma_shared32_q4_K`, which
+    /// found that widening further to 32 rows *without* fixing the decode
+    /// loses to 16) for the trail that led here.
     ///
-    /// llama.cpp's own Q4_K prefill matmul uses a 64-row tile against this
-    /// engine's 8 (`gemv_mma_shared`), cooperatively dequantized by all 128
-    /// threads in a threadgroup rather than one simdgroup decoding for the
-    /// other three to consume -- see the kernel's own doc comment in
-    /// quant.metal. Before committing to that much larger rewrite, this
-    /// checked the cheaper half of the hypothesis: does merely widening the
-    /// row tile help even without also making the decode cooperative.
-    /// It does, cleanly, at every token count `gemv_mma_shared` is ever
-    /// actually dispatched at (32-128, `examples/gemv_mma_shared16_check.rs`):
-    /// 1.12-1.32x, byte-exact, no losses anywhere in that range. Replaces
-    /// `gemv_mma_shared` outright rather than sitting behind a further
-    /// threshold; `gemv_mma_shared` itself stays in quant.metal undeleted,
-    /// same as this session's other superseded-but-documented kernels.
-    fn gemv_mma_shared16(
+    /// Measured against the original 8-row `gemv_mma_shared_q4_K` at every
+    /// token count it is ever actually dispatched at (32-128,
+    /// `examples/gemv_mma_shared16_check.rs`): 1.24-2.36x, byte-exact,
+    /// beating both `gemv_mma_shared16_q4_K` (1.12-1.19x there) and
+    /// `gemv_mma_shared32_q4_K` (0.94-1.06x) at every one of them. Replaces
+    /// `gemv_mma_shared16` outright in the `gemv` dispatch; all three
+    /// superseded kernels stay in quant.metal undeleted.
+    fn gemv_mma_coop32(
         &self,
         out: &mut ViewMut<'_, f32>,
         w: &View<'_, u8>,
@@ -4655,10 +4657,10 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_quant", quant_src(), "gemv_mma_shared16_q4_K")?;
+            .get("tuili_quant", quant_src(), "gemv_mma_coop32_q4_K")?;
         let cfg = LaunchConfig {
             grid_dim: (
-                (n as u32).div_ceil(16),
+                (n as u32).div_ceil(32),
                 (n_tokens as u32).div_ceil(8 * TOKGROUPS).max(1),
                 1,
             ),
@@ -4670,8 +4672,8 @@ impl Kernels {
         b.arg(out).arg(w).arg(x).arg(&k_i).arg(&n_i).arg(&nt_i);
         self.dev
             .profile()
-            .time("gemv_mma_shared16", self.dev.stream(), || {
-                unsafe { b.launch(cfg) }.context("gemv_mma_shared16")?;
+            .time("gemv_mma_coop32", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("gemv_mma_coop32")?;
                 Ok(())
             })
     }
@@ -4795,7 +4797,7 @@ impl Kernels {
                 .filter(|v| *v > 0)
                 .unwrap_or(32);
             if n_tokens >= shared_min {
-                return self.gemv_mma_shared16(out, w, x, k, n, n_tokens);
+                return self.gemv_mma_coop32(out, w, x, k, n, n_tokens);
             }
             return self.gemv_mma(out, w, x, k, n, n_tokens);
         }
