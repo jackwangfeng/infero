@@ -1,6 +1,6 @@
 // FP8 E4M3 weights with a 128x128 block scale grid, read four rows at a time.
 //
-// The 27B ships FP8 and tuili was dequantizing it to f16 at load, which is
+// The 27B ships FP8 and infero was dequantizing it to f16 at load, which is
 // correct and costs a factor of two in the only resource decode has: a step
 // reads every weight once, so 51 GiB of f16 takes twice as long as 29 GiB of
 // FP8 no matter how good the arithmetic is. Measured, that was 13.2 tok/s
@@ -64,7 +64,7 @@ __device__ __forceinline__ float e4m3_to_f32(unsigned int b) {
 #define FP8_ROW_GROUP 4
 
 // Attribution switches for `examples/fp8_row_cost.rs`, compiled in by
-// `fp8::strip_flags()` when `TUILI_FP8_STRIP` asks. A marginal row costs 2.25 ms
+// `fp8::strip_flags()` when `INFERO_FP8_STRIP` asks. A marginal row costs 2.25 ms
 // where its DRAM bytes are zero, and three end-to-end guesses at why were all
 // wrong — so the remaining move is to take pieces out and see which one the cost
 // follows. These produce wrong answers by construction and are never on in a

@@ -18,7 +18,7 @@
 //
 // Every one of those runs to completion under the wrong reading and produces a
 // fluent description of the wrong image, so each is checked against
-// `tuili_model::qwen35_vision` — itself checked against a capture of the
+// `infero_model::qwen35_vision` — itself checked against a capture of the
 // reference implementation on the real checkpoint — in tests/vision.rs, with the
 // alternative reading computed and required to disagree. See
 // notes/qwen3.5-vision.md for the measured deviation of each wrong reading.
@@ -470,13 +470,24 @@ extern "C" __global__ void vision_attn_f32(float* __restrict__ out,
 // other orderings — (t, c, y, x), (c, t, x, y), (y, x, c, t) — fill every slot,
 // type-check, and feed the patch embedding a transposed patch.
 //
-// `n_frames` is how many frames `frames` actually holds; temporal tap `t` reads
-// frame `min(t, n_frames - 1)`. For a still image that is 1, so **both taps see
-// the same pixels** — the processor `expand`s rather than zero-filling, and the
-// Conv3d's two temporal taps therefore act as their sum. Filling only the first
-// tap moves the patch embedding by 0.83 out of a peak of 3.15. For video it is
-// 2, and an odd frame count has its last frame repeated by the caller passing
-// the same offset twice.
+// `n_frames` is how many frames one temporal-patch group holds; temporal tap
+// `t` reads frame `min(t, n_frames - 1)` *within its own group*. For a still
+// image that is 1, so **both taps see the same pixels** — the processor
+// `expand`s rather than zero-filling, and the Conv3d's two temporal taps
+// therefore act as their sum. Filling only the first tap moves the patch
+// embedding by 0.83 out of a peak of 3.15. For video it is 2, and an odd
+// frame count has its last frame repeated by the caller passing the same
+// offset twice.
+//
+// `grid_t` batches every temporal-patch group of one clip into a single
+// launch, rather than the host looping `grid_t` times into offset slices of
+// the same output buffer (what this did before, and numerically still does
+// — `ti = 0, grid_t = 1` is exactly that old per-group launch, one thread's
+// `idx` maps to the same `out` row either way). `frames` is one contiguous
+// `[grid_t * n_frames, C, H, W]` buffer (`PreparedClip::planar`'s own
+// layout), so group `ti`'s frames start at `ti * n_frames` along that axis —
+// the only new arithmetic here is picking that group out before falling
+// through to the same per-patch indexing as before.
 extern "C" __global__ void vision_patchify_f32(float* __restrict__ out,
                                                __half* __restrict__ out_h,
                                                const float* __restrict__ frames,
@@ -485,14 +496,18 @@ extern "C" __global__ void vision_patchify_f32(float* __restrict__ out,
                                                int width, int channels,
                                                int patch, int temporal,
                                                int merge, int grid_h,
-                                               int grid_w) {
+                                               int grid_w, int grid_t) {
     const int patch_dim = channels * temporal * patch * patch;
-    const long long total = (long long)grid_h * grid_w * patch_dim;
+    const long long group_total = (long long)grid_h * grid_w * patch_dim;
+    const long long total = group_total * grid_t;
     const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
 
-    const int p = (int)(idx / patch_dim);
-    const int slot = (int)(idx % patch_dim);
+    const int ti = (int)(idx / group_total);
+    const long long local = idx % group_total;
+
+    const int p = (int)(local / patch_dim);
+    const int slot = (int)(local % patch_dim);
 
     const int x = slot % patch;
     const int y = (slot / patch) % patch;
@@ -507,7 +522,7 @@ extern "C" __global__ void vision_patchify_f32(float* __restrict__ out,
     const int row = block_row * merge + in_row;
     const int col = block_col * merge + in_col;
 
-    const int frame = min(t, n_frames - 1);
+    const int frame = ti * n_frames + min(t, n_frames - 1);
     const float val = frames[(long long)frame * frame_stride +
                              (long long)(c * height + row * patch + y) * width +
                              col * patch + x];

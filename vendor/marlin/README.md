@@ -11,7 +11,7 @@ compiled; these files are the reference the port in
 
 ## What was established by reading them
 
-The paper's subject is exactly the regime `tuili` is stuck in. Four-bit kernels
+The paper's subject is exactly the regime `infero` is stuck in. Four-bit kernels
 before Marlin — AWQ's and GPTQ's own, and llama.cpp's MMQ, which this repo's
 `mmq.cu` follows — help at a batch of one, where the step is bandwidth-bound,
 and stop helping as the batch grows. Marlin's claim is a near-ideal 4x out to a
@@ -400,7 +400,7 @@ gate/up — share it, which is what `norm_for_group` already did for Q8_1.
 
 ### What is left, and where
 
-`TUILI_PROFILE=1` at batch 32 puts the GEMM at 72% of the step, attention at
+`INFERO_PROFILE=1` at batch 32 puts the GEMM at 72% of the step, attention at
 20%, everything else at 7% — so the GEMM is still the thing.
 
 At 32 tokens it runs 185 GB/s against the 294 it reaches at 8. Forcing one
@@ -429,14 +429,14 @@ the isolated `ffn_gate` went 150 to 185 GB/s while the step went 118 to 121.
 Most of a decode step's weight volume is not in the matrices this kernel is
 being tuned on.
 
-Keep `TUILI_MMQ_VARIANT` as the switch and add each stage as a new name, so
+Keep `INFERO_MMQ_VARIANT` as the switch and add each stage as a new name, so
 every step stays A/B-able against the ones before it.
 
 ## How to measure
 
 Two instruments, and picking the wrong one wasted a day here.
 
-- `cargo run --release -p tuili-model --example batch_bench -- <awq-dir> 256`
+- `cargo run --release -p infero-model --example batch_bench -- <awq-dir> 256`
   reproduces to 0.2% and is what a kernel change should be judged on.
 - The server benchmark varies by **±18%** at 32 clients — identical code has
   measured 434 and 518 — because the batch width changes as sequences finish.
@@ -450,7 +450,7 @@ Two traps that cost real time:
 
 - Selecting the two arms of an A/B through *different* switches. `direct` looked
   worth 10% that way and is worth 0% when both arms go through
-  `TUILI_MMQ_VARIANT`.
+  `INFERO_MMQ_VARIANT`.
 - Concluding from a mechanism rather than a measurement. Five structural changes
   here were argued for convincingly and measured at zero. The one that worked
   differed from a failed attempt only in a constant.
@@ -465,7 +465,7 @@ cache is 1.2 GB a step against the weights' 5.03 — 24% of the traffic for 22%
 of the time, which is bandwidth-proportional. The K row cannot be shared across
 tokens the way it is shared across a GQA group, because a decode batch is 32
 *different sequences* and each indexes its own pages. TurboQuant is implemented
-here and would cut those bytes fourfold; measured, `TUILI_KV=tq4` runs 537 tok/s
+here and would cut those bytes fourfold; measured, `INFERO_KV=tq4` runs 537 tok/s
 against F16's 838, so the dequantization costs more than the bandwidth saves.
 
 **The GEMM is done at small batch and unexplained at large.** It reaches 97% of
@@ -479,7 +479,7 @@ its access pattern's ceiling at 8 tokens and 63% at 32, and at 32 tokens it is:
 | the activation stream | `mmqnh_*`, half the copies | 7% |
 | more weight rows a block | `mmqf2w8s2`, `mmqf1w16s2`, `mmqf4w8s2` | -30% |
 | eight-bit activations | `mmqe_*`, Q8_1 ring under the f16 MMA | -30% |
-| the KV cache | `TUILI_KV=tq4` | -36% |
+| the KV cache | `INFERO_KV=tq4` | -36% |
 
 The occupancy story is what is left, and `mmqe_*` is what killed it. At two
 token tiles the f16 ring is 34.8 KB and the SM holds two blocks of eight warps;
@@ -518,7 +518,7 @@ pool's own byte count against the VRAM left after the weights, and the
 scheduler already refuses a prompt that will not fit, so oversubscribing is
 safe.
 
-| tuili AWQ, 32 clients | tok/s | behind vLLM |
+| infero AWQ, 32 clients | tok/s | behind vLLM |
 | --- | --- | --- |
 | as recorded in the top-level README | 515 | 3.45x |
 | this session's kernels, `--max-seqs 8` | 368 | 4.82x |
@@ -531,7 +531,7 @@ disagreed by a factor of two and the disagreement was a command-line default.
 
 ## The roofline, and why 2.5x is not one more kernel
 
-Priced per decode step at a batch of eight, where `TUILI_PROFILE=1` puts the
+Priced per decode step at a batch of eight, where `INFERO_PROFILE=1` puts the
 GEMM at 78% and attention at 13%:
 
 | | ms | note |
@@ -539,7 +539,7 @@ GEMM at 78% and attention at 13%:
 | `mmq` | 14.7 | 4.27 GB of weights, so 290 GB/s |
 | attention | 2.7 | its own bandwidth bound is 0.75 |
 | norms, rope, silu, adds, `to_f16` | 1.4 | eight small elementwise kernels |
-| **tuili** | **18.8** | 425 tok/s |
+| **infero** | **18.8** | 425 tok/s |
 | **vLLM** | **14.2** | 564 tok/s |
 
 **This kernel alone takes as long as vLLM's whole step.** Set attention to its
@@ -586,7 +586,7 @@ that consumes them are new traffic and a third launch.
 The fused path (`attn_flash_f32`) is gated to shapes with too few blocks, and
 the guess was that its other two properties — the score matrix never reaching
 HBM, two launches a layer instead of three — would pay at any batch.
-`TUILI_FLASH_WIDE=1` measures **379 against 405** at a batch of eight and **730
+`INFERO_FLASH_WIDE=1` measures **379 against 405** at a batch of eight and **730
 against 852** at thirty-two. The fused block holds a chunk of scores in shared
 memory and that caps its occupancy; the unfused one does not.
 

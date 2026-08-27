@@ -16,7 +16,7 @@
 // the weights stop dominating, not before.
 //
 // Every layout choice below has a second reading that runs to completion and
-// produces fluent nonsense. They are checked against `tuili_model::qwen35`,
+// produces fluent nonsense. They are checked against `infero_model::qwen35`,
 // which is checked against a capture of the reference implementation on the
 // real checkpoint.
 

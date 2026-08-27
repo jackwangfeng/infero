@@ -377,6 +377,21 @@ extern "C" __global__ void rope_norm_f32(float* __restrict__ x,
 //
 // Dimensions at or past `rotary_dim` are never addressed here, so they keep
 // their bits by construction: this kernel rotates in place.
+//
+// `mrope_axis`/`pos_stride` let one launch serve both a plain scalar position
+// per token and Qwen3.5's three-axis (time/height/width) one. `positions` is
+// `pos_stride` values a token rather than one; `mrope_axis[i]` says which of
+// those `pos_stride` values frequency `i` reads. `pos_stride == 1` with every
+// `mrope_axis` entry `0` collapses `positions[token * 1 + 0]` to exactly
+// `positions[token]` -- the pre-mRoPE arithmetic, bit for bit, not an
+// approximation of it. See `qwen35_vision::interleaved_mrope_axis` for where
+// `mrope_axis`'s contents come from on a model that has them.
+// `mrope_axis`/`pos_stride` come last in the parameter list, not beside
+// `positions`/`freq_factors` where they read most naturally, because the
+// Metal twin's `[[buffer(n)]]` order has to match this one position for
+// position -- one `Kernels::rope_qk_partial` builds one `.arg()` sequence for
+// whichever backend compiled, and appending at the end is the change least
+// likely to silently swap two buffers of the same type on the Metal side.
 extern "C" __global__ void rope_qk_f32(float* __restrict__ q,
                                        float* __restrict__ k,
                                        const int* __restrict__ positions,
@@ -384,7 +399,9 @@ extern "C" __global__ void rope_qk_f32(float* __restrict__ q,
                                        int n_heads, int n_kv_heads, int d_head,
                                        int rotary_dim,
                                        float theta_base, float freq_scale,
-                                       int interleaved) {
+                                       int interleaved,
+                                       const int* __restrict__ mrope_axis,
+                                       int pos_stride) {
     const int half = rotary_dim / 2;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= half) return;
@@ -396,7 +413,8 @@ extern "C" __global__ void rope_qk_f32(float* __restrict__ q,
     float* base = is_q ? q : k;
     const int heads = is_q ? n_heads : n_kv_heads;
 
-    const float pos = (float)positions[token] * freq_scale;
+    const int axis = mrope_axis[i];
+    const float pos = (float)positions[(size_t)token * pos_stride + axis] * freq_scale;
     const float inv_freq = __powf(theta_base, -2.0f * (float)i / (float)rotary_dim);
     const float angle = pos * inv_freq / freq_factors[i];
     float sin_a, cos_a;
@@ -458,6 +476,9 @@ extern "C" __global__ void store_kv_f16(__half* __restrict__ pool,
 // `q` is written out to its own buffer because attention reads it contiguously;
 // `k` is rotated in place, where `store_kv2_packed_f16` picks it up next to the
 // `v` it never had to move at all.
+//
+// `mrope_axis`/`pos_stride`: see `rope_qk_f32`'s comment. Same reason they
+// come last here too -- positional agreement with the Metal buffer order.
 extern "C" __global__ void rope_qk_packed_f32(float* __restrict__ q_dst,
                                              float* __restrict__ packed,
                                              int stride, int q_off, int k_off,
@@ -466,7 +487,9 @@ extern "C" __global__ void rope_qk_packed_f32(float* __restrict__ q_dst,
                                              int n_heads, int n_kv_heads,
                                              int d_head, int rotary_dim,
                                              float theta_base,
-                                             float freq_scale, int interleaved) {
+                                             float freq_scale, int interleaved,
+                                             const int* __restrict__ mrope_axis,
+                                             int pos_stride) {
     const int half = rotary_dim / 2;
     const int tail = d_head - rotary_dim;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -501,7 +524,8 @@ extern "C" __global__ void rope_qk_packed_f32(float* __restrict__ q_dst,
         return;
     }
 
-    const float pos = (float)positions[token] * freq_scale;
+    const int axis = mrope_axis[i];
+    const float pos = (float)positions[(size_t)token * pos_stride + axis] * freq_scale;
     const float inv_freq = __powf(theta_base, -2.0f * (float)i / (float)rotary_dim);
     const float angle = pos * inv_freq / freq_factors[i];
     float sin_a, cos_a;
@@ -1590,8 +1614,8 @@ extern "C" __global__ void attn_flash_gqa_f32(
 // The three-kernel path is 47.5 us a layer at the shape a decode step actually
 // runs — batch 32, 384 of history, 32 query heads over 8 KV heads of 128 —
 // against `vllm_flash_attn`'s 33.3 us measured inside its own engine. Both
-// numbers took some finding: the 85.8 us this file's comments quote for tuili
-// was taken under `TUILI_PROFILE`, which serializes and puts an event pair
+// numbers took some finding: the 85.8 us this file's comments quote for infero
+// was taken under `INFERO_PROFILE`, which serializes and puts an event pair
 // around every launch, and the 58.1 us they quote for vLLM came from a Python
 // harness whose own overhead is 28 us — it reports the same 58 us at a history
 // of 128, where the kernel cannot possibly be doing that much work.

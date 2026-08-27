@@ -9,7 +9,7 @@
 // and the multinomial draw, and only `sampled_token_ids` — one int per row —
 // crosses back.
 //
-// This is that, with tuili's parameter set and, importantly, tuili's exact
+// This is that, with infero's parameter set and, importantly, infero's exact
 // semantics. `crates/model/src/sampling.rs` has two paths that do not agree
 // with each other about the repetition penalty, and both have to be reproduced:
 //

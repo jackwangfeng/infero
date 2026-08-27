@@ -12,7 +12,7 @@
 //
 // Every layout choice here has a second reading that runs to completion and
 // produces fluent nonsense, so all of it is checked against
-// `tuili_model::qwen35`, which is in turn checked against a capture of the
+// `infero_model::qwen35`, which is in turn checked against a capture of the
 // reference implementation on the real checkpoint. See tests/gated_delta.rs.
 
 //
@@ -24,7 +24,7 @@
 //
 // Every layout choice below has a second reading that runs to completion and
 // produces fluent nonsense, so all of it is checked against
-// `tuili_model::qwen35`, which is in turn checked against a capture of the
+// `infero_model::qwen35`, which is in turn checked against a capture of the
 // reference implementation on the real checkpoint. See tests/gated_delta.rs.
 
 // Depthwise causal convolution over time with a carried window, plus SiLU.

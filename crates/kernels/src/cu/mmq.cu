@@ -181,7 +181,7 @@ __device__ __forceinline__ void mmq_load_w_q8_0(int8_t* ws, float* wd, float* wm
 // `mmq_load_w_q8_0` above reads two bytes at a time and says why: a `block_q8_0`
 // is 34 bytes, so `qs` is only ever halfword-aligned and a word load would fault
 // on odd blocks. That is a layout problem, not a kernel one, and the vocab
-// projection is the one matrix tuili quantizes itself — so the layout is ours to
+// projection is the one matrix infero quantizes itself — so the layout is ours to
 // choose. Here a row's quants are one contiguous run of `k` bytes and the scales
 // follow in a trailing region, which makes the tile load sixteen bytes a thread.
 //
@@ -676,7 +676,7 @@ __device__ __forceinline__ int mmq_g_high(int g) { return (g % 4) / 2; }
    It is correct at every shape and token count, it does not hang, and it is
    **3.3% slower**: 4848 tok/s against 5012, `layers_ms` 5.880 against 5.671.
 
-   The cost is not the locks. The same binary with `TUILI_MMQ_LOCKS=0` — the
+   The cost is not the locks. The same binary with `INFERO_MMQ_LOCKS=0` — the
    reordering kept, the memset back — measures 4862, so **splitting the run into
    two passes is itself worth -3%**, against the 2.2% the memsets cost. The
    `MMQ_Y_LOADW` hand-over carries a k-tile of weights across row-group
@@ -1517,7 +1517,7 @@ extern "C" __global__ void mmq_deq4_f16_probe(const void* __restrict__ wv,
 // answer unattributable.
 //
 // Measured on an A4000 against the AWQ 8B at 256 tokens of history, in tok/s,
-// each arm cold and selected through `TUILI_MMQ_VARIANT`:
+// each arm cold and selected through `INFERO_MMQ_VARIANT`:
 //
 //                       batch 8   16     32
 //   mmqd (the default)     329   565    527
@@ -2143,7 +2143,7 @@ MMQ_REGPIPE_SET(2w2s4_2, 2, 2, 2, 4)
 //     is the worst point in it — below bps 2 at every width. The curve is not
 //     monotonic at the low end and no mechanism offered here explains that, so
 //     it stays a measurement. Anyone benchmarking this variant without setting
-//     `TUILI_MMQ_BPS` used to land exactly on the dip.
+//     `INFERO_MMQ_BPS` used to land exactly on the dip.
 //
 // Where that leaves the port, against the `mmqd` default measured cold from the
 // same binary: 168 against 177 at four tokens, 323 against 329 at eight, 580
@@ -2289,7 +2289,7 @@ MMQ_REGPIPE_SET(2w2s4_2, 2, 2, 2, 4)
     }
 
 /* Same shapes as `mmqr_*`, so the partition is the only difference and
-   `TUILI_MMQ_BPS` sets the blocks per SM the grid is sized to. */
+   `INFERO_MMQ_BPS` sets the blocks per SM the grid is sized to. */
 MMQ_STRIPED_REGPIPE_SET(2w4s4, 4, 2, 1, 4)
 MMQ_STRIPED_REGPIPE_SET(2w4s4_2, 4, 2, 2, 4)
 MMQ_STRIPED_REGPIPE_SET(2w2s4, 2, 2, 1, 4)

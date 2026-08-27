@@ -340,7 +340,7 @@ MMVQ_KERNEL(mmvq_q4_g128t, TQ_DOT_G128T, 4, 1, 128)
 // every one lands between 16.20 and 16.35 ms for the same 4.62 GB — under one
 // percent apart, inside the noise. The kernel is waiting on memory the whole
 // time, so what the threads do between loads does not show up. Kept behind
-// `TUILI_MMVQ_ROWS` because the negative result is worth being able to re-run.
+// `INFERO_MMVQ_ROWS` because the negative result is worth being able to re-run.
 
 #define MMVQ_WARP_KERNEL(NAME, DOT, SLICES, IQS_STEP, BLOCK_ELEMS)             \
     extern "C" __global__ void NAME(float* __restrict__ out,                   \

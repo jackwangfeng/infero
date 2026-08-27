@@ -359,7 +359,7 @@ kernel void rope_partial_f32(device float* x                [[buffer(0)]],
 // ---- the engine's paged-pool path ---------------------------------------
 //
 // Everything above this line serves the vertical-slice examples, which own a
-// contiguous cache. What follows is what `tuili-model` actually launches: a
+// contiguous cache. What follows is what `infero-model` actually launches: a
 // paged KV pool addressed through a per-sequence slot table, so one batch can
 // hold sequences of different lengths and a freed sequence's slots return to
 // the pool without moving anyone else's.
@@ -556,6 +556,8 @@ kernel void store_kv2_packed_f16(device half* k_pool          [[buffer(0)]],
 /// writing only the first `rotary_dim` would leave `[rotary_dim, d_head)` of
 /// `q_dst` holding whatever the previous layer left there. Three quarters of
 /// every query head stale rather than absent, which runs.
+///
+/// `mrope_axis`/`pos_stride`: see `rope_qk_f32`'s comment above.
 kernel void rope_qk_packed_f32(device float* q_dst              [[buffer(0)]],
                                device float* packed             [[buffer(1)]],
                                constant int& stride             [[buffer(2)]],
@@ -570,6 +572,8 @@ kernel void rope_qk_packed_f32(device float* q_dst              [[buffer(0)]],
                                constant float& theta_base       [[buffer(11)]],
                                constant float& freq_scale       [[buffer(12)]],
                                constant int& interleaved        [[buffer(13)]],
+                               device const int* mrope_axis     [[buffer(14)]],
+                               constant int& pos_stride          [[buffer(15)]],
                                uint3 tgid  [[threadgroup_position_in_grid]],
                                uint3 tid   [[thread_position_in_threadgroup]],
                                uint3 tgdim [[threads_per_threadgroup]]) {
@@ -597,7 +601,8 @@ kernel void rope_qk_packed_f32(device float* q_dst              [[buffer(0)]],
         return;
     }
 
-    const float pos = float(positions[token]) * freq_scale;
+    const int axis = mrope_axis[i];
+    const float pos = float(positions[size_t(token) * size_t(pos_stride) + size_t(axis)]) * freq_scale;
     const float inv_freq = pow(theta_base, -2.0f * float(i) / float(rotary_dim));
     const float angle = pos * inv_freq / freq_factors[i];
     const float sin_a = sin(angle);
@@ -928,6 +933,12 @@ kernel void split_qkv_f32(device float* q                [[buffer(0)]],
 }
 
 /// Rotary over separate q and k buffers, either pairing convention.
+///
+/// `mrope_axis`/`pos_stride` let one launch serve both a plain scalar
+/// position per token and Qwen3.5's three-axis one, the same way the CUDA
+/// twin does -- see its comment. `pos_stride == 1` with an all-zero
+/// `mrope_axis` reduces `positions[token * 1 + 0]` to `positions[token]`
+/// bit for bit.
 kernel void rope_qk_f32(device float* q                    [[buffer(0)]],
                         device float* k                    [[buffer(1)]],
                         device const int* positions        [[buffer(2)]],
@@ -939,6 +950,8 @@ kernel void rope_qk_f32(device float* q                    [[buffer(0)]],
                         constant float& theta_base         [[buffer(8)]],
                         constant float& freq_scale         [[buffer(9)]],
                         constant int& interleaved          [[buffer(10)]],
+                        device const int* mrope_axis       [[buffer(11)]],
+                        constant int& pos_stride            [[buffer(12)]],
                         uint3 tgid  [[threadgroup_position_in_grid]],
                         uint3 tid   [[thread_position_in_threadgroup]],
                         uint3 tgdim [[threads_per_threadgroup]]) {
@@ -953,7 +966,8 @@ kernel void rope_qk_f32(device float* q                    [[buffer(0)]],
     device float* base = is_q ? q : k;
     const int heads = is_q ? n_heads : n_kv_heads;
 
-    const float pos = float(positions[token]) * freq_scale;
+    const int axis = mrope_axis[i];
+    const float pos = float(positions[size_t(token) * size_t(pos_stride) + size_t(axis)]) * freq_scale;
     const float inv_freq = pow(theta_base, -2.0f * float(i) / float(rotary_dim));
     const float angle = pos * inv_freq / freq_factors[i];
     const float sin_a = sin(angle);

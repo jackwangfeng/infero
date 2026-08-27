@@ -1,28 +1,24 @@
-# tuili
+# infero
 
-A CUDA inference engine for GGUF models, written in Rust. Hand-written kernels,
-no PyTorch, no `libtorch`, no ggml — the whole path from a `.gguf` file on disk
-to an OpenAI-compatible HTTP response is in this repository.
+[中文](README.zh-CN.md)
 
-```
-$ tuili --model models/qwen2.5-0.5b-instruct-q8_0.gguf
-  qwen2.5-0.5b-instruct (qwen2) 24 layers, d_model 896, 14 heads / 2 kv, ...
-  model ready quant=Q8_0 weights_mib=638
-  listening on http://127.0.0.1:8080
-```
+An inference engine written in Rust for GGUF, AWQ, and FP8 (W8A8) checkpoints,
+with hand-written kernels for both NVIDIA (CUDA) and Apple Silicon (Metal)
+GPUs — no PyTorch, no `libtorch`, no ggml. CUDA is the primary, most complete
+backend; Metal covers dense decode, GQA attention and GatedDeltaNet today,
+with MoE, the vision tower, and the INT4/FP8 tensor-core GEMM paths still
+CUDA-only (see [Metal](#also-runs-on-apple-gpu-metal) below). The whole path
+from a model checkpoint on disk to an OpenAI-compatible HTTP response is in
+this repository.
 
-```console
-$ curl http://127.0.0.1:8080/v1/chat/completions \
-    -H 'Content-Type: application/json' \
-    -d '{"messages":[{"role":"user","content":"What is the capital of France?"}]}'
-{"choices":[{"message":{"role":"assistant","content":"The capital of France is Paris."}}], ...}
-```
+<p align="center"><img src="docs/images/demo.png" width="700" alt="infero serving a GGUF model over an OpenAI-compatible endpoint"></p>
 
 The official `openai` Python SDK works against it unmodified, streaming included.
 
 ## Status
 
-Runs Qwen2 and Llama-family GGUF models on a single CUDA GPU. Correctness is
+Runs Qwen2, Llama-family, and Qwen3-MoE GGUF models, plus AWQ- and
+FP8(W8A8)-quantized Hugging Face checkpoints, on a single GPU. Correctness is
 checked against the reference implementations rather than eyeballed: the
 tokenizer is compared token-for-token against Hugging Face, the quantized
 decoders against the F16 build of the same checkpoint, and the forward pass
@@ -31,11 +27,30 @@ against `transformers` logits.
 The KV cache can be compressed with TurboQuant; see below for what that
 actually buys on this model.
 
-Requests are served with continuous batching over a paged KV cache, and layers
-can be offloaded to host memory to fit a model into less VRAM.
+Requests are served with continuous batching over a paged KV cache, layers can
+be offloaded to host memory to fit a model into less VRAM, and completed
+prompt prefixes are cached across requests so a shared system prompt or a
+multi-turn conversation only pays for its new tokens.
 
-**Not yet:** split GGUF files (`*-00001-of-0000N.gguf`), prefix caching,
-multi-GPU, tool calls, GPU-side sampling.
+**Beyond plain text decode:**
+
+- **MoE.** Sparse-FFN architectures (Qwen3-MoE and similar) load their experts
+  individually — AWQ per expert — and route through a dedicated top-k kernel
+  at decode and a counting-sort-then-per-expert-GEMM path at prefill.
+- **Vision and video.** Qwen3.5-VL-style checkpoints take `image_url` and
+  `video_url` content parts over the same chat-completions endpoint, with
+  M-RoPE for the resulting 3-axis position ids, chunked prefill of the vision
+  placeholder tokens, and content-aware token pruning for long clips
+  (`crates/model/src/qwen35_vision*.rs`, `crates/server/src/video.rs`).
+- **Speculative decoding.** A GGUF's embedded or sidecar MTP head drafts `k`
+  tokens ahead of the main model; `INFERO_SPEC_K` controls the draft depth and
+  `0` turns it off (`crates/model/src/spec.rs`).
+- **Tool calls.** OpenAI-style `tools`/`tool_choice`, with `<tool_call>` tags
+  scanned out of the model's own output and returned as structured
+  `tool_calls`, streaming included (`crates/server/src/tool_call.rs`).
+
+**Not yet:** split GGUF files (`*-00001-of-0000N.gguf`), multi-GPU, GPU-side
+sampling, native NVFP4/GPTQ checkpoints.
 
 **Batch invariance, precisely.** Two properties hold exactly, and are asserted
 in the tests rather than assumed:
@@ -63,13 +78,13 @@ mkdir -p models && cd models
 curl -LO https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf
 cd ..
 
-cargo run --release -p tuili-server -- --model models/qwen2.5-0.5b-instruct-q8_0.gguf
+cargo run --release -p infero-server -- --model models/qwen2.5-0.5b-instruct-q8_0.gguf
 ```
 
 A terminal client comes with it:
 
 ```bash
-cargo run --release -p tuili-tui -- --host 127.0.0.1:8080
+cargo run --release -p infero-tui -- --host 127.0.0.1:8080
 ```
 
 Streams tokens as they arrive, shows tok/s per reply, and `esc` cancels a
@@ -81,15 +96,46 @@ There is also a CLI for a single generation, which is what to reach for when
 something looks wrong:
 
 ```bash
-cargo run --release -p tuili-model --example generate -- \
+cargo run --release -p infero-model --example generate -- \
     models/qwen2.5-0.5b-instruct-q8_0.gguf "Explain RoPE in one sentence." --greedy
 ```
 
 and a GGUF inspector:
 
 ```bash
-cargo run -p tuili-gguf --example info -- models/qwen2.5-0.5b-instruct-q8_0.gguf --tensors
+cargo run -p infero-gguf --example info -- models/qwen2.5-0.5b-instruct-q8_0.gguf --tensors
 ```
+
+### Also runs on Apple GPU (Metal)
+
+`infero-gpu` is a thin device-layer trait that either `infero-cuda` or
+`infero-metal` implements; whichever is compiled in is the only one linked,
+picked by feature flag rather than a runtime branch:
+
+```bash
+cargo run --release -p infero-server --no-default-features --features metal -- \
+    --model models/qwen2.5-0.5b-instruct-q8_0.gguf
+```
+
+The Metal backend was built to match `cudarc`'s own shapes — `Buf`, `View`,
+`ViewMut`, `LaunchConfig`, method names, argument order — so the 160 launch
+sites in `infero-kernels` needed no change at all to compile against it; only
+the device layer underneath differs. Kernels are ported file for file: `ops.cu`
+→ `ops.metal`, `quant.cu` → `quant.metal`, `gdn.cu` → `gdn.metal`, `mmvq.cu` →
+`mmvq.metal`, and so on, with `unimplemented.metal` standing in for what has
+not been ported yet, so a missing kernel fails at pipeline-build time rather
+than silently returning garbage.
+
+On Metal today: F16 and Q8_0 decode, the integer mat-vec, a fused GQA decode
+attention kernel, GatedDeltaNet, host-side sampling, and M-RoPE all run and are
+checked against the same CPU references and logits fixtures the CUDA path
+uses. Not yet ported: the tensor-core-style integer GEMM (`mmq.cu` and
+`vendor/marlin` have no MSL twin — Apple GPUs have no equivalent
+matrix-multiply instruction shape to target), MoE, the vision tower, FP8
+(Apple GPUs have no FP8 matrix unit), and TurboQuant KV compression. Those stay
+behind `#[cfg(feature = "cuda")]` rather than being faked on Metal. Design
+notes and the measured starting point are in
+`docs/superpowers/specs/2026-08-23-infero-metal-port-design.md`.
 
 ### No CUDA toolkit required
 
@@ -98,7 +144,7 @@ compiled at runtime by NVRTC, and `scripts/setup-cuda.sh` links `vendor/cuda`
 at the CUDA userspace shipped inside the pip `nvidia-*` wheels that PyTorch
 already pulls in. Set `CUDA_HOME` to use a real toolkit instead.
 
-Because those libraries are not on the system search path, `tuili-cuda` opens
+Because those libraries are not on the system search path, `infero-cuda` opens
 them by absolute path with `RTLD_GLOBAL` at startup; `dlopen` dedupes by soname,
 so cudarc's later lookup by bare name finds them. That trick is what makes
 `libnvrtc-builtins.so` resolve without `LD_LIBRARY_PATH`.
@@ -107,13 +153,15 @@ so cudarc's later lookup by bare name finds them. That trick is what makes
 
 | crate | what it does |
 | --- | --- |
-| `tuili-gguf` | GGUF container: header, metadata, tensor index. mmap'd, zero-copy. |
-| `tuili-cuda` | Device, stream, cuBLAS handle, NVRTC compilation with a PTX disk cache. |
-| `tuili-kernels` | The `.cu` sources and their launch wrappers. |
-| `tuili-tokenizer` | Byte-level BPE built from the GGUF vocab, plus the chat template. |
-| `tuili-model` | Config, weight upload, the forward pass, KV cache, sampling. |
-| `tuili-server` | Continuous-batching scheduler and the OpenAI-compatible HTTP API. |
-| `tuili-tui` | Terminal chat client. Hand-rolled HTTP so no proxy env var can redirect a loopback request. |
+| `infero-gguf` | GGUF container: header, metadata, tensor index. mmap'd, zero-copy. |
+| `infero-gpu` | The device-layer trait `infero-cuda` and `infero-metal` both implement; exactly one is linked in. |
+| `infero-cuda` | The NVIDIA half: device, stream, cuBLAS handle, NVRTC compilation with a PTX disk cache. |
+| `infero-metal` | The Apple half: device, buffers, MSL compilation, dispatch — built to the same shapes as `infero-cuda`. |
+| `infero-kernels` | The `.cu`/`.metal` sources and their launch wrappers. |
+| `infero-tokenizer` | Byte-level BPE built from the GGUF vocab, plus the chat template. |
+| `infero-model` | Config, weight upload, the forward pass, KV cache, sampling. |
+| `infero-server` | Continuous-batching scheduler and the OpenAI-compatible HTTP API. |
+| `infero-tui` | Terminal chat client. Hand-rolled HTTP so no proxy env var can redirect a loopback request. |
 
 One decoder block:
 
@@ -165,7 +213,7 @@ cuBLAS wins instead. A matrix whose type has a mat-vec but no GEMM repeats the
 mat-vec per token up to twelve tokens — the float `gemv` decodes one weight per
 thread and runs an order of magnitude below the memory bound, so even a dozen
 repeated passes beat it once. Both thresholds were measured on an A4000, not
-derived; `TUILI_MMQ_TILES` and `TUILI_NO_MMQ` exist to re-measure them.
+derived; `INFERO_MMQ_TILES` and `INFERO_NO_MMQ` exist to re-measure them.
 
 The vocab projection uses `mmq` at *every* row count including one. That looks
 like a throughput sacrifice and is the opposite: it is what makes the logits
@@ -189,7 +237,7 @@ end of that step and a waiting request takes its place at the start of the
 next, with nothing else pausing.
 
 ```bash
-tuili --model model.gguf --max-seqs 32 --kv-slots 32768
+infero --model model.gguf --max-seqs 32 --kv-slots 32768
 ```
 
 Two rules shape a batch. **Decodes go first** — they cost one token each, and a
@@ -217,8 +265,8 @@ is unaffected by who else is in it.
 host memory, streamed back in a layer at a time:
 
 ```bash
-tuili --model model.gguf --gpu-layers 12       # 12 blocks resident, rest streamed
-tuili --model model.gguf --gpu-layers 0        # only embeddings and the vocab head stay
+infero --model model.gguf --gpu-layers 12       # 12 blocks resident, rest streamed
+infero --model model.gguf --gpu-layers 0        # only embeddings and the vocab head stay
 ```
 
 **Compute never leaves the GPU.** This is not llama.cpp's `-ngl`, which runs
@@ -235,7 +283,7 @@ copy stream fills slot `(L+1) % 2`, with events in both directions —
 transfer on compute finishing. Norms and biases stay resident; they are
 kilobytes, and streaming them would add descriptors without saving anything.
 
-Because only the route changes, the result does not: `cargo test -p tuili-model
+Because only the route changes, the result does not: `cargo test -p infero-model
 --test offload` asserts the logits are **bit-for-bit identical** to a fully
 resident run at 0, 1, 12 and 23 resident layers.
 
@@ -278,8 +326,8 @@ non-integer 2.5 and 3.5 bit rates come from (32 channels at 3 bits, 96 at 2,
 over `d = 128`). Widths here are 2, 4 and 8 so codes pack into bytes.
 
 ```bash
-tuili --model model.gguf --kv-quant k8v4     # keys 8-bit, values 4-bit
-tuili --model model.gguf --kv-quant tq4      # the paper's symmetric 4-bit
+infero --model model.gguf --kv-quant k8v4     # keys 8-bit, values 4-bit
+infero --model model.gguf --kv-quant tq4      # the paper's symmetric 4-bit
 ```
 
 Presets `tq2` / `tq4` / `tq8` are symmetric with QJL, `tq2-mse` / `tq4-mse`
@@ -330,7 +378,7 @@ is empty.
 | Continuous batching | Four sequences prefilled together produce logits identical to each prefilled alone; a request's logits are bit-for-bit unchanged by swapping its batchmates; a sequence joining mid-flight is unaffected; recycled pool slots carry no history from their previous tenant. Greedy decode is required to track solo decode for at least five of eight steps — see the batch-invariance note above for why not all eight. |
 | Tensor-core GEMM | `mma.m16n8k32.s8` fragment layouts pinned against an integer reference, including one-hot inputs that localize a mis-mapped index to one cell. Per-tensor cosine ≥ 0.99993 against the float mat-vec for Q8_0, Q4_K and Q6_K at 1, 5, 16, 19, 33 and 64 tokens — the ragged widths on purpose, since an edge slip in the token tile is what they catch. Bit-identical output across batch widths 1, 5, 16, 17 and 64. |
 | TUI | SSE frames reassembled across chunk boundaries; wrapping never overflows a line, counting CJK as two cells. |
-| Integer mat-vec | Per-tensor cosine 0.999994 against the float path for Q8_0, Q4_K and Q6_K; end-to-end decode cosine 0.99982 against a float-only run of the same model (`TUILI_NO_MMVQ=1`). |
+| Integer mat-vec | Per-tensor cosine 0.999994 against the float path for Q8_0, Q4_K and Q6_K; end-to-end decode cosine 0.99982 against a float-only run of the same model (`INFERO_NO_MMVQ=1`). |
 | Rotary variants | Both pairings preserve norms and differ from each other; a doubled frequency factor matches halving the position. |
 | Kernels | RMSNorm, RoPE, SwiGLU, GQA attention with causal masking, all against CPU references. |
 | Forward pass | Argmax, top-10 set and logit spread against `transformers` f32 logits on four prompts. |
@@ -402,7 +450,7 @@ read over a whole chunk of tokens, so at zero resident layers it still runs at
 75% of the resident rate. Decode reads every weight once per token, so it lands
 straight on the PCIe bus: 363 MiB per token at 34 tok/s is 12.2 GB/s, against
 the 13.2 GB/s this machine reaches on a pinned host-to-device copy
-(`cargo run --release -p tuili-kernels --example launch_overhead`). At 92% of
+(`cargo run --release -p infero-kernels --example launch_overhead`). At 92% of
 the link's ceiling there is nothing left to win in the transfer path — the
 prefetch is fully hiding the compute, and the remaining lever is moving fewer
 bytes, not moving them faster.
@@ -413,7 +461,7 @@ That is also why the pinned allocation matters: the same benchmark measures
 ### Continuous batching
 
 Decode steps with 512 tokens of history per sequence, on an RTX A4000
-(`cargo run --release -p tuili-model --example batch_bench`). `TUILI_NO_MMQ=1`
+(`cargo run --release -p infero-model --example batch_bench`). `INFERO_NO_MMQ=1`
 is the same engine with the tensor-core GEMM disabled, so the column isolates
 what it bought:
 
@@ -474,13 +522,19 @@ recording because neither was in the batching code:
   replaced the mat-vec there without giving up the property the mat-vec was
   there to protect.
 
-### AWQ
+### AWQ, and FP8 checkpoints
 
-`--model` takes a Hugging Face checkpoint directory as well as a GGUF file. The
-quantized projections are transposed and repacked into `Q4_G128` on the way in —
-128 weights per block, an `f16` scale and zero, output-major, so the existing
-mat-vec and tensor-core GEMM read them unchanged. vLLM's `awq_marlin` repacks
-for the same reason.
+`--model` takes a Hugging Face checkpoint directory as well as a GGUF file.
+The loader inspects each tensor rather than the checkpoint as a whole:
+`.qweight`/`.qzeros`/`.scales` means AWQ, `.weight`/`.weight_scale_inv` means a
+native FP8 (W8A8) checkpoint, and the two can be mixed in one file — an MoE
+checkpoint that ships some experts AWQ and others FP8 loads either way with no
+extra flag. AWQ's quantized projections are transposed and repacked into
+`Q4_G128` on the way in — 128 weights per block, an `f16` scale and zero,
+output-major, so the existing mat-vec and tensor-core GEMM read them
+unchanged. vLLM's `awq_marlin` repacks for the same reason. FP8 tensors are
+repacked into the block layout `crates/kernels/src/fp8.rs`'s tensor-core path
+reads directly, at native e4m3 precision — no dequantize-then-requantize step.
 
 Two things this is worth stating precisely, because the obvious version of both
 is wrong.
@@ -529,7 +583,7 @@ tokens per request at temperature 0, GPU allowed to cool to 62 C before each run
 reading). llama.cpp runs *the same GGUF file*, which is what separates engine
 quality from quantization format:
 
-| clients | vLLM 0.27.1 (AWQ) | llama.cpp (GGUF) | tuili (GGUF) | tuili (AWQ) |
+| clients | vLLM 0.27.1 (AWQ) | llama.cpp (GGUF) | infero (GGUF) | infero (AWQ) |
 | --- | --- | --- | --- | --- |
 | 1 | 76.1 tok/s | 66.6 | 63.2 | **78.1** |
 | 8 | 564.5 | 167.3 | 199 | **405** |
@@ -552,7 +606,7 @@ rather than the format — see the design note at the top of
 `crates/kernels/src/cu/mmq.cu` for what reading Marlin established about it,
 and `vendor/marlin/README.md` for what porting it measured.
 
-Against the engine reading the same bytes, tuili is 7-11% behind at one token,
+Against the engine reading the same bytes, infero is 7-11% behind at one token,
 **ahead by 15% at eight**, and 4.7% behind at 32. Against vLLM it is 3.7x behind
 at 32 — and llama.cpp is 3.5x behind there too.
 
@@ -567,12 +621,12 @@ Which reframes what is worth doing. Closing on vLLM means supporting AWQ or
 GPTQ, a format decision.
 
 Ollama, which is llama.cpp behind a Go server, measures 66.5 tok/s at one
-client on the same file against tuili's 63. That 5% is the subject of the
+client on the same file against infero's 63. That 5% is the subject of the
 next section, and it is smaller than it looks.
 
 ### How much of a decode step is left to win
 
-`cargo run --release -p tuili-model --example decode_floor` replays exactly the
+`cargo run --release -p infero-model --example decode_floor` replays exactly the
 mat-vecs a decode step performs — the same tensors in the same order inside one
 CUDA graph — and nothing else. It is the floor: a step has to read every weight
 once, and on this class of card that read is the job.
@@ -583,22 +637,22 @@ windowed per-step average over 200 decode steps:
 | | ms per token |
 | --- | --- |
 | the mat-vecs alone, sustained | **14.93** (309 GB/s) |
-| tuili's full forward pass | 15.75 |
+| infero's full forward pass | 15.75 |
 | Ollama's whole token, HTTP included | 15.04 |
 
-So the mat-vecs are 95% of a step, and everything else tuili does — attention,
+So the mat-vecs are 95% of a step, and everything else infero does — attention,
 normalization, RoPE, the KV writes, the residual adds, sampling, streaming — is
-0.82 ms. Ollama's entire token costs less than tuili's mat-vecs do, which puts
-llama.cpp's own mat-vec at 323 GB/s or better against tuili's 309: 4% apart, on
+0.82 ms. Ollama's entire token costs less than infero's mat-vecs do, which puts
+llama.cpp's own mat-vec at 323 GB/s or better against infero's 309: 4% apart, on
 a card whose pure streaming read tops out at 405.
 
-Run the floor with `TUILI_FLOOR_REPS=220` rather than the default 20. Twenty
+Run the floor with `INFERO_FLOOR_REPS=220` rather than the default 20. Twenty
 steps finish before the clocks drop and report a floor no server will ever see;
 it is the difference between 14.27 ms and 14.93.
 
 ### Where the time goes
 
-`TUILI_PROFILE=1` times every kernel with CUDA events and prints a table sorted
+`INFERO_PROFILE=1` times every kernel with CUDA events and prints a table sorted
 by share. It serializes the stream, so absolute numbers are inflated and only
 the split is meaningful — that is the point. Adding it was the first step of the
 tensor-core work, after three rounds of guessing at a different kernel had
@@ -615,7 +669,7 @@ plausible enough to have been worth building without it:
 | the scale path is minor | not worth touching | 22% of the kernel; hoisting bought 17% |
 
 A second round went after the decode step's launch count, on the theory that
-~300 kernels per step is what stands between tuili and llama.cpp. Every one of
+~300 kernels per step is what stands between infero and llama.cpp. Every one of
 them measured level, and for one reason: the CUDA graph had already removed the
 launch cost, so merging kernels only merged their work.
 
@@ -629,7 +683,7 @@ launch cost, so merging kernels only merged their work.
 | a warp per mat-vec row instead of a block | 16.20 vs 16.33 ms; inside the noise |
 
 A third round went after the tensor-core GEMM at batch, where the gap to vLLM
-is 3.4x. `TUILI_PROFILE` had attributed 68% of that kernel to filling shared
+is 3.4x. `INFERO_PROFILE` had attributed 68% of that kernel to filling shared
 memory and 17% to the tensor cores, so two candidates followed from it directly,
 and both were built and measured:
 
@@ -681,15 +735,15 @@ exactly with the registers a strided load produces — group `b` lands in warp
 shared memory nor a barrier.
 
 Graphs and per-kernel profiling cannot coexist: timing records CUDA events, and
-that is illegal on a capturing stream. `TUILI_PROFILE` therefore turns capture
-off, and `TUILI_STEP_TIMING` exists for the other question — host-side phase
+that is illegal on a capturing stream. `INFERO_PROFILE` therefore turns capture
+off, and `INFERO_STEP_TIMING` exists for the other question — host-side phase
 timing with the graphs left alone.
 
 At 32 tokens the cost turned out to be spread almost evenly — staging 36%,
 MMA and B operands 28%, scale lookups 22%, A operands 14% — which is why every
 single-target fix returned a tenth and no more.
 
-`cargo run --release -p tuili-model --example gemm_bench` isolates one real GGUF
+`cargo run --release -p infero-model --example gemm_bench` isolates one real GGUF
 tensor across kernels and token counts, so a change takes seconds to evaluate
 instead of a full model run. The `no-A`, `no-scale` and `stage` columns are
 variants of the real kernel with one part stubbed out; that is how the table
@@ -716,7 +770,7 @@ Decode was 97 tok/s before two fixes worth recording:
   is only 28 Q8_0 blocks, so a 256-thread block ran at 11% occupancy and still
   paid for a block-wide reduction. Eight elements per thread instead.
 
-`cargo run --release -p tuili-kernels --example launch_overhead` reports the
+`cargo run --release -p infero-kernels --example launch_overhead` reports the
 per-launch floor on your machine.
 
 Q4_K_M trailing Q8_0 is expected here: that file is mostly `Q5_0`, whose
@@ -770,7 +824,12 @@ Still on the list, in the order the measurements rank them:
 
 ## Requirements
 
-- NVIDIA GPU, compute capability 7.0+ (tested on sm_86)
-- Driver supporting CUDA 12 or 13
+- NVIDIA GPU, compute capability 7.0+ (tested on sm_86), driver supporting
+  CUDA 12 or 13, and a CUDA userspace from pip wheels or a toolkit install
+- Or: Apple Silicon GPU (Metal 3+), macOS — see
+  [Metal](#also-runs-on-apple-gpu-metal) above for what runs there today
 - Rust 1.90+
-- A CUDA userspace from pip wheels or a toolkit install
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=jackwangfeng/infero&type=Date)](https://star-history.com/#jackwangfeng/infero&Date)

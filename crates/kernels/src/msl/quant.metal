@@ -324,7 +324,7 @@ kernel void gemv1_q4_K(GEMV_ARGS) { GEMV_BODY_Q4_K(1) }
 // on both of this model's real Q4_K decode shapes: 1.07x on ffn_gate/up,
 // 1.12x on ffn_down, at `ROWS = 2, SGS = 4` -- the best of a `(rows, sgs)`
 // sweep over `{2,4,8} x {2,4}`. Wired into the live `gemv` dispatch and
-// measured end to end with `TUILI_STEP_TIMING=1`, it made every decode step
+// measured end to end with `INFERO_STEP_TIMING=1`, it made every decode step
 // *slower*: advance_ms 70.83ms on the first post-warmup sample against
 // 67.93ms for the deployed kernel, reproduced by reverting the dispatch,
 // rebuilding, and re-measuring on the same running server. The isolated
@@ -1496,7 +1496,7 @@ kernel void gemv_mma_shared_q4_K(
 /// weight decode stays serial on simdgroup 0 either way?
 ///
 /// llama.cpp's Metal `kernel_mul_mm` (its Q4_K prefill path, not the
-/// batch=1 `kernel_mul_mv`) uses a 64-row-by-32-token tile against tuili's
+/// batch=1 `kernel_mul_mv`) uses a 64-row-by-32-token tile against infero's
 /// 8-by-32, and cooperatively dequantizes with all 128 threads in a
 /// threadgroup rather than one simdgroup decoding for the other three to
 /// consume. Before committing to reproducing that whole design -- a much
