@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>infero — a Rust inference engine for GGUF, AWQ and FP8</title>
+<meta name="description" content="An inference engine written in Rust for GGUF, AWQ, and FP8 (W8A8) checkpoints, with hand-written CUDA and Metal kernels. No PyTorch, no libtorch, no ggml.">
+<meta property="og:title" content="infero">
+<meta property="og:description" content="An inference engine written in Rust for GGUF, AWQ, and FP8 (W8A8) checkpoints, with hand-written CUDA and Metal kernels.">
+<meta property="og:image" content="https://jackwangfeng.github.io/infero/images/demo.png">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>⚡</text></svg>">
+<style>
+  :root{
+    --bg: #0b0d12;
+    --bg-raised: #12151c;
+    --fg: #e7e9ee;
+    --fg-dim: #9aa1ae;
+    --border: #232833;
+    --accent: #7dd3c0;
+    --accent-strong: #a6e8da;
+    --code-bg: #0e1117;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Helvetica, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: light){
+    :root{
+      --bg: #fbfbfa;
+      --bg-raised: #ffffff;
+      --fg: #1a1d24;
+      --fg-dim: #5b6270;
+      --border: #e4e6ea;
+      --accent: #0f8f78;
+      --accent-strong: #0b6d5b;
+      --code-bg: #f3f4f6;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg: #0b0d12; --bg-raised: #12151c; --fg: #e7e9ee; --fg-dim: #9aa1ae;
+    --border: #232833; --accent: #7dd3c0; --accent-strong: #a6e8da; --code-bg: #0e1117;
+  }
+  :root[data-theme="light"]{
+    --bg: #fbfbfa; --bg-raised: #ffffff; --fg: #1a1d24; --fg-dim: #5b6270;
+    --border: #e4e6ea; --accent: #0f8f78; --accent-strong: #0b6d5b; --code-bg: #f3f4f6;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--bg); color:var(--fg); font-family:var(--sans);
+    line-height:1.55; -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:820px; margin:0 auto; padding:0 24px}
+  header.hero{padding:72px 0 40px; border-bottom:1px solid var(--border)}
+  .kicker{
+    font-family:var(--mono); font-size:13px; color:var(--accent);
+    letter-spacing:.06em; text-transform:uppercase; margin:0 0 14px;
+  }
+  h1{font-size:clamp(34px,6vw,52px); margin:0 0 18px; letter-spacing:-0.02em; font-weight:700}
+  .tagline{font-size:19px; color:var(--fg-dim); max-width:640px; margin:0 0 28px}
+  .tagline code{font-family:var(--mono); font-size:0.9em; color:var(--fg)}
+  .cta{display:flex; gap:12px; flex-wrap:wrap}
+  .btn{
+    font-family:var(--mono); font-size:14px; padding:10px 18px; border-radius:8px;
+    text-decoration:none; border:1px solid var(--border); color:var(--fg);
+    transition:border-color .15s, color .15s;
+  }
+  .btn:hover{border-color:var(--accent); color:var(--accent-strong)}
+  .btn.primary{background:var(--accent); border-color:var(--accent); color:#08110f; font-weight:600}
+  .btn.primary:hover{background:var(--accent-strong); border-color:var(--accent-strong); color:#08110f}
+
+  .badges{display:flex; gap:8px; flex-wrap:wrap; margin:22px 0 0}
+  .badge{
+    font-family:var(--mono); font-size:12px; color:var(--fg-dim);
+    border:1px solid var(--border); border-radius:999px; padding:4px 11px;
+  }
+
+  section{padding:44px 0; border-bottom:1px solid var(--border)}
+  section:last-of-type{border-bottom:none}
+  h2{
+    font-family:var(--mono); font-size:13px; letter-spacing:.06em; text-transform:uppercase;
+    color:var(--fg-dim); margin:0 0 22px; font-weight:600;
+  }
+
+  .shot{width:100%; border-radius:10px; border:1px solid var(--border); display:block}
+
+  pre{
+    background:var(--code-bg); border:1px solid var(--border); border-radius:10px;
+    padding:16px 18px; overflow-x:auto; margin:0 0 14px;
+  }
+  code{font-family:var(--mono); font-size:13.5px}
+  pre code{color:var(--fg)}
+  .comment{color:var(--fg-dim)}
+
+  .grid{display:grid; grid-template-columns:repeat(2,1fr); gap:22px}
+  @media (max-width:600px){.grid{grid-template-columns:1fr}}
+  .feature h3{font-size:15px; margin:0 0 6px; font-weight:600}
+  .feature p{font-size:14px; color:var(--fg-dim); margin:0}
+
+  table{width:100%; border-collapse:collapse; font-size:13.5px}
+  caption{text-align:left; color:var(--fg-dim); font-size:13px; margin-bottom:10px}
+  th,td{
+    text-align:right; padding:9px 12px; border-bottom:1px solid var(--border);
+    font-family:var(--mono); white-space:nowrap;
+  }
+  th:first-child,td:first-child{text-align:left; font-family:var(--sans)}
+  thead th{color:var(--fg-dim); font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:.04em}
+  td.win{color:var(--accent-strong); font-weight:700}
+  .table-scroll{overflow-x:auto}
+
+  .stat-row{display:flex; gap:32px; flex-wrap:wrap; margin-top:6px}
+  .stat{min-width:120px}
+  .stat .n{font-family:var(--mono); font-size:26px; font-weight:700; color:var(--accent-strong)}
+  .stat .l{font-size:13px; color:var(--fg-dim)}
+
+  footer{padding:36px 0 64px}
+  footer p{font-size:13px; color:var(--fg-dim); font-family:var(--mono)}
+  footer a{color:var(--fg-dim)}
+  a{color:inherit}
+  .fine{font-size:13px; color:var(--fg-dim)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <p class="kicker">infero</p>
+    <h1>A GPU inference engine, hand-written down to the kernel.</h1>
+    <p class="tagline">
+      Written in Rust for <code>GGUF</code>, <code>AWQ</code>, and <code>FP8 (W8A8)</code>
+      checkpoints, with hand-written CUDA and Metal kernels — no PyTorch, no
+      <code>libtorch</code>, no ggml. The whole path from a model checkpoint on
+      disk to an OpenAI-compatible HTTP response is in one repository.
+    </p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/jackwangfeng/infero">View on GitHub →</a>
+      <a class="btn" href="https://github.com/jackwangfeng/infero#quick-start">Quick start</a>
+      <a class="btn" href="https://github.com/jackwangfeng/infero/blob/main/README.zh-CN.md">中文</a>
+    </div>
+    <div class="badges">
+      <span class="badge">NVIDIA CUDA</span>
+      <span class="badge">Apple Silicon Metal</span>
+      <span class="badge">Rust</span>
+      <span class="badge">OpenAI-compatible API</span>
+      <span class="badge">Apache-2.0</span>
+    </div>
+  </header>
+
+  <section>
+    <h2>Serving a model</h2>
+    <img class="shot" src="images/demo.png" alt="infero serving a GGUF model over an OpenAI-compatible endpoint">
+  </section>
+
+  <section>
+    <h2>Quick start</h2>
+    <pre><code><span class="comment"># links a CUDA userspace into vendor/</span>
+./scripts/setup-cuda.sh
+
+<span class="comment"># any GGUF, AWQ, or FP8 checkpoint works</span>
+cargo run --release -p infero-server -- --model models/qwen2.5-0.5b-instruct-q8_0.gguf</code></pre>
+    <pre><code>curl http://127.0.0.1:8080/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"messages":[{"role":"user","content":"What is the capital of France?"}]}'</code></pre>
+    <p class="fine">The official <code>openai</code> Python SDK works against it unmodified, streaming included.</p>
+  </section>
+
+  <section>
+    <h2>Beyond plain text decode</h2>
+    <div class="grid">
+      <div class="feature">
+        <h3>MoE</h3>
+        <p>Sparse-FFN architectures load experts individually — AWQ per expert — and route through a dedicated top-k kernel at decode, counting-sort + per-expert GEMM at prefill.</p>
+      </div>
+      <div class="feature">
+        <h3>Vision &amp; video</h3>
+        <p>Qwen3.5-VL-style checkpoints take <code>image_url</code> and <code>video_url</code> content parts, with M-RoPE, chunked vision prefill, and content-aware token pruning for long clips.</p>
+      </div>
+      <div class="feature">
+        <h3>Speculative decoding</h3>
+        <p>A GGUF's embedded or sidecar MTP head drafts <code>k</code> tokens ahead of the main model.</p>
+      </div>
+      <div class="feature">
+        <h3>Tool calls</h3>
+        <p>OpenAI-style <code>tools</code>/<code>tool_choice</code>, scanned out of the model's own output and returned as structured <code>tool_calls</code>, streaming included.</p>
+      </div>
+      <div class="feature">
+        <h3>Continuous batching</h3>
+        <p>Requests share the GPU over a paged KV cache; decodes go first, prefill fills what's left and may split across steps.</p>
+      </div>
+      <div class="feature">
+        <h3>CPU offload</h3>
+        <p>Layers stream from page-locked host memory when a model doesn't fit in VRAM — compute never leaves the GPU.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Batch invariance, precisely</h2>
+    <p class="fine">
+      Two properties hold exactly, and are asserted in the tests rather than assumed: a request's logits
+      never depend on which other requests share its batch, and the tensor-core GEMM gives bit-identical
+      results at any batch width — so the vocab projection is invariant to batch size.
+    </p>
+  </section>
+
+  <section>
+    <h2>Against vLLM and llama.cpp</h2>
+    <p class="fine" style="margin-bottom:16px">
+      Same RTX A4000, one load generator against every engine's OpenAI endpoint, 200 tokens per request
+      at temperature 0. llama.cpp runs the same GGUF file — which is what separates engine quality from
+      quantization format.
+    </p>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>clients</th><th>vLLM 0.27.1 (AWQ)</th><th>llama.cpp (GGUF)</th><th>infero (GGUF)</th><th>infero (AWQ)</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1</td><td>76.1 tok/s</td><td>66.6</td><td>63.2</td><td class="win">78.1</td></tr>
+          <tr><td>8</td><td>564.5</td><td>167.3</td><td>199</td><td class="win">405</td></tr>
+          <tr><td>32</td><td>1774.9</td><td>500.6</td><td>497</td><td class="win">782</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="fine" style="margin-top:14px">
+      Against the engine reading the same bytes, infero is ahead by 15% at eight clients and within
+      5–11% at one and thirty-two. See the README for what closes the remaining gap.
+    </p>
+  </section>
+
+  <section>
+    <h2>Correctness, checked not eyeballed</h2>
+    <div class="stat-row">
+      <div class="stat"><div class="n">139</div><div class="l">tests in <code>cargo test</code></div></div>
+      <div class="stat"><div class="n">bit-exact</div><div class="l">CPU offload vs. resident</div></div>
+      <div class="stat"><div class="n">token-for-token</div><div class="l">tokenizer vs. HF</div></div>
+      <div class="stat"><div class="n">0.99998</div><div class="l">Q8_0 cosine vs. F16</div></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>
+      <a href="https://github.com/jackwangfeng/infero">github.com/jackwangfeng/infero</a>
+      · Apache-2.0
+    </p>
+  </footer>
+
+</div>
+</body>
+</html>
