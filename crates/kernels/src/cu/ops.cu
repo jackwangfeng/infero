@@ -2175,6 +2175,21 @@ extern "C" __global__ void attn_decode_mma_f32(
                 svt[(w8 * 8 + i) * vrow + r] = vh[i];
             }
         }
+        // The softmax weight for a key past `n` is masked to exactly zero, but
+        // `svt` at that key is whatever an earlier, unrelated launch's shared
+        // memory left behind -- not necessarily zero, and IEEE 754 does not let
+        // a zero weight save you from a NaN or Inf operand (`0 * NaN = NaN`).
+        // Every tile but the last is a full sixteen keys per warp with nothing
+        // to pad, so this only costs anything on the tail.
+        if (n < ATTN_MMA_TILE) {
+            for (int e = threadIdx.x; e < (ATTN_MMA_TILE - n) * quads; e += blockDim.x) {
+                const int r = n + e / quads, w8 = e % quads;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    svt[(w8 * 8 + i) * vrow + r] = __float2half(0.0f);
+                }
+            }
+        }
         __syncthreads();
 
         const int k_lo = warp * ATTN_MMA_WK;

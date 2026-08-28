@@ -825,9 +825,9 @@ fn attn_decode_matches_the_three_kernels() -> Result<()> {
         // see the note on `attn_decode_mma_f32`.
         //
         // Mirrors `Kernels::attn_decode`'s own selection: the env var opts in,
-        // and only up to `d_head` 128 -- past that is disabled outright, see
+        // and only up to `d_head` 256 -- past that is disabled outright, see
         // the long comment at that gate for why.
-        const ATTN_MMA_MAX_D_HEAD: usize = 128;
+        const ATTN_MMA_MAX_D_HEAD: usize = 256;
         let mma_active =
             std::env::var("INFERO_ATTN_MMA").as_deref() == Ok("1") && d_head <= ATTN_MMA_MAX_D_HEAD;
         let tol = if mma_active { 2e-3 } else { 2e-4 };

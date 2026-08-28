@@ -2352,26 +2352,29 @@ impl Kernels {
         );
 
         // `INFERO_ATTN_MMA=1` runs the tensor-core decomposition instead; see
-        // `attn_decode_mma_f32`.
+        // `attn_decode_mma_f32`. Opt-in rather than auto-selected: the softmax
+        // weights go through f16 on their way into the value product where the
+        // scalar kernel keeps them in f32, which is ~6e-4 relative on an output
+        // element -- small, but the chunk count depends on batch width, so a
+        // batched and a solo decode can round a greedy token differently. See
+        // the longer comment on `attn_decode_mma_f32` in `ops.cu`.
         //
-        // *** `d_head` past 128 is disabled here, pending a real bug fix. ***
-        // The register arrays and the gate below were widened to 256 (see git
-        // history for the full attempt) and the arithmetic checked out cell by
-        // cell -- but on the real 24-head/4-kv-head/d_head-256 checkpoint, a
-        // second request on the same warm server reliably corrupted memory:
-        // `compute-sanitizer` caught it as an out-of-bounds read inside
-        // `gather_rows_f16` (token embedding, an entirely different kernel run
-        // on a *later* step), which is the signature of an out-of-bounds
-        // *write* here landing in a heap region a later allocation reused.
-        // Confirmed by direct A/B: the same wide chunk (`INFERO_BATCH_TOKENS`
-        // forced past 128) with this path forced off via `INFERO_NO_DECODE_ATTN`
-        // never crashed; turning this path back on at `d_head` 256 crashed
-        // every time, independent of `--ctx`, batch width, speculative
-        // decoding, and CUDA graphs (all tried and ruled out). The exact
-        // out-of-bounds access was not found before this had to ship, so the
-        // gate stays at the width it was actually shipped and measured at
-        // rather than risk a heap corruption reaching production silently.
-        const ATTN_MMA_MAX_D_HEAD: usize = 128;
+        // `d_head` up to 256 (Qwen3.8-27B-FP8's shape) was blocked here for a
+        // while after a real bug: a partial key tile (`n < ATTN_MMA_TILE`, true
+        // on the last tile whenever `kv_len` is not a multiple of 64, which is
+        // most of the time) left `svt`'s padding rows holding whatever an
+        // earlier, unrelated kernel's shared memory had in it. The softmax
+        // weight for those keys is correctly masked to zero, but IEEE 754 does
+        // not let a zero weight save a `mma.sync` accumulator from a NaN or Inf
+        // operand (`0 * NaN = NaN`), so the corruption was in the *values*, not
+        // an address -- invisible to both `compute-sanitizer memcheck`
+        // (nothing here reads or writes out of bounds) and `racecheck` (no
+        // hazard, just uninitialized shared memory used as if it were zero).
+        // It always surfaced several kernels and sometimes several layers
+        // later, once the NaN reached something that used it as an index.
+        // Fixed in `ops.cu` by zeroing `svt`'s tail explicitly whenever a tile
+        // is partial.
+        const ATTN_MMA_MAX_D_HEAD: usize = 256;
         static MMA_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let mma_env =
             *MMA_ENV.get_or_init(|| std::env::var("INFERO_ATTN_MMA").as_deref() == Ok("1"));
