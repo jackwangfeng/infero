@@ -2353,11 +2353,39 @@ impl Kernels {
 
         // `INFERO_ATTN_MMA=1` runs the tensor-core decomposition instead; see
         // `attn_decode_mma_f32`. It wants four warps whatever the group is, a
-        // 64-key tile, and V transposed on the way into shared.
-        static MMA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let mma = *MMA.get_or_init(|| std::env::var("INFERO_ATTN_MMA").as_deref() == Ok("1"))
+        // 64-key tile, and V transposed on the way into shared. `ATTN_MMA_MAX_D`
+        // there must track `ATTN_MMA_MAX_D_HEAD` here -- both size the same
+        // kernel's register arrays for the same widest `d_head`.
+        //
+        // Also auto-selected once `n_tokens` is wide enough that this cannot be
+        // a decode step: a decode batch is bounded by how many sequences are
+        // concurrently in flight, comfortably under this threshold in every
+        // config measured here, while one sequence's prefill chunk routinely
+        // reaches into the hundreds. The scalar kernel's cost is per query
+        // *inside* the chunk on top of `kv_len` -- every one of a 256-token
+        // chunk's queries independently rescans the same, nearly-overlapping
+        // key range in scalar arithmetic -- so a wide chunk pays that
+        // redundancy once per query instead of once per chunk; the tensor
+        // cores do not care how many queries share a key tile once it is
+        // staged in shared memory. Measured live: a 29K-token prompt on
+        // Qwen3.8-27B-FP8 (24 heads over 4, `d_head` 256) spent 52.9% of a
+        // prefill's GPU time in the scalar kernel here.
+        //
+        // Auto-selecting only past the threshold, rather than always past it,
+        // is what keeps a real decode batch off this path: the batch-invariance
+        // tests hold decode to bit-for-bit reproducibility regardless of batch
+        // composition, and the tensor-core path's ~6e-4 relative rounding
+        // (`f16` operands where the scalar path keeps `f32`) is enough to flip
+        // which token a greedy decode picks — see `attn_decode_mma_f32`'s own
+        // comment. A wide prefill chunk is not part of that guarantee.
+        const ATTN_MMA_MAX_D_HEAD: usize = 256;
+        const ATTN_MMA_MIN_TOKENS: usize = 64;
+        static MMA_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let mma_env =
+            *MMA_ENV.get_or_init(|| std::env::var("INFERO_ATTN_MMA").as_deref() == Ok("1"));
+        let mma = (mma_env || dims.n_tokens >= ATTN_MMA_MIN_TOKENS)
             && dims.d_head.is_multiple_of(16)
-            && dims.d_head <= 128
+            && dims.d_head <= ATTN_MMA_MAX_D_HEAD
             && group <= 8;
         let f = self.dev.kernels().get(
             "infero_ops",
@@ -2391,6 +2419,12 @@ impl Kernels {
                 + 2 * 16 * (dims.d_head + 8) * 2
                 + group * dims.d_head * 2) as u32
         };
+        // Past the 48 KiB static default -- true for the MMA path once
+        // `d_head` reaches 256 (74 KiB here) -- a launch needs the kernel
+        // opted in explicitly or the driver refuses it.
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared)?;
+        }
         let single = i32::from(n_chunks == 1);
         let cfg = LaunchConfig {
             grid_dim: (dims.n_kv_heads as u32, dims.n_tokens as u32, n_chunks),

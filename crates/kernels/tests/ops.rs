@@ -4,7 +4,7 @@ mod common;
 
 use anyhow::Result;
 use half::f16;
-use tuili_kernels::{AttnDims, BatchLayout, Kernels};
+use infero_kernels::{AttnDims, BatchLayout, Kernels};
 
 use common::*;
 
@@ -103,6 +103,7 @@ fn rope_qk_matches_the_single_tensor_form() -> Result<()> {
         .map(|x| x.abs() + 0.5)
         .collect::<Vec<_>>();
     let dff = stream.clone_htod(&ff)?;
+    let axis0 = scalar_axis(&stream, d_head / 2)?;
 
     for interleaved in [false, true] {
         let (mut sq, mut sk) = (stream.clone_htod(&q)?, stream.clone_htod(&v)?);
@@ -136,6 +137,8 @@ fn rope_qk_matches_the_single_tensor_form() -> Result<()> {
             &mut fk.as_view_mut(),
             &dpos.as_view(),
             &dff.as_view(),
+            &axis0.as_view(),
+            1,
             n_tokens,
             n_heads,
             n_kv_heads,
@@ -690,12 +693,14 @@ fn attn_decode_matches_the_three_kernels() -> Result<()> {
     // turns on a different exit — the kernel normalizes and writes the answer
     // itself instead of handing partials to the combine pass. 8 KV heads by 128
     // tokens is 1024 blocks, past `sm_count * 4` on anything this runs on.
-    // Two shapes of model, not one: Llama-3.1's 4 query heads a KV head over
-    // 128 dimensions, and Qwen2.5-0.5B's *seven* over 64. A group that does not
-    // divide the MMA's sixteen rows, and a head that does not fill its lanes,
-    // are exactly where an off-by-one in a fragment index hides — and where the
+    // Three shapes of model, not one: Llama-3.1's 4 query heads a KV head over
+    // 128 dimensions, Qwen2.5-0.5B's *seven* over 64, and Qwen3.8-27B-FP8's 6
+    // over 256 -- the widest `d_head` `attn_decode_mma_f32`'s register arrays
+    // are sized for (`ATTN_MMA_MAX_D` in ops.cu). A group that does not divide
+    // the MMA's sixteen rows, and a head that does not fill its lanes, are
+    // exactly where an off-by-one in a fragment index hides — and where the
     // batching tests caught one that these shapes had not.
-    for (n_heads, n_kv_heads, d_head) in [(8usize, 2usize, 128usize), (14, 2, 64)] {
+    for (n_heads, n_kv_heads, d_head) in [(8usize, 2usize, 128usize), (14, 2, 64), (24, 4, 256)] {
     for (n_tokens, kv_len) in [
         (5usize, 100usize),
         (3, 32),
@@ -815,11 +820,15 @@ fn attn_decode_matches_the_three_kernels() -> Result<()> {
         // scalar kernel keeps them in f32. FlashAttention does the same. It costs
         // about 6e-4 relative here, and it is why that path is not the default —
         // see the note on `attn_decode_mma_f32`.
-        let tol = if std::env::var("TUILI_ATTN_MMA").as_deref() == Ok("1") {
-            2e-3
-        } else {
-            2e-4
-        };
+        //
+        // Mirrors `Kernels::attn_decode`'s own selection: the env var forces it
+        // on, and so does a chunk wide enough that it cannot be a decode step
+        // (`ATTN_MMA_MIN_TOKENS`) — this loop's `128` and `64`-token cases hit
+        // that automatically even with the var unset.
+        const ATTN_MMA_MIN_TOKENS: usize = 64;
+        let mma_active = std::env::var("INFERO_ATTN_MMA").as_deref() == Ok("1")
+            || n_tokens >= ATTN_MMA_MIN_TOKENS;
+        let tol = if mma_active { 2e-3 } else { 2e-4 };
         let (abs, at) = max_abs_diff(&got, &want);
         assert!(
             abs < tol,

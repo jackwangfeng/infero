@@ -2071,6 +2071,13 @@ extern "C" __global__ void attn_kv_probe_f32(float* __restrict__ sink,
    stride of this, and 66 halves puts consecutive lanes two banks apart where 72
    would put them on the same one. */
 #define ATTN_MMA_VPAD 2
+/* Widest `d_head` this kernel's register arrays are sized for -- Qwen3.8-27B's
+   256 against Llama-3.1's 128, which is what the arrays were `[16]`/`[8]` for
+   before. `attn_decode_mma_f32`'s own gate in `Kernels::decode_attention`
+   keeps callers past this out. */
+#define ATTN_MMA_MAX_D 256
+#define ATTN_MMA_MAX_KSTEPS (ATTN_MMA_MAX_D / 16)
+#define ATTN_MMA_MAX_NTILES (ATTN_MMA_MAX_D / 8)
 
 extern "C" __global__ void attn_decode_mma_f32(
     float* __restrict__ partial, int ms_off, float* __restrict__ out, int single,
@@ -2120,9 +2127,9 @@ extern "C" __global__ void attn_decode_mma_f32(
     const int cc = mma_c_col(lane);
 
     // The query fragments, once for the whole kernel.
-    mma_a_f16 qa[8];
+    mma_a_f16 qa[ATTN_MMA_MAX_KSTEPS];
 #pragma unroll
-    for (int t = 0; t < 8; ++t) {
+    for (int t = 0; t < ATTN_MMA_MAX_KSTEPS; ++t) {
         if (t >= ksteps) break;
         const __half* lo = sq + ar * krow + t * 16 + k0;
         const __half* hi = sq + (ar + 8) * krow + t * 16 + k0;
@@ -2142,9 +2149,9 @@ extern "C" __global__ void attn_decode_mma_f32(
     if (end > kv_len) end = kv_len;
     if (end > last + 1) end = last + 1;
 
-    mma_c_f32 o[16];
+    mma_c_f32 o[ATTN_MMA_MAX_NTILES];
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < ATTN_MMA_MAX_NTILES; ++i) {
         o[i].x[0] = 0.0f;
         o[i].x[1] = 0.0f;
         o[i].x[2] = 0.0f;
@@ -2182,7 +2189,7 @@ extern "C" __global__ void attn_decode_mma_f32(
                 s2[nt].x[3] = 0.0f;
                 const int key0 = k_lo + nt * 8;
 #pragma unroll
-                for (int t = 0; t < 8; ++t) {
+                for (int t = 0; t < ATTN_MMA_MAX_KSTEPS; ++t) {
                     if (t >= ksteps) break;
                     mma_b_f16 b;
                     const __half* bp = sk + (key0 + bc) * krow + t * 16 + k0;
@@ -2236,7 +2243,7 @@ extern "C" __global__ void attn_decode_mma_f32(
                 l_run = l_run * corr + psum;
                 m_run = m_new;
 #pragma unroll
-                for (int i = 0; i < 16; ++i) {
+                for (int i = 0; i < ATTN_MMA_MAX_NTILES; ++i) {
                     if (i >= ntiles) break;
                     o[i].x[0] *= corr;
                     o[i].x[1] *= corr;
@@ -2253,7 +2260,7 @@ extern "C" __global__ void attn_decode_mma_f32(
                 pa.x[1] = 0;
                 pa.x[3] = 0;
 #pragma unroll
-                for (int i = 0; i < 16; ++i) {
+                for (int i = 0; i < ATTN_MMA_MAX_NTILES; ++i) {
                     if (i >= ntiles) break;
                     mma_b_f16 b;
                     const __half* bp = svt + (i * 8 + bc) * vrow + k_lo + k0;
@@ -2273,7 +2280,7 @@ extern "C" __global__ void attn_decode_mma_f32(
     __syncthreads();
     if (cr < group) {
 #pragma unroll
-        for (int i = 0; i < 16; ++i) {
+        for (int i = 0; i < ATTN_MMA_MAX_NTILES; ++i) {
             if (i >= ntiles) break;
             float* dst = sacc + ((size_t)warp * group + cr) * d_head + i * 8 + cc;
             dst[0] = o[i].x[0];
