@@ -2352,38 +2352,30 @@ impl Kernels {
         );
 
         // `INFERO_ATTN_MMA=1` runs the tensor-core decomposition instead; see
-        // `attn_decode_mma_f32`. It wants four warps whatever the group is, a
-        // 64-key tile, and V transposed on the way into shared. `ATTN_MMA_MAX_D`
-        // there must track `ATTN_MMA_MAX_D_HEAD` here -- both size the same
-        // kernel's register arrays for the same widest `d_head`.
+        // `attn_decode_mma_f32`.
         //
-        // Also auto-selected once `n_tokens` is wide enough that this cannot be
-        // a decode step: a decode batch is bounded by how many sequences are
-        // concurrently in flight, comfortably under this threshold in every
-        // config measured here, while one sequence's prefill chunk routinely
-        // reaches into the hundreds. The scalar kernel's cost is per query
-        // *inside* the chunk on top of `kv_len` -- every one of a 256-token
-        // chunk's queries independently rescans the same, nearly-overlapping
-        // key range in scalar arithmetic -- so a wide chunk pays that
-        // redundancy once per query instead of once per chunk; the tensor
-        // cores do not care how many queries share a key tile once it is
-        // staged in shared memory. Measured live: a 29K-token prompt on
-        // Qwen3.8-27B-FP8 (24 heads over 4, `d_head` 256) spent 52.9% of a
-        // prefill's GPU time in the scalar kernel here.
-        //
-        // Auto-selecting only past the threshold, rather than always past it,
-        // is what keeps a real decode batch off this path: the batch-invariance
-        // tests hold decode to bit-for-bit reproducibility regardless of batch
-        // composition, and the tensor-core path's ~6e-4 relative rounding
-        // (`f16` operands where the scalar path keeps `f32`) is enough to flip
-        // which token a greedy decode picks — see `attn_decode_mma_f32`'s own
-        // comment. A wide prefill chunk is not part of that guarantee.
-        const ATTN_MMA_MAX_D_HEAD: usize = 256;
-        const ATTN_MMA_MIN_TOKENS: usize = 64;
+        // *** `d_head` past 128 is disabled here, pending a real bug fix. ***
+        // The register arrays and the gate below were widened to 256 (see git
+        // history for the full attempt) and the arithmetic checked out cell by
+        // cell -- but on the real 24-head/4-kv-head/d_head-256 checkpoint, a
+        // second request on the same warm server reliably corrupted memory:
+        // `compute-sanitizer` caught it as an out-of-bounds read inside
+        // `gather_rows_f16` (token embedding, an entirely different kernel run
+        // on a *later* step), which is the signature of an out-of-bounds
+        // *write* here landing in a heap region a later allocation reused.
+        // Confirmed by direct A/B: the same wide chunk (`INFERO_BATCH_TOKENS`
+        // forced past 128) with this path forced off via `INFERO_NO_DECODE_ATTN`
+        // never crashed; turning this path back on at `d_head` 256 crashed
+        // every time, independent of `--ctx`, batch width, speculative
+        // decoding, and CUDA graphs (all tried and ruled out). The exact
+        // out-of-bounds access was not found before this had to ship, so the
+        // gate stays at the width it was actually shipped and measured at
+        // rather than risk a heap corruption reaching production silently.
+        const ATTN_MMA_MAX_D_HEAD: usize = 128;
         static MMA_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let mma_env =
             *MMA_ENV.get_or_init(|| std::env::var("INFERO_ATTN_MMA").as_deref() == Ok("1"));
-        let mma = (mma_env || dims.n_tokens >= ATTN_MMA_MIN_TOKENS)
+        let mma = mma_env
             && dims.d_head.is_multiple_of(16)
             && dims.d_head <= ATTN_MMA_MAX_D_HEAD
             && group <= 8;
@@ -4042,6 +4034,7 @@ impl Kernels {
             "infero_mmq" => mmq_src(),
             "infero_mmvq" => mmvq_src(),
             "infero_ops" => ops_src(),
+            "infero_fp8" => fp8_src(),
             _ => quant_src(),
         };
         let f = self.dev.kernels().get(module, src, name)?;

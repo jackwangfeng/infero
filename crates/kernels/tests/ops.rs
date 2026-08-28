@@ -710,6 +710,9 @@ fn attn_decode_matches_the_three_kernels() -> Result<()> {
         (128, 100),
         (64, 64),
         (33, 40),
+        // A real chunked prefill's tail: kv_len in the tens of thousands,
+        // which none of the shapes above reach anywhere near.
+        (256, 30000),
     ] {
         let dims = AttnDims {
             n_heads,
@@ -821,13 +824,12 @@ fn attn_decode_matches_the_three_kernels() -> Result<()> {
         // about 6e-4 relative here, and it is why that path is not the default —
         // see the note on `attn_decode_mma_f32`.
         //
-        // Mirrors `Kernels::attn_decode`'s own selection: the env var forces it
-        // on, and so does a chunk wide enough that it cannot be a decode step
-        // (`ATTN_MMA_MIN_TOKENS`) — this loop's `128` and `64`-token cases hit
-        // that automatically even with the var unset.
-        const ATTN_MMA_MIN_TOKENS: usize = 64;
-        let mma_active = std::env::var("INFERO_ATTN_MMA").as_deref() == Ok("1")
-            || n_tokens >= ATTN_MMA_MIN_TOKENS;
+        // Mirrors `Kernels::attn_decode`'s own selection: the env var opts in,
+        // and only up to `d_head` 128 -- past that is disabled outright, see
+        // the long comment at that gate for why.
+        const ATTN_MMA_MAX_D_HEAD: usize = 128;
+        let mma_active =
+            std::env::var("INFERO_ATTN_MMA").as_deref() == Ok("1") && d_head <= ATTN_MMA_MAX_D_HEAD;
         let tol = if mma_active { 2e-3 } else { 2e-4 };
         let (abs, at) = max_abs_diff(&got, &want);
         assert!(
