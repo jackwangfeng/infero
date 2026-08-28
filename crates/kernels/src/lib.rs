@@ -1,7 +1,7 @@
 //! The GPU operator set: everything a decoder-only transformer needs, and
 //! nothing else.
 //!
-//! Kernels are plain CUDA C compiled by NVRTC at startup (see `tuili-cuda`).
+//! Kernels are plain CUDA C compiled by NVRTC at startup (see `infero-cuda`).
 //! Weights stay in their GGUF block encoding on the device and are decoded
 //! inside the kernel that consumes them, which is the whole reason a 7B model
 //! fits in 5 GB.
@@ -17,9 +17,9 @@ pub mod vision;
 mod weight;
 
 use anyhow::{Context, Result};
-use tuili_gpu::{View, ViewMut, LaunchConfig, KernelArg};
+use infero_gpu::{View, ViewMut, LaunchConfig, KernelArg};
 use half::f16;
-use tuili_gpu::Device;
+use infero_gpu::Device;
 
 pub use BatchLayout as Batch;
 pub use turboquant::{Codebook, DeviceTables as TqTables, KvQuant};
@@ -74,7 +74,7 @@ const REDUCE_BLOCK: u32 = 256;
 fn mma_min() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("TUILI_MMA_MIN")
+        std::env::var("INFERO_MMA_MIN")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|v| *v > 0)
@@ -144,7 +144,7 @@ fn vision_src() -> &'static str {
 #[cfg(feature = "cuda")]
 fn fp8_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    // `TUILI_FP8_STRIP` prepends `#define`s that take pieces out of the mat-vec,
+    // `INFERO_FP8_STRIP` prepends `#define`s that take pieces out of the mat-vec,
     // for `examples/fp8_row_cost.rs` to attribute the marginal row's cost. The
     // defines change the source, so they change the NVRTC cache key — a stripped
     // build cannot be confused with a serving one.
@@ -271,7 +271,7 @@ unsafe impl cudarc::driver::DeviceRepr for TmaDesc {}
 /// separates the plain norm from the f16-writing one.
 fn b_args(
     k: &Kernels,
-    f: &tuili_gpu::Function,
+    f: &infero_gpu::Function,
     cfg: LaunchConfig,
     out: &mut ViewMut<'_, f32>,
     h_out: Option<&mut ViewMut<'_, f16>>,
@@ -288,7 +288,7 @@ fn b_args(
         }
         None => {
             b.arg(out)
-                .arg(&tuili_gpu::NULL_BUFFER)
+                .arg(&infero_gpu::NULL_BUFFER)
                 .arg(x)
                 .arg(weight)
                 .arg(&d)
@@ -366,7 +366,7 @@ impl Kernels {
             "store_kv2_packed_f16",
             "qk_norm_f32",
         ] {
-            self.dev.kernels().get("tuili_ops", ops_src(), name)?;
+            self.dev.kernels().get("infero_ops", ops_src(), name)?;
         }
         // The GatedDeltaNet unit compiles separately, so warm it separately.
         // Skipping this would push a first-token latency spike into whichever
@@ -380,7 +380,7 @@ impl Kernels {
             "sigmoid_gate_f32",
             "split_interleaved_f32",
         ] {
-            self.dev.kernels().get("tuili_gdn", gdn_src(), name)?;
+            self.dev.kernels().get("infero_gdn", gdn_src(), name)?;
         }
         // The FP8 unit, warmed the same way and for the same reason -- and
         // skipped where the hardware has no FP8 matmul. That is the same fact
@@ -400,7 +400,7 @@ impl Kernels {
             "mmv_f8_block_batch16_f32",
             "dequant_f8_block_f16",
         ] {
-            self.dev.kernels().get("tuili_fp8", fp8_src(), name)?;
+            self.dev.kernels().get("infero_fp8", fp8_src(), name)?;
         }
         }
         // And the vision tower, which is its own translation unit again. A
@@ -423,7 +423,7 @@ impl Kernels {
             "vision_add_pos_embed_f32",
             "vision_splice_f32",
         ] {
-            self.dev.kernels().get("tuili_vision", vision_src(), name)?;
+            self.dev.kernels().get("infero_vision", vision_src(), name)?;
         }
         // Every weight type's gemv, row gather and dequantisation.
         //
@@ -442,7 +442,7 @@ impl Kernels {
                 // and the embedding gather never see it. The prefill
                 // dequantization and the mat-vec do.
                 self.dev.kernels().get(
-                    "tuili_quant",
+                    "infero_quant",
                     quant_src(),
                     "dequant_q4_g128t_f16",
                 )?;
@@ -461,19 +461,19 @@ impl Kernels {
                     "dequant" => format!("dequant_{}_f16", ty.suffix()),
                     _ => format!("{prefix}_{}", ty.suffix()),
                 };
-                self.dev.kernels().get("tuili_quant", quant_src(), &name)?;
+                self.dev.kernels().get("infero_quant", quant_src(), &name)?;
             }
         }
         self.dev
             .kernels()
-            .get("tuili_mmvq", mmvq_src(), "quantize_q8_1_f32")?;
+            .get("infero_mmvq", mmvq_src(), "quantize_q8_1_f32")?;
         for ty in WeightType::ALL.iter().filter(|t| Self::has_mmvq(**t)) {
             // Every width the dispatch can reach, not just the single-token
             // one: a missing kernel is otherwise a 500 on whichever request
             // happens to leave two sequences running.
             for tag in ["", "t1", "t2", "t4", "t8", "t16"] {
                 let name = format!("mmvq{tag}_{}", ty.suffix());
-                self.dev.kernels().get("tuili_mmvq", mmvq_src(), &name)?;
+                self.dev.kernels().get("infero_mmvq", mmvq_src(), &name)?;
             }
         }
         // CUDA-only from here: `mmq.cu` and `turboquant.cu` have no MSL
@@ -496,7 +496,7 @@ impl Kernels {
                         .filter(|t| Self::has_mmq(**t) && **t != WeightType::Q4G128T)
                     {
                         let name = format!("mmq{tag}_{}", ty.suffix());
-                        self.dev.kernels().get("tuili_mmq", mmq_src(), &name)?;
+                        self.dev.kernels().get("infero_mmq", mmq_src(), &name)?;
                     }
                 }
             }
@@ -507,7 +507,7 @@ impl Kernels {
                 "tq_attn_scores",
                 "tq_attn_output",
             ] {
-                self.dev.kernels().get("tuili_turboquant", tq_src(), name)?;
+                self.dev.kernels().get("infero_turboquant", tq_src(), name)?;
             }
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "kernels compiled");
@@ -540,7 +540,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_ops", ops_src(), "qk_norm_f32")?;
+            .get("infero_ops", ops_src(), "qk_norm_f32")?;
         let cfg = LaunchConfig {
             grid_dim: ((n_tokens * n_heads) as u32, 1, 1),
             block_dim: (REDUCE_BLOCK, 1, 1),
@@ -586,7 +586,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_ops", ops_src(), "rms_norm_f32")?;
+            .get("infero_ops", ops_src(), "rms_norm_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (n_tokens as u32, 1, 1),
             block_dim: (REDUCE_BLOCK, 1, 1),
@@ -610,7 +610,7 @@ impl Kernels {
         b_in: &View<'_, f32>,
         n: usize,
     ) -> Result<()> {
-        let f = self.dev.kernels().get("tuili_ops", ops_src(), "add_f32")?;
+        let f = self.dev.kernels().get("infero_ops", ops_src(), "add_f32")?;
         let n_i = n as i32;
         let mut b = self.dev.stream().launch_builder(&f);
         b.arg(out).arg(a).arg(b_in).arg(&n_i);
@@ -631,7 +631,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_ops", ops_src(), "add_assign_f32")?;
+            .get("infero_ops", ops_src(), "add_assign_f32")?;
         let n_i = n as i32;
         let mut b = self.dev.stream().launch_builder(&f);
         b.arg(out).arg(b_in).arg(&n_i);
@@ -656,7 +656,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_ops", ops_src(), "add_bias_f32")?;
+            .get("infero_ops", ops_src(), "add_bias_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (
                 (n_cols as u32).div_ceil(ELEMENTWISE_BLOCK).max(1),
@@ -687,7 +687,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_ops", ops_src(), "silu_mul_f32")?;
+            .get("infero_ops", ops_src(), "silu_mul_f32")?;
         let n_i = n as i32;
         let mut b = self.dev.stream().launch_builder(&f);
         b.arg(out).arg(gate).arg(up).arg(&n_i);
@@ -715,7 +715,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_ops", ops_src(), "split_qkv_f32")?;
+            .get("infero_ops", ops_src(), "split_qkv_f32")?;
         let total = n_tokens * (d + 2 * kv_dim);
         let (d_i, kv_i, t_i) = (d as i32, kv_dim as i32, total as i32);
         let mut b = self.dev.stream().launch_builder(&f);
@@ -743,7 +743,7 @@ impl Kernels {
         width_b: usize,
         n_tokens: usize,
     ) -> Result<()> {
-        let f = self.dev.kernels().get("tuili_ops", ops_src(), "split2_f32")?;
+        let f = self.dev.kernels().get("infero_ops", ops_src(), "split2_f32")?;
         let total = n_tokens * (width_a + width_b);
         let (a_i, b_i, t_i) = (width_a as i32, width_b as i32, total as i32);
         let mut bld = self.dev.stream().launch_builder(&f);
@@ -769,7 +769,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_ops", ops_src(), "silu_mul_split_f32")?;
+            .get("infero_ops", ops_src(), "silu_mul_split_f32")?;
         let (d_i, t_i) = (d_ff as i32, total as i32);
         let mut b = self.dev.stream().launch_builder(&f);
         b.arg(out).arg(xy).arg(&d_i).arg(&t_i);
@@ -801,7 +801,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_ops", ops_src(), "silu_mul_split_f16_f32")?;
+            .get("infero_ops", ops_src(), "silu_mul_split_f16_f32")?;
         let (d_i, t_i) = (d_ff as i32, total as i32);
         let mut b = self.dev.stream().launch_builder(&f);
         b.arg(out).arg(hout).arg(xy).arg(&d_i).arg(&t_i);
@@ -891,7 +891,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_sample", sample_src(), "argmax_partial_f32")?;
+            .get("infero_sample", sample_src(), "argmax_partial_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (splits as u32, n_rows as u32, 1),
             block_dim: (Self::SAMPLE_BLOCK, 1, 1),
@@ -920,7 +920,7 @@ impl Kernels {
         let g = self
             .dev
             .kernels()
-            .get("tuili_sample", sample_src(), "argmax_combine_f32")?;
+            .get("infero_sample", sample_src(), "argmax_combine_f32")?;
         let cfg2 = LaunchConfig {
             grid_dim: (n_rows as u32, 1, 1),
             block_dim: (Self::SAMPLE_BLOCK, 1, 1),
@@ -990,7 +990,7 @@ impl Kernels {
         let f1 = self
             .dev
             .kernels()
-            .get("tuili_sample", sample_src(), "sample_topk_partial_f32")?;
+            .get("infero_sample", sample_src(), "sample_topk_partial_f32")?;
         let cfg1 = LaunchConfig {
             grid_dim: (n_rows as u32, Self::SAMPLE_SPLITS as u32, 1),
             block_dim: (256, 1, 1),
@@ -1018,7 +1018,7 @@ impl Kernels {
         let f2 = self
             .dev
             .kernels()
-            .get("tuili_sample", sample_src(), "sample_rows_topk_f32")?;
+            .get("infero_sample", sample_src(), "sample_rows_topk_f32")?;
         let cfg2 = LaunchConfig {
             grid_dim: (n_rows as u32, 1, 1),
             block_dim: (256, 1, 1),
@@ -1041,7 +1041,7 @@ impl Kernels {
                 b2.arg(x.id).arg(x.p).arg(x.len);
             }
             None => {
-                b2.arg(&tuili_gpu::NULL_BUFFER).arg(&tuili_gpu::NULL_BUFFER).arg(&tuili_gpu::NULL_BUFFER);
+                b2.arg(&infero_gpu::NULL_BUFFER).arg(&infero_gpu::NULL_BUFFER).arg(&infero_gpu::NULL_BUFFER);
             }
         }
         b2.arg(&sstride);
@@ -1073,7 +1073,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_sample", sample_src(), "sample_rows_f32")?;
+            .get("infero_sample", sample_src(), "sample_rows_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (n_rows as u32, 1, 1),
             block_dim: (Self::SAMPLE_BLOCK, 1, 1),
@@ -1097,7 +1097,7 @@ impl Kernels {
                 b.arg(v.id).arg(v.p).arg(v.len);
             }
             None => {
-                b.arg(&tuili_gpu::NULL_BUFFER).arg(&tuili_gpu::NULL_BUFFER).arg(&tuili_gpu::NULL_BUFFER);
+                b.arg(&infero_gpu::NULL_BUFFER).arg(&infero_gpu::NULL_BUFFER).arg(&infero_gpu::NULL_BUFFER);
             }
         }
         b.arg(&sstride);
@@ -1121,7 +1121,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_ops", ops_src(), "take_rows_f32")?;
+            .get("infero_ops", ops_src(), "take_rows_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (
                 (d as u32).div_ceil(ELEMENTWISE_BLOCK).max(1),
@@ -1177,7 +1177,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_ops", ops_src(), name)?;
+            .get("infero_ops", ops_src(), name)?;
         let n_i = n as i32;
         let mut b = self.dev.stream().launch_builder(&f);
         b.arg(out).arg(x).arg(&n_i);
@@ -1211,6 +1211,8 @@ impl Kernels {
         k: &mut ViewMut<'_, f32>,
         positions: &View<'_, i32>,
         freq_factors: &View<'_, f32>,
+        mrope_axis: &View<'_, i32>,
+        pos_stride: usize,
         n_tokens: usize,
         n_heads: usize,
         n_kv_heads: usize,
@@ -1224,6 +1226,8 @@ impl Kernels {
             k,
             positions,
             freq_factors,
+            mrope_axis,
+            pos_stride,
             n_tokens,
             n_heads,
             n_kv_heads,
@@ -1244,6 +1248,15 @@ impl Kernels {
     /// frequency exponent is normalized by `rotary_dim` rather than `d_head`,
     /// which makes the table a compression of the full frequency span into
     /// fewer dimensions rather than its leading slice.
+    /// `mrope_axis`/`pos_stride`: `positions` normally holds one value a
+    /// token (`pos_stride == 1`) and every entry of `mrope_axis` is `0`, which
+    /// reduces the read to exactly `positions[token]` -- the plain-position
+    /// arithmetic, unchanged. A model with Qwen3.5-style M-RoPE instead sets
+    /// `pos_stride == 3` (`positions` holds a time/height/width triple a
+    /// token) and fills `mrope_axis[i]` with which of the three frequency `i`
+    /// reads, from `qwen35_vision::interleaved_mrope_axis`. Both `positions`
+    /// and `mrope_axis` must be real, non-null buffers either way — Metal has
+    /// no null buffer argument.
     #[allow(clippy::too_many_arguments)]
     pub fn rope_qk_partial(
         &self,
@@ -1251,6 +1264,8 @@ impl Kernels {
         k: &mut ViewMut<'_, f32>,
         positions: &View<'_, i32>,
         freq_factors: &View<'_, f32>,
+        mrope_axis: &View<'_, i32>,
+        pos_stride: usize,
         n_tokens: usize,
         n_heads: usize,
         n_kv_heads: usize,
@@ -1274,10 +1289,25 @@ impl Kernels {
             freq_factors.len(),
             rotary_dim / 2
         );
+        anyhow::ensure!(
+            pos_stride == 1 || pos_stride == 3,
+            "pos_stride {pos_stride} must be 1 (plain position) or 3 (mRoPE T/H/W)"
+        );
+        anyhow::ensure!(
+            mrope_axis.len() >= rotary_dim / 2,
+            "mrope_axis holds {} entries, short of the {} frequencies that rotate",
+            mrope_axis.len(),
+            rotary_dim / 2
+        );
+        anyhow::ensure!(
+            positions.len() >= n_tokens * pos_stride,
+            "positions holds {} entries, short of {n_tokens} tokens x pos_stride {pos_stride}",
+            positions.len()
+        );
         let f = self
             .dev
             .kernels()
-            .get("tuili_ops", ops_src(), "rope_qk_f32")?;
+            .get("infero_ops", ops_src(), "rope_qk_f32")?;
         let half = (rotary_dim / 2) as u32;
         let block = half.clamp(1, 128);
         let cfg = LaunchConfig {
@@ -1289,13 +1319,18 @@ impl Kernels {
             block_dim: (block, 1, 1),
             shared_mem_bytes: 0,
         };
-        let (h, kh, dh, rd, il) = (
+        let (h, kh, dh, rd, il, ps) = (
             n_heads as i32,
             n_kv_heads as i32,
             d_head as i32,
             rotary_dim as i32,
             i32::from(interleaved),
+            pos_stride as i32,
         );
+        // Argument order matches the kernel's parameter order exactly, which
+        // for both backends puts `mrope_axis`/`pos_stride` last -- see the
+        // comment on the CUDA kernel for why they aren't next to `positions`
+        // where they'd read more naturally.
         let mut b = self.dev.stream().launch_builder(&f);
         b.arg(q)
             .arg(k)
@@ -1307,7 +1342,9 @@ impl Kernels {
             .arg(&rd)
             .arg(&theta_base)
             .arg(&freq_scale)
-            .arg(&il);
+            .arg(&il)
+            .arg(mrope_axis)
+            .arg(&ps);
         self.dev.profile().time("rope_qk", self.dev.stream(), || {
             unsafe { b.launch(cfg) }.context("rope_qk")?;
             Ok(())
@@ -1332,6 +1369,8 @@ impl Kernels {
         k_off: usize,
         positions: &View<'_, i32>,
         freq_factors: &View<'_, f32>,
+        mrope_axis: &View<'_, i32>,
+        pos_stride: usize,
         n_tokens: usize,
         n_heads: usize,
         n_kv_heads: usize,
@@ -1348,6 +1387,8 @@ impl Kernels {
             k_off,
             positions,
             freq_factors,
+            mrope_axis,
+            pos_stride,
             n_tokens,
             n_heads,
             n_kv_heads,
@@ -1370,6 +1411,8 @@ impl Kernels {
     /// keep the previous layer's values past `rotary_dim`, which on the 27B is
     /// three quarters of every query.
     #[allow(clippy::too_many_arguments)]
+    /// `mrope_axis`/`pos_stride`: see [`Self::rope_qk_partial`]'s doc comment.
+    #[allow(clippy::too_many_arguments)]
     pub fn rope_qk_packed_partial(
         &self,
         q_dst: &mut ViewMut<'_, f32>,
@@ -1379,6 +1422,8 @@ impl Kernels {
         k_off: usize,
         positions: &View<'_, i32>,
         freq_factors: &View<'_, f32>,
+        mrope_axis: &View<'_, i32>,
+        pos_stride: usize,
         n_tokens: usize,
         n_heads: usize,
         n_kv_heads: usize,
@@ -1403,6 +1448,21 @@ impl Kernels {
             rotary_dim / 2
         );
         anyhow::ensure!(
+            pos_stride == 1 || pos_stride == 3,
+            "pos_stride {pos_stride} must be 1 (plain position) or 3 (mRoPE T/H/W)"
+        );
+        anyhow::ensure!(
+            mrope_axis.len() >= rotary_dim / 2,
+            "mrope_axis holds {} entries, short of the {} frequencies that rotate",
+            mrope_axis.len(),
+            rotary_dim / 2
+        );
+        anyhow::ensure!(
+            positions.len() >= n_tokens * pos_stride,
+            "positions holds {} entries, short of {n_tokens} tokens x pos_stride {pos_stride}",
+            positions.len()
+        );
+        anyhow::ensure!(
             packed.len() >= (n_tokens - 1) * stride + k_off + n_kv_heads * d_head,
             "packed qkv holds {} elements, short for {n_tokens} rows of {stride}",
             packed.len()
@@ -1415,7 +1475,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_ops", ops_src(), "rope_qk_packed_f32")?;
+            .get("infero_ops", ops_src(), "rope_qk_packed_f32")?;
         // The rotating lanes plus the ones that carry q's untouched tail
         // across. Equal to `d_head / 2` when the whole head rotates, which is
         // the grid this kernel always had.
@@ -1431,13 +1491,16 @@ impl Kernels {
             shared_mem_bytes: 0,
         };
         let (st, qo, ko) = (stride as i32, q_off as i32, k_off as i32);
-        let (h, kh, dh, rd, il) = (
+        let (h, kh, dh, rd, il, ps) = (
             n_heads as i32,
             n_kv_heads as i32,
             d_head as i32,
             rotary_dim as i32,
             i32::from(interleaved),
+            pos_stride as i32,
         );
+        // Same reason as `rope_qk_partial`: `mrope_axis`/`pos_stride` last so
+        // this one `.arg()` sequence matches both backends' parameter order.
         let mut b = self.dev.stream().launch_builder(&f);
         b.arg(q_dst)
             .arg(packed)
@@ -1452,7 +1515,9 @@ impl Kernels {
             .arg(&rd)
             .arg(&theta_base)
             .arg(&freq_scale)
-            .arg(&il);
+            .arg(&il)
+            .arg(mrope_axis)
+            .arg(&ps);
         self.dev.profile().time("rope_qk", self.dev.stream(), || {
             unsafe { b.launch(cfg) }.context("rope_qk_packed")?;
             Ok(())
@@ -1479,7 +1544,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_ops", ops_src(), "store_kv2_packed_f16")?;
+            .get("infero_ops", ops_src(), "store_kv2_packed_f16")?;
         let block = (d_head as u32).clamp(1, 256);
         let cfg = LaunchConfig {
             grid_dim: (
@@ -1538,7 +1603,7 @@ impl Kernels {
         } else {
             "rope_neox_f32"
         };
-        let f = self.dev.kernels().get("tuili_ops", ops_src(), name)?;
+        let f = self.dev.kernels().get("infero_ops", ops_src(), name)?;
         let half = (d_head / 2) as u32;
         let block = half.clamp(1, 128);
         let cfg = LaunchConfig {
@@ -1589,7 +1654,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_ops", ops_src(), "store_kv2_f16")?;
+            .get("infero_ops", ops_src(), "store_kv2_f16")?;
         let block = (d_head as u32).clamp(1, 256);
         let cfg = LaunchConfig {
             grid_dim: (
@@ -1637,7 +1702,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_ops", ops_src(), "store_kv_f16")?;
+            .get("infero_ops", ops_src(), "store_kv_f16")?;
         let block = (d_head as u32).clamp(1, 256);
         let cfg = LaunchConfig {
             grid_dim: (
@@ -1683,7 +1748,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_ops", ops_src(), "write_slot_table")?;
+            .get("infero_ops", ops_src(), "write_slot_table")?;
         let (stride, n) = (table_stride as i32, n_tokens as i32);
         let mut b = self.dev.stream().launch_builder(&f);
         b.arg(table)
@@ -1726,7 +1791,7 @@ impl Kernels {
             && dims.d_head <= 4 * 32
             && dims.d_head.is_multiple_of(32);
         let f = self.dev.kernels().get(
-            "tuili_ops",
+            "infero_ops",
             ops_src(),
             // Strided, and measured against the contiguous alternative rather
             // than assumed. `attn_scores_gqa_v4_f32` gives each lane a
@@ -1742,12 +1807,12 @@ impl Kernels {
             // already perfectly coalesced — a warp's strided read is 128
             // consecutive floats. There is nothing to win and a branch to lose.
             //
-            // `TUILI_ATTN_V1` still selects the older `attn_output`, which is
+            // `INFERO_ATTN_V1` still selects the older `attn_output`, which is
             // the one where the width mattered.
             // Two keys a warp, which doubles what the score loop has in
             // flight: 43.4 us a layer down to 33.9 at a batch of 32, or 762
-            // GB/s of K up to 990. `TUILI_ATTN_X2=0` restores one key a warp.
-            match (gqa, !std::env::var("TUILI_ATTN_X2").is_ok_and(|v| v == "0")) {
+            // GB/s of K up to 990. `INFERO_ATTN_X2=0` restores one key a warp.
+            match (gqa, !std::env::var("INFERO_ATTN_X2").is_ok_and(|v| v == "0")) {
                 (true, true) => "attn_scores_gqa_v4_f32",
                 (true, false) => "attn_scores_gqa_f32",
                 (false, _) => "attn_scores_f32",
@@ -1759,7 +1824,7 @@ impl Kernels {
                     // The `x2` variant gives a warp two keys, so it needs half
                     // the blocks to cover the range.
                     let per = if gqa
-                        && !std::env::var("TUILI_ATTN_X2").is_ok_and(|v| v == "0")
+                        && !std::env::var("INFERO_ATTN_X2").is_ok_and(|v| v == "0")
                     {
                         SCORE_WARPS * 2
                     } else {
@@ -1819,7 +1884,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_ops", ops_src(), "attn_softmax_f32")?;
+            .get("infero_ops", ops_src(), "attn_softmax_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (n_heads as u32, n_tokens as u32, 1),
             block_dim: (REDUCE_BLOCK, 1, 1),
@@ -1873,9 +1938,9 @@ impl Kernels {
         // The gate counts blocks and nothing else, and a block is not the only
         // thing that can be short of work: `attn_output_f32` walks the whole
         // key range in one loop, so its latency is `kv_len` dependent loads
-        // however many blocks there are. `TUILI_ATTN_SPLIT=1` chunks anyway.
+        // however many blocks there are. `INFERO_ATTN_SPLIT=1` chunks anyway.
         static ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let always = *ALWAYS.get_or_init(|| std::env::var_os("TUILI_ATTN_SPLIT").is_some());
+        let always = *ALWAYS.get_or_init(|| std::env::var_os("INFERO_ATTN_SPLIT").is_some());
         if (blocks >= want && !always) || kv_len <= 128 {
             return (0, 0);
         }
@@ -1918,12 +1983,12 @@ impl Kernels {
     fn flash_grid_heads(dims: &AttnDims) -> usize {
         let group = dims.n_heads / dims.n_kv_heads.max(1);
         let lanes = (dims.d_head as u32).next_multiple_of(32).clamp(32, 1024);
-        let subs = std::env::var("TUILI_ATTN_SUBS")
+        let subs = std::env::var("INFERO_ATTN_SUBS")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(4)
             .clamp(1, 1024 / lanes.max(1));
-        let grouped = std::env::var("TUILI_ATTN_GQA").is_ok_and(|v| v != "0")
+        let grouped = std::env::var("INFERO_ATTN_GQA").is_ok_and(|v| v != "0")
             && group > 1
             && group <= 8
             && lanes * subs >= group as u32 * 32
@@ -1948,7 +2013,7 @@ impl Kernels {
             // Enough blocks already, so the *split* buys nothing. The fused
             // kernel does two other things — keeps the score matrix out of HBM
             // and costs two launches a layer instead of three — and the guess
-            // was that those would pay at any batch. `TUILI_FLASH_WIDE=1`
+            // was that those would pay at any batch. `INFERO_FLASH_WIDE=1`
             // measures it and they do not: on an A4000, 379 tok/s against 405
             // at a batch of eight and 730 against 852 at thirty-two; on a
             // Blackwell RTX PRO 6000, 1057.8 against 1091.9 and 1990.5 against
@@ -2031,14 +2096,14 @@ impl Kernels {
             // The gate stays; the switch stays so the result is re-runnable.
             static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             let on = *WIDE
-                .get_or_init(|| std::env::var_os("TUILI_FLASH_WIDE").is_some());
+                .get_or_init(|| std::env::var_os("INFERO_FLASH_WIDE").is_some());
             return if on {
                 Some((1, (kv_len as u32).next_multiple_of(32).min(MAX_CHUNK)))
             } else {
                 None
             };
         }
-        let want = std::env::var("TUILI_ATTN_WANT")
+        let want = std::env::var("INFERO_ATTN_WANT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(want);
@@ -2066,7 +2131,7 @@ impl Kernels {
             return false;
         }
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| !std::env::var("TUILI_NO_FLASH_ATTN").is_ok_and(|v| v != "0"))
+        *ON.get_or_init(|| !std::env::var("INFERO_NO_FLASH_ATTN").is_ok_and(|v| v != "0"))
             && self.attn_flash_split(dims, kv_len).is_some()
     }
 
@@ -2087,7 +2152,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_ops", ops_src(), "attn_kv_probe_f32")?;
+            .get("infero_ops", ops_src(), "attn_kv_probe_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (dims.n_kv_heads as u32, dims.n_tokens as u32, n_chunks),
             block_dim: (128, 1, 1),
@@ -2141,7 +2206,7 @@ impl Kernels {
     /// range, so this is not gated any tighter than the memory cap itself.
     pub fn decode_attention(&self, dims: &AttnDims, kv_len: usize) -> bool {
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *OFF.get_or_init(|| std::env::var("TUILI_NO_DECODE_ATTN").is_ok_and(|v| v != "0")) {
+        if *OFF.get_or_init(|| std::env::var("INFERO_NO_DECODE_ATTN").is_ok_and(|v| v != "0")) {
             return false;
         }
         if !cfg!(feature = "cuda") {
@@ -2161,6 +2226,21 @@ impl Kernels {
             && dims.d_head.is_multiple_of(8)
     }
 
+    /// Whether [`Self::tq_attn_decode`] would take this shape, independent of
+    /// `kv_len` -- mirrors the group-ratio check `tq_attn_decode` asserts
+    /// internally, so a caller can decide once, at load time, whether a
+    /// TurboQuant-quantized model will ever fall back to the score-
+    /// materializing three-kernel path (`tq_attn_scores`/`attn_softmax`/
+    /// `tq_attn_output`).
+    pub fn tq_decode_attention(&self, dims: &AttnDims) -> bool {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var("INFERO_TQ_DECODE_ATTN").is_ok_and(|v| v == "0")) {
+            return false;
+        }
+        let group = dims.n_heads / dims.n_kv_heads.max(1);
+        group >= 1 && group <= 8 && dims.n_heads == group * dims.n_kv_heads
+    }
+
     /// How the key range is cut up for [`Self::attn_decode`].
     ///
     /// The kernel's grid is one block per (KV head, token, chunk), and the
@@ -2170,7 +2250,7 @@ impl Kernels {
     /// smallest count that fills the device rather than the largest.
     fn decode_chunks(&self, dims: &AttnDims, kv_len: usize) -> (u32, u32) {
         let blocks = (dims.n_kv_heads * dims.n_tokens).max(1) as u32;
-        let want = std::env::var("TUILI_DECODE_WANT")
+        let want = std::env::var("INFERO_DECODE_WANT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(self.dev.sm_count() * 4);
@@ -2217,7 +2297,7 @@ impl Kernels {
             let f = self
                 .dev
                 .kernels()
-                .get("tuili_ops", ops_src(), "attn_decode_fused_f32")?;
+                .get("infero_ops", ops_src(), "attn_decode_fused_f32")?;
             let sg_for_scores = (kv_len as u32).div_ceil(2).max(1);
             let block = (sg_for_scores * 32)
                 .max((dims.d_head as u32).next_multiple_of(32))
@@ -2271,16 +2351,16 @@ impl Kernels {
             "attn_decode: {n_chunks} chunks past the partial buffer's 32"
         );
 
-        // `TUILI_ATTN_MMA=1` runs the tensor-core decomposition instead; see
+        // `INFERO_ATTN_MMA=1` runs the tensor-core decomposition instead; see
         // `attn_decode_mma_f32`. It wants four warps whatever the group is, a
         // 64-key tile, and V transposed on the way into shared.
         static MMA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let mma = *MMA.get_or_init(|| std::env::var("TUILI_ATTN_MMA").as_deref() == Ok("1"))
+        let mma = *MMA.get_or_init(|| std::env::var("INFERO_ATTN_MMA").as_deref() == Ok("1"))
             && dims.d_head.is_multiple_of(16)
             && dims.d_head <= 128
             && group <= 8;
         let f = self.dev.kernels().get(
-            "tuili_ops",
+            "infero_ops",
             ops_src(),
             if mma { "attn_decode_mma_f32" } else { "attn_decode_gqa_f32" },
         )?;
@@ -2365,7 +2445,7 @@ impl Kernels {
         } else {
             "attn_flash_reduce_f32"
         };
-        let r = self.dev.kernels().get("tuili_ops", ops_src(), name)?;
+        let r = self.dev.kernels().get("infero_ops", ops_src(), name)?;
         let mut rb = self.dev.stream().launch_builder(&r);
         let wrote = match hout {
             Some(h16) => {
@@ -2425,7 +2505,7 @@ impl Kernels {
         // is the kernel's cost, and one group per block leaves the memory
         // pipeline with too few independent addresses to work on.
         let lanes = (dims.d_head as u32).next_multiple_of(32).clamp(32, 1024);
-        let subs = std::env::var("TUILI_ATTN_SUBS")
+        let subs = std::env::var("INFERO_ATTN_SUBS")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(4)
@@ -2451,14 +2531,14 @@ impl Kernels {
         // whole chunk of keys — the phase that the unfused `attn_scores_gqa_f32`
         // spreads over the entire grid — which is what made the fused kernel
         // slower than the three it replaces.
-        let gqa = std::env::var("TUILI_ATTN_GQA").is_ok_and(|v| v != "0")
+        let gqa = std::env::var("INFERO_ATTN_GQA").is_ok_and(|v| v != "0")
             && group > 1
             && group <= 8
             && block >= group as u32 * 32
             && dims.d_head.is_multiple_of(8)
             && block.is_multiple_of((dims.d_head / 8) as u32);
         let f = self.dev.kernels().get(
-            "tuili_ops",
+            "infero_ops",
             ops_src(),
             if gqa { "attn_flash_gqa_f32" } else { "attn_flash_f32" },
         )?;
@@ -2509,7 +2589,7 @@ impl Kernels {
         let r = self
             .dev
             .kernels()
-            .get("tuili_ops", ops_src(), "attn_flash_reduce_f32")?;
+            .get("infero_ops", ops_src(), "attn_flash_reduce_f32")?;
         let part = partial.as_view();
         let total = (dims.n_tokens * dims.n_heads * dims.d_head) as u32;
         let nt = dims.n_tokens as i32;
@@ -2564,7 +2644,7 @@ impl Kernels {
             let group = dims.n_heads / dims.n_kv_heads.max(1);
             let gqa = cfg!(feature = "cuda") && group > 1 && group <= 8;
             let f = self.dev.kernels().get(
-                "tuili_ops",
+                "infero_ops",
                 ops_src(),
                 if gqa {
                     "attn_output_gqa_split_f32"
@@ -2615,7 +2695,7 @@ impl Kernels {
             let r = self
                 .dev
                 .kernels()
-                .get("tuili_ops", ops_src(), "attn_output_reduce_f32")?;
+                .get("infero_ops", ops_src(), "attn_output_reduce_f32")?;
             let total = (dims.n_tokens * dims.n_heads * dims.d_head) as u32;
             let (nt, ncr) = (dims.n_tokens as i32, n_chunks as i32);
             let mut rb = self.dev.stream().launch_builder(&r);
@@ -2643,14 +2723,14 @@ impl Kernels {
         let group_i = 0i32;
         // Eight halves per thread and sixteen key slices per block, which is a
         // load width and a count of loads in flight rather than a different
-        // sum. `TUILI_ATTN_V1` puts the two-byte version back for A/B.
+        // sum. `INFERO_ATTN_V1` puts the two-byte version back for A/B.
         // `attn_output_v4_f32` -- eight halves a thread, sixteen key slices a
         // block -- and the GQA variant are CUDA-only for now; false takes
         // `attn_output_f32`, which is ported.
         let wide = cfg!(feature = "cuda")
             && dims.d_head.is_multiple_of(8)
             && dims.d_head >= 8
-            && std::env::var_os("TUILI_ATTN_V1").is_none();
+            && std::env::var_os("INFERO_ATTN_V1").is_none();
         let (lanes, slices) = if wide {
             let l = dims.d_head / 8;
             // A power of two, so the reduction across slices is a clean tree.
@@ -2659,7 +2739,7 @@ impl Kernels {
             (0, 0)
         };
         let f = self.dev.kernels().get(
-            "tuili_ops",
+            "infero_ops",
             ops_src(),
             match (wide, gqa) {
                 (true, _) => "attn_output_v4_f32",
@@ -2730,7 +2810,7 @@ impl Kernels {
         // vocab = 248320), 1.0-2.9x depending on token count, never a
         // regression (`examples/embed_row_check.rs`).
         if !cfg!(feature = "cuda") && ty == WeightType::Q4K {
-            let f = self.dev.kernels().get("tuili_quant", quant_src(), "embed_row_q4_K")?;
+            let f = self.dev.kernels().get("infero_quant", quant_src(), "embed_row_q4_K")?;
             let cfg = LaunchConfig {
                 grid_dim: (1, n_tokens as u32, 1),
                 block_dim: (128, 1, 1),
@@ -2745,7 +2825,7 @@ impl Kernels {
             });
         }
         let name = format!("gather_rows_{}", ty.suffix());
-        let f = self.dev.kernels().get("tuili_quant", quant_src(), &name)?;
+        let f = self.dev.kernels().get("infero_quant", quant_src(), &name)?;
         let cfg = LaunchConfig {
             grid_dim: (
                 (k as u32).div_ceil(ELEMENTWISE_BLOCK).max(1),
@@ -2787,7 +2867,7 @@ impl Kernels {
         // 5.6-5.9x faster, 40 GB/s to 235 -- this kernel was compute-bound on
         // redundant scalar work, not the memory traffic it looks like on
         // paper. `dequant_to_f16` is ~half of a prefill call's cost (measured
-        // on a 53-token prompt, `TUILI_METAL_PROFILE=1`), so this is not a
+        // on a 53-token prompt, `INFERO_METAL_PROFILE=1`), so this is not a
         // rounding error on that number.
         // `Q6_K` earns a smaller multiple: `dequant_q6_K_f16_vec` gives one
         // thread the same four elements `GEMV_BODY_Q6_K` already gives one
@@ -2810,7 +2890,7 @@ impl Kernels {
             (WeightType::Q6K, true) => "dequant_q6_K_f16_vec".to_string(),
             _ => format!("dequant_{}_f16", ty.suffix()),
         };
-        let f = self.dev.kernels().get("tuili_quant", quant_src(), &name)?;
+        let f = self.dev.kernels().get("infero_quant", quant_src(), &name)?;
         let work_items = match vec_group {
             Some(g) => (n_elements as u64) / g,
             None => n_elements as u64,
@@ -2940,7 +3020,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_mmvq", mmvq_src(), "quantize_q8_1_f32")?;
+            .get("infero_mmvq", mmvq_src(), "quantize_q8_1_f32")?;
         let k_i = k as i32;
         let mut b = self.dev.stream().launch_builder(&f);
         b.arg(out).arg(x).arg(&k_i);
@@ -2954,12 +3034,26 @@ impl Kernels {
     }
 
     /// Tokens one multi-token mat-vec block serves. Chosen per call.
+    ///
+    /// Rounded up to the smallest template that covers `n_tokens` in one
+    /// block, not down to the largest one under it: `mmvqt{T}`'s grid is
+    /// `(n, ceil(n_tokens / T), 1)`, so picking a `T` below `n_tokens` (the
+    /// previous rule, e.g. `T=4` for five tokens) buys a second row of blocks
+    /// that re-streams the *entire* weight matrix a second time to cover one
+    /// leftover token. That second pass is exactly the cost this kernel
+    /// exists to avoid -- a speculative verify pass at `k=4` (five rows)
+    /// measured 88.33 ms with `T=4` against 55.74 ms once dispatch got as far
+    /// as this kernel at all, and `T=8` (one block, three lanes idle rather
+    /// than a second launch) took that to correctness parity with `k=3`'s
+    /// four rows, which already landed on a one-block `T=4`. Idle lanes in a
+    /// bandwidth-bound kernel cost nothing; a second weight stream costs
+    /// everything.
     fn mmvq_t(n_tokens: usize) -> u32 {
         match n_tokens {
             0..=1 => 1,
-            2..=3 => 2,
-            4..=7 => 4,
-            8..=15 => 8,
+            2 => 2,
+            3..=4 => 4,
+            5..=8 => 8,
             _ => 16,
         }
     }
@@ -2986,7 +3080,7 @@ impl Kernels {
         anyhow::ensure!(Self::has_mmvq(ty), "no integer mat-vec for {ty}");
         let t = Self::mmvq_t(n_tokens);
         let name = format!("mmvqt{t}_{}", ty.suffix());
-        let f = self.dev.kernels().get("tuili_mmvq", mmvq_src(), &name)?;
+        let f = self.dev.kernels().get("infero_mmvq", mmvq_src(), &name)?;
         let slices = match ty {
             WeightType::Q8_0 => k / 8,
             WeightType::Q4K => k / 16,
@@ -3044,7 +3138,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_moe", moe_src(), "moe_topk_f32")?;
+            .get("infero_moe", moe_src(), "moe_topk_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (n_tokens as u32, 1, 1),
             block_dim: (per_vector_block(n_experts), 1, 1),
@@ -3093,7 +3187,7 @@ impl Kernels {
             "{n_slots} slots do not group into activation rows of {y_group}"
         );
         let name = format!("mmvq_moe_{}", ty.suffix());
-        let f = self.dev.kernels().get("tuili_moe", moe_src(), &name)?;
+        let f = self.dev.kernels().get("infero_moe", moe_src(), &name)?;
         let slices = match ty {
             WeightType::Q8_0 => k / 8,
             WeightType::Q4G128 | WeightType::Q4G128T => k / 32,
@@ -3139,7 +3233,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_moe", moe_src(), "moe_combine_f32")?;
+            .get("infero_moe", moe_src(), "moe_combine_f32")?;
         let total = d * n_tokens;
         let (d_i, k_i, total_i) = (d as i32, k as i32, total as i32);
         let mut b = self.dev.stream().launch_builder(&f);
@@ -3186,7 +3280,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_mmvq", mmvq_src(), "add_rms_norm_f16_f32")?;
+            .get("infero_mmvq", mmvq_src(), "add_rms_norm_f16_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (n_tokens as u32, 1, 1),
             block_dim: (rms_block(d), 1, 1),
@@ -3199,7 +3293,7 @@ impl Kernels {
                 bl.arg(out).arg(h);
             }
             None => {
-                bl.arg(out).arg(&tuili_gpu::NULL_BUFFER);
+                bl.arg(out).arg(&infero_gpu::NULL_BUFFER);
             }
         }
         bl.arg(&mut *x).arg(b).arg(weight).arg(&d_i).arg(&eps_f);
@@ -3228,7 +3322,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_mmvq", mmvq_src(), "rms_norm_f16_f32")?;
+            .get("infero_mmvq", mmvq_src(), "rms_norm_f16_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (n_tokens as u32, 1, 1),
             block_dim: (rms_block(d), 1, 1),
@@ -3266,7 +3360,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_mmvq", mmvq_src(), "rms_norm_q8_1_f32")?;
+            .get("infero_mmvq", mmvq_src(), "rms_norm_q8_1_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (n_tokens as u32, 1, 1),
             block_dim: (block, 1, 1),
@@ -3326,7 +3420,7 @@ impl Kernels {
         anyhow::ensure!(
             self.dev.caps().int_tensor_gemm,
             "the tensor-core integer gemm has no implementation on the {} backend",
-            tuili_gpu::BACKEND
+            infero_gpu::BACKEND
         );
         anyhow::ensure!(k.is_multiple_of(32), "mmq needs k divisible by 32, got {k}");
         if matches!(ty, WeightType::Q4K | WeightType::Q6K) {
@@ -3341,8 +3435,8 @@ impl Kernels {
         // a single contiguous sector.
         if ty == WeightType::Q4G128T {
             // One kernel reads this layout, and it is the one the layout was
-            // made for. `TUILI_MMQ_VARIANT` still selects a shape.
-            let v = match std::env::var("TUILI_MMQ_VARIANT") {
+            // made for. `INFERO_MMQ_VARIANT` still selects a shape.
+            let v = match std::env::var("INFERO_MMQ_VARIANT") {
                 Ok(s)
                     if s.starts_with("mmqz")
                         || s.starts_with("mmqy")
@@ -3369,7 +3463,7 @@ impl Kernels {
             // `mmqw<warps>[_<tiles>]`. An `mmqy`-style name pinned for the
             // layer matmuls has no instantiation here, and accepting it landed
             // as `mmqy1w8s2_q8_0s not found` at the first decode step.
-            match std::env::var("TUILI_MMQ_VARIANT") {
+            match std::env::var("INFERO_MMQ_VARIANT") {
                 Ok(v)
                     if v == "mmq"
                         || v.strip_prefix("mmq").is_some_and(|r| {
@@ -3386,7 +3480,7 @@ impl Kernels {
         } else {
             // `mmqp` is the epilogue probe: right pipeline, wrong answer. It
             // prices the per-group scale application and nothing else.
-            match std::env::var("TUILI_MMQ_VARIANT").as_deref() {
+            match std::env::var("INFERO_MMQ_VARIANT").as_deref() {
                 Ok("staged") => "mmq",
                 Ok("probe") => "mmqp",
                 Ok("direct") => "mmqd",
@@ -3536,7 +3630,7 @@ impl Kernels {
             let f = self
                 .dev
                 .kernels()
-                .get("tuili_mmq", mmq_src(), "mmq2r_q4_K")?;
+                .get("infero_mmq", mmq_src(), "mmq2r_q4_K")?;
             let cfg = LaunchConfig {
                 grid_dim: ((n as u32).div_ceil(128), (n_tokens as u32).div_ceil(16), 1),
                 block_dim: (256, 1, 1),
@@ -3556,7 +3650,7 @@ impl Kernels {
             let f = self
                 .dev
                 .kernels()
-                .get("tuili_mmq", mmq_src(), "mmq_readonly_q4_K")?;
+                .get("infero_mmq", mmq_src(), "mmq_readonly_q4_K")?;
             let cfg = LaunchConfig {
                 grid_dim: ((n as u32).div_ceil(64), 1, 1),
                 block_dim: (256, 1, 1),
@@ -3574,7 +3668,7 @@ impl Kernels {
             let f = self
                 .dev
                 .kernels()
-                .get("tuili_mmq", mmq_src(), &format!("mmqw_{}", ty.suffix()))?;
+                .get("infero_mmq", mmq_src(), &format!("mmqw_{}", ty.suffix()))?;
             let cfg = LaunchConfig {
                 grid_dim: (
                     (n as u32).div_ceil(64),
@@ -3736,7 +3830,7 @@ impl Kernels {
             } else {
                 4
             };
-            let bps = std::env::var("TUILI_MMQ_BPS")
+            let bps = std::env::var("INFERO_MMQ_BPS")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(default_bps);
@@ -3763,9 +3857,9 @@ impl Kernels {
             // 97.3 with `gate_up` down from 752 blocks to 224. The atomics and
             // the memset together are worth less than the block count they buy,
             // which is the same trade every other row-tile experiment on this
-            // kernel has made and lost. Off by default; `TUILI_MMQ_ALIGNED=1`
+            // kernel has made and lost. Off by default; `INFERO_MMQ_ALIGNED=1`
             // re-runs it.
-            let aligned = std::env::var("TUILI_MMQ_ALIGNED").is_ok_and(|v| v == "1")
+            let aligned = std::env::var("INFERO_MMQ_ALIGNED").is_ok_and(|v| v == "1")
                 && n_tiles >= self.dev.sm_count()
                 && n_tokens <= per_block as usize;
             // Never hand a block fewer than two of the flattened units. At the
@@ -3781,14 +3875,14 @@ impl Kernels {
             // 259, `ffn_gate` unchanged at 334 because its grid was never the
             // binding term. Fitting a constant per shape does better still —
             // 187 and 285 — and is overfitting to three matrices.
-            // `TUILI_MMQ_BLOCKS` pins the count, for testing whether the
+            // `INFERO_MMQ_BLOCKS` pins the count, for testing whether the
             // partition's *balance* matters rather than its size. At 376 blocks
             // `gate_up`'s 3584 units come out 9.53 to a block — so some get ten
             // and some nine — and 376 blocks over 188 SMs holding 2.9 each is
             // 0.69 of a wave, which exposes that 10% in full instead of
             // averaging it away. A count that divides the units evenly would
             // not. It is also what the non-monotonic bps sweep looks like.
-            if let Some(b) = std::env::var("TUILI_MMQ_BLOCKS")
+            if let Some(b) = std::env::var("INFERO_MMQ_BLOCKS")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
             {
@@ -3811,18 +3905,18 @@ impl Kernels {
         if accumulates {
             // The slices accumulate into `out`, so it has to start at zero.
             //
-            // `TUILI_MMQ_NO_ZERO=1` skips it and computes the wrong answer on
+            // `INFERO_MMQ_NO_ZERO=1` skips it and computes the wrong answer on
             // purpose: 130 of a step's ~420 graph nodes are these memsets, and
             // their cost is their bytes *plus* a node transition each. Their
             // execution time is 0.12 ms a step in a trace; this prices what
             // removing them would actually be worth. Same idea as `mmqp`.
-            if !std::env::var("TUILI_MMQ_NO_ZERO").is_ok_and(|v| v == "1") {
+            if !std::env::var("INFERO_MMQ_NO_ZERO").is_ok_and(|v| v == "1") {
                 self.dev.stream().memset_zeros(out)?;
             }
         }
-        let f = self.dev.kernels().get("tuili_mmq", mmq_src(), &name)?;
+        let f = self.dev.kernels().get("infero_mmq", mmq_src(), &name)?;
         if dyn_shared > 0 {
-            tuili_gpu::set_max_dynamic_shared(&f, dyn_shared)?;
+            infero_gpu::set_max_dynamic_shared(&f, dyn_shared)?;
         }
         let cfg = LaunchConfig {
             grid_dim: (
@@ -3889,14 +3983,14 @@ impl Kernels {
         dynamic: usize,
     ) -> Result<u32> {
         let src = match module {
-            "tuili_mmq" => mmq_src(),
-            "tuili_mmvq" => mmvq_src(),
-            "tuili_ops" => ops_src(),
+            "infero_mmq" => mmq_src(),
+            "infero_mmvq" => mmvq_src(),
+            "infero_ops" => ops_src(),
             _ => quant_src(),
         };
         let f = self.dev.kernels().get(module, src, name)?;
         if dynamic > 48 * 1024 {
-            tuili_gpu::set_max_dynamic_shared(&f, dynamic as u32)?;
+            infero_gpu::set_max_dynamic_shared(&f, dynamic as u32)?;
         }
         Ok(f.occupancy_max_active_blocks_per_multiprocessor(threads, dynamic, None)?)
     }
@@ -3911,9 +4005,9 @@ impl Kernels {
     #[cfg(feature = "cuda")]
     pub fn kernel_registers(&self, module: &'static str, name: &str) -> Result<(i32, i32)> {
         let src = match module {
-            "tuili_mmq" => mmq_src(),
-            "tuili_mmvq" => mmvq_src(),
-            "tuili_ops" => ops_src(),
+            "infero_mmq" => mmq_src(),
+            "infero_mmvq" => mmvq_src(),
+            "infero_ops" => ops_src(),
             _ => quant_src(),
         };
         let f = self.dev.kernels().get(module, src, name)?;
@@ -3935,27 +4029,27 @@ impl Kernels {
         blocks: u32,
     ) -> Result<()> {
         let name = match wide {
-            // `TUILI_MMQ_PROBE=coalesced` reads the same bytes as one 512-byte
+            // `INFERO_MMQ_PROBE=coalesced` reads the same bytes as one 512-byte
             // run a warp instead of eight 64-byte ones; see the kernel.
-            true if std::env::var("TUILI_MMQ_PROBE").as_deref() == Ok("coalesced") => {
+            true if std::env::var("INFERO_MMQ_PROBE").as_deref() == Ok("coalesced") => {
                 "mmq_bw_probe_c16"
             }
             // With the scale read the kernel also pays for, row-major or
             // block-major; see the kernels.
-            true if std::env::var("TUILI_MMQ_PROBE").as_deref() == Ok("scales") => {
+            true if std::env::var("INFERO_MMQ_PROBE").as_deref() == Ok("scales") => {
                 "mmq_bw_probe_s16"
             }
-            true if std::env::var("TUILI_MMQ_PROBE").as_deref() == Ok("scales_bm") => {
+            true if std::env::var("INFERO_MMQ_PROBE").as_deref() == Ok("scales_bm") => {
                 "mmq_bw_probe_sc16"
             }
             // A write stream beside the read one; see the kernel.
-            true if std::env::var("TUILI_MMQ_PROBE").as_deref() == Ok("rw") => {
+            true if std::env::var("INFERO_MMQ_PROBE").as_deref() == Ok("rw") => {
                 "mmq_bw_probe_rw16"
             }
             true => "mmq_bw_probe_w16",
             false => "mmq_bw_probe_w4",
         };
-        let f = self.dev.kernels().get("tuili_mmq", mmq_src(), name)?;
+        let f = self.dev.kernels().get("infero_mmq", mmq_src(), name)?;
         let cfg = LaunchConfig {
             grid_dim: (blocks, 1, 1),
             block_dim: (128, 1, 1),
@@ -3980,7 +4074,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_mmq", mmq_src(), "stream_read_probe")?;
+            .get("infero_mmq", mmq_src(), "stream_read_probe")?;
         let n_vec = (src.len() / 16) as i32;
         let cfg = LaunchConfig {
             grid_dim: (2048, 1, 1),
@@ -4014,7 +4108,7 @@ impl Kernels {
     /// and shared memory is what caps blocks per SM. Since the staging is
     /// latency-bound rather than bandwidth-bound, losing resident warps can
     /// cost more than the saved pass — so the thresholds are measured, not
-    /// derived. `TUILI_MMQ_TILES` overrides them for re-measuring.
+    /// derived. `INFERO_MMQ_TILES` overrides them for re-measuring.
     fn mmq_tiles(n_tokens: usize) -> u32 {
         if let Some(t) = Self::tiles_override() {
             return t;
@@ -4033,12 +4127,12 @@ impl Kernels {
         if n_tokens <= 16 { 1 } else { 2 }
     }
 
-    /// The f16-operand kernel `TUILI_MMQ_VARIANT` selects, if it selects one.
+    /// The f16-operand kernel `INFERO_MMQ_VARIANT` selects, if it selects one.
     ///
     /// The model has to ask, because this path wants a different activation
     /// buffer: f16 rather than Q8_1. Only Q4_G128 has such a kernel.
     /// The f16-operand kernel is the Q4_G128 default, unless
-    /// `TUILI_MMQ_VARIANT` names something else.
+    /// `INFERO_MMQ_VARIANT` names something else.
     ///
     /// Measured on every Q4_G128 shape a Llama-3.1-8B step touches, in GB/s of
     /// weights against `mmqd`, which held this slot before:
@@ -4081,7 +4175,7 @@ impl Kernels {
         // An explicitly pinned variant is pinned: without this the shape rule
         // below silently overrides it on the widest matrix, so pinning
         // `mmqy1w8s2` to measure the rule measured the rule.
-        if std::env::var_os("TUILI_MMQ_VARIANT").is_some() {
+        if std::env::var_os("INFERO_MMQ_VARIANT").is_some() {
             return Some(v);
         }
         // One shape for every width. `gate_up` used to get `mmqy2w8s2` — twice
@@ -4093,7 +4187,7 @@ impl Kernels {
         //
         // Re-measured on the Blackwell at 32 tokens, isolated (GB/s of
         // weights): 1164 for `mmqy1w8s2` against 1082 for `mmqy2w8s2`, 53.6 us
-        // against 57.7. In the served engine, one binary, `TUILI_MMQ_VARIANT`
+        // against 57.7. In the served engine, one binary, `INFERO_MMQ_VARIANT`
         // pinning the narrow shape for every matrix: **layers 5.898 ms against
         // 5.988 and 4828 tok/s against 4772**.
         //
@@ -4110,7 +4204,7 @@ impl Kernels {
         static VT: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
         match ty {
             WeightType::Q4G128T => *VT.get_or_init(|| {
-                match std::env::var("TUILI_MMQ_VARIANT") {
+                match std::env::var("INFERO_MMQ_VARIANT") {
                     // `mmqc` is the weight-ring family, which reads the same
                     // f16 activations and so belongs on this path too — it was
                     // unreachable from the model before, and measuring it
@@ -4126,7 +4220,7 @@ impl Kernels {
                     Err(_) => Some("mmqy1w8s2"),
                 }
             }),
-            _ => *V.get_or_init(|| match std::env::var("TUILI_MMQ_VARIANT") {
+            _ => *V.get_or_init(|| match std::env::var("INFERO_MMQ_VARIANT") {
                 Ok(v) if v.starts_with("mmqf") => Some(&*Box::leak(v.into_boxed_str())),
                 // Any other explicit name means the caller wants an integer
                 // kernel, and those take Q8_1 activations.
@@ -4136,11 +4230,11 @@ impl Kernels {
         }
     }
 
-    /// `TUILI_MMQ_SPLITS` pins the k-split factor.
+    /// `INFERO_MMQ_SPLITS` pins the k-split factor.
     fn mmq_splits() -> Option<u32> {
         static V: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
         *V.get_or_init(|| {
-            std::env::var("TUILI_MMQ_SPLITS")
+            std::env::var("INFERO_MMQ_SPLITS")
                 .ok()
                 .and_then(|v| v.parse().ok())
         })
@@ -4149,14 +4243,14 @@ impl Kernels {
     fn tiles_override() -> Option<u32> {
         static O: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
         *O.get_or_init(|| {
-            std::env::var("TUILI_MMQ_TILES").ok().and_then(|v| v.parse().ok())
+            std::env::var("INFERO_MMQ_TILES").ok().and_then(|v| v.parse().ok())
         })
     }
 
     fn warps_override() -> Option<u32> {
         static O: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
         *O.get_or_init(|| {
-            std::env::var("TUILI_MMQ_WARPS").ok().and_then(|v| v.parse().ok())
+            std::env::var("INFERO_MMQ_WARPS").ok().and_then(|v| v.parse().ok())
         })
     }
 
@@ -4182,7 +4276,7 @@ impl Kernels {
     /// blocks to 16. Measured end to end, a flat 8 gained 2% at batch 32 and
     /// lost 5% at batch 8 for exactly that reason.
     ///
-    /// `TUILI_MMQ_WARPS` overrides, for re-measuring on another device.
+    /// `INFERO_MMQ_WARPS` overrides, for re-measuring on another device.
     fn mmq_warps(&self, n: usize, _n_tokens: usize) -> u32 {
         if let Some(w) = Self::warps_override() {
             return w;
@@ -4216,9 +4310,9 @@ impl Kernels {
     #[cfg(feature = "cuda")]
     pub fn kernel_limits(&self, module: &'static str, name: &str) -> Result<(i32, i32)> {
         let src = match module {
-            "tuili_mmq" => mmq_src(),
-            "tuili_mmvq" => mmvq_src(),
-            "tuili_ops" => ops_src(),
+            "infero_mmq" => mmq_src(),
+            "infero_mmvq" => mmvq_src(),
+            "infero_ops" => ops_src(),
             _ => quant_src(),
         };
         let f = self.dev.kernels().get(module, src, name)?;
@@ -4235,7 +4329,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_mmq", mmq_src(), "ldmatrix_a_probe")?;
+            .get("infero_mmq", mmq_src(), "ldmatrix_a_probe")?;
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (32, 1, 1),
@@ -4256,7 +4350,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_mmq", mmq_src(), "ldmatrix_b_probe")?;
+            .get("infero_mmq", mmq_src(), "ldmatrix_b_probe")?;
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (32, 1, 1),
@@ -4283,7 +4377,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_mmq", mmq_src(), "mma_s8_probe")?;
+            .get("infero_mmq", mmq_src(), "mma_s8_probe")?;
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (32, 1, 1),
@@ -4359,7 +4453,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_mmq", mmq_src(), "mma_f16_probe")?;
+            .get("infero_mmq", mmq_src(), "mma_f16_probe")?;
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (32, 1, 1),
@@ -4385,7 +4479,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_mmq", mmq_src(), "mma_e4m3_probe")?;
+            .get("infero_mmq", mmq_src(), "mma_e4m3_probe")?;
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (32, 1, 1),
@@ -4407,7 +4501,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_mmq", mmq_src(), "mmq_deq4_f16_probe")?;
+            .get("infero_mmq", mmq_src(), "mmq_deq4_f16_probe")?;
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (32, 1, 1),
@@ -4506,10 +4600,10 @@ impl Kernels {
         &self,
         ty: WeightType,
         prefix: &str,
-    ) -> Result<tuili_gpu::Function> {
+    ) -> Result<infero_gpu::Function> {
         anyhow::ensure!(Self::has_mmvq(ty), "no integer mat-vec for {ty}");
         let name = format!("{prefix}{}", ty.suffix());
-        self.dev.kernels().get("tuili_mmvq", mmvq_src(), &name)
+        self.dev.kernels().get("infero_mmvq", mmvq_src(), &name)
     }
 
     /// Same block shape as [`Kernels::mmvq`], over the concatenated rows.
@@ -4577,14 +4671,14 @@ impl Kernels {
         // default. Read once — this is asked 225 times a step.
         static ROWS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
         let rows = *ROWS.get_or_init(|| {
-            std::env::var("TUILI_MMVQ_ROWS")
+            std::env::var("INFERO_MMVQ_ROWS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0)
         });
         let warped = rows > 0 && (n as u32).is_multiple_of(rows);
         let name = format!("{}{}", if warped { "mmvqw_" } else { "mmvq_" }, ty.suffix());
-        let f = self.dev.kernels().get("tuili_mmvq", mmvq_src(), &name)?;
+        let f = self.dev.kernels().get("infero_mmvq", mmvq_src(), &name)?;
         // One slice per thread, same shape as the float path.
         let slices = match ty {
             WeightType::Q8_0 => k / 8,
@@ -4638,7 +4732,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_quant", quant_src(), "gemv_mma_q4_K")?;
+            .get("infero_quant", quant_src(), "gemv_mma_q4_K")?;
         let cfg = LaunchConfig {
             grid_dim: (
                 (n as u32).div_ceil(8),
@@ -4671,7 +4765,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_quant", quant_src(), "gemv_mma_q8_0")?;
+            .get("infero_quant", quant_src(), "gemv_mma_q8_0")?;
         let cfg = LaunchConfig {
             grid_dim: (
                 (n as u32).div_ceil(8),
@@ -4713,7 +4807,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_quant", quant_src(), "gemv_mma_coop_q8_0")?;
+            .get("infero_quant", quant_src(), "gemv_mma_coop_q8_0")?;
         let cfg = LaunchConfig {
             grid_dim: (
                 (n as u32).div_ceil(32),
@@ -4765,7 +4859,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_quant", quant_src(), "gemv_mma_coop32_q4_K")?;
+            .get("infero_quant", quant_src(), "gemv_mma_coop32_q4_K")?;
         let cfg = LaunchConfig {
             grid_dim: (
                 (n as u32).div_ceil(32),
@@ -4886,7 +4980,7 @@ impl Kernels {
         //
         // So it loses at two -- which is what a speculative verification pass
         // is, and why speculation cannot be rescued this way -- and wins from
-        // eight, by 1.8x to 2.2x. `TUILI_MMA_MIN` moves the line.
+        // eight, by 1.8x to 2.2x. `INFERO_MMA_MIN` moves the line.
         let mma = !cfg!(feature = "cuda")
             && ty == WeightType::Q4K
             && n_tokens >= mma_min()
@@ -4906,8 +5000,8 @@ impl Kernels {
             // rather than re-guessing a new one -- there is no token count
             // left where the plain kernel wins back. Overridable for
             // re-measuring rather than arguing about it, same as
-            // `TUILI_MMA_MIN` above.
-            let shared_min: usize = std::env::var("TUILI_MMA_SHARED_MIN")
+            // `INFERO_MMA_MIN` above.
+            let shared_min: usize = std::env::var("INFERO_MMA_SHARED_MIN")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|v| *v > 0)
@@ -4928,9 +5022,9 @@ impl Kernels {
         // 32-token floor has: `gemv_mma_coop_q8_0`'s 32-token-wide tile
         // loses to the single-tile `gemv_mma_q8_0` below 24 tokens
         // (0.75-0.92x, mostly-empty tile) and wins from 24 up
-        // (1.14-1.62x). `TUILI_Q8_0_COOP_MIN` moves the line.
+        // (1.14-1.62x). `INFERO_Q8_0_COOP_MIN` moves the line.
         if !cfg!(feature = "cuda") && ty == WeightType::Q8_0 && n_tokens >= 8 && n as u32 >= 32 {
-            let coop_min: usize = std::env::var("TUILI_Q8_0_COOP_MIN")
+            let coop_min: usize = std::env::var("INFERO_Q8_0_COOP_MIN")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|v| *v > 0)
@@ -4950,7 +5044,7 @@ impl Kernels {
         } else {
             format!("gemv{per}_{}", ty.suffix())
         };
-        let f = self.dev.kernels().get("tuili_quant", quant_src(), &name)?;
+        let f = self.dev.kernels().get("infero_quant", quant_src(), &name)?;
         // Size the block to the work rather than to a constant: an oversized
         // block idles most of its threads and still pays for the block-wide
         // reduction, which for the vocab projection is the difference between
@@ -5018,7 +5112,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_turboquant", tq_src(), "tq_matvec")?;
+            .get("infero_turboquant", tq_src(), "tq_matvec")?;
         let cfg = LaunchConfig {
             grid_dim: (n_vec as u32, 1, 1),
             block_dim: (per_vector_block(d), 1, 1),
@@ -5054,7 +5148,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_turboquant", tq_src(), "tq_store_v")?;
+            .get("infero_turboquant", tq_src(), "tq_store_v")?;
         let cfg = LaunchConfig {
             grid_dim: (n_kv_heads as u32, n_tokens as u32, 1),
             block_dim: (per_vector_block(d), 1, 1),
@@ -5109,7 +5203,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_turboquant", tq_src(), "tq_store_k")?;
+            .get("infero_turboquant", tq_src(), "tq_store_k")?;
         let cfg = LaunchConfig {
             grid_dim: (n_kv_heads as u32, n_tokens as u32, 1),
             block_dim: (per_vector_block(d), 1, 1),
@@ -5168,7 +5262,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_turboquant", tq_src(), "tq_attn_scores")?;
+            .get("infero_turboquant", tq_src(), "tq_attn_scores")?;
         let cfg = LaunchConfig {
             grid_dim: (
                 (kv_len as u32).div_ceil(SCORE_WARPS).max(1),
@@ -5235,7 +5329,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_turboquant", tq_src(), "tq_attn_output")?;
+            .get("infero_turboquant", tq_src(), "tq_attn_output")?;
         let cfg = LaunchConfig {
             grid_dim: (dims.n_heads as u32, dims.n_tokens as u32, 1),
             block_dim: (per_vector_block(dims.d_head), 1, 1),
@@ -5322,7 +5416,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_turboquant", tq_src(), "tq_attn_decode_f32")?;
+            .get("infero_turboquant", tq_src(), "tq_attn_decode_f32")?;
         let block = (SCORE_WARPS * 32).max(per_vector_block(dims.d_head));
         let tile = block / 32;
         let cfg = LaunchConfig {
@@ -5389,7 +5483,7 @@ impl Kernels {
         let r = self
             .dev
             .kernels()
-            .get("tuili_ops", ops_src(), "attn_flash_reduce_f32")?;
+            .get("infero_ops", ops_src(), "attn_flash_reduce_f32")?;
         let part = partial.as_view();
         let total = (dims.n_tokens * dims.n_heads * dims.d_head) as u32;
         let (nt, nc) = (dims.n_tokens as i32, n_chunks as i32);
@@ -5423,7 +5517,7 @@ impl Kernels {
     ///
     /// The whole implementation is in the backend, because reaching MPS needs
     /// the raw `MTLBuffer` behind a view and that is not something a neutral
-    /// caller should be able to do. See `tuili_metal::gemm`.
+    /// caller should be able to do. See `infero_metal::gemm`.
     ///
     /// One difference from the cuBLAS path worth carrying at the call site:
     /// cuBLAS is asked for an f32 accumulator with f16 operands, and MPS
@@ -5441,7 +5535,7 @@ impl Kernels {
         n: usize,
     ) -> Result<()> {
         self.dev.profile().time("gemm_f16", self.dev.stream(), || {
-            tuili_gpu::gemm_f16_to_f32(&self.dev, c, a, b, n_tokens, k, n)
+            infero_gpu::gemm_f16_to_f32(&self.dev, c, a, b, n_tokens, k, n)
         })
     }
 

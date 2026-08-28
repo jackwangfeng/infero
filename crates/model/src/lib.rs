@@ -36,18 +36,18 @@ mod sampling;
 pub mod weights;
 
 use anyhow::{Context, Result};
-use tuili_gpu::{Buf, View, ViewMut};
-use tuili_gpu::{Event as CudaEvent, OwnedStream as CudaStream};
+use infero_gpu::{Buf, View, ViewMut};
+use infero_gpu::{Event as CudaEvent, OwnedStream as CudaStream};
 use half::f16;
 use std::sync::Arc;
-use tuili_gpu::Device;
-use tuili_gguf::Gguf;
-use tuili_kernels::{AttnDims, BatchLayout, Kernels, KvQuant, TqTables};
+use infero_gpu::Device;
+use infero_gguf::Gguf;
+use infero_kernels::{AttnDims, BatchLayout, Kernels, KvQuant, TqTables};
 
 pub use cache::{KvPool, SeqId};
 pub use config::Config;
 pub use sampling::{Sampler, SamplingParams};
-pub use tuili_kernels::KvQuant as KvCacheQuant;
+pub use infero_kernels::KvQuant as KvCacheQuant;
 pub use weights::Weights;
 
 use weights::Matrix;
@@ -114,19 +114,86 @@ fn batch_ceiling(max_logit_rows: usize) -> usize {
 /// mat-vec, and a chunk small enough to do that has given up the thing chunks
 /// are being enlarged for.
 ///
-/// `TUILI_BATCH_TOKENS` overrides it outright, budget included, because the
+/// `INFERO_BATCH_TOKENS` overrides it outright, budget included, because the
 /// person measuring is entitled to a worse setting than this picks.
-pub fn batch_tokens_for(n_heads: usize, max_seq: usize, max_logit_rows: usize) -> usize {
+///
+/// The budget only applies when `needs_score_buffer` is true. A model whose
+/// attention shape always takes a fused kernel (see [`needs_score_buffer`])
+/// never materializes the `n_heads * chunk * max_seq` buffer this trades
+/// against, so throttling the chunk to protect it would only be shrinking
+/// prefill for no memory saved.
+///
+/// `fp8_ceiling` is separate from that budget and applies regardless of
+/// `needs_score_buffer`: it is
+/// [`infero_kernels::fp8::MMA_MAX_TOKENS_FP8`][mma], the width past which an
+/// FP8-weighted model's tensor-core GEMM declines the shape and every matmul
+/// in the chunk falls to the expand-then-dequantize path instead -- a
+/// correctness-preserving but much slower kernel that raising this function's
+/// other ceilings (a large `--max-seqs`, or a fused attention kernel freeing
+/// `needs_score_buffer`) could otherwise walk the chunk straight into. `None`
+/// for a model with no FP8 weights, which that path never applies to.
+///
+/// [mma]: infero_kernels::fp8::MMA_MAX_TOKENS_FP8
+pub fn batch_tokens_for(
+    n_heads: usize,
+    max_seq: usize,
+    max_logit_rows: usize,
+    needs_score_buffer: bool,
+    fp8_ceiling: Option<usize>,
+) -> usize {
     let ceiling = batch_ceiling(max_logit_rows);
-    if let Some(n) = std::env::var("TUILI_BATCH_TOKENS")
+    if let Some(n) = std::env::var("INFERO_BATCH_TOKENS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
     {
         return n.min(ceiling);
     }
-    let per_token = n_heads.max(1) * max_seq.max(1) * std::mem::size_of::<f32>();
-    (SCORE_BUDGET / per_token.max(1)).clamp(64, ceiling)
+    let chunk = if !needs_score_buffer {
+        ceiling
+    } else {
+        let per_token = n_heads.max(1) * max_seq.max(1) * std::mem::size_of::<f32>();
+        (SCORE_BUDGET / per_token.max(1)).clamp(64, ceiling)
+    };
+    match fp8_ceiling {
+        Some(cap) => chunk.min(cap),
+        None => chunk,
+    }
+}
+
+/// Whether this model's attention will ever run the score-materializing
+/// three-kernel path (`attn_scores`/`tq_attn_scores`, `attn_softmax`,
+/// `attn_output`/`tq_attn_output`) rather than a kernel that tiles the KV
+/// range and never writes a `[heads, tokens, kv_len]` matrix to HBM.
+///
+/// Both fused kernels' gates ([`Kernels::decode_attention`] on CUDA,
+/// [`Kernels::tq_decode_attention`]) depend only on the model's GQA shape,
+/// not on how many tokens a step carries or how far into the sequence it
+/// is -- so this can be decided once at load time, the same way `max_seq`
+/// and `kv_quant` are fixed for the process's lifetime.
+///
+/// [`Kernels::decode_attention`]'s Metal fallback *does* depend on `kv_len`
+/// (capped at 8192), which a probe taken once at load time cannot rule out
+/// for the rest of the run -- so this stays conservative (`true`) off CUDA
+/// rather than risk sizing the score buffer for a kernel that stops being
+/// chosen once a sequence grows past that cap.
+fn needs_score_buffer(kern: &Kernels, cfg: &Config, max_seq: usize, kv_quant: KvQuant) -> bool {
+    if !cfg!(feature = "cuda") {
+        return true;
+    }
+    let dims = AttnDims {
+        n_heads: cfg.n_heads,
+        n_kv_heads: cfg.n_kv_heads,
+        d_head: cfg.d_head,
+        n_slots: 0,
+        n_tokens: 0,
+    };
+    let fused = if kv_quant.is_quantized() {
+        kern.tq_decode_attention(&dims)
+    } else {
+        kern.decode_attention(&dims, max_seq)
+    };
+    !fused
 }
 
 /// Default ceiling on sequences that may ask for logits in one pass.
@@ -195,12 +262,46 @@ pub struct BatchItem<'a> {
     ///
     /// Carried on the item rather than held per sequence because a chunked
     /// prefill splits a prompt at token boundaries that know nothing about where
-    /// an image sits: the caller that cut the chunk is the only one that can say
-    /// which feature rows belong to it. Its length must equal the number of
-    /// placeholder ids in `tokens` — [`Model::forward_batch_device`] refuses
-    /// otherwise rather than splicing a prefix, because a count mismatch means
-    /// the grid the tower ran on is not the grid the prompt was built for.
+    /// an image or video sits: the caller that cut the chunk is the only one
+    /// that can say which feature rows belong to it. This can be the *whole*
+    /// clip's features, or -- once a placeholder run outgrows one step's
+    /// `batch_tokens` budget -- the same clip across several chunks in a row,
+    /// each seeing however many of its placeholder tokens landed in that
+    /// chunk; `vision_row_offset` below is what tells `forward_batch_device`
+    /// which of the clip's rows this chunk's tokens correspond to. A chunk
+    /// with no placeholder tokens at all (before the run starts, or after it
+    /// ends) is fine too -- the splice is a no-op for it.
     pub vision: Option<&'a VisionFeatures>,
+    /// How many of `vision`'s feature rows earlier chunks of this same
+    /// sequence already consumed -- `0` for a clip whose whole placeholder run
+    /// lands in one chunk (the common case), and for chunks that come before
+    /// or after the run (there `forward_batch_device` finds no placeholder ids
+    /// in `tokens` and never reads this). See `Running::vision_at` in the
+    /// scheduler, which is what a caller slicing at `from..from+len` computes
+    /// this from (`from.saturating_sub(vision_at)`).
+    pub vision_row_offset: usize,
+    /// This chunk's absolute M-RoPE `[T, H, W]` positions, token-major
+    /// (`3 * tokens.len()` entries), for a model with `cfg.mrope_section` set.
+    ///
+    /// `None` for every model without one, and for a decode step even on a
+    /// model that has one — a single generated token is never mid-image, so
+    /// its three axes are always `pool.len(seq) + mrope_delta` and there is
+    /// nothing here to look up. `Some` only for a prefill chunk that overlaps
+    /// a spliced sequence's absolute position array, sliced by the caller at
+    /// `from..from+len` — see `Running::mrope` in the scheduler, which owns
+    /// the array this borrows from.
+    pub mrope: Option<&'a [i32]>,
+    /// The constant to add to a plain running length to get this sequence's
+    /// M-RoPE position, on every axis, when `mrope` above is `None`.
+    ///
+    /// Zero for a model or a sequence without M-RoPE, which reproduces
+    /// `pool.len(seq) + k` on all three axes — identical to the one-axis
+    /// scalar position. Negative for a sequence that has passed through an
+    /// image: M-RoPE's image advance rule moves the running position by the
+    /// larger spatial extent rather than by token count, so the position
+    /// after an image is *behind* where token-counting would put it. See
+    /// `qwen35_vision::llm_position_ids`'s doc comment.
+    pub mrope_delta: i32,
 }
 
 impl<'a> BatchItem<'a> {
@@ -210,6 +311,9 @@ impl<'a> BatchItem<'a> {
             tokens,
             wants_logits: true,
             vision: None,
+            vision_row_offset: 0,
+            mrope: None,
+            mrope_delta: 0,
         }
     }
 
@@ -219,6 +323,9 @@ impl<'a> BatchItem<'a> {
             tokens,
             wants_logits: false,
             vision: None,
+            vision_row_offset: 0,
+            mrope: None,
+            mrope_delta: 0,
         }
     }
 }
@@ -278,7 +385,7 @@ const GEMM_THRESHOLD_DEFAULT: usize = 16;
 fn gemm_threshold() -> usize {
     static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
-        std::env::var("TUILI_GEMM_THRESHOLD")
+        std::env::var("INFERO_GEMM_THRESHOLD")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|v| *v > 0)
@@ -299,7 +406,7 @@ const GRAPH_KV_BUCKET: usize = 64;
 /// The bucket, overridable so the trade can be measured: coarser buckets mean
 /// fewer captures and more masked KV read per step, finer ones the reverse.
 fn graph_kv_bucket() -> usize {
-    std::env::var("TUILI_KV_BUCKET")
+    std::env::var("INFERO_KV_BUCKET")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
@@ -315,22 +422,22 @@ fn graph_kv_bucket() -> usize {
 /// step's 549 nodes, which is what a graph launch costs when the driver has to
 /// set the executable up again rather than replay one it has already staged.
 ///
-/// It is not the instantiation. `TUILI_GRAPH_MODE` was added to price the two
+/// It is not the instantiation. `INFERO_GRAPH_MODE` was added to price the two
 /// alternatives and they are the same number: `autofree` 8.46 ms a step,
 /// `plain` plus an explicit `upload()` 8.60, and `INSTANTIATE_FLAG_UPLOAD` is
 /// rejected outright by the driver (`CUDA_ERROR_INVALID_VALUE`) because it
 /// needs the `WithParams` form. Most of the 721 us is the node-level tracing
 /// that measured it: the same server runs a 7.71 ms step without `nsys` and an
 /// 8.72 ms step under it. Dropping the graph entirely costs 0.8 ms a step
-/// (`TUILI_NO_GRAPH=1`: 9.30 against 8.49), so the graph is paying — it just
+/// (`INFERO_NO_GRAPH=1`: 9.30 against 8.49), so the graph is paying — it just
 /// is not free.
 ///
 /// The switch stays so the result is re-runnable; the default is what it has
 /// always been.
-fn graph_instantiate_flags() -> tuili_gpu::GraphFlags {
-    use tuili_gpu::GraphFlags as F;
+fn graph_instantiate_flags() -> infero_gpu::GraphFlags {
+    use infero_gpu::GraphFlags as F;
     static PLAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *PLAIN.get_or_init(|| std::env::var("TUILI_GRAPH_MODE").as_deref() == Ok("plain")) {
+    if *PLAIN.get_or_init(|| std::env::var("INFERO_GRAPH_MODE").as_deref() == Ok("plain")) {
         // The enum has no zero variant; instantiate takes the raw value.
         return unsafe { std::mem::transmute::<u32, F>(0) };
     }
@@ -345,7 +452,7 @@ fn graph_instantiate_flags() -> tuili_gpu::GraphFlags {
 /// inference worker once and used only from there, so a graph has exactly one
 /// owner for its whole life. `CudaGraph` is `!Send` only because it wraps raw
 /// handles.
-struct SendGraph(tuili_gpu::Graph);
+struct SendGraph(infero_gpu::Graph);
 
 // Safety: as above — one owner, moved rather than shared, and every `Model`
 // method takes `&mut self`.
@@ -382,6 +489,12 @@ struct Activations {
     logits: Buf<f32>,
     token_ids: Buf<i32>,
     positions: Buf<i32>,
+    /// `[chunk, 3]`, token-major `[T, H, W]` — fed to the rope kernels
+    /// instead of `positions` whenever `cfg.mrope_section` is set. Allocated
+    /// unconditionally (`3 * chunk` i32, trivial next to the buffers around
+    /// it) rather than behind an `Option`, so every model pays the same fixed
+    /// shape and only `pos_stride` decides which buffer the rope call reads.
+    mrope_positions: Buf<i32>,
     /// Per token: which sequence row it belongs to.
     seq_of: Buf<i32>,
     /// Per token: the pool slot its key/value go to.
@@ -543,18 +656,18 @@ pub struct Model {
     tq: Option<TqBuffers>,
     offload: Option<Offload>,
     kv_quant: KvQuant,
-    /// False when `TUILI_NO_MMVQ` is set, forcing decode through the float
+    /// False when `INFERO_NO_MMVQ` is set, forcing decode through the float
     /// mat-vec. Read once at load; the point is to be able to A/B the integer
     /// path's accuracy against a reference that shares everything else.
     use_mmvq: bool,
-    /// False when `TUILI_NO_MMQ` is set, sending batches back through
+    /// False when `INFERO_NO_MMQ` is set, sending batches back through
     /// `dequant_to_f16` + cuBLAS. Separate from `use_mmvq` so the tensor-core
     /// GEMM can be A/B'd without also disabling the batch-1 mat-vec.
     use_mmq: bool,
     /// Decode graphs by (tokens, kv bucket). A step issues roughly 700 kernel
     /// launches; replaying one graph removes that cost.
     graphs: std::collections::HashMap<(u64, usize, usize, bool), GraphSlot>,
-    /// Cleared by `TUILI_NO_GRAPH`, for measuring what the graphs are worth.
+    /// Cleared by `INFERO_NO_GRAPH`, for measuring what the graphs are worth.
     use_graph: bool,
     max_logit_rows: usize,
     /// Tokens one forward pass carries, resolved once against this session's
@@ -601,36 +714,36 @@ pub struct Model {
     /// MTP head is loaded under.
     vision: Option<weights::VisionTower>,
     /// One vision call's activations, sized by the largest image admitted.
-    vision_scratch: Option<tuili_kernels::vision::VisionScratch>,
+    vision_scratch: Option<infero_kernels::vision::VisionScratch>,
 }
 
 /// Device-side scratch for sampling. Sized once, at the batch and vocabulary
 /// the model was built for.
 struct SampleBufs {
-    params: tuili_gpu::Buf<f32>,
+    params: infero_gpu::Buf<f32>,
     /// Slice winners for the split greedy argmax; see
     /// `Kernels::sample_rows_greedy`.
-    arg_v: tuili_gpu::Buf<f32>,
-    arg_i: tuili_gpu::Buf<i32>,
-    pen_tok: tuili_gpu::Buf<i32>,
-    pen_cnt: tuili_gpu::Buf<i32>,
-    pen_len: tuili_gpu::Buf<i32>,
-    rnd: tuili_gpu::Buf<f64>,
-    out: tuili_gpu::Buf<u32>,
+    arg_v: infero_gpu::Buf<f32>,
+    arg_i: infero_gpu::Buf<i32>,
+    pen_tok: infero_gpu::Buf<i32>,
+    pen_cnt: infero_gpu::Buf<i32>,
+    pen_len: infero_gpu::Buf<i32>,
+    rnd: infero_gpu::Buf<f64>,
+    out: infero_gpu::Buf<u32>,
     /// Per-slice top-k candidates for `Kernels::sample_rows_split`.
-    cand_v: tuili_gpu::Buf<f32>,
-    cand_i: tuili_gpu::Buf<i32>,
+    cand_v: infero_gpu::Buf<f32>,
+    cand_i: infero_gpu::Buf<i32>,
     /// The surviving distribution each row drew from, which is what the
     /// speculative acceptance rule composes with.
-    surv_id: tuili_gpu::Buf<u32>,
-    surv_p: tuili_gpu::Buf<f32>,
-    surv_len: tuili_gpu::Buf<i32>,
+    surv_id: infero_gpu::Buf<u32>,
+    surv_p: infero_gpu::Buf<f32>,
+    surv_len: infero_gpu::Buf<i32>,
     stride: usize,
     /// Entries the candidate and survivor buffers hold a row.
     top_k: usize,
 }
 
-/// Where a step's *GPU* time goes, under `TUILI_PHASE_EVENTS`.
+/// Where a step's *GPU* time goes, under `INFERO_PHASE_EVENTS`.
 ///
 /// `StepPhases` below marks host timestamps, which say when work was issued and
 /// not when it ran. `Profile` says when each kernel ran but charges an event
@@ -641,7 +754,7 @@ struct SampleBufs {
 /// It exists to attribute the 0.4 ms a step that subtracting per-kernel
 /// estimates from the wall clock could not.
 struct PhaseEvents {
-    ev: Vec<tuili_gpu::Event>,
+    ev: Vec<infero_gpu::Event>,
     /// Accumulated spans and the step count, so one line covers many steps.
     sums: [f64; 3],
     steps: u64,
@@ -649,21 +762,21 @@ struct PhaseEvents {
 
 impl PhaseEvents {
     fn new(dev: &Device) -> Result<Option<Self>> {
-        if std::env::var_os("TUILI_PHASE_EVENTS").is_none() {
+        if std::env::var_os("INFERO_PHASE_EVENTS").is_none() {
             return Ok(None);
         }
         let mut ev = Vec::new();
         for _ in 0..4 {
             ev.push(
                 dev.context()
-                    .new_event(Some(tuili_gpu::EVENT_DEFAULT))?,
+                    .new_event(Some(infero_gpu::EVENT_DEFAULT))?,
             );
         }
         Ok(Some(Self { ev, sums: [0.0; 3], steps: 0 }))
     }
 }
 
-/// Where a forward pass spent its wall clock, under `TUILI_STEP_TIMING`.
+/// Where a forward pass spent its wall clock, under `INFERO_STEP_TIMING`.
 ///
 /// `forward_batch` ends with a device synchronise, so these are GPU times, not
 /// launch times: the prologue's mark lands before any of the layer work has
@@ -677,7 +790,7 @@ pub(crate) struct StepPhases {
 impl StepPhases {
     pub(crate) fn start() -> Self {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let on = *ON.get_or_init(|| std::env::var_os("TUILI_STEP_TIMING").is_some());
+        let on = *ON.get_or_init(|| std::env::var_os("INFERO_STEP_TIMING").is_some());
         Self {
             t0: on.then(std::time::Instant::now),
             marks: std::cell::RefCell::new(Vec::new()),
@@ -792,7 +905,7 @@ impl Model {
     ) -> Result<Self> {
         let max_logit_rows = max_logit_rows.clamp(1, MAX_BATCH_TOKENS);
         let dir = dir.as_ref();
-        let shards = tuili_safetensors::Shards::open_dir(dir)?;
+        let shards = infero_safetensors::Shards::open_dir(dir)?;
         let json = shards.json("config.json")?;
         let name = dir
             .file_name()
@@ -861,13 +974,17 @@ impl Model {
         // Resolved here and stored, not recomputed: the buffers below are sized
         // from it and `forward` splits its input by it, and those two disagreeing
         // is the kind of mismatch `add_assign` already cost a day of.
-        let batch_tokens = batch_tokens_for(cfg.n_heads, max_seq, max_logit_rows);
+        let needs_scores = needs_score_buffer(&kern, &cfg, max_seq, kv_quant);
+        let fp8_ceiling = (w.dominant_type() == infero_kernels::WeightType::F8E4M3)
+            .then_some(infero_kernels::fp8::MMA_MAX_TOKENS_FP8);
+        let batch_tokens =
+            batch_tokens_for(cfg.n_heads, max_seq, max_logit_rows, needs_scores, fp8_ceiling);
         tracing::info!(
             batch_tokens,
-            score_mib = cfg.n_heads * batch_tokens * max_seq * 4 >> 20,
+            score_mib = cfg.n_heads * batch_tokens * (if needs_scores { max_seq } else { 1 }) * 4 >> 20,
             "tokens a pass carries"
         );
-        let act = Activations::new(&dev, &cfg, max_seq, max_logit_rows)?;
+        let act = Activations::new(&dev, &cfg, max_seq, max_logit_rows, needs_scores, batch_tokens)?;
         let scratch = Scratch {
             w16: dev
                 .stream()
@@ -903,7 +1020,7 @@ impl Model {
                         .d_ff
                         .max(cfg.d_model)
                         .max(cfg.d_attn())
-                        .div_ceil(tuili_kernels::fp8::ACT_QUANT_GROUP),
+                        .div_ceil(infero_kernels::fp8::ACT_QUANT_GROUP),
             )?,
         };
 
@@ -930,9 +1047,9 @@ impl Model {
             None
         };
 
-        let use_mmvq = std::env::var_os("TUILI_NO_MMVQ").is_none();
+        let use_mmvq = std::env::var_os("INFERO_NO_MMVQ").is_none();
         if !use_mmvq {
-            tracing::warn!("TUILI_NO_MMVQ set: decode will use the float mat-vec");
+            tracing::warn!("INFERO_NO_MMVQ set: decode will use the float mat-vec");
         }
         // Per-kernel timing records and synchronises CUDA events, which is
         // illegal on a stream that is capturing. The two tools answer different
@@ -945,11 +1062,11 @@ impl Model {
         // part of this backend's per-step overhead lives: 880 dispatches at
         // 18.3 us of command-buffer submit each.
         let use_graph = cfg!(feature = "cuda")
-            && std::env::var_os("TUILI_NO_GRAPH").is_none()
+            && std::env::var_os("INFERO_NO_GRAPH").is_none()
             && !dev.profile().enabled();
-        let use_mmq = std::env::var_os("TUILI_NO_MMQ").is_none();
+        let use_mmq = std::env::var_os("INFERO_NO_MMQ").is_none();
         if !use_mmq {
-            tracing::warn!("TUILI_NO_MMQ set: batches will use dequant + cuBLAS");
+            tracing::warn!("INFERO_NO_MMQ set: batches will use dequant + cuBLAS");
         }
         let logits_host = vec![0.0; max_logit_rows * cfg.vocab_size];
         dev.synchronize()?;
@@ -1035,7 +1152,7 @@ impl Model {
     /// the file states dtypes per tensor and the loader may re-encode them, so
     /// what the model is *running* is a property of the loaded matrices rather
     /// than of the file.
-    pub fn dominant_weight_type(&self) -> tuili_kernels::WeightType {
+    pub fn dominant_weight_type(&self) -> infero_kernels::WeightType {
         self.w.dominant_type()
     }
 
@@ -1249,6 +1366,17 @@ impl Model {
         let mut positions = Vec::with_capacity(n_tokens);
         let mut slots = Vec::with_capacity(n_tokens);
         let mut logit_rows = Vec::with_capacity(n_logit_rows);
+        // Token-major `[T, H, W]`, built only for a model with M-RoPE -- see
+        // `Kernels::rope_qk_partial`'s doc comment and `BatchItem::mrope`.
+        // `positions` above already carries the plain running length every
+        // model needs for the slot table and the causal mask; this is a
+        // second, parallel array only the rope call reads.
+        let has_mrope = self.cfg.mrope_section.is_some();
+        let mut mrope = if has_mrope {
+            Vec::with_capacity(n_tokens * 3)
+        } else {
+            Vec::new()
+        };
         let mut kv_len = 0usize;
 
         // Per sequence slot: where its tokens begin in this flat batch, and how
@@ -1261,6 +1389,28 @@ impl Model {
                 starts[item.seq.0] = (token_ids.len(), start);
             }
             let taken = pool.extend(item.seq, item.tokens.len())?;
+            if has_mrope {
+                match item.mrope {
+                    Some(m) => {
+                        anyhow::ensure!(
+                            m.len() == 3 * item.tokens.len(),
+                            "a batch item carries {} mrope entries for {} tokens, \
+                             expected {} -- the position array was built for a \
+                             different splice than the tokens it is paired with",
+                            m.len(),
+                            item.tokens.len(),
+                            3 * item.tokens.len()
+                        );
+                        mrope.extend_from_slice(m);
+                    }
+                    None => {
+                        for k in 0..item.tokens.len() {
+                            let p = (start + k) as i32 + item.mrope_delta;
+                            mrope.extend_from_slice(&[p, p, p]);
+                        }
+                    }
+                }
+            }
             for (k, (&tok, &slot)) in item.tokens.iter().zip(&taken).enumerate() {
                 token_ids.push(tok as i32);
                 seq_of.push(item.seq.0 as i32);
@@ -1284,6 +1434,12 @@ impl Model {
         stream.memcpy_htod(&token_ids, &mut self.act.token_ids.slice_mut(..n_tokens))?;
         stream.memcpy_htod(&seq_of, &mut self.act.seq_of.slice_mut(..n_tokens))?;
         stream.memcpy_htod(&positions, &mut self.act.positions.slice_mut(..n_tokens))?;
+        if has_mrope {
+            stream.memcpy_htod(
+                &mrope,
+                &mut self.act.mrope_positions.slice_mut(..n_tokens * 3),
+            )?;
+        }
         stream.memcpy_htod(&slots, &mut self.act.slots.slice_mut(..n_tokens))?;
         if n_logit_rows > 0 {
             stream.memcpy_htod(
@@ -1365,17 +1521,31 @@ impl Model {
                         "vision features are {} wide and the embedding is {d}",
                         f.out_hidden
                     );
-                    let rows = self.vision_targets(item.tokens, f.tokens)?;
-                    let shifted: Vec<i32> =
-                        rows.iter().map(|r| *r + base as i32).collect();
-                    let dst = self.dev.stream().clone_htod(&shifted)?;
-                    self.kern.vision_splice(
-                        &mut self.act.x.slice_mut(..n_tokens * d),
-                        &f.view(),
-                        &dst.as_view(),
-                        d,
-                        f.tokens,
-                    )?;
+                    let rows = self.vision_targets(item.tokens)?;
+                    // A chunk before or after the placeholder run has none --
+                    // common once one clip's run spans several chunks, see
+                    // `BatchItem::vision_row_offset`'s doc comment.
+                    if !rows.is_empty() {
+                        let n = rows.len();
+                        anyhow::ensure!(
+                            item.vision_row_offset + n <= f.tokens,
+                            "this chunk wants rows {}..{} of a {}-row clip; a \
+                             chunk-slicing bug in the caller, not a request problem",
+                            item.vision_row_offset,
+                            item.vision_row_offset + n,
+                            f.tokens
+                        );
+                        let shifted: Vec<i32> =
+                            rows.iter().map(|r| *r + base as i32).collect();
+                        let dst = self.dev.stream().clone_htod(&shifted)?;
+                        self.kern.vision_splice(
+                            &mut self.act.x.slice_mut(..n_tokens * d),
+                            &f.rows_view(item.vision_row_offset, n),
+                            &dst.as_view(),
+                            d,
+                            n,
+                        )?;
+                    }
                 }
                 base += item.tokens.len();
             }
@@ -1419,7 +1589,7 @@ impl Model {
                 let stream = self.dev.stream().clone();
                 if record {
                     stream.begin_capture(
-                        tuili_gpu::CAPTURE_RELAXED,
+                        infero_gpu::CAPTURE_RELAXED,
                     )?;
                 }
                 let kv = if graphable { key.2 } else { kv_len };
@@ -1444,15 +1614,15 @@ impl Model {
                         }
                         self.feed_forward(layer, n_tokens, s)?;
                         self.release_layer(s)?;
-                        // `TUILI_LAYER_RMS=1` reports the residual stream's
+                        // `INFERO_LAYER_RMS=1` reports the residual stream's
                         // magnitude after every block. Nine single-suspect A/Bs
                         // came back negative, so the question stops being
                         // "which component" and becomes "which layer": a stream
                         // that grows smoothly and then jumps names the block to
                         // read, where a component-by-component search does not.
-                        // Only meaningful with TUILI_NO_GRAPH=1 — a device copy
+                        // Only meaningful with INFERO_NO_GRAPH=1 — a device copy
                         // cannot happen inside a capture region.
-                        if std::env::var_os("TUILI_LAYER_RMS").is_some() {
+                        if std::env::var_os("INFERO_LAYER_RMS").is_some() {
                             let stream = self.kern.device().stream();
                             let row = stream.clone_dtoh(&self.act.x.slice(..d))?;
                             self.kern.device().synchronize()?;
@@ -1624,13 +1794,13 @@ impl Model {
             )?;
         }
 
-        // `TUILI_LOGIT_PROBE=1` reports the last row's top-5 ids and values.
+        // `INFERO_LOGIT_PROBE=1` reports the last row's top-5 ids and values.
         // The residual stream is healthy all the way to layer 35 (RMS climbs
         // 0.98 → 62 with no non-finite value), so whatever is wrong sits after
         // the blocks. This splits the two remaining candidates: a sane argmax
         // whose text is wrong means detokenization, and a nonsense argmax means
         // the final norm or the vocab projection.
-        if std::env::var_os("TUILI_LOGIT_PROBE").is_some() {
+        if std::env::var_os("INFERO_LOGIT_PROBE").is_some() {
             let row = n_logit_rows - 1;
             let start = row * vocab_size;
             let v = self
@@ -1835,7 +2005,7 @@ impl Model {
                 vocab,
                 stride,
                 max_k,
-                Some(tuili_kernels::Survivors {
+                Some(infero_kernels::Survivors {
                     id: &mut id_v,
                     p: &mut p_v,
                     len: &mut len_v,
@@ -1897,10 +2067,10 @@ impl Model {
             b.rnd.slice(..n),
         );
         let mut out_v = b.out.slice_mut(..n);
-        // Escape hatch for the same reason `TUILI_NO_MMQ` and its neighbours
+        // Escape hatch for the same reason `INFERO_NO_MMQ` and its neighbours
         // exist: the person measuring a change here is entitled to the old
         // kernel to compare against.
-        let no_split = std::env::var_os("TUILI_NO_SAMPLE_SPLIT").is_some();
+        let no_split = std::env::var_os("INFERO_NO_SAMPLE_SPLIT").is_some();
         if all_greedy {
             let (mut av, mut ai) = (
                 b.arg_v.slice_mut(..n * Kernels::ARGMAX_SPLITS),
@@ -2169,7 +2339,7 @@ impl Model {
         }
 
         let (first, ntok, mut recurrent, mut conv) = pool.gdn_parts(ordinal);
-        let seqs = tuili_kernels::gdn::SeqLayout {
+        let seqs = infero_kernels::gdn::SeqLayout {
             first_token: &first,
             n_tokens: &ntok,
             n_seqs,
@@ -2360,13 +2530,13 @@ impl Model {
         // the mat-vec runs instead and that path wants Q8_1.
         let want_h = self.use_mmq
             && n > 1
-            && n <= tuili_kernels::MMQ_MAX_TOKENS
+            && n <= infero_kernels::MMQ_MAX_TOKENS
             && Kernels::mmq_f16_variant_for(l.attn().wq.ty).is_some()
             && [&l.attn().wq, &l.attn().wk, &l.attn().wv].iter().all(|w| {
                 matches!(
                     w.ty,
-                    tuili_kernels::WeightType::Q4G128
-                        | tuili_kernels::WeightType::Q4G128T
+                    infero_kernels::WeightType::Q4G128
+                        | infero_kernels::WeightType::Q4G128T
                 ) && w.k == d
             });
         let eps = cfg.rms_eps;
@@ -2403,12 +2573,24 @@ impl Model {
         // Two hundred and twenty-five mat-vecs back to back run at 328 GB/s
         // where one alone runs at 392 — each drains before the next can start
         // — and merging this group and the FFN's removes ninety-six of those.
-        if Self::fusable(&[&l.attn().wq, &l.attn().wk, &l.attn().wv], shared, n, self.use_mmvq) {
+        if !l.attn().output_gate
+            && Self::fusable(&[&l.attn().wq, &l.attn().wk, &l.attn().wv], shared, n, self.use_mmvq)
+        {
             // `q8_1_bytes(d)`: the operand is the residual row, which is `d`
             // wide. `q`'s *output* is `da` wide, and the two differ on
             // Qwen3-30B-A3B — the view was `..d`, which the kernel overran
             // harmlessly because `act.q` is allocated `chunk * da`. Naming the
             // real width keeps it that way for a reason rather than by luck.
+            //
+            // A gated `wq` is excluded above rather than left for `fusable`
+            // to catch: `mmvq_fused3` writes each output at its own weight's
+            // width, and a gated `wq` is `2 * da` wide with the query and
+            // gate interleaved per head — writing that straight into a
+            // `da`-wide `q` slice does not recover "the first half", it
+            // recovers half of every head, which is what the `else` branch's
+            // `split_interleaved` exists to undo. `wk`/`wv` stay ordinary
+            // width, which is why `fusable` itself never noticed: it only
+            // compares `ty`/`k` across the group, and those still agree.
             let bytes = Kernels::q8_1_bytes(d);
             let (q, k_, v) = (&mut self.act.q, &mut self.act.k, &mut self.act.v);
             self.kern.mmvq_fused3(
@@ -2440,7 +2622,7 @@ impl Model {
             // back past its own batching limit, so the fused buffer is worth
             // taking at any `n` there; `w_qkv` only exists at all when
             // `stacked3` found it safe to build.
-            n > 1 && (want_h || w.ty == tuili_kernels::WeightType::F8E4M3)
+            n > 1 && (want_h || w.ty == infero_kernels::WeightType::F8E4M3)
         }) {
             // One matmul for all three, then a scatter. Separately they cost
             // 14.7 + 8.5 + 8.5 us a layer at a batch of 32 because the two
@@ -2626,12 +2808,12 @@ impl Model {
         // works, and the model generates degenerate repetition ("的博客 的博客
         // …") rather than failing. The unit tests cannot see this: they check
         // the kernel against a CPU reference, and the kernel was never wrong.
-        // `TUILI_NO_QK_NORM=1` skips both, which is how a bad answer is
+        // `INFERO_NO_QK_NORM=1` skips both, which is how a bad answer is
         // attributed: a checkpoint that needs QK-norm is degenerate without it,
         // so if the output is *equally* degenerate either way the fault is
         // somewhere else and this path is only taking the blame.
         static NO_QK_NORM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let skip_qk_norm = *NO_QK_NORM.get_or_init(|| std::env::var_os("TUILI_NO_QK_NORM").is_some());
+        let skip_qk_norm = *NO_QK_NORM.get_or_init(|| std::env::var_os("INFERO_NO_QK_NORM").is_some());
 
         if let Some(qn) = l.attn().q_norm.as_ref().filter(|_| !skip_qk_norm) {
             let (buf, stride, len) = if packed_qkv {
@@ -2650,13 +2832,13 @@ impl Model {
                 cfg.rms_eps,
             )?;
         }
-        // `TUILI_QK_NORM_PROBE=1` checks the invariant at the real call site
+        // `INFERO_QK_NORM_PROBE=1` checks the invariant at the real call site
         // rather than against a reference implementation. RMS-normalizing head
         // h and scaling by `w` leaves `RMS(out_h / w) == 1`, so if the offsets
         // and stride are right every head reads 1.0 here. The unit tests cannot
         // establish this: they compare the kernel to a CPU reference built from
         // the same assumed layout, so a wrong assumption is wrong in both.
-        if std::env::var_os("TUILI_QK_NORM_PROBE").is_some()
+        if std::env::var_os("INFERO_QK_NORM_PROBE").is_some()
             && !skip_qk_norm
             && let Some(qn) = l.attn().q_norm.as_ref()
         {
@@ -2707,7 +2889,7 @@ impl Model {
         // un-normalized values (0.51, 0.60, 2.67, 0.067) that looked exactly
         // like a real bug. A probe placed before the thing it measures is not
         // a weaker check, it is a check of something else.
-        if std::env::var_os("TUILI_QK_NORM_PROBE").is_some()
+        if std::env::var_os("INFERO_QK_NORM_PROBE").is_some()
             && !skip_qk_norm
             && let Some(kn) = l.attn().k_norm.as_ref()
         {
@@ -2734,6 +2916,19 @@ impl Model {
             tracing::info!(?rms, "qk_norm probe: RMS(k/w) per kv head, want 1.0");
         }
 
+        // `pos_stride == 1` (every model without M-RoPE) reproduces the
+        // original scalar-position rope bit for bit: `self.act.positions`
+        // holds one value a token, and `self.w.mrope_axis` is all zeros, so
+        // `positions[token * 1 + 0]` is exactly `positions[token]`. A model
+        // with `cfg.mrope_section` set reads `self.act.mrope_positions`
+        // instead, `3` values a token, `self.w.mrope_axis[i]` choosing which.
+        // See `Kernels::rope_qk_partial`'s doc comment.
+        let pos_stride = if cfg.mrope_section.is_some() { 3 } else { 1 };
+        let rope_positions = if pos_stride == 3 {
+            self.act.mrope_positions.slice(..n * 3)
+        } else {
+            self.act.positions.slice(..n)
+        };
         if packed_qkv {
             let (q, packed) = (&mut self.act.q, &mut self.act.gate);
             self.kern.rope_qk_packed_partial(
@@ -2742,8 +2937,10 @@ impl Model {
                 fused_w,
                 0,
                 da,
-                &self.act.positions.slice(..n),
+                &rope_positions,
                 &self.w.rope_freqs.as_view(),
+                &self.w.mrope_axis.as_view(),
+                pos_stride,
                 n,
                 cfg.n_heads,
                 cfg.n_kv_heads,
@@ -2761,8 +2958,10 @@ impl Model {
             self.kern.rope_qk_partial(
                 &mut q.slice_mut(..n * da),
                 &mut k.slice_mut(..n * kv_dim),
-                &self.act.positions.slice(..n),
+                &rope_positions,
                 &self.w.rope_freqs.as_view(),
+                &self.w.mrope_axis.as_view(),
+                pos_stride,
                 n,
                 cfg.n_heads,
                 cfg.n_kv_heads,
@@ -2847,11 +3046,11 @@ impl Model {
                 // `attn_decode` reports whether it actually wrote it.
                 let wo_f16 = self.use_mmq
                     && n > 1
-                    && n <= tuili_kernels::MMQ_MAX_TOKENS
+                    && n <= infero_kernels::MMQ_MAX_TOKENS
                     && matches!(
                         l.attn().wo.ty,
-                        tuili_kernels::WeightType::Q4G128
-                            | tuili_kernels::WeightType::Q4G128T
+                        infero_kernels::WeightType::Q4G128
+                            | infero_kernels::WeightType::Q4G128T
                     )
                     && Kernels::mmq_f16_variant_for_shape(l.attn().wo.ty, l.attn().wo.n).is_some()
                     && Self::mmq_shape_ok(&l.attn().wo);
@@ -2865,9 +3064,9 @@ impl Model {
                 // profile, 77.5 us a layer against 66.2.
                 //
                 // So a kernel is not slow or fast on its own, and neither
-                // number here was wrong. `TUILI_DECODE_ATTN=0` restores the
+                // number here was wrong. `INFERO_DECODE_ATTN=0` restores the
                 // three.
-                if !std::env::var("TUILI_DECODE_ATTN").is_ok_and(|v| v == "0")
+                if !std::env::var("INFERO_DECODE_ATTN").is_ok_and(|v| v == "0")
                     && self.kern.decode_attention(&dims, kv_len)
                 {
                     let mut h16 = self.scratch.x16.slice_mut(..n * da);
@@ -3004,14 +3203,9 @@ impl Model {
                 // three kernels and for the same reason: the unfused path
                 // below writes the whole score row to HBM and reads it back
                 // twice, and at a batch of one that round trip is latency
-                // rather than bytes. `TUILI_TQ_DECODE_ATTN=0` restores the
+                // rather than bytes. `INFERO_TQ_DECODE_ATTN=0` restores the
                 // three-kernel path this replaces.
-                let group = n_heads / n_kv_heads.max(1);
-                if !std::env::var("TUILI_TQ_DECODE_ATTN").is_ok_and(|v| v == "0")
-                    && group >= 1
-                    && group <= 8
-                    && n_heads == group * n_kv_heads
-                {
+                if self.kern.tq_decode_attention(&dims) {
                     let (kcodes, ksigns, kscale, kgamma) = pool.tq_key(layer);
                     let (vcodes, vscale) = pool.tq_value(layer);
                     self.kern.tq_attn_decode(
@@ -3087,8 +3281,36 @@ impl Model {
             }
         }
 
+        // The output gate, applied to the attention output before anything
+        // downstream reads it -- both the fast path just below and the
+        // generic one after it read `self.act.attn` straight, so gating it
+        // here once covers both rather than duplicating the call in each.
+        // Sigmoid, not silu: the reference implementation does not read
+        // config's `output_gate_type: "swish"`, and the two give different
+        // answers. See `the_output_gate_is_sigmoid_not_silu`.
+        if l.attn().output_gate {
+            let Activations { attn, attn_gate, .. } = &mut self.act;
+            let ag = attn_gate
+                .as_ref()
+                .context("a gated attention layer with no gate buffer allocated")?;
+            self.kern.sigmoid_gate(
+                &mut attn.slice_mut(..n * da),
+                &ag.slice(..n * da),
+                n * da,
+            )?;
+        }
+
         // Straight into the residual stream: this projection's result is only
         // ever added to it, and the mat-vec can do that itself.
+        //
+        // Gating happened above rather than being folded in here: a gated
+        // layer's `self.act.attn` needed `sigmoid_gate` applied before
+        // anything quantized it, and this path used to quantize straight off
+        // the raw (un-gated) activation instead -- same width, same shape,
+        // wrong values, so it decoded fluent-looking nonsense rather than
+        // erroring. Moving the gate above this branch instead of excluding
+        // gated layers from it keeps the fused mat-vec-plus-residual-add for
+        // them too, rather than paying for a separate `add_assign` a layer.
         if l.attn().bo.is_none() && Self::residual_fusable(&l.attn().wo, n, self.use_mmvq) {
             // `da`, not `d`: this projection contracts over the attention
             // interior and produces the residual width. The two are equal on
@@ -3115,22 +3337,6 @@ impl Model {
                 l.attn().wo.n,
             )?;
             return Ok(());
-        }
-
-        // The output gate, applied to the attention output before the output
-        // projection reads it. Sigmoid, not silu: the reference implementation
-        // does not read config's `output_gate_type: "swish"`, and the two give
-        // different answers. See `the_output_gate_is_sigmoid_not_silu`.
-        if l.attn().output_gate {
-            let Activations { attn, attn_gate, .. } = &mut self.act;
-            let ag = attn_gate
-                .as_ref()
-                .context("a gated attention layer with no gate buffer allocated")?;
-            self.kern.sigmoid_gate(
-                &mut attn.slice_mut(..n * da),
-                &ag.slice(..n * da),
-                n * da,
-            )?;
         }
 
         Self::matmul_pre(
@@ -3179,7 +3385,7 @@ impl Model {
     /// successor to absorb it, so both ends still add explicitly.
     ///
     /// Both sides read this: `feed_forward` skips its add exactly when the next
-    /// layer's `attention` will do it. `TUILI_FUSE_RESIDUAL=0` turns off this
+    /// layer's `attention` will do it. `INFERO_FUSE_RESIDUAL=0` turns off this
     /// one and the FFN one together.
     fn attn_norm_takes_residual(&self, layer: usize, n: usize) -> bool {
         // The bounds check comes first: `feed_forward` asks about `layer + 1`,
@@ -3193,7 +3399,7 @@ impl Model {
             return false;
         }
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *OFF.get_or_init(|| std::env::var("TUILI_FUSE_RESIDUAL").as_deref() == Ok("0")) {
+        if *OFF.get_or_init(|| std::env::var("INFERO_FUSE_RESIDUAL").as_deref() == Ok("0")) {
             return false;
         }
         let l = &self.w.layers[layer];
@@ -3203,12 +3409,12 @@ impl Model {
         // because the fused add-and-norm is the kernel that writes f16.
         let consumer = self.use_mmq
             && n > 1
-            && n <= tuili_kernels::MMQ_MAX_TOKENS
+            && n <= infero_kernels::MMQ_MAX_TOKENS
             && Kernels::mmq_f16_variant_for(l.attn().wq.ty).is_some()
             && [&l.attn().wq, &l.attn().wk, &l.attn().wv].iter().all(|w| {
                 matches!(
                     w.ty,
-                    tuili_kernels::WeightType::Q4G128 | tuili_kernels::WeightType::Q4G128T
+                    infero_kernels::WeightType::Q4G128 | infero_kernels::WeightType::Q4G128T
                 ) && w.k == d
             });
         // The producer: the previous layer's `down` has to have left its output
@@ -3227,7 +3433,7 @@ impl Model {
         let l = &self.w.layers[layer];
         let d = self.cfg.d_model;
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *OFF.get_or_init(|| std::env::var("TUILI_FUSE_RESIDUAL").as_deref() == Ok("0")) {
+        if *OFF.get_or_init(|| std::env::var("INFERO_FUSE_RESIDUAL").as_deref() == Ok("0")) {
             return false;
         }
         // The sparse FFN's own matmuls are the integer mat-vec and the
@@ -3236,12 +3442,12 @@ impl Model {
         let Some(f) = &l.dense else { return false };
         self.use_mmq
             && n > 1
-            && n <= tuili_kernels::MMQ_MAX_TOKENS
+            && n <= infero_kernels::MMQ_MAX_TOKENS
             && Kernels::mmq_f16_variant_for(f.w_gate.ty).is_some()
             && [&f.w_gate, &f.w_up].iter().all(|w| {
                 matches!(
                     w.ty,
-                    tuili_kernels::WeightType::Q4G128 | tuili_kernels::WeightType::Q4G128T
+                    infero_kernels::WeightType::Q4G128 | infero_kernels::WeightType::Q4G128T
                 ) && w.k == d
             })
     }
@@ -3262,13 +3468,13 @@ impl Model {
                 .all(|w| Kernels::has_mmvq(w.ty) && w.k == d);
         let want_h = self.use_mmq
             && n > 1
-            && n <= tuili_kernels::MMQ_MAX_TOKENS
+            && n <= infero_kernels::MMQ_MAX_TOKENS
             && Kernels::mmq_f16_variant_for(l.dense().w_gate.ty).is_some()
             && [&l.dense().w_gate, &l.dense().w_up].iter().all(|w| {
                 matches!(
                     w.ty,
-                    tuili_kernels::WeightType::Q4G128
-                        | tuili_kernels::WeightType::Q4G128T
+                    infero_kernels::WeightType::Q4G128
+                        | infero_kernels::WeightType::Q4G128T
                 ) && w.k == d
             });
         // When the norm is the f16-writing one it also adds the attention
@@ -3311,7 +3517,7 @@ impl Model {
         // own and falls back past its own batching limit there, so the fused
         // buffer is worth taking at any `n`.
         let stacked = l.dense().w_gate_up.as_ref().filter(|w| {
-            n > 1 && (want_h || w.ty == tuili_kernels::WeightType::F8E4M3)
+            n > 1 && (want_h || w.ty == infero_kernels::WeightType::F8E4M3)
         });
         // Whether `down` will read its activation as f16, which is the only
         // case where writing that copy early is worth anything. Mirrors what
@@ -3320,10 +3526,10 @@ impl Model {
         let ffn_f16 = stacked.is_some()
             && self.use_mmq
             && n > 1
-            && n <= tuili_kernels::MMQ_MAX_TOKENS
+            && n <= infero_kernels::MMQ_MAX_TOKENS
             && matches!(
                 l.dense().w_down.ty,
-                tuili_kernels::WeightType::Q4G128 | tuili_kernels::WeightType::Q4G128T
+                infero_kernels::WeightType::Q4G128 | infero_kernels::WeightType::Q4G128T
             )
             && Kernels::mmq_f16_variant_for_shape(l.dense().w_down.ty, l.dense().w_down.n).is_some()
             && Self::mmq_shape_ok(&l.dense().w_down);
@@ -3388,8 +3594,8 @@ impl Model {
             // targets, and on `gemm_threshold` because below it neither call
             // reaches `to_f16` at all.
             let gemm_shared = n > gemm_threshold()
-                && l.dense().w_gate.ty == tuili_kernels::WeightType::Q4K
-                && l.dense().w_up.ty == tuili_kernels::WeightType::Q4K;
+                && l.dense().w_gate.ty == infero_kernels::WeightType::Q4K
+                && l.dense().w_up.ty == infero_kernels::WeightType::Q4K;
             if gemm_shared {
                 self.kern.to_f16(
                     &mut self.scratch.x16.slice_mut(..n * d),
@@ -3672,11 +3878,11 @@ impl Model {
         }
         // The fusion trades a launch for parallelism: the standalone quantizer
         // spreads `d` elements over many blocks, while the fused one does that
-        // work inside the single block that computed the norm. `TUILI_NO_FUSED_NORM`
+        // work inside the single block that computed the norm. `INFERO_NO_FUSED_NORM`
         // exists to measure which way that trade actually falls.
         static SEPARATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let separate =
-            *SEPARATE.get_or_init(|| std::env::var_os("TUILI_NO_FUSED_NORM").is_some());
+            *SEPARATE.get_or_init(|| std::env::var_os("INFERO_NO_FUSED_NORM").is_some());
         if separate && want_q8_1 && d.is_multiple_of(32) {
             kern.rms_norm(
                 &mut act_xb.slice_mut(..n_tokens * d),
@@ -3728,10 +3934,10 @@ impl Model {
         match w.ty {
             // A Q4_G128 tile is two 128-weight blocks, so it wants the same
             // 256-wide step the K-quants do.
-            tuili_kernels::WeightType::Q4K
-            | tuili_kernels::WeightType::Q6K
-            | tuili_kernels::WeightType::Q4G128
-            | tuili_kernels::WeightType::Q4G128T => w.k.is_multiple_of(256),
+            infero_kernels::WeightType::Q4K
+            | infero_kernels::WeightType::Q6K
+            | infero_kernels::WeightType::Q4G128
+            | infero_kernels::WeightType::Q4G128T => w.k.is_multiple_of(256),
             _ => w.k.is_multiple_of(32),
         }
     }
@@ -3811,7 +4017,7 @@ impl Model {
         // cuBLAS's GEMM with m = 1 — the profiler had `gemm_f16` at 75% of a
         // step at 86.8 us a launch — so the mat-vec replaces both the byte count
         // and the wrong kernel shape.
-        if w.ty == tuili_kernels::WeightType::F8E4M3 {
+        if w.ty == infero_kernels::WeightType::F8E4M3 {
             // A handful of tokens reads each weight once and spends it on all of
             // them, which is what batching is for. The expansion path below
             // costs five bytes a weight — one read, two written, two read back —
@@ -3843,7 +4049,7 @@ impl Model {
             // activation-quantize launch is not worth it at one token, where
             // `mma_f8_block` already sits near the weight-load floor.
             if n_tokens >= 2 {
-                let scale_cols = w.k.div_ceil(tuili_kernels::fp8::ACT_QUANT_GROUP);
+                let scale_cols = w.k.div_ceil(infero_kernels::fp8::ACT_QUANT_GROUP);
                 let xq_len = n_tokens * w.k;
                 let xs_len = n_tokens * scale_cols;
                 if scratch.xq_e4m3.len() >= xq_len && scratch.xs_e4m3.len() >= xs_len {
@@ -3952,13 +4158,24 @@ impl Model {
             return kern.mmvq(out, &weights, w.ty, &scratch.q8_1.slice(..bytes), w.k, w.n);
         }
 
-        // Two or three tokens are the awkward middle: the tensor-core GEMM pays
+        // A handful of tokens is the awkward middle: the tensor-core GEMM pays
         // for a full 16-token tile whatever it is given, while the mat-vec can
         // stream the weights once and spend them on a handful of tokens without
         // staging anything through shared memory. Measured on a 31.5 MiB Q4_K
         // projection: at two tokens 120 us against the GEMM's 182, at four they
-        // are level, and by eight the GEMM is ahead 222 to 368.
-        if int_x && (2..=3).contains(&n_tokens) {
+        // are level, and by eight the GEMM is ahead 222 to 368 -- so `mmq` takes
+        // over there for that type.
+        //
+        // Q8_0 does not cross over at the same point: a speculative verify pass
+        // at `k=4` (5 rows) on a real Q8_0 GGUF measured `mmq` at 155.2 us a
+        // launch against `mmvq_batch`'s 47.9 us at two rows on the same
+        // projections -- more than 3x, not "level". `mmvqt16_*` is the widest
+        // template `Kernels::mmvq_t` picks from, so 16 is the natural ceiling
+        // for how far this range can go without a new kernel; Q8_0 gets it and
+        // everything else keeps the narrower, separately-measured one until it
+        // is measured too.
+        let mmvq_batch_max = if w.ty == infero_kernels::WeightType::Q8_0 { 16 } else { 3 };
+        if int_x && (2..=mmvq_batch_max).contains(&n_tokens) {
             let bytes = Kernels::q8_1_bytes(w.k);
             if pre_quantized.is_none() {
                 kern.quantize_q8_1(
@@ -3983,10 +4200,10 @@ impl Model {
         // versus the dequant path's read-write-read of a full f16 copy. That
         // gap was 79% of a batch-32 decode step. Past `MMQ_MAX_TOKENS` the
         // per-tile re-reads add up and cuBLAS wins instead.
-        if mmq_ok && n_tokens > 1 && n_tokens <= tuili_kernels::MMQ_MAX_TOKENS {
+        if mmq_ok && n_tokens > 1 && n_tokens <= infero_kernels::MMQ_MAX_TOKENS {
             // The f16-operand kernels take activations unquantized, so they
             // need a different buffer and a different launcher. Off unless
-            // `TUILI_MMQ_VARIANT` names one; the default path below is
+            // `INFERO_MMQ_VARIANT` names one; the default path below is
             // untouched.
             //
             // This re-converts per matmul where the Q8_1 path can hand the
@@ -3994,7 +4211,7 @@ impl Model {
             // it measures is if anything pessimistic.
             if matches!(
                 w.ty,
-                tuili_kernels::WeightType::Q4G128 | tuili_kernels::WeightType::Q4G128T
+                infero_kernels::WeightType::Q4G128 | infero_kernels::WeightType::Q4G128T
             ) {
                 if let Some(v) = Kernels::mmq_f16_variant_for_shape(w.ty, w.n) {
                     let n = n_tokens * w.k;
@@ -4073,13 +4290,13 @@ impl Model {
         // GEMM into a clear win, so raising the crossover point specifically
         // for this weight type is worth it in a way it was not before that
         // kernel existed. Measured end to end (real 27B, real prompts,
-        // TUILI_GEMM_THRESHOLD's own methodology): a 20-120 token prompt's
+        // INFERO_GEMM_THRESHOLD's own methodology): a 20-120 token prompt's
         // queued_ms is 33-50% lower through this path than through GEMM at
         // the same size. No measurement past 120 yet, so 200 is a margin on
         // top of what is actually verified, not a re-measured crossing.
-        // TUILI_Q4K_MMA_MAX overrides it for finding the real one.
+        // INFERO_Q4K_MMA_MAX overrides it for finding the real one.
         const Q4K_MMA_MAX_DEFAULT: usize = 200;
-        let q4k_mma_max: usize = std::env::var("TUILI_Q4K_MMA_MAX")
+        let q4k_mma_max: usize = std::env::var("INFERO_Q4K_MMA_MAX")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|v| *v > 0)
@@ -4092,17 +4309,17 @@ impl Model {
         // to GEMM winning somewhere between 90 and 128 (0.93-1.17x there),
         // so 100 rather than Q4_K's 200 -- this is every GDN and attention
         // projection in a GGUF checkpoint, not one weight type among several,
-        // so erring low costs more of them if wrong. TUILI_Q8_0_MMA_MAX
+        // so erring low costs more of them if wrong. INFERO_Q8_0_MMA_MAX
         // overrides it for re-measuring the real crossing.
         const Q8_0_MMA_MAX_DEFAULT: usize = 100;
-        let q8_0_mma_max: usize = std::env::var("TUILI_Q8_0_MMA_MAX")
+        let q8_0_mma_max: usize = std::env::var("INFERO_Q8_0_MMA_MAX")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|v| *v > 0)
             .unwrap_or(Q8_0_MMA_MAX_DEFAULT);
-        let use_gemv = if !cfg!(feature = "cuda") && w.ty == tuili_kernels::WeightType::Q4K {
+        let use_gemv = if !cfg!(feature = "cuda") && w.ty == infero_kernels::WeightType::Q4K {
             n_tokens <= q4k_mma_max
-        } else if !cfg!(feature = "cuda") && w.ty == tuili_kernels::WeightType::Q8_0 {
+        } else if !cfg!(feature = "cuda") && w.ty == infero_kernels::WeightType::Q8_0 {
             n_tokens <= q8_0_mma_max
         } else {
             n_tokens <= gemm_threshold()
@@ -4120,7 +4337,7 @@ impl Model {
             kern.to_f16(&mut scratch.x16.slice_mut(..n_x), x, n_x)?;
         }
 
-        if w.ty == tuili_kernels::WeightType::F16 {
+        if w.ty == infero_kernels::WeightType::F16 {
             // Already f16 on the device: reinterpret rather than copy.
             //
             // Safety: the range holds exactly `k * n` f16 values copied from
@@ -4147,14 +4364,14 @@ impl Model {
     }
 }
 
-/// `TUILI_PROBE=<layer>` reports the RMS of named intermediates inside that
+/// `INFERO_PROBE=<layer>` reports the RMS of named intermediates inside that
 /// block. Enough to bisect a block against a second implementation of the same
 /// forward pass -- which is the only way the last two composition bugs were
 /// found, and the only tool that would have found them faster.
 fn probe(kern: &Kernels, layer: usize, name: &'static str, v: &View<'_, f32>) {
     static WANT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     let want = WANT.get_or_init(|| {
-        std::env::var("TUILI_PROBE").ok().and_then(|v| v.parse().ok())
+        std::env::var("INFERO_PROBE").ok().and_then(|v| v.parse().ok())
     });
     if *want != Some(layer) {
         return;
@@ -4164,11 +4381,11 @@ fn probe(kern: &Kernels, layer: usize, name: &'static str, v: &View<'_, f32>) {
     let n = row.len().max(1);
     let rms = (row.iter().map(|x| x * x).sum::<f32>() / n as f32).sqrt();
     tracing::info!(layer, name, rms, len = row.len(), first = row.first().copied(), "probe");
-    // `TUILI_PROBE_DUMP=<dir>` also writes the raw f32, so two implementations
+    // `INFERO_PROBE_DUMP=<dir>` also writes the raw f32, so two implementations
     // of the same forward pass can be diffed element by element rather than
     // through summary statistics. RMS and element zero can both agree while the
     // vectors differ, which is how this cost an hour.
-    if let Ok(dir) = std::env::var("TUILI_PROBE_DUMP") {
+    if let Ok(dir) = std::env::var("INFERO_PROBE_DUMP") {
         let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
         let _ = std::fs::write(format!("{dir}/eng.{name}.f32"), bytes);
     }
@@ -4181,9 +4398,10 @@ impl Activations {
         cfg: &Config,
         max_seq: usize,
         max_logit_rows: usize,
+        needs_score_buffer: bool,
+        chunk: usize,
     ) -> Result<Self> {
         let stream = dev.stream();
-        let chunk = batch_tokens_for(cfg.n_heads, max_seq, max_logit_rows);
         let d = cfg.d_model;
         // The attention interior can be wider than the residual stream — 24
         // heads of 256 against 5120 on Qwen3.8 — so `q` and the attention
@@ -4206,7 +4424,7 @@ impl Activations {
             v: alloc_f32(chunk * kv_dim, "values")?,
             attn: alloc_f32(chunk * d_attn, "attention output")?,
             proj: alloc_f32(chunk * d.max(1), "projection")?,
-            // Twice `d_ff`: under `TUILI_FUSE_FFN` one matmul writes `gate` and
+            // Twice `d_ff`: under `INFERO_FUSE_FFN` one matmul writes `gate` and
             // `up` into a single row of this, and `silu_mul_split` reads the
             // two halves. The unfused path uses the first half only.
             //
@@ -4221,10 +4439,17 @@ impl Activations {
             )?,
             up: alloc_f32(chunk * cfg.d_ff, "ffn up")?,
             ffn: alloc_f32(chunk * cfg.d_ff, "ffn hidden")?,
-            scores: alloc_f32(cfg.n_heads * chunk * max_seq, "attention scores")?,
+            // A fused attention kernel (see `needs_score_buffer`) never reads
+            // or writes this, so it costs nothing to leave it at its minimum
+            // rather than the `max_seq`-wide buffer the unfused path needs.
+            scores: alloc_f32(
+                cfg.n_heads * chunk * if needs_score_buffer { max_seq } else { 1 },
+                "attention scores",
+            )?,
             logits: alloc_f32(max_logit_rows * cfg.vocab_size, "logits")?,
             token_ids: stream.alloc_zeros::<i32>(chunk)?,
             positions: stream.alloc_zeros::<i32>(chunk)?,
+            mrope_positions: stream.alloc_zeros::<i32>(chunk * 3)?,
             seq_of: stream.alloc_zeros::<i32>(chunk)?,
             slots: stream.alloc_zeros::<i32>(chunk)?,
             logit_rows: stream.alloc_zeros::<i32>(max_logit_rows)?,
@@ -4292,11 +4517,11 @@ impl Model {
         dir: impl AsRef<std::path::Path>,
         max_patches: usize,
     ) -> Result<bool> {
-        let shards = tuili_safetensors::Shards::open_dir(dir.as_ref())?;
+        let shards = infero_safetensors::Shards::open_dir(dir.as_ref())?;
         let Some(tower) = weights::load_vision(&self.dev, &shards, &self.cfg)? else {
             return Ok(false);
         };
-        let scratch = tuili_kernels::vision::VisionScratch::new(&self.dev, &tower.shape, max_patches)?;
+        let scratch = infero_kernels::vision::VisionScratch::new(&self.dev, &tower.shape, max_patches)?;
         tracing::info!(
             max_patches,
             scratch_mib = (max_patches * 85) >> 10,
@@ -4312,7 +4537,7 @@ impl Model {
     }
 
     /// The tower's dimensions, for a caller sizing images to it.
-    pub fn vision_shape(&self) -> Option<&tuili_kernels::vision::VisionShape> {
+    pub fn vision_shape(&self) -> Option<&infero_kernels::vision::VisionShape> {
         self.vision.as_ref().map(|t| &t.shape)
     }
 
@@ -4336,22 +4561,32 @@ pub struct VisionFeatures {
     /// run has to be exactly `tokens` long.
     pub grid_h: usize,
     pub grid_w: usize,
+    /// Temporal patch groups: 1 for a still image, `frames / 2` for a clip.
+    /// `tokens == grid_t * grid_h * grid_w / merge_unit`.
+    pub grid_t: usize,
 }
 
 impl VisionFeatures {
     pub fn view(&self) -> View<'_, f32> {
         self.rows.as_view()
     }
+
+    /// Rows `[start, start+count)` -- what a chunked prefill step reads when
+    /// only part of this clip's placeholder run lands in that step, rather
+    /// than the whole clip (`view()`'s job, and still what `count == self
+    /// .tokens` here reduces to).
+    pub fn rows_view(&self, start: usize, count: usize) -> View<'_, f32> {
+        let w = self.out_hidden;
+        self.rows.as_view().slice(start * w..(start + count) * w)
+    }
 }
 
 impl Model {
-    /// The resize target this tower wants for a `src_h x src_w` image.
-    ///
-    /// Exposed because the caller has to build the prompt's placeholder run
-    /// before the image is encoded, and the run's length is decided here.
-    pub fn vision_resize(&self, src_h: usize, src_w: usize, max_patches: usize) -> Result<(usize, usize, usize)> {
+    /// `VisionDims` reads off the loaded tower's shape and config, the
+    /// common setup `vision_resize`/`vision_resize_video` both start from.
+    fn vision_dims(&self) -> Result<qwen35_vision::VisionDims> {
         let t = self.vision.as_ref().context("this model has no vision tower")?;
-        let dims = qwen35_vision::VisionDims {
+        Ok(qwen35_vision::VisionDims {
             depth: t.shape.depth,
             hidden: t.shape.hidden,
             heads: t.shape.heads,
@@ -4364,7 +4599,15 @@ impl Model {
             num_position_embeddings: t.cfg.position_embeddings,
             eps: t.shape.eps,
             rope_theta: t.shape.rope_theta,
-        };
+        })
+    }
+
+    /// The resize target this tower wants for a `src_h x src_w` image.
+    ///
+    /// Exposed because the caller has to build the prompt's placeholder run
+    /// before the image is encoded, and the run's length is decided here.
+    pub fn vision_resize(&self, src_h: usize, src_w: usize, max_patches: usize) -> Result<(usize, usize, usize)> {
+        let dims = self.vision_dims()?;
         // `min_pixels` is one merge block's worth and `max_pixels` is the
         // caller's patch budget, both in pixels because that is the unit
         // `smart_resize` compares against. `None` means an aspect ratio past
@@ -4373,85 +4616,190 @@ impl Model {
             src_h,
             src_w,
             dims.resize_factor(),
-            t.shape.patch * t.shape.patch * dims.merge_unit(),
-            max_patches * t.shape.patch * t.shape.patch,
+            dims.patch * dims.patch * dims.merge_unit(),
+            max_patches * dims.patch * dims.patch,
         )
         .with_context(|| {
             format!("a {src_h}x{src_w} image is past the 200:1 aspect ratio the \
                      processor accepts")
         })?;
-        let tokens = (h / t.shape.patch) * (w / t.shape.patch) / dims.merge_unit();
+        let tokens = (h / dims.patch) * (w / dims.patch) / dims.merge_unit();
         Ok((h, w, tokens))
+    }
+
+    /// [`Self::vision_resize`] for a `frames`-frame clip: the same target
+    /// size every frame shares, plus how many temporal-patch groups they
+    /// fold into and the total placeholder token count across all of them.
+    ///
+    /// The one real difference from a single image: `max_patches` bounds the
+    /// *whole clip's* patches, not one frame-group's, so the pixel budget
+    /// `smart_resize` sizes against is `max_patches` divided by `grid_t` --
+    /// matching the reference video processor's own `t_bar * h_bar * w_bar`
+    /// comparison, which is this same "the budget is per clip, not per
+    /// frame-group" idea expressed with a third axis this codebase's 2-D
+    /// `smart_resize` does not carry. Dividing first and resizing once,
+    /// rather than resizing at the full budget and refusing if `grid_t`
+    /// copies of it overrun, is what keeps every frame-group the same size —
+    /// a per-image resize on each frame independently would still balloon
+    /// past `max_patches` for any `grid_t > 1`, which is exactly the bug
+    /// this function exists to not have.
+    pub fn vision_resize_video(
+        &self,
+        frames: usize,
+        src_h: usize,
+        src_w: usize,
+        max_patches: usize,
+    ) -> Result<(usize, usize, usize, usize)> {
+        // The vision tower's compute kernels (`vision_patchify`, `vision_attn`,
+        // ...) exist only in `crates/kernels/src/cu/vision.cu` -- there is no
+        // `vision.metal` yet, still images and all. A still image already
+        // shares that gap silently; video is new work added this session, so
+        // it gets the explicit refusal a real dispatch failure deep inside
+        // `encode_clip` would not: a clear message here, before any device
+        // work, rather than a bare "kernel not found" partway through it.
+        #[cfg(not(feature = "cuda"))]
+        anyhow::bail!(
+            "video input needs the vision tower's CUDA kernels; this build has \
+             no vision.metal yet, so video requests are refused outright"
+        );
+        let dims = self.vision_dims()?;
+        let (grid_t, per_group_patches) = qwen35_vision::video_resize_budget(
+            frames,
+            dims.temporal_patch,
+            dims.merge_unit(),
+            max_patches,
+        )
+        .with_context(|| {
+            format!(
+                "a {frames}-frame clip against a {max_patches}-patch budget: either \
+                 there are no frames, or the budget split across the resulting \
+                 frame-groups leaves less than one merge block a group"
+            )
+        })?;
+        let (h, w) = qwen35_vision::smart_resize(
+            src_h,
+            src_w,
+            dims.resize_factor(),
+            dims.patch * dims.patch * dims.merge_unit(),
+            per_group_patches * dims.patch * dims.patch,
+        )
+        .with_context(|| {
+            format!("a {src_h}x{src_w} frame is past the 200:1 aspect ratio the \
+                     processor accepts")
+        })?;
+        let tokens_per_group = (h / dims.patch) * (w / dims.patch) / dims.merge_unit();
+        Ok((h, w, grid_t, grid_t * tokens_per_group))
     }
 
     /// Run the tower over one prepared frame.
     ///
-    /// The whole of the vision path in one call: patchify, the 27 blocks, the
+    /// A thin `grid_t = 1` wrapper around [`Self::encode_clip`] — see that
+    /// for the whole of the vision path. Kept as its own entry point (rather
+    /// than making every image caller build a one-frame `PreparedClip`) so
+    /// the image path and its tests are untouched by video's generality.
+    pub fn encode_image(
+        &mut self,
+        frame: &qwen35_vision_image::PreparedFrame,
+    ) -> Result<VisionFeatures> {
+        let tower = self.vision.as_ref().context("this model has no vision tower")?;
+        let temporal_patch = tower.shape.temporal_patch;
+        // A still image's two temporal taps see the same pixels -- the
+        // processor's `expand`, not a real second frame -- so the one-frame
+        // planar buffer is repeated `temporal_patch` times, matching what
+        // `vision_patchify`'s `n_frames=1` + `min(t, n_frames-1)` read
+        // already did here before this became `encode_clip`'s job instead.
+        let clip = qwen35_vision_image::PreparedClip {
+            planar: frame.planar.repeat(temporal_patch),
+            frames: temporal_patch,
+            height: frame.height,
+            width: frame.width,
+            grid_h: frame.grid_h,
+            grid_w: frame.grid_w,
+        };
+        self.encode_clip(&clip)
+    }
+
+    /// Run the tower over a multi-frame clip: patchify, the 27 blocks, the
     /// merger. What comes back is what the prompt's placeholder tokens will be
     /// replaced by, and its `tokens` count is what the placeholder run has to be
     /// as long as — a mismatch is refused at splice time rather than silently
     /// truncated, because it means the grid the tower ran on is not the grid the
     /// prompt was built for.
-    pub fn encode_image(
-        &mut self,
-        frame: &qwen35_vision_image::PreparedFrame,
-    ) -> Result<VisionFeatures> {
+    pub fn encode_clip(&mut self, clip: &qwen35_vision_image::PreparedClip) -> Result<VisionFeatures> {
         let tower = self.vision.as_ref().context("this model has no vision tower")?;
         let scratch = self
             .vision_scratch
             .as_mut()
             .context("the vision tower is loaded but its scratch is not")?;
         let shape = tower.shape;
-        let patches = frame.grid_h * frame.grid_w;
+        anyhow::ensure!(
+            clip.frames.is_multiple_of(shape.temporal_patch),
+            "a clip of {} frames does not split evenly into temporal patches of {}",
+            clip.frames,
+            shape.temporal_patch
+        );
+        let grid_t = clip.frames / shape.temporal_patch;
+        let patches_per_group = clip.grid_h * clip.grid_w;
+        let patches = grid_t * patches_per_group;
         let merge_unit = shape.merge * shape.merge;
         anyhow::ensure!(
-            patches.is_multiple_of(merge_unit),
+            patches_per_group.is_multiple_of(merge_unit),
             "a {}x{} patch grid does not group into whole {}x{} blocks",
-            frame.grid_h,
-            frame.grid_w,
+            clip.grid_h,
+            clip.grid_w,
             shape.merge,
             shape.merge
+        );
+        anyhow::ensure!(
+            patches <= scratch.max_patches(),
+            "this clip needs {patches} patches ({grid_t} frame-groups of \
+             {patches_per_group}), the vision scratch was sized for {}",
+            scratch.max_patches()
         );
 
         // Geometry first, on the host, from the same functions the reference
         // capture pinned: one segment per frame, two position axes, and the
-        // learned 48x48 grid resampled to this image's grid.
-        let grid = qwen35_vision::Grid {
-            t: 1,
-            h: frame.grid_h,
-            w: frame.grid_w,
-        };
+        // learned 48x48 grid resampled to this clip's grid. All already
+        // `t`-generic — a still image's `grid_t = 1` is the case they were
+        // written for, video's `grid_t > 1` costs them nothing new.
+        let grid = qwen35_vision::Grid { t: grid_t, h: clip.grid_h, w: clip.grid_w };
         let grids = [grid];
         let cu = qwen35_vision::cu_seqlens(&grids);
         let pos_ids = qwen35_vision::vision_position_ids(&grids, shape.merge);
         let (idx, wts) =
             qwen35_vision::pos_embed_taps(&grids, tower.cfg.grid_per_side(), shape.merge);
-        let geo = tuili_kernels::vision::VisionGeometry::new(
+        let geo = infero_kernels::vision::VisionGeometry::new(
             &self.kern, &shape, &cu, &pos_ids, &idx, &wts,
         )?;
 
-        // Patchify on the device: the host holds planar `[C, H, W]` and the
-        // patch embedding wants one row a patch.
-        let planar = self.dev.stream().clone_htod(&frame.planar)?;
+        // Patchify on the device: one launch for every temporal-patch group
+        // in the clip at once, `vision_patchify`'s own `grid_t` picking each
+        // group's frames and output slice out of the same contiguous
+        // buffers a `grid_t`-loop of launches used to address by hand (see
+        // that function's doc comment, and the CUDA source's). `PreparedClip
+        // ::frames` being even by construction (`prepare_clip` pads an odd
+        // count) is what makes every group exactly `shape.temporal_patch`
+        // frames wide -- there is no shorter last group to special-case.
+        let planar = self.dev.stream().clone_htod(&clip.planar)?;
         {
-            let pd = shape.patch_dim();
-            let mut rows = self.dev.stream().alloc_zeros::<f32>(patches * pd)?;
-            let mut rows_h = scratch.pixels_h_mut();
+            let (mut rows_f32, mut rows_h) = scratch.patchify_views();
+            let total = patches_per_group * shape.patch_dim() * grid_t;
             self.kern.vision_patchify(
-                &mut rows.as_view_mut(),
-                &mut rows_h,
+                &mut rows_f32.slice_mut(..total),
+                &mut rows_h.slice_mut(..total),
                 &planar.as_view(),
-                1,
-                frame.height,
-                frame.width,
+                shape.temporal_patch,
+                clip.height,
+                clip.width,
                 &shape,
+                grid_t,
             )?;
         }
 
         let w = tower.weights();
-        tuili_kernels::vision::vision_forward(&self.kern, &shape, &w, &geo, scratch)?;
+        infero_kernels::vision::vision_forward(&self.kern, &shape, &w, &geo, scratch)?;
 
-        // Copy the features out of the scratch, which the next image would
+        // Copy the features out of the scratch, which the next call would
         // overwrite.
         let tokens = patches / merge_unit;
         let mut rows = self
@@ -4466,32 +4814,33 @@ impl Model {
             rows,
             tokens,
             out_hidden: shape.out_hidden,
-            grid_h: frame.grid_h,
-            grid_w: frame.grid_w,
+            grid_h: clip.grid_h,
+            grid_w: clip.grid_w,
+            grid_t,
         })
     }
 
     /// Which rows of `tokens` are vision placeholders, using **this**
     /// checkpoint's ids.
     ///
-    /// Not `tuili_kernels::vision::splice_targets`, which hardcodes 248056 and
+    /// Not `infero_kernels::vision::splice_targets`, which hardcodes 248056 and
     /// 248057. Those are right for this checkpoint and the config is what says
     /// so; a loader that checks the config and then splices on a constant has
     /// two sources of truth and only tests one.
-    fn vision_targets(&self, tokens: &[u32], n_features: usize) -> Result<Vec<i32>> {
+    /// Positions within `tokens` (this chunk only) that are an image or video
+    /// placeholder id -- however many of them there are, from zero (a chunk
+    /// entirely before or after a clip's placeholder run) up to `tokens.len()`
+    /// (a chunk entirely inside one). The caller matches this count against
+    /// `BatchItem.vision_row_offset` before reading `vision`'s rows; this
+    /// function itself has no way to know how many rows the *whole* clip has,
+    /// only how many placeholder ids are in front of it right now.
+    fn vision_targets(&self, tokens: &[u32]) -> Result<Vec<i32>> {
         let (img, vid) = self.vision_tokens().context("no vision tower")?;
-        let rows: Vec<i32> = tokens
+        Ok(tokens
             .iter()
             .enumerate()
             .filter(|&(_, &t)| t == img || t == vid)
             .map(|(i, _)| i as i32)
-            .collect();
-        anyhow::ensure!(
-            rows.len() == n_features,
-            "{} placeholder tokens in this chunk but {n_features} feature rows; \
-             the grid the tower ran on is not the grid the prompt was built for",
-            rows.len()
-        );
-        Ok(rows)
+            .collect())
     }
 }

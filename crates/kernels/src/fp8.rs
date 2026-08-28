@@ -1,6 +1,6 @@
 //! Launchers for block-scaled FP8 E4M3 weights.
 //!
-//! Why these exist rather than dequantizing at load, which is what tuili did
+//! Why these exist rather than dequantizing at load, which is what infero did
 //! first and which is correct: a decode step reads every weight exactly once,
 //! so it is bound by how many bytes the weights are. Expanding FP8 to f16 at
 //! load doubles that, and the profiler put `gemm_f16` at 75% of a step on the
@@ -19,7 +19,7 @@
 //! matrix, is not a rounding difference — it is a different matrix.
 
 use anyhow::{Context, Result};
-use tuili_gpu::{View, ViewMut, LaunchConfig, KernelArg};
+use infero_gpu::{View, ViewMut, LaunchConfig, KernelArg};
 use half::f16;
 
 use crate::{Kernels, fp8_src};
@@ -32,19 +32,19 @@ pub const FP8_BLOCK: usize = 128;
 ///
 /// A marginal row costs 2.25 ms where its DRAM bytes are zero, and three
 /// end-to-end explanations were all wrong — so the move left is to remove one
-/// piece at a time and see which one the cost follows. `TUILI_FP8_STRIP` takes
+/// piece at a time and see which one the cost follows. `INFERO_FP8_STRIP` takes
 /// `fma`, `reduce`, or `both`; anything else, including unset, is the real
 /// kernel. These produce wrong answers by construction.
 pub fn strip_flags() -> &'static str {
     static F: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     F.get_or_init(|| {
-        let want = std::env::var("TUILI_FP8_STRIP").unwrap_or_default();
+        let want = std::env::var("INFERO_FP8_STRIP").unwrap_or_default();
         let fma = want == "fma" || want == "both";
         let reduce = want == "reduce" || want == "both";
         if fma || reduce {
             tracing::warn!(
                 strip = %want,
-                "TUILI_FP8_STRIP is set: the FP8 mat-vec is computing the wrong answer \
+                "INFERO_FP8_STRIP is set: the FP8 mat-vec is computing the wrong answer \
                  on purpose"
             );
         }
@@ -249,11 +249,11 @@ pub const MMA_GROUPS_W32: [(usize, &str); 2] = [
 
 /// Force one warp count, for the A/B that set [`MMA_WARP_TARGET`].
 ///
-/// `TUILI_FP8_MMA_WARPS=8` or `=32`. Unset picks by width.
+/// `INFERO_FP8_MMA_WARPS=8` or `=32`. Unset picks by width.
 fn mma_warp_override() -> Option<u32> {
     static V: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("TUILI_FP8_MMA_WARPS")
+        std::env::var("INFERO_FP8_MMA_WARPS")
             .ok()
             .and_then(|v| v.parse().ok())
     })
@@ -261,7 +261,7 @@ fn mma_warp_override() -> Option<u32> {
 
 /// Where thirty-two warps a block stops paying, in warps an SM at eight.
 ///
-/// The A/B, one row, `TUILI_FP8_MMA_WARPS` forcing each:
+/// The A/B, one row, `INFERO_FP8_MMA_WARPS` forcing each:
 ///
 /// ```text
 ///        n   blocks   warps/SM   8 warps   32 warps
@@ -304,9 +304,21 @@ pub const BATCH_KERNELS: [(usize, &str); 8] = [
 /// occupancy grows with the batch while a GEMM's does not. This is the widest
 /// instantiation there is, derived from [`BATCH_KERNELS`] rather than repeated,
 /// so that adding a kernel cannot leave the dispatch reaching for one that does
-/// not exist. `TUILI_FP8_BATCH_MAX` moves the *crossover* for an A/B and is
+/// not exist. `INFERO_FP8_BATCH_MAX` moves the *crossover* for an A/B and is
 /// clamped to this.
 pub const MAX_BATCH_TOKENS_FP8: usize = BATCH_KERNELS[BATCH_KERNELS.len() - 1].0;
+
+/// Above this many tokens, [`Kernels::mma_f8_block`] and
+/// [`Kernels::mma_e4m3_block`] decline the shape too (see their own
+/// `n_tokens > 4 * <groups>.last().0 * MMA_TOKENS` gate), and the caller
+/// falls all the way to the expand-then-dequantize-then-GEMM path those
+/// functions' doc comments call out as "a performance bug the profiler
+/// cannot see." A prefill chunk sized above this for an FP8-weighted model
+/// pays that cost on every step rather than the tensor-core GEMM's.
+///
+/// `MMA_GROUPS` and `MMA_E4M3_GROUPS` share the same last group count, so one
+/// constant covers both gates.
+pub const MMA_MAX_TOKENS_FP8: usize = 4 * MMA_GROUPS[MMA_GROUPS.len() - 1].0 * MMA_TOKENS;
 
 /// Where the batched mat-vec stops winning, measured.
 ///
@@ -340,13 +352,13 @@ pub const MAX_BATCH_TOKENS_FP8: usize = BATCH_KERNELS[BATCH_KERNELS.len() - 1].0
 /// back. The mat-vec needs neither. Level on time and cheaper in memory and
 /// traffic is not a tie.
 ///
-/// `TUILI_FP8_BATCH_MAX` moves it, which is how the table above was produced.
+/// `INFERO_FP8_BATCH_MAX` moves it, which is how the table above was produced.
 /// The real fix for the large-batch end is an FP8 GEMM that feeds tensor cores
 /// directly rather than either of these.
 pub fn batched_matvec_limit() -> usize {
     static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
-        std::env::var("TUILI_FP8_BATCH_MAX")
+        std::env::var("INFERO_FP8_BATCH_MAX")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(16)
@@ -557,7 +569,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_fp8", fp8_src(), "fp8_repack_rows")?;
+            .get("infero_fp8", fp8_src(), "fp8_repack_rows")?;
         let chunks = n * (k / 4);
         const BLOCK: u32 = 256;
         let cfg = LaunchConfig {
@@ -603,7 +615,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_fp8", fp8_src(), "quantize_act_e4m3_f32")?;
+            .get("infero_fp8", fp8_src(), "quantize_act_e4m3_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (n_tokens as u32, (k / ACT_QUANT_GROUP) as u32, 1),
             block_dim: (ACT_QUANT_GROUP as u32, 1, 1),
@@ -652,7 +664,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_fp8", fp8_src(), "mmv_f8_block_f32")?;
+            .get("infero_fp8", fp8_src(), "mmv_f8_block_f32")?;
         // Eight warps, so eight of the group's 128-wide slices are in flight and
         // each finishes with a shuffle rather than a barrier. One block per
         // *group* of `ROW_GROUP` rows, which is the unit the layout interleaves.
@@ -743,7 +755,7 @@ impl Kernels {
             .find(|(g, _)| want <= *g)
             .unwrap_or(table.last().unwrap());
         let warps = if wide { 32u32 } else { 8u32 };
-        let f = self.dev.kernels().get("tuili_fp8", fp8_src(), name)?;
+        let f = self.dev.kernels().get("infero_fp8", fp8_src(), name)?;
         // One block per 16-row tile. The 16 has to track the MMA's M and the
         // kernel's shared tile together; it is not a tuning knob.
         let k_tile = warps as usize * 16;
@@ -824,7 +836,7 @@ impl Kernels {
             .iter()
             .find(|(g, _)| want <= *g)
             .unwrap_or(MMA_E4M3_GROUPS.last().unwrap());
-        let f = self.dev.kernels().get("tuili_fp8", fp8_src(), name)?;
+        let f = self.dev.kernels().get("infero_fp8", fp8_src(), name)?;
         // Byte tile, not halves — no unpack means no reason to double it —
         // and `+16` bytes of pad plays `mma_f8_block`'s `+8` halves' role:
         // both add one `int4`'s worth of stride so a 16-row gather's banks
@@ -909,7 +921,7 @@ impl Kernels {
                     BATCH_KERNELS.last().unwrap().0
                 )
             })?;
-        let f = self.dev.kernels().get("tuili_fp8", fp8_src(), name)?;
+        let f = self.dev.kernels().get("infero_fp8", fp8_src(), name)?;
         const BLOCK: u32 = 256;
         // One block per *group* of output rows, not per row. This has to track
         // `FP8_ROW_GROUP` in the kernel: too few blocks and the tail of the
@@ -959,7 +971,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_fp8", fp8_src(), "dequant_f8_block_f16")?;
+            .get("infero_fp8", fp8_src(), "dequant_f8_block_f16")?;
         let cfg = LaunchConfig {
             grid_dim: (
                 k.div_ceil(FP8_BLOCK) as u32,
