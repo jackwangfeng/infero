@@ -31,3 +31,12 @@ cuda = ["dep:infero-cuda", "dep:cudarc", "infero-gpu/cuda"]
 cuda-13 = ["cuda", "infero-cuda/cuda-13", "cudarc/cuda-13010", "infero-gpu/cuda-13"]
 cuda-12 = ["cuda", "infero-cuda/cuda-12", "cudarc/cuda-12080", "infero-gpu/cuda-12"]
 metal = ["infero-gpu/metal"]
+# AOT-compiles crates/kernels/src/cutlass/fp8_bw_gemm.cu with nvcc and links
+# it in -- needs a full CUDA Toolkit (INFERO_NVCC) and an NVIDIA/cutlass
+# checkout (INFERO_CUTLASS_DIR); see build.rs. Off by default: every other
+# kernel needs neither.
+cutlass = ["cuda"]
+
+[[example]]
+name = "cutlass_vs_block"
+required-features = ["cutlass"]

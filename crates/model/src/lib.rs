@@ -124,14 +124,23 @@ fn batch_ceiling(max_logit_rows: usize) -> usize {
 /// prefill for no memory saved.
 ///
 /// `fp8_ceiling` is separate from that budget and applies regardless of
-/// `needs_score_buffer`: it is
-/// [`infero_kernels::fp8::MMA_MAX_TOKENS_FP8`][mma], the width past which an
-/// FP8-weighted model's tensor-core GEMM declines the shape and every matmul
-/// in the chunk falls to the expand-then-dequantize path instead -- a
-/// correctness-preserving but much slower kernel that raising this function's
-/// other ceilings (a large `--max-seqs`, or a fused attention kernel freeing
-/// `needs_score_buffer`) could otherwise walk the chunk straight into. `None`
-/// for a model with no FP8 weights, which that path never applies to.
+/// `needs_score_buffer`: for the legacy interleaved-layout FP8 tensor-core
+/// GEMM (`mma_e4m3_block`) it's
+/// [`infero_kernels::fp8::MMA_MAX_TOKENS_FP8`][mma], the width past which
+/// that kernel declines the shape and every matmul in the chunk falls to the
+/// expand-then-dequantize path instead -- a correctness-preserving but much
+/// slower kernel that raising this function's other ceilings (a large
+/// `--max-seqs`, or a fused attention kernel freeing `needs_score_buffer`)
+/// could otherwise walk the chunk straight into. `None` for a model with no
+/// FP8 weights, which that path never applies to. The CUTLASS/unified-layout
+/// path's caller passes its own, separately measured ceiling instead:
+/// `mma_e4m3_cutlass` doesn't decline a wide `M` the way `mma_e4m3_block`
+/// does (it just tiles more of it), so `MMA_MAX_TOKENS_FP8` would only
+/// throttle the chunk there for a constraint that doesn't exist on the
+/// kernel actually running -- but "uncapped" isn't strictly better either:
+/// on a 30552-token prefill, capped at 256 (the legacy ceiling, before this
+/// distinction existed) was 11.1s, uncapped (~2048, this server's
+/// `batch_ceiling`) was 9.0s, and 1024 was the measured optimum at 8.7s.
 ///
 /// [mma]: infero_kernels::fp8::MMA_MAX_TOKENS_FP8
 pub fn batch_tokens_for(
@@ -396,6 +405,16 @@ fn gemm_threshold() -> usize {
 /// integer mat-vec once per token instead of taking the float path. Measured
 /// against Llama-3.1-8B Q4_K_M, whose Q6_K matrices are the ones affected.
 const MMVQ_REPEAT_MAX: usize = 12;
+/// `Some(n)` routes an FP8 GEMM through `mma_e4m3_cutlass` at `n_tokens >=
+/// n`; `None` (unset) never does. New and opt-in rather than a measured
+/// default: `cutlass_vs_block` puts the crossover against `mma_e4m3_block`
+/// around 128-256 tokens on the 27B's FFN shapes, but that was measured in
+/// isolation, not against a real serve loop yet.
+#[cfg(feature = "cutlass")]
+fn ffn_cutlass_min_tokens() -> Option<usize> {
+    static T: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("INFERO_FFN_CUTLASS").ok().and_then(|v| v.parse().ok()))
+}
 /// Granularity at which decode graphs are captured. A captured graph fixes
 /// every launch parameter including `kv_len`, so it is rounded up to a bucket
 /// and re-captured only when the bucket changes; attention already masks
@@ -975,8 +994,26 @@ impl Model {
         // from it and `forward` splits its input by it, and those two disagreeing
         // is the kind of mismatch `add_assign` already cost a day of.
         let needs_scores = needs_score_buffer(&kern, &cfg, max_seq, kv_quant);
-        let fp8_ceiling = (w.dominant_type() == infero_kernels::WeightType::F8E4M3)
-            .then_some(infero_kernels::fp8::MMA_MAX_TOKENS_FP8);
+        // `MMA_MAX_TOKENS_FP8` bounds `mma_e4m3_block`'s legacy interleaved-
+        // layout GEMM, which declines a wider shape outright and falls back
+        // to a much slower kernel. The CUTLASS/unified path's GEMM has no
+        // such shape decline -- it just tiles a wider `M` into more blocks --
+        // so applying that ceiling there only throttles the chunk for a
+        // constraint that doesn't exist on the kernel actually running.
+        // `CUTLASS_BATCH_TOKENS` is its own, separately measured ceiling on
+        // the real 30552-token prefill: uncapped (only `batch_ceiling`'s
+        // ~2048 at this server's `--max-seqs`) was 9.0s; capped at 256 (the
+        // legacy ceiling, before this fix existed) was 11.1s; 1024 was the
+        // measured optimum at 8.7s, with 512 and 2048 both slightly worse --
+        // a real optimum, not "bigger is strictly better."
+        const CUTLASS_BATCH_TOKENS: usize = 1024;
+        let fp8_ceiling = if w.dominant_type() != infero_kernels::WeightType::F8E4M3 {
+            None
+        } else if weights::fp8_unified_layout() {
+            Some(CUTLASS_BATCH_TOKENS)
+        } else {
+            Some(infero_kernels::fp8::MMA_MAX_TOKENS_FP8)
+        };
         let batch_tokens =
             batch_tokens_for(cfg.n_heads, max_seq, max_logit_rows, needs_scores, fp8_ceiling);
         tracing::info!(
@@ -1425,6 +1462,15 @@ impl Model {
                 logit_rows.push(row as i32);
             }
         }
+        // Whether this whole pass is one item — one sequence, contiguous,
+        // causal positions increasing by exactly one — which is the only
+        // shape `Kernels::attn_prefill` may see (see its doc comment: a tile
+        // spanning two sequences would read one's KV slots for the other's
+        // rows). A batch of more than one item is not attempted here even
+        // when every item happens to be a wide prefill chunk; splitting
+        // `attn_prefill`'s tiling across item boundaries mid-kernel is a
+        // sharper version of the same hazard and is not implemented.
+        let single_seq_run = (items.len() == 1).then(|| items[0].tokens.len());
 
         phase.mark(2);
         let stream = self.dev.stream().clone();
@@ -1573,6 +1619,21 @@ impl Model {
         // ways round: an ordinary pass would advance a working copy and throw its
         // state update away, and a verification pass would advance the persistent
         // state and then have its journal replayed on top of it.
+        // `attn_prefill`'s tiling is chosen from *this call's* item layout
+        // (`run_base`/`run_tokens`), not read from device memory the way
+        // `attn_decode`'s per-token grid is — so unlike every other kernel a
+        // captured graph replays here, its launch would be wrong for any
+        // later call that reuses this graph's key (`n_tokens`, bucketed
+        // `kv_len`) with a different item layout (say, two items instead of
+        // one summing to the same `n_tokens`). Simplest correct fix: a pass
+        // that would use it is never captured or replayed, only run eagerly.
+        // One block's worth of tiling (four warps of two tokens at this
+        // model's group) is the smallest run `attn_prefill` was measured
+        // against; below that, `attn_decode`'s one-token-a-block kernel is
+        // both simpler and already fast enough.
+        const MIN_PREFILL_RUN: usize = 8;
+        let prefill_run = single_seq_run.filter(|&t| t >= MIN_PREFILL_RUN);
+
         let armed = self.gdn_rollback.as_ref().is_some_and(|r| r.is_armed());
         let key = (
             pool.id(),
@@ -1580,7 +1641,8 @@ impl Model {
             kv_len.next_multiple_of(graph_kv_bucket()),
             armed,
         );
-        let graphable = self.use_graph && self.offload.is_none() && key.2 <= self.max_seq;
+        let graphable =
+            self.use_graph && self.offload.is_none() && key.2 <= self.max_seq && prefill_run.is_none();
 
         match self.graphs.get(&key) {
             Some(GraphSlot::Ready(g)) if graphable => g.0.launch()?,
@@ -1610,7 +1672,7 @@ impl Model {
                         if self.layer_kinds[layer] {
                             self.linear_attention(layer, n_tokens, pool, s)?;
                         } else {
-                            self.attention(layer, n_tokens, kv, dims, pool, s)?;
+                            self.attention(layer, n_tokens, kv, dims, pool, s, prefill_run)?;
                         }
                         self.feed_forward(layer, n_tokens, s)?;
                         self.release_layer(s)?;
@@ -2499,6 +2561,7 @@ impl Model {
         dims: AttnDims,
         pool: &mut KvPool,
         slot: Option<usize>,
+        prefill_run: Option<usize>,
     ) -> Result<()> {
         let stage = slot.map(|s| &self.offload.as_ref().unwrap().stage[s]);
         let cfg = &self.cfg;
@@ -3066,7 +3129,26 @@ impl Model {
                 // So a kernel is not slow or fast on its own, and neither
                 // number here was wrong. `INFERO_DECODE_ATTN=0` restores the
                 // three.
-                if !std::env::var("INFERO_DECODE_ATTN").is_ok_and(|v| v == "0")
+                // `prefill_run` is `Some(n)` only when this whole pass is one
+                // item — one sequence, `n` tokens, contiguous, causal — which
+                // `attn_prefill` requires and the caller (`forward_batch_rows`)
+                // has already checked; see its own doc comment for why a
+                // narrower run is not attempted here.
+                if let Some(run_tokens) = prefill_run.filter(|_| self.kern.prefill_attention(&dims)) {
+                    self.kern.attn_prefill(
+                        &mut attn_out.slice_mut(..n * da),
+                        &self.act.q.slice(..n * da),
+                        &pool.dense(layer).0.as_view(),
+                        &pool.dense(layer).1.as_view(),
+                        batch,
+                        dims,
+                        0,
+                        run_tokens,
+                        kv_len,
+                        attn_scale,
+                        &mut partial.as_view_mut(),
+                    )?;
+                } else if !std::env::var("INFERO_DECODE_ATTN").is_ok_and(|v| v == "0")
                     && self.kern.decode_attention(&dims, kv_len)
                 {
                     let mut h16 = self.scratch.x16.slice_mut(..n * da);
@@ -4018,6 +4100,59 @@ impl Model {
         // step at 86.8 us a launch — so the mat-vec replaces both the byte count
         // and the wrong kernel shape.
         if w.ty == infero_kernels::WeightType::F8E4M3 {
+            // Unified layout (`INFERO_FP8_UNIFIED=1` under the `cutlass`
+            // feature): this matrix's device buffer is plain `[n,k]`
+            // row-major, not `fp8::ROW_GROUP`-interleaved -- so none of
+            // `mma_e4m3_block`/`mma_f8_block`/`mmv_f8_block*` below can read
+            // it correctly, only `mmv_f8_plain` and CUTLASS can. Handled
+            // completely separately rather than folded into the chain below
+            // so that invariant stays checkable by inspection: nothing after
+            // this block runs for a matrix loaded this way.
+            #[cfg(feature = "cutlass")]
+            if crate::weights::fp8_unified_layout() {
+                if n_tokens == 1 {
+                    kern.mmv_f8_plain(out, &weights, x, w.k, w.n, false)?;
+                    return Ok(());
+                }
+                let scale_cols = w.k.div_ceil(infero_kernels::fp8::ACT_QUANT_GROUP);
+                let xq_len = n_tokens * w.k;
+                let xs_len = n_tokens * scale_cols;
+                anyhow::ensure!(
+                    scratch.xq_e4m3.len() >= xq_len && scratch.xs_e4m3.len() >= xs_len,
+                    "activation quant scratch too small for {n_tokens} tokens at k={}",
+                    w.k
+                );
+                kern.quantize_act_e4m3(
+                    &mut scratch.xq_e4m3.slice_mut(..xq_len),
+                    &mut scratch.xs_e4m3.slice_mut(..xs_len),
+                    x,
+                    w.k,
+                    n_tokens,
+                )?;
+                let cw = w
+                    .cutlass_weight(kern)
+                    .with_context(|| format!("preparing CUTLASS weight for a {}x{} matrix", w.n, w.k))?;
+                let ran = kern.mma_e4m3_cutlass(
+                    out,
+                    &weights,
+                    cw,
+                    &scratch.xq_e4m3.slice(..xq_len),
+                    &scratch.xs_e4m3.slice(..xs_len),
+                    w.k,
+                    w.n,
+                    n_tokens,
+                    false,
+                )?;
+                anyhow::ensure!(
+                    ran,
+                    "CUTLASS declined a {}x{} matmul at {n_tokens} tokens under the unified FP8 \
+                     layout, which has no other kernel that can read it -- likely k or n not a \
+                     multiple of 128",
+                    w.n,
+                    w.k
+                );
+                return Ok(());
+            }
             // A handful of tokens reads each weight once and spends it on all of
             // them, which is what batching is for. The expansion path below
             // costs five bytes a weight — one read, two written, two read back —
@@ -4060,6 +4195,31 @@ impl Model {
                         w.k,
                         n_tokens,
                     )?;
+                    // The AOT CUTLASS SM120 GEMM: ~5-8x `mma_e4m3_block`'s
+                    // measured TFLOPS on this model's FFN shapes, but only
+                    // past the token count where its fixed per-call
+                    // overhead (padding, workspace, activation-scale
+                    // transpose) stops dominating -- a prefill-batch lever,
+                    // not a decode one, same reasoning as `attn_prefill`'s
+                    // `MIN_PREFILL_RUN`. Opt-in behind `INFERO_FFN_CUTLASS`
+                    // (a token-count threshold) while this path is new.
+                    #[cfg(feature = "cutlass")]
+                    if ffn_cutlass_min_tokens().is_some_and(|min| n_tokens >= min)
+                        && let Some(cw) = w.cutlass_weight(kern)
+                        && kern.mma_e4m3_cutlass(
+                            out,
+                            &weights,
+                            cw,
+                            &scratch.xq_e4m3.slice(..xq_len),
+                            &scratch.xs_e4m3.slice(..xs_len),
+                            w.k,
+                            w.n,
+                            n_tokens,
+                            false,
+                        )?
+                    {
+                        return Ok(());
+                    }
                     if kern.mma_e4m3_block(
                         out,
                         &weights,

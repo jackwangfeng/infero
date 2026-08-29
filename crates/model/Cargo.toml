@@ -17,6 +17,10 @@ cudarc = { version = "0.19.9", default-features = false, optional = true, featur
 infero-kernels.workspace = true
 rand = "0.9"
 serde_json = "1"
+# A video's frames resize independently of each other (`qwen35_vision_image
+# ::prepare_clip`) -- real CPU-bound work with no shared state, exactly what
+# rayon's work-stealing pool is for.
+rayon = "1"
 
 [dev-dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
@@ -30,3 +34,4 @@ cuda = ["dep:infero-cuda", "dep:cudarc", "infero-kernels/cuda", "infero-gpu/cuda
 cuda-13 = ["cuda", "infero-kernels/cuda-13", "infero-cuda/cuda-13", "cudarc/cuda-13010", "infero-gpu/cuda-13"]
 cuda-12 = ["cuda", "infero-kernels/cuda-12", "infero-cuda/cuda-12", "cudarc/cuda-12080", "infero-gpu/cuda-12"]
 metal = ["infero-kernels/metal", "infero-gpu/metal"]
+cutlass = ["infero-kernels/cutlass"]

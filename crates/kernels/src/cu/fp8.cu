@@ -237,6 +237,75 @@ __device__ __forceinline__ void mmv_f8_group_body(
     }
 }
 
+// `mmv_f8_group_body` against plain `[n,k]` row-major quants (CUTLASS's
+// native layout, no `fp8::repack_rows`) instead of the `ROW_GROUP`-
+// interleaved one. This file's header describes two *older* attempts at
+// getting multi-row reuse without repacking, both slower than no reuse at
+// all -- but that was measured on a different, smaller-L2 GPU generation.
+// Re-measured on SM120 (`examples/cutlass_vs_block.rs`): 2-17% slower than
+// the interleaved `mmv_f8_block`, not a multiple -- small enough that the
+// `cutlass` feature's unified-format path uses this for one-token decode
+// rather than keep a second, `repack_rows`d copy of every FP8 weight
+// around just for that kernel. One-token only, the case that matters most
+// (`mmv_f8_block`'s "every plain decode step").
+extern "C" __global__ void mmv_f8_plain_f32(float* __restrict__ out,
+                                            const unsigned char* __restrict__ w_plain,
+                                            const float* __restrict__ x, int k, int n,
+                                            int scale_cols, int accum) {
+    const int group = blockIdx.x;
+    const int row0 = group * FP8_ROW_GROUP;
+    if (row0 >= n) return;
+    const int rows = (n - row0 < FP8_ROW_GROUP) ? (n - row0) : FP8_ROW_GROUP;
+    // Same buffer layout as `mmv_f8_block`: quants (padded to a whole
+    // ROW_GROUP of rows) then the scale grid, untransposed, right after.
+    const int padded = ((n + FP8_ROW_GROUP - 1) / FP8_ROW_GROUP) * FP8_ROW_GROUP;
+    const float* scale_grid = (const float*)(w_plain + (size_t)padded * k);
+    const float* srow = scale_grid + (size_t)(row0 / 128) * scale_cols;
+
+    float acc[FP8_ROW_GROUP];
+#pragma unroll
+    for (int r = 0; r < FP8_ROW_GROUP; ++r) acc[r] = 0.0f;
+
+    const int chunks = k / 4;
+    for (int c = threadIdx.x; c < chunks; c += blockDim.x) {
+        const int i0 = c * 4;
+        const float s = srow[i0 >> 7];
+        const float4 xv4 = *(const float4*)(const void*)(x + i0);
+        const float xv[4] = {xv4.x, xv4.y, xv4.z, xv4.w};
+#pragma unroll
+        for (int r = 0; r < FP8_ROW_GROUP; ++r) {
+            if (r >= rows) break;
+            // Four independent 4-byte loads, `k` bytes apart -- the "R runs
+            // apart" pattern the file header says lost before. `w_plain` is
+            // row `row0+r` at byte `i0`, no interleave to exploit.
+            const unsigned int wq = *(const unsigned int*)(const void*)(
+                w_plain + (size_t)(row0 + r) * k + i0);
+            float wv[4];
+            fp8_unpack4(wq, s, wv);
+            acc[r] += wv[0] * xv[0] + wv[1] * xv[1] + wv[2] * xv[2] + wv[3] * xv[3];
+        }
+    }
+
+    __shared__ float partial[32][FP8_ROW_GROUP];
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int warps = blockDim.x / WARP_SIZE;
+#pragma unroll
+    for (int r = 0; r < FP8_ROW_GROUP; ++r) {
+        if (r >= rows) break;
+        float v = acc[r];
+        for (int off = WARP_SIZE / 2; off > 0; off >>= 1) v += __shfl_down_sync(FULL_MASK, v, off);
+        if (lane == 0) partial[warp][r] = v;
+    }
+    __syncthreads();
+    for (int r = threadIdx.x; r < rows; r += blockDim.x) {
+        float sum = 0.0f;
+        for (int wi = 0; wi < warps; ++wi) sum += partial[wi][r];
+        float* o = out + row0 + r;
+        *o = accum ? *o + sum : sum;
+    }
+}
+
 // The one-token case, which is every plain decode step. A dedicated
 // instantiation rather than a call with `n_tokens = 1`, so the accumulator array
 // is four floats and the token loop unrolls to nothing.
@@ -888,7 +957,106 @@ __device__ __forceinline__ void mma_e4m3_body(
                                      n_tokens, accum);                        \
     }
 
+// `_g8` unbounded measures 128 registers a thread — 256 threads' worth is
+// exactly 32768 of the SM's 65536, so it lands on precisely two resident
+// blocks with nothing to spare. `__launch_bounds__`'s second argument asks
+// nvcc for three instead: it needs 85 registers a thread to fit
+// (65536 / (3*256)), so the compiler either finds slack the unbounded build
+// left on the table or spills to local memory buying occupancy it then pays
+// for in loads — which one this is is a measurement, not something to
+// assume from the register count alone. The narrower `_f32`/`_g2`/`_g4`
+// instantiations aren't given one: at 40-64 registers they already sit at
+// four to six blocks unbounded, past where another one buys anything.
+#define E4M3_MMA_ENTRY_BOUNDED(WARPS, GROUPS, NAME, MINBLOCKS)                 \
+    extern "C" __global__ void __launch_bounds__((WARPS) * 32, MINBLOCKS)     \
+    NAME(float* __restrict__ out, const unsigned char* __restrict__ w,        \
+         const unsigned char* __restrict__ xq, const float* __restrict__ xs,  \
+         int k, int n, int scale_cols, int n_tokens, int accum) {             \
+        mma_e4m3_body<WARPS, GROUPS>(out, w, xq, xs, k, n, scale_cols,        \
+                                     n_tokens, accum);                        \
+    }
+
 E4M3_MMA_ENTRY(8, 1, mma_e4m3_block_f32)
 E4M3_MMA_ENTRY(8, 2, mma_e4m3_block_g2_f32)
 E4M3_MMA_ENTRY(8, 4, mma_e4m3_block_g4_f32)
-E4M3_MMA_ENTRY(8, 8, mma_e4m3_block_g8_f32)
+E4M3_MMA_ENTRY_BOUNDED(8, 8, mma_e4m3_block_g8_f32, 3)
+
+// Below: small NVRTC-compiled adapters around the AOT `nvcc`-built CUTLASS
+// SM120 GEMM (`cutlass/fp8_bw_gemm.cu`, `cutlass` feature only), whose
+// memory layout is transposed from `quantize_act_e4m3_f32`'s and
+// `WeightType::F8E4M3`'s on the scale grids. See that file's header for why.
+
+// The inverse of `fp8::repack_rows` (see its doc comment for the forward
+// permutation this undoes): `interleaved` is `WeightType::F8E4M3`'s quant
+// region (`ROW_GROUP`-row-interleaved), `plain` comes out `[n, k]` row-major
+// -- what the CUTLASS GEMM's `B` operand wants. One thread per four-byte
+// chunk; `n_padded` is `n` rounded up to `ROW_GROUP`, matching how
+// `repack_rows` sized its output (the padding rows are read but not written
+// to `plain`, which the caller never allocated space for).
+extern "C" __global__ void unrepack_rows_e4m3(unsigned char* __restrict__ plain,
+                                               const unsigned char* __restrict__ interleaved, int k,
+                                               int n) {
+    const int ROW_GROUP = 4;
+    const int chunks = k / 4;
+    const long groups = (n + ROW_GROUP - 1) / ROW_GROUP;
+    const long total = groups * chunks * ROW_GROUP;
+    const long gid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= total) return;
+    const int r = gid % ROW_GROUP;
+    const long tmp = gid / ROW_GROUP;
+    const int c = tmp % chunks;
+    const long g = tmp / chunks;
+    const int row = g * ROW_GROUP + r;
+    if (row >= n) return;
+    const long src = g * (long)ROW_GROUP * k + c * 16 + r * 4;
+    const long dst = (long)row * k + c * 4;
+#pragma unroll
+    for (int j = 0; j < 4; j++) plain[dst + j] = interleaved[src + j];
+}
+
+// `xs` is `quantize_act_e4m3_f32`'s `[n_tokens, groups]` row-major output;
+// `sfa_t` is the CUTLASS kernel's `[groups, m_pad]` row-major input, zero
+// past `n_tokens` so the padded rows the GEMM still computes (but the caller
+// discards) read a finite, harmless scale rather than garbage.
+extern "C" __global__ void transpose_pad_scale_a_f32(float* __restrict__ sfa_t,
+                                                      const float* __restrict__ xs, int n_tokens,
+                                                      int groups, int m_pad) {
+    const int tok = blockIdx.x * blockDim.x + threadIdx.x;
+    const int group = blockIdx.y;
+    if (tok >= m_pad) return;
+    sfa_t[(size_t)group * m_pad + tok] = (tok < n_tokens) ? xs[(size_t)tok * groups + group] : 1.0f;
+}
+
+// `w_bytes + scale_byte_offset` is `WeightType::F8E4M3`'s `[n_blocks,
+// k_blocks]` row-major grid (`infero_kernels::fp8::scale_grid`'s layout,
+// right after the quant bytes in the same buffer -- taking the offset as a
+// kernel argument instead of a separate typed view sidesteps needing a
+// second cudarc view over the same allocation just to change element type);
+// `sfb_t` is the CUTLASS kernel's `[k_blocks, n_blocks]` row-major input.
+extern "C" __global__ void transpose_scale_b_f32(float* __restrict__ sfb_t,
+                                                  const unsigned char* __restrict__ w_bytes,
+                                                  int scale_byte_offset, int n_blocks, int k_blocks) {
+    const int kb = blockIdx.x * blockDim.x + threadIdx.x;
+    const int nb = blockIdx.y;
+    if (kb >= k_blocks) return;
+    const float* sfb = (const float*)(w_bytes + scale_byte_offset);
+    sfb_t[(size_t)kb * n_blocks + nb] = sfb[(size_t)nb * k_blocks + kb];
+}
+
+// The CUTLASS kernel's `[m_pad, n]` row-major bf16 output, upconverted and
+// either written or added into `out`'s `[n_tokens, n]` f32 -- same `accum`
+// convention as `mma_e4m3_block`. Only the first `n_tokens` rows are read;
+// `m_pad`'s padding rows are computed but never looked at.
+extern "C" __global__ void bf16_store_or_accum_f32(float* __restrict__ out,
+                                                    const unsigned short* __restrict__ d_bf16,
+                                                    int n_tokens, int n, int m_pad, int accum) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    if (col >= n || row >= n_tokens) return;
+    const unsigned short bits = d_bf16[(size_t)row * n + col];
+    const unsigned int f32_bits = (unsigned int)bits << 16;
+    float v;
+    memcpy(&v, &f32_bits, sizeof(v));
+    float* o = &out[(size_t)row * n + col];
+    *o = accum ? *o + v : v;
+}

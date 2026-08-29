@@ -20,10 +20,29 @@ use infero_gguf::{GgmlType, Gguf, TensorInfo};
 use infero_kernels::WeightType;
 
 use crate::config::Config;
+use crate::qwen35_vision::interleaved_mrope_axis;
 
 /// Matrices inside a layer blob start on this boundary, which satisfies every
 /// ggml block type's alignment and keeps each sub-copy DMA-friendly.
 const BLOB_ALIGN: usize = 256;
+
+/// Whether FP8 weights load as plain `[n,k]` row-major (`fp8::pad_rows`,
+/// CUTLASS's and [`infero_kernels::Kernels::mmv_f8_plain`]'s native layout)
+/// instead of [`infero_kernels::fp8::repack_rows`]'s `ROW_GROUP`-interleaved
+/// one. Compiles to a hard `false` without the `cutlass` feature: nothing
+/// non-CUTLASS reads plain layout, so this must never be true when the
+/// kernels that would misread it (`mma_e4m3_block`, `mmv_f8_block`) are the
+/// only ones available -- that would silently corrupt every FP8 matmul, not
+/// fail loudly.
+#[cfg(feature = "cutlass")]
+pub(crate) fn fp8_unified_layout() -> bool {
+    static U: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *U.get_or_init(|| std::env::var("INFERO_FP8_UNIFIED").as_deref() == Ok("1"))
+}
+#[cfg(not(feature = "cutlass"))]
+pub(crate) fn fp8_unified_layout() -> bool {
+    false
+}
 
 /// Where a matrix's bytes live.
 enum Storage {
@@ -42,6 +61,15 @@ enum Storage {
     Streamed { offset: usize },
 }
 
+/// Holds a lazily-built [`infero_kernels::CutlassWeight`] for a resident
+/// matrix, off the `cutlass` feature. `()` when the feature is off, so every
+/// `Matrix { .. }` literal can write `cutlass_weight: Default::default()`
+/// without a `#[cfg]` at each of the several construction sites.
+#[cfg(feature = "cutlass")]
+type CutlassSlot = std::sync::OnceLock<Option<infero_kernels::CutlassWeight>>;
+#[cfg(not(feature = "cutlass"))]
+type CutlassSlot = ();
+
 /// A 2-D weight matrix, still in its GGUF block encoding.
 pub struct Matrix {
     pub ty: WeightType,
@@ -51,6 +79,7 @@ pub struct Matrix {
     pub n: usize,
     pub n_bytes: usize,
     storage: Storage,
+    cutlass_weight: CutlassSlot,
 }
 
 impl Matrix {
@@ -60,6 +89,26 @@ impl Matrix {
 
     pub fn is_resident(&self) -> bool {
         matches!(self.storage, Storage::Device(_))
+    }
+
+    /// This matrix's [`infero_kernels::CutlassWeight`], built and cached on
+    /// first use. Only for resident, [`WeightType::F8E4M3`] matrices --
+    /// `None` otherwise, including for offloaded ones: their bytes live in a
+    /// per-layer staging buffer that a different layer's DMA overwrites
+    /// between calls, so caching a repack of it would go stale silently. The
+    /// repack itself is a one-time `O(n*k)` cost the same order as reading
+    /// the matrix once, negligible next to loading the checkpoint.
+    #[cfg(feature = "cutlass")]
+    pub fn cutlass_weight(&self, kern: &infero_kernels::Kernels) -> Option<&infero_kernels::CutlassWeight> {
+        if self.ty != WeightType::F8E4M3 || !self.is_resident() {
+            return None;
+        }
+        self.cutlass_weight
+            .get_or_init(|| {
+                let view = self.view(None).ok()?;
+                kern.prepare_cutlass_weight(&view, self.k, self.n, fp8_unified_layout()).ok()
+            })
+            .as_ref()
     }
 
     /// A device view of this matrix.
@@ -194,6 +243,22 @@ pub struct MoeWeights {
 /// A 1-D parameter — norm gains and biases — always held as f32 on the device.
 pub type Vector = Buf<f32>;
 
+/// The host-side table for [`Weights::mrope_axis`], uploaded by both loaders.
+///
+/// `rotary_dim / 2` is `0` only when `rotary_dim` is `0`, which the config
+/// loaders already refuse, but `mrope_axis.len() >= rotary_dim / 2` is a
+/// buffer-size invariant `rope_qk_partial` enforces at every call, and Metal
+/// takes no null buffers -- so this is `.max(1)` rather than exactly zero for
+/// a model with no rotary width at all (there are none today, but nothing
+/// upstream promises there won't be).
+pub(crate) fn mrope_axis_table(rotary_dim: usize, section: Option<[usize; 3]>) -> Vec<i32> {
+    let half = (rotary_dim / 2).max(1);
+    match section {
+        Some(s) => (0..half).map(|i| interleaved_mrope_axis(i, s) as i32).collect(),
+        None => vec![0i32; half],
+    }
+}
+
 impl Matrix {
     /// Upload `[n, k]` f16 values, row-major, as a resident matrix.
     ///
@@ -217,6 +282,7 @@ impl Matrix {
             n,
             n_bytes: raw.len(),
             storage: Storage::Device(dev.stream().clone_htod(raw)?),
+                cutlass_weight: Default::default(),
         })
     }
 }
@@ -424,6 +490,13 @@ pub struct Weights {
     /// Per-dimension RoPE frequency divisors, `d_head / 2` of them. All ones
     /// unless the file carries `rope_freqs.weight`.
     pub rope_freqs: Vector,
+    /// Which of a token's `pos_stride` position values each of the
+    /// `rotary_dim / 2` rope frequencies reads. All zeros -- read the one
+    /// scalar position every model before Qwen3.5 has -- unless
+    /// `cfg.mrope_section` is set, in which case this is
+    /// `interleaved_mrope_axis(i, section)` per frequency `i`. See
+    /// `Kernels::rope_qk_partial`'s doc comment and `notes/mrope-and-video.md`.
+    pub mrope_axis: Buf<i32>,
     /// Weight bytes held in VRAM.
     pub device_bytes: usize,
     /// Weight bytes held in page-locked host memory.
@@ -481,6 +554,12 @@ impl Weights {
             }
             None => dev.stream().clone_htod(&vec![1.0f32; cfg.d_head / 2])?,
         };
+        // No GGUF conversion carries a Qwen3.5 vision tower (`cfg.mrope_section`
+        // is always `None` from this loader -- see `Config::from_gguf`), so
+        // this is always the all-scalar table.
+        let mrope_axis = dev
+            .stream()
+            .clone_htod(&mrope_axis_table(cfg.rotary_dim, cfg.mrope_section))?;
 
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
@@ -690,6 +769,7 @@ impl Weights {
             // the split layout is only for the one infero quantizes itself.
             output_split: None,
             rope_freqs,
+            mrope_axis,
             device_bytes,
             host_bytes,
             max_blob_bytes,
@@ -1052,6 +1132,7 @@ pub fn load_mtp(
                 n,
                 n_bytes: bytes.len(),
                 storage: Storage::Device(dev.stream().clone_htod(&bytes)?),
+                cutlass_weight: Default::default(),
             });
         }
         // `mtp.fc` lands here — BF16 in this checkpoint. Not a special case in
@@ -1071,6 +1152,7 @@ pub fn load_mtp(
             n,
             n_bytes: raw.len(),
             storage: Storage::Device(dev.stream().clone_htod(raw)?),
+                cutlass_weight: Default::default(),
         })
     };
 
@@ -1193,6 +1275,7 @@ fn stacked2_gguf(dev: &Device, f: &Gguf, a: &str, b: &str, total: &mut usize) ->
         n: n_a + n_b,
         n_bytes: bytes.len(),
         storage: Storage::Device(dev.stream().clone_htod(&bytes)?),
+                cutlass_weight: Default::default(),
     }))
 }
 
@@ -1228,6 +1311,7 @@ pub fn load_awq(
             n,
             n_bytes: bytes.len(),
             storage: Storage::Device(dev.stream().clone_htod(bytes)?),
+                cutlass_weight: Default::default(),
         })
     };
     let arch = cfg.arch.clone();
@@ -1312,18 +1396,29 @@ pub fn load_awq(
                 // in `fp8::repack_rows` so that this and `tests/fp8_matvec.rs`
                 // cannot drift apart.
                 //
-                // `repack_rows` already hands back a `padded * k`-byte `Vec`,
-                // filled in parallel — appending it into a second, freshly
-                // `with_capacity`'d buffer instead of just using it looked
-                // harmless but wasn't: that second buffer's pages are unmapped
-                // until this exact `extend_from_slice` first touches them, so
-                // the copy pays for every one of the 43 GB checkpoint's page
-                // faults on a single thread. `repack_rows`'s own allocation
-                // pays the same fault cost already, just spread over sixteen
-                // threads — 3.6 s measured against this copy's 25.7 s of the
-                // 27B's ~60 s load. Reusing it and only growing it for the
-                // scale tail turns that second full pass into nothing.
-                let mut bytes = infero_kernels::fp8::repack_rows(t.data, k, n)?;
+                // Unless `fp8_unified_layout()` is on, in which case this is
+                // `fp8::pad_rows` instead -- plain `[n,k]` row-major, no
+                // permutation, which is both `Kernels::mmv_f8_plain`'s and
+                // CUTLASS's native layout. See that function's doc comment
+                // for why this is safe to prefer now.
+                //
+                // `repack_rows`/`pad_rows` already hand back a `padded *
+                // k`-byte `Vec`, filled in parallel — appending it into a
+                // second, freshly `with_capacity`'d buffer instead of just
+                // using it looked harmless but wasn't: that second buffer's
+                // pages are unmapped until this exact `extend_from_slice`
+                // first touches them, so the copy pays for every one of the
+                // 43 GB checkpoint's page faults on a single thread.
+                // `repack_rows`'s own allocation pays the same fault cost
+                // already, just spread over sixteen threads — 3.6 s measured
+                // against this copy's 25.7 s of the 27B's ~60 s load. Reusing
+                // it and only growing it for the scale tail turns that
+                // second full pass into nothing.
+                let mut bytes = if fp8_unified_layout() {
+                    infero_kernels::fp8::pad_rows(t.data, k, n)?
+                } else {
+                    infero_kernels::fp8::repack_rows(t.data, k, n)?
+                };
                 bytes.reserve_exact(scales.len() * 4);
                 for v in &scales {
                     bytes.extend_from_slice(&v.to_le_bytes());
@@ -1656,6 +1751,9 @@ pub fn load_awq(
     };
     device_bytes += freq_factors.len() * 4;
     let rope_freqs = dev.stream().clone_htod(freq_factors)?;
+    let mrope_axis = dev
+        .stream()
+        .clone_htod(&mrope_axis_table(cfg.rotary_dim, cfg.mrope_section))?;
 
     // Where the decoder layers live. A multimodal checkpoint nests the text
     // model under `language_model`, so the same layer is
@@ -1925,6 +2023,7 @@ pub fn load_awq(
         output,
         output_split,
         rope_freqs,
+        mrope_axis,
         device_bytes,
         host_bytes: 0,
         max_blob_bytes: 0,
@@ -1963,6 +2062,7 @@ fn upload_matrix(
         n,
         n_bytes,
         storage,
+        cutlass_weight: Default::default(),
     })
 }
 
@@ -2003,6 +2103,7 @@ fn pack_layer(dev: &Device, f: &Gguf, names: &[String]) -> Result<(Vec<Matrix>, 
             n,
             n_bytes,
             storage: Storage::Streamed { offset },
+                cutlass_weight: Default::default(),
         })
         .collect();
 

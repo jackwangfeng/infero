@@ -479,6 +479,24 @@ pub fn repack_rows(quants: &[u8], k: usize, n: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// [`repack_rows`], with the identity permutation: `[n,k]` row-major in,
+/// zero-padded up to a whole [`ROW_GROUP`] rows, same total size
+/// `repack_rows` returns. For [`Kernels::mmv_f8_plain`] and the `cutlass`
+/// feature's unified-format weight path, where nothing reads the
+/// interleave and `[n,k]` row-major is what CUTLASS wants natively too —
+/// see `cutlass/fp8_bw_gemm.cu`'s header.
+pub fn pad_rows(quants: &[u8], k: usize, n: usize) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        quants.len() == n * k,
+        "{} quant bytes for an [{n}, {k}] matrix",
+        quants.len()
+    );
+    let padded = n.next_multiple_of(ROW_GROUP);
+    let mut out = vec![0u8; padded * k];
+    out[..quants.len()].copy_from_slice(quants);
+    Ok(out)
+}
+
 /// How many scales an `[n, k]` matrix's grid holds.
 pub fn scale_grid(k: usize, n: usize) -> usize {
     n.div_ceil(FP8_BLOCK) * k.div_ceil(FP8_BLOCK)
@@ -689,6 +707,53 @@ impl Kernels {
             .profile()
             .time("mmv_f8_block", self.dev.stream(), || {
                 unsafe { b.launch(cfg) }.context("mmv_f8_block")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// [`Kernels::mmv_f8_block`] against plain `[n,k]` row-major quants
+    /// ([`pad_rows`], not [`repack_rows`]) and an untransposed
+    /// `[n/128,k/128]` scale grid -- CUTLASS's native weight layout. The
+    /// `cutlass` feature's unified-format path (single-token decode) uses
+    /// this instead of `mmv_f8_block`, at a measured 2-17% cost on an SM120
+    /// card (`examples/cutlass_vs_block.rs`) against
+    /// `repack_rows`-interleaved reads -- small enough, on this hardware, to
+    /// not keep two copies of every FP8 weight over. See
+    /// `cutlass/fp8_bw_gemm.cu`'s header for why this is CUTLASS's format
+    /// too, so a matrix stored this way needs no extra copy for either
+    /// kernel.
+    pub fn mmv_f8_plain(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
+        x: &View<'_, f32>,
+        k: usize,
+        n: usize,
+        accum: bool,
+    ) -> Result<()> {
+        debug_assert!(
+            w.len() >= fp8_bytes(k, n),
+            "an [{n}, {k}] FP8 matrix wants {} bytes, the view holds {}",
+            fp8_bytes(k, n),
+            w.len()
+        );
+        let f = self.dev.kernels().get("infero_fp8", fp8_src(), "mmv_f8_plain_f32")?;
+        const BLOCK: u32 = 256;
+        let cfg = LaunchConfig {
+            grid_dim: (n.div_ceil(ROW_GROUP) as u32, 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (ki, ni) = (k as i32, n as i32);
+        let scols = k.div_ceil(FP8_BLOCK) as i32;
+        let acc = i32::from(accum);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(w).arg(x).arg(&ki).arg(&ni).arg(&scols).arg(&acc);
+        self.dev
+            .profile()
+            .time("mmv_f8_plain", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("mmv_f8_plain")?;
                 Ok(())
             })?;
         Ok(())
