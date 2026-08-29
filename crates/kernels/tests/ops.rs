@@ -1124,6 +1124,49 @@ fn attn_prefill_matches_the_three_kernels() -> Result<()> {
                 "attn_prefill_pipev {n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
                  wrote past the run"
             );
+
+            // Same reference, the warp-specialized producer/consumer kernel.
+            let mut got_ws_d = stream.clone_htod(&want)?;
+            let mut part_ws = stream.alloc_zeros::<f32>(Kernels::attn_partial_floats(
+                dims.n_heads,
+                dims.d_head,
+                run_tokens,
+            ))?;
+            k.attn_prefill_ws(
+                &mut got_ws_d.as_view_mut(),
+                &dq.as_view(),
+                &dk.as_view(),
+                &dv.as_view(),
+                batch,
+                dims,
+                pad,
+                run_tokens,
+                kv_len,
+                scale,
+                &mut part_ws.as_view_mut(),
+            )?;
+            let got_ws = stream.clone_dtoh(&got_ws_d)?;
+            k.device().synchronize()?;
+            let (abs_ws, at_ws) = max_abs_diff(&got_ws[run_lo..run_hi], &want[run_lo..run_hi]);
+            assert!(
+                abs_ws < 2e-3,
+                "attn_prefill_ws {n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
+                 max abs diff {abs_ws} at {at_ws} (got {}, want {})",
+                got_ws[run_lo + at_ws],
+                want[run_lo + at_ws]
+            );
+            assert_eq!(
+                &got_ws[..run_lo],
+                &want[..run_lo],
+                "attn_prefill_ws {n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
+                 wrote before the run"
+            );
+            assert_eq!(
+                &got_ws[run_hi..],
+                &want[run_hi..],
+                "attn_prefill_ws {n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
+                 wrote past the run"
+            );
         }
     }
     Ok(())

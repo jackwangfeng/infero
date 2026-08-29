@@ -3259,18 +3259,17 @@ extern "C" __global__ void attn_prefill_mma_natv_f32(
 // only pipelined K (V's transpose blocked it) and measured slower than
 // `attn_prefill_mma_f32` (0.869x); this one prefetches *both* operands --
 // removing the synchronous load from the iteration entirely, not just half
-// of it. **This is the one that won**: 1.082x on a standalone 16-layer x
-// 30552-token benchmark, and 8729ms -> 8479ms (-2.9%) on the real model's
-// end-to-end prefill -- consistent with `attn_prefill` being ~35% of that
-// total. Verified via `attn_prefill_matches_the_three_kernels`,
-// `compute-sanitizer --tool memcheck` (0 errors) and `--tool racecheck`
-// (0 hazards), and the full `infero-model` test suite (batching invariance
-// included) before being wired in as `Model`'s default prefill attention
-// kernel. `attn_prefill_mma_f32`/`_pipe_f32`/`_natv_f32` stay in tree as the
-// documented steps that got here — `_pipe_f32` shows K-only isn't enough,
-// `_natv_f32` shows the V-layout change alone is nearly free — matching this
-// codebase's convention of keeping the real intermediate results, not just
-// the final answer.
+// of it. Measured 1.082x standalone, 8729ms -> 8479ms (-2.9%) real
+// end-to-end -- a real win, but since superseded as `Model`'s default by
+// `attn_prefill_mma_ws_f32` below, which took the same natural-V-layout
+// insight further (1.369x standalone, -6.8% real end-to-end). Kept in tree,
+// verified via `attn_prefill_matches_the_three_kernels`, `compute-sanitizer
+// --tool memcheck`/`--tool racecheck` (0 errors/hazards), and the full
+// `infero-model` suite, as one of the documented steps that got there --
+// `attn_prefill_mma_pipe_f32` shows K-only isn't enough, `_natv_f32` shows
+// the V-layout change alone is nearly free, this one shows cooperative
+// load-then-compute (every warp doing both) still leaves real overlap on
+// the table that only true producer/consumer warp specialization reaches.
 //
 // Same `NWARPS=7`/`ATTN_MMA_KPAD=8` budget as `attn_prefill`: two `WK`-wide
 // K buffers plus two `WK`-wide V buffers together cost less than
@@ -3506,6 +3505,297 @@ extern "C" __global__ void attn_prefill_mma_pipev_f32(
         }
 
         __syncthreads();
+    }
+
+#pragma unroll
+    for (int rg = 0; rg < 2; ++rg) {
+        if (!row_live[rg]) continue;
+        const int abs_row = cr + rg * 8;
+        const int token = run_base + tile * tile_tokens + local0 + row_j[rg];
+        const int head = kv_head * group + abs_row % group;
+        const float den = l_run[rg];
+        const float m = m_run[rg];
+#pragma unroll
+        for (int i = 0; i < ATTN_MMA_MAX_NTILES; ++i) {
+            if (i >= ntiles) break;
+            const int d0 = i * 8 + cc;
+            const float v0 = o[i].x[rg * 2];
+            const float v1 = o[i].x[rg * 2 + 1];
+            if (single) {
+                out[((size_t)token * n_heads + head) * d_head + d0] =
+                    den > 0.0f ? v0 / den : 0.0f;
+                out[((size_t)token * n_heads + head) * d_head + d0 + 1] =
+                    den > 0.0f ? v1 / den : 0.0f;
+            } else {
+                const int local_token = tile * tile_tokens + local0 + row_j[rg];
+                float* dst =
+                    partial + (((size_t)c * run_tokens + local_token) * n_heads + head) * d_head + d0;
+                dst[0] = v0;
+                dst[1] = v1;
+                if (d0 == 0) {
+                    float* ms = partial + ms_off
+                              + (((size_t)c * run_tokens + local_token) * n_heads + head) * 2;
+                    ms[0] = m;
+                    ms[1] = den;
+                }
+            }
+        }
+    }
+}
+
+// A true producer/consumer warp-specialized version of `attn_prefill_mma_pipev_f32`:
+// one dedicated warp (warp 0) does nothing but issue cp.async for K and V
+// into a 2-stage ring buffer and signal readiness via named barriers
+// (`bar.sync`/`bar.arrive`, PTX -- validated in isolation, no attention
+// logic, before this kernel was written: a toy producer/consumer handoff
+// over 5000 tiles x 7 consumer warps, `compute-sanitizer --tool racecheck`
+// clean). The other `NWARPS` warps are pure consumers, each still owning
+// `tpw` query tokens and walking the whole key range exactly like every
+// other kernel in this family.
+//
+// The point `attn_prefill_mma_pipev_f32` couldn't reach: there, every warp
+// both loads (cooperatively) *and* computes, so the `__syncthreads()`
+// between them still makes every warp wait for the slowest one at each
+// tile boundary. Here the producer never computes and never waits on
+// consumers except via the FREE barrier for a *specific* buffer slot two
+// iterations behind -- it can be issuing block b+1's load while consumers
+// are still finishing block b's compute, with no block-wide rendezvous.
+//
+// Costs one extra warp (`NWARPS + 1` total, `NWARPS` still the consumer/
+// compute count) rather than converting an existing compute warp, so
+// consumer capacity matches `attn_prefill`'s own `NWARPS=7` exactly, unlike
+// this session's earlier `NWARPS`-cutting pipe32 experiment.
+//
+// Barrier IDs 1-4 (0 reserved). `bar.sync`/`bar.arrive`'s `count` argument
+// must be the *same* total participant count (producer + every consumer
+// warp) on every call to the same barrier ID, or the hardware barrier unit
+// never reaches it -- a wrong count hangs, it does not miscompute, which is
+// why the isolated probe above tested exactly this arithmetic first.
+#define ATTN_WS_BAR_READY0 1
+#define ATTN_WS_BAR_READY1 2
+#define ATTN_WS_BAR_FREE0 3
+#define ATTN_WS_BAR_FREE1 4
+
+extern "C" __global__ void attn_prefill_mma_ws_f32(
+    float* __restrict__ partial, int ms_off, float* __restrict__ out, int single,
+    const float* __restrict__ q, const __half* __restrict__ k_cache,
+    const __half* __restrict__ v_cache, const int* __restrict__ seq_of,
+    const int* __restrict__ positions, const int* __restrict__ slot_table,
+    int table_stride, int n_heads, int n_kv_heads, int d_head, int n_slots,
+    float scale, int chunk, int kv_len, int group, int tpw, int run_base,
+    int run_tokens) {
+    const int kv_head = blockIdx.x;
+    const int tile = blockIdx.y;
+    const int c = blockIdx.z;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const bool is_producer = (warp == 0);
+    const int cwarp = warp - 1;  // valid only for consumers
+    const int nwarps = blockDim.x / WARP_SIZE - 1;  // consumer count
+    const int tile_tokens = nwarps * tpw;
+    const int total_threads = blockDim.x;
+
+    const int krow = d_head + ATTN_MMA_KPAD;
+    const int ksteps = d_head / 16;
+    const int ntiles = d_head / 8;
+    const int quads = d_head / 8;
+
+    extern __shared__ char attn_ws_smem[];
+    __half* sq = (__half*)attn_ws_smem;  // nwarps (consumer) slabs of 16 rows each
+    __half* sk0 = sq + (size_t)nwarps * 16 * krow;
+    __half* sk1 = sk0 + (size_t)ATTN_MMA_WK * krow;
+    __half* sv0 = sk1 + (size_t)ATTN_MMA_WK * krow;
+    __half* sv1 = sv0 + (size_t)ATTN_MMA_WK * krow;
+
+    // One seq_of/slot-table lookup for the whole tile, needed by both roles.
+    const int tile_base = run_base + tile * tile_tokens;
+    const int base_last = positions[tile_base];
+    const int* table = slot_table + (size_t)seq_of[tile_base] * table_stride;
+    const __half* kbase = k_cache + (size_t)kv_head * n_slots * d_head;
+    const __half* vbase = v_cache + (size_t)kv_head * n_slots * d_head;
+    const int tokens_here = min(tile_tokens, run_tokens - tile * tile_tokens);
+    const int last_max = base_last + tokens_here - 1;
+    const int begin = c * chunk;
+    int end = begin + chunk;
+    if (end > kv_len) end = kv_len;
+    if (end > last_max + 1) end = last_max + 1;
+    const int n_blk = end > begin ? (end - begin + ATTN_MMA_WK - 1) / ATTN_MMA_WK : 0;
+
+    if (is_producer) {
+        for (int b = 0; b < n_blk; ++b) {
+            const int stage = b & 1;
+            if (b >= 2) {
+                const int bar = (stage == 0) ? ATTN_WS_BAR_FREE0 : ATTN_WS_BAR_FREE1;
+                asm volatile("bar.sync %0, %1;" ::"r"(bar), "r"(total_threads));
+            }
+            __half* skb = (stage == 0) ? sk0 : sk1;
+            __half* svb = (stage == 0) ? sv0 : sv1;
+            const int base = begin + b * ATTN_MMA_WK;
+            const int n = min(ATTN_MMA_WK, end - base);
+            for (int e = lane; e < ATTN_MMA_WK * quads; e += WARP_SIZE) {
+                const int r = e / quads, w8 = e % quads;
+                const bool hit = r < n;
+                const size_t off = (size_t)table[base + (hit ? r : 0)] * d_head + w8 * 8;
+                cp_async16(skb + r * krow + w8 * 8, kbase + off, hit);
+                cp_async16(svb + r * krow + w8 * 8, vbase + off, hit);
+            }
+            CP_ASYNC_FENCE();
+            CP_ASYNC_WAIT(0);
+            const int bar = (stage == 0) ? ATTN_WS_BAR_READY0 : ATTN_WS_BAR_READY1;
+            asm volatile("bar.arrive %0, %1;" ::"r"(bar), "r"(total_threads));
+        }
+        return;
+    }
+
+    // Consumer: this warp's own 16-row Q slab, its own tokens/heads.
+    __half* wq = sq + (size_t)cwarp * 16 * krow;
+    const int local0 = cwarp * tpw;
+    for (int i = lane; i < 16 * d_head; i += WARP_SIZE) {
+        const int r = i / d_head, d = i % d_head;
+        float v = 0.0f;
+        const int j = r / group;
+        if (r < tpw * group && local0 + j < run_tokens) {
+            const int token = run_base + tile * tile_tokens + local0 + j;
+            v = q[((size_t)token * n_heads + kv_head * group + r % group) * d_head + d];
+        }
+        wq[r * krow + d] = __float2half(v);
+    }
+    __syncwarp();
+
+    const int ar = mma_a_row(lane);
+    const int bc = mma_b_col(lane);
+    const int k0 = mma_k0_f16(lane);
+    const int cr = mma_c_row(lane);
+    const int cc = mma_c_col(lane);
+
+    mma_a_f16 qa[ATTN_MMA_MAX_KSTEPS];
+#pragma unroll
+    for (int t = 0; t < ATTN_MMA_MAX_KSTEPS; ++t) {
+        if (t >= ksteps) break;
+        const __half* lo = wq + ar * krow + t * 16 + k0;
+        const __half* hi = wq + (ar + 8) * krow + t * 16 + k0;
+        qa[t].x[0] = *(const unsigned*)(const void*)lo;
+        qa[t].x[1] = *(const unsigned*)(const void*)hi;
+        qa[t].x[2] = *(const unsigned*)(const void*)(lo + 8);
+        qa[t].x[3] = *(const unsigned*)(const void*)(hi + 8);
+    }
+
+    mma_c_f32 o[ATTN_MMA_MAX_NTILES];
+#pragma unroll
+    for (int i = 0; i < ATTN_MMA_MAX_NTILES; ++i) {
+        o[i].x[0] = 0.0f;
+        o[i].x[1] = 0.0f;
+        o[i].x[2] = 0.0f;
+        o[i].x[3] = 0.0f;
+    }
+    float m_run[2] = {-INFINITY, -INFINITY};
+    float l_run[2] = {0.0f, 0.0f};
+    int row_j[2], row_last[2];
+    bool row_live[2];
+#pragma unroll
+    for (int rg = 0; rg < 2; ++rg) {
+        const int abs_row = cr + rg * 8;
+        row_j[rg] = abs_row / group;
+        row_last[rg] = base_last + local0 + row_j[rg];
+        row_live[rg] = abs_row < tpw * group && local0 + row_j[rg] < tokens_here;
+    }
+
+    for (int b = 0; b < n_blk; ++b) {
+        const int stage = b & 1;
+        const int rbar = (stage == 0) ? ATTN_WS_BAR_READY0 : ATTN_WS_BAR_READY1;
+        asm volatile("bar.sync %0, %1;" ::"r"(rbar), "r"(total_threads));
+
+        __half* skb = (stage == 0) ? sk0 : sk1;
+        __half* svb = (stage == 0) ? sv0 : sv1;
+        const int base = begin + b * ATTN_MMA_WK;
+        const int n = min(ATTN_MMA_WK, end - base);
+
+        mma_c_f32 s2[2];
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            s2[nt].x[0] = 0.0f;
+            s2[nt].x[1] = 0.0f;
+            s2[nt].x[2] = 0.0f;
+            s2[nt].x[3] = 0.0f;
+            const int key0 = nt * 8;
+#pragma unroll
+            for (int t = 0; t < ATTN_MMA_MAX_KSTEPS; ++t) {
+                if (t >= ksteps) break;
+                mma_b_f16 b_;
+                const __half* bp = skb + (key0 + bc) * krow + t * 16 + k0;
+                b_.x[0] = *(const unsigned*)(const void*)bp;
+                b_.x[1] = *(const unsigned*)(const void*)(bp + 8);
+                mma_f16(s2[nt], qa[t], b_);
+            }
+        }
+
+        float sv_score[8];
+#pragma unroll
+        for (int rg = 0; rg < 2; ++rg) {
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+#pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    const int key = nt * 8 + cc + e;
+                    const int abs_key = base + key;
+                    sv_score[rg * 4 + nt * 2 + e] =
+                        (row_live[rg] && key < n && abs_key <= row_last[rg])
+                            ? s2[nt].x[rg * 2 + e] * scale
+                            : -INFINITY;
+                }
+            }
+        }
+
+        float p[8];
+#pragma unroll
+        for (int rg = 0; rg < 2; ++rg) {
+            float* svr = sv_score + rg * 4;
+            float m_own = fmaxf(fmaxf(svr[0], svr[1]), fmaxf(svr[2], svr[3]));
+            m_own = fmaxf(m_own, __shfl_xor_sync(0xffffffff, m_own, 1, WARP_SIZE));
+            m_own = fmaxf(m_own, __shfl_xor_sync(0xffffffff, m_own, 2, WARP_SIZE));
+            const float m_new = fmaxf(m_run[rg], m_own);
+            float psum = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                p[rg * 4 + i] = (svr[i] == -INFINITY) ? 0.0f : __expf(svr[i] - m_new);
+                psum += p[rg * 4 + i];
+            }
+            psum += __shfl_xor_sync(0xffffffff, psum, 1, WARP_SIZE);
+            psum += __shfl_xor_sync(0xffffffff, psum, 2, WARP_SIZE);
+
+            const float corr =
+                (m_run[rg] == -INFINITY) ? 0.0f : __expf(m_run[rg] - m_new);
+            l_run[rg] = l_run[rg] * corr + psum;
+            m_run[rg] = m_new;
+#pragma unroll
+            for (int i = 0; i < ATTN_MMA_MAX_NTILES; ++i) {
+                if (i >= ntiles) break;
+                o[i].x[rg * 2] *= corr;
+                o[i].x[rg * 2 + 1] *= corr;
+            }
+        }
+
+        mma_a_f16 pa;
+        const __half2 p_rg0_nt0 = __floats2half2_rn(p[0], p[1]);
+        const __half2 p_rg1_nt0 = __floats2half2_rn(p[4], p[5]);
+        const __half2 p_rg0_nt1 = __floats2half2_rn(p[2], p[3]);
+        const __half2 p_rg1_nt1 = __floats2half2_rn(p[6], p[7]);
+        pa.x[0] = *(const unsigned*)(const void*)&p_rg0_nt0;
+        pa.x[1] = *(const unsigned*)(const void*)&p_rg1_nt0;
+        pa.x[2] = *(const unsigned*)(const void*)&p_rg0_nt1;
+        pa.x[3] = *(const unsigned*)(const void*)&p_rg1_nt1;
+#pragma unroll
+        for (int i = 0; i < ATTN_MMA_MAX_NTILES; ++i) {
+            if (i >= ntiles) break;
+            const int dim = i * 8 + bc;
+            mma_b_f16 b_;
+            b_.x[0] = attn_pack_half2(svb + (k0) * krow + dim, svb + (k0 + 1) * krow + dim);
+            b_.x[1] = attn_pack_half2(svb + (k0 + 8) * krow + dim, svb + (k0 + 9) * krow + dim);
+            mma_f16(o[i], pa, b_);
+        }
+
+        const int fbar = (stage == 0) ? ATTN_WS_BAR_FREE0 : ATTN_WS_BAR_FREE1;
+        asm volatile("bar.arrive %0, %1;" ::"r"(fbar), "r"(total_threads));
     }
 
 #pragma unroll

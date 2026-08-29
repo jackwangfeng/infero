@@ -84,7 +84,11 @@ fn main() -> Result<()> {
                         &mut out.as_view_mut(), &dq.as_view(), &dk.as_view(), &dv.as_view(),
                         batch, dims, base, run_tokens, kv_len, scale, &mut part.as_view_mut(),
                     )?,
-                    _ => k.attn_prefill_pipev(
+                    3 => k.attn_prefill_pipev(
+                        &mut out.as_view_mut(), &dq.as_view(), &dk.as_view(), &dv.as_view(),
+                        batch, dims, base, run_tokens, kv_len, scale, &mut part.as_view_mut(),
+                    )?,
+                    _ => k.attn_prefill_ws(
                         &mut out.as_view_mut(), &dq.as_view(), &dk.as_view(), &dv.as_view(),
                         batch, dims, base, run_tokens, kv_len, scale, &mut part.as_view_mut(),
                     )?,
@@ -96,14 +100,14 @@ fn main() -> Result<()> {
         Ok(t0.elapsed().as_secs_f64() * 1000.0)
     };
 
-    // Warmup all four, then take the best of a few timed reps each.
-    for v in 0..4 {
+    // Warmup all five, then take the best of a few timed reps each.
+    for v in 0..5 {
         run_one(v, &mut out, &mut part)?;
     }
 
-    let mut best = [f64::MAX; 4];
+    let mut best = [f64::MAX; 5];
     for _ in 0..3 {
-        for v in 0..4u32 {
+        for v in 0..5u32 {
             best[v as usize] = best[v as usize].min(run_one(v, &mut out, &mut part)?);
         }
     }
@@ -111,5 +115,6 @@ fn main() -> Result<()> {
     println!("attn_prefill_pipe   best: {:.2} ms total, {:.3}x", best[1], best[0] / best[1]);
     println!("attn_prefill_natv   best: {:.2} ms total, {:.3}x", best[2], best[0] / best[2]);
     println!("attn_prefill_pipev  best: {:.2} ms total, {:.3}x", best[3], best[0] / best[3]);
+    println!("attn_prefill_ws     best: {:.2} ms total, {:.3}x", best[4], best[0] / best[4]);
     Ok(())
 }

@@ -3131,11 +3131,11 @@ impl Model {
                 // three.
                 // `prefill_run` is `Some(n)` only when this whole pass is one
                 // item — one sequence, `n` tokens, contiguous, causal — which
-                // `attn_prefill_pipev` requires and the caller
+                // `attn_prefill_ws` requires and the caller
                 // (`forward_batch_rows`) has already checked; see its own doc
                 // comment for why a narrower run is not attempted here.
                 if let Some(run_tokens) = prefill_run.filter(|_| self.kern.prefill_attention(&dims)) {
-                    self.kern.attn_prefill_pipev(
+                    self.kern.attn_prefill_ws(
                         &mut attn_out.slice_mut(..n * da),
                         &self.act.q.slice(..n * da),
                         &pool.dense(layer).0.as_view(),
