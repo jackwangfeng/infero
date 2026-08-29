@@ -61,7 +61,14 @@ extern "C" __global__ void gdn_conv_f32(float* __restrict__ out,
     float win[8];
     for (int j = 0; j < hist; ++j) win[j] = st[j];
 
-    const float* wc = w + (size_t)c * k;
+    // wc doesn't vary with n, so it's loaded into registers once rather than
+    // re-read from global memory every one of the (up to thousands of)
+    // iterations below -- that redundant per-step load was also badly
+    // strided across threads (consecutive c's are k floats apart), which is
+    // what made it show up as an uncoalesced-access hotspot in profiling.
+    const float* wc_g = w + (size_t)c * k;
+    float wc[8];
+    for (int j = 0; j <= hist; ++j) wc[j] = wc_g[j];
     for (int n = 0; n < nt; ++n) {
         const float cur = x[(size_t)(t0 + n) * channels + c];
         float acc = wc[hist] * cur;
