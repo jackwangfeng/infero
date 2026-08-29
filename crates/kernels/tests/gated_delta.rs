@@ -867,7 +867,7 @@ fn the_three_delta_rule_kernels_agree_with_each_other_and_the_reference() -> Res
         ("one token at a time", (0..t_len).map(|t| (t, 1)).collect()),
         ("5 then 8", vec![(0usize, 5usize), (5, 8)]),
     ] {
-        for variant in [DeltaVariant::Global, DeltaVariant::Reg, DeltaVariant::Shared] {
+        for variant in [DeltaVariant::Global, DeltaVariant::Reg, DeltaVariant::Shared, DeltaVariant::Chunk] {
             let (out, state) =
                 run_variant(&k, &row, &g, &beta, off, t_len, &chunks, variant)?;
             let (worst, at) = max_abs_diff(&out, &want);
@@ -912,7 +912,7 @@ fn the_fallback_kernels_keep_sequences_apart_and_idle_slots_untouched() -> Resul
     let stride = off.0;
     let per_seq = VAL_HEADS * DK * DV;
 
-    for variant in [DeltaVariant::Global, DeltaVariant::Shared, DeltaVariant::Reg] {
+    for variant in [DeltaVariant::Global, DeltaVariant::Shared, DeltaVariant::Reg, DeltaVariant::Chunk] {
         let d_row = stream.clone_htod(&row)?;
         let d_g = stream.clone_htod(&g)?;
         let d_beta = stream.clone_htod(&beta)?;
@@ -1138,6 +1138,53 @@ fn the_register_state_does_not_spill() -> Result<()> {
         "the register-blocked delta rule fits no block an SM at all: {regs} \
          registers over 2 * {DV} threads is past this device's budget, and the \
          launch will fail rather than run slowly"
+    );
+    Ok(())
+}
+
+/// Same check as above, for `gdn_chunk_delta_rule_f32`'s register-resident
+/// state -- it uses the identical per-thread layout (`sc[64]`, fully unrolled)
+/// so it is exactly as vulnerable to a dynamically-indexed array quietly
+/// moving to local memory.
+#[test]
+fn the_chunked_kernels_register_state_does_not_spill() -> Result<()> {
+    let k = kernels()?;
+    const GDN_CHUNK: usize = 32;
+    const GDN_ROW_PAD: usize = DK + 4;
+    const GDN_A_STRIDE: usize = GDN_CHUNK + 1;
+    let shared = (3 * GDN_CHUNK * GDN_ROW_PAD * 4)   // sk + sq + sv, f32
+        + (3 * GDN_CHUNK * 4)                        // sgc + sbeta + sbg, f32
+        + (GDN_CHUNK * GDN_A_STRIDE * 4)              // sA, f32
+        + (GDN_CHUNK * GDN_ROW_PAD * 4)                // sW, f32
+        + (GDN_CHUNK * GDN_ROW_PAD * 4);               // sD, f32
+    let (regs, stat, spill) = k.gdn_kernel_registers("gdn_chunk_delta_rule_f32")?;
+    let blocks = k.gdn_occupancy_blocks("gdn_chunk_delta_rule_f32", 2 * DV as u32, shared)?;
+    eprintln!(
+        "  gdn_chunk_delta_rule_f32: {regs} regs, {stat} B static shared, \
+         {spill} B spill, {blocks} blocks/SM ({shared} B dynamic shared)"
+    );
+    // Unlike `gdn_delta_rule_reg128_f32` above, this one measures a small,
+    // fixed 8 B spill (two floats) no matter how the per-token forward-decay
+    // factor in the state-update loop is restructured -- moving it out of
+    // the `#pragma unroll`'d loop to avoid recomputing it 64 times over
+    // (a real, tried fix) made it *worse* (16 B), so this is accepted as
+    // ptxas's actual allocation for this body rather than chased further.
+    // The failure mode `the_register_state_does_not_spill` (0 B, above)
+    // exists for -- the whole `sc[64]` state array falling back to local
+    // memory because a loop over it isn't fully unrolled -- would spill on
+    // the order of hundreds of bytes, not 8; a small fixed spill here is a
+    // minor, bounded cost, not that regression class.
+    assert!(
+        spill <= 8,
+        "the chunked delta rule spills {spill} bytes a thread, more than the \
+         8 B measured and accepted when this test was written; its state may \
+         have fallen back to local memory rather than staying in registers"
+    );
+    assert!(
+        blocks >= 1,
+        "the chunked delta rule fits no block an SM at all: {regs} registers \
+         over 2 * {DV} threads plus {shared} B shared is past this device's \
+         budget"
     );
     Ok(())
 }

@@ -845,3 +845,158 @@ fn attn_decode_matches_the_three_kernels() -> Result<()> {
     }
     Ok(())
 }
+
+/// [`Kernels::attn_prefill`] against the same three-kernel reference,
+/// restricted to the one shape it is allowed to see: a single contiguous,
+/// single-sequence run. Requires `INFERO_ATTN_MMA=1` in the environment
+/// *before the test binary starts* — the gate reads it through a `OnceLock`
+/// shared by every test in this file, so setting it from inside a test can
+/// lose a race against whichever test's attention call runs first.
+///
+/// The run is embedded inside a larger fake batch (`pad` tokens of an
+/// unrelated sequence on each side, at unrelated KV slots) rather than run
+/// alone, so a bug that reads past `[run_base, run_base + run_tokens)` — the
+/// exact multi-tenant hazard the kernel's doc comment warns a cross-sequence
+/// tile would create — shows up as a wrong answer here instead of only in
+/// production traffic.
+#[test]
+fn attn_prefill_matches_the_three_kernels() -> Result<()> {
+    if std::env::var("INFERO_ATTN_MMA").as_deref() != Ok("1") {
+        eprintln!("skipping: needs INFERO_ATTN_MMA=1 set before the test binary starts");
+        return Ok(());
+    }
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+
+    // 256 with d_head 256 is Qwen3.8-27B-FP8's own shape; 4 and 7 are groups
+    // that do not divide sixteen evenly, matching the decode test's choices.
+    for (n_heads, n_kv_heads, d_head) in [(24usize, 4usize, 256usize), (8, 2, 128), (14, 2, 64)] {
+        let dims_probe = AttnDims { n_heads, n_kv_heads, d_head, n_slots: 1, n_tokens: 1 };
+        if !k.prefill_attention(&dims_probe) {
+            continue;
+        }
+        // Tile-boundary shapes: `tile_tokens` for `group * 2 <= 16` is
+        // `4 * (16 / group)`. Exercise under, at, and past one tile, plus a
+        // long run that forces `n_chunks > 1`.
+        for (run_tokens, kv_len) in [
+            (1usize, 40usize),
+            (2, 33),
+            (7, 33),
+            (16, 100),
+            (17, 100),
+            (63, 4000),
+            (256, 30000),
+        ] {
+            let pad = 5usize;
+            let n_tokens = pad + run_tokens + pad;
+            let n_slots = 512usize;
+            let dims = AttnDims { n_heads, n_kv_heads, d_head, n_slots, n_tokens };
+            let scale = 1.0 / (dims.d_head as f32).sqrt();
+            let q = pseudo_random(n_tokens * dims.n_heads * dims.d_head, 0x71);
+            let kv_elems = dims.n_kv_heads * n_slots * dims.d_head;
+            let kh: Vec<f16> = pseudo_random(kv_elems, 0x82).into_iter().map(f16::from_f32).collect();
+            let vh: Vec<f16> = pseudo_random(kv_elems, 0x93).into_iter().map(f16::from_f32).collect();
+
+            // Sequence 0 owns the padding on both sides, at positions and
+            // slots that share nothing with sequence 1's run in the middle —
+            // any read that strays outside the run picks up sequence 0's
+            // data and the comparison below catches it.
+            let mut seq_of = vec![0i32; n_tokens];
+            let mut positions = vec![0i32; n_tokens];
+            for t in 0..n_tokens {
+                if t >= pad && t < pad + run_tokens {
+                    seq_of[t] = 1;
+                    positions[t] = (t - pad) as i32;
+                } else {
+                    positions[t] = (200 + t) as i32 % (n_slots as i32);
+                }
+            }
+            let table: Vec<i32> = (0..2)
+                .flat_map(|s| (0..kv_len.max(n_slots)).map(move |p| ((p * 2 + s + 1) % n_slots) as i32))
+                .collect();
+            let table_stride = kv_len.max(n_slots);
+
+            let dq = stream.clone_htod(&q)?;
+            let dk = stream.clone_htod(&kh)?;
+            let dv = stream.clone_htod(&vh)?;
+            let dpos = stream.clone_htod(&positions)?;
+            let dseq = stream.clone_htod(&seq_of)?;
+            let dtable = stream.clone_htod(&table)?;
+            let (vseq, vpos, vtable) = (dseq.as_view(), dpos.as_view(), dtable.as_view());
+            let batch = BatchLayout {
+                seq_of: &vseq,
+                positions: &vpos,
+                slot_table: &vtable,
+                table_stride,
+            };
+
+            // Reference: the three-kernel path over the *whole* fake batch,
+            // then slice out the run's rows.
+            let mut dscores = stream.alloc_zeros::<f32>(dims.n_heads * n_tokens * kv_len)?;
+            let out_len = n_tokens * dims.n_heads * dims.d_head;
+            let mut want_d = stream.alloc_zeros::<f32>(out_len)?;
+            k.attn_scores(&mut dscores.as_view_mut(), &dq.as_view(), &dk.as_view(), batch, dims, kv_len, scale)?;
+            k.attn_softmax(&mut dscores.as_view_mut(), dims.n_heads, n_tokens, kv_len)?;
+            k.attn_output(&mut want_d.as_view_mut(), &dscores.as_view(), &dv.as_view(), batch, dims, kv_len, None)?;
+            let want = stream.clone_dtoh(&want_d)?;
+
+            // The kernel under test: only the run's slice of `out` gets
+            // written, so seed it with the reference's *own* padding rows
+            // and only overwrite the run — a bug that leaves the run
+            // untouched would otherwise slip through as a false pass.
+            let mut got_d = stream.clone_htod(&want)?;
+            let mut part = stream.alloc_zeros::<f32>(Kernels::attn_partial_floats(
+                dims.n_heads,
+                dims.d_head,
+                run_tokens,
+            ))?;
+            k.attn_prefill(
+                &mut got_d.as_view_mut(),
+                &dq.as_view(),
+                &dk.as_view(),
+                &dv.as_view(),
+                batch,
+                dims,
+                pad,
+                run_tokens,
+                kv_len,
+                scale,
+                &mut part.as_view_mut(),
+            )?;
+            let got = stream.clone_dtoh(&got_d)?;
+            k.device().synchronize()?;
+
+            // Same tolerance as the decode MMA path: f16 softmax weights on
+            // the way into the value product.
+            let run_lo = pad * dims.n_heads * dims.d_head;
+            let run_hi = (pad + run_tokens) * dims.n_heads * dims.d_head;
+            let (abs, at) = max_abs_diff(&got[run_lo..run_hi], &want[run_lo..run_hi]);
+            assert!(
+                abs < 2e-3,
+                "{n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
+                 max abs diff {abs} at {at} (got {}, want {})",
+                got[run_lo + at],
+                want[run_lo + at]
+            );
+            assert!(
+                want[run_lo..run_hi].iter().any(|v| v.abs() > 1e-3),
+                "reference is all zeros"
+            );
+            // Padding rows outside the run must come back untouched.
+            assert_eq!(
+                &got[..run_lo],
+                &want[..run_lo],
+                "{n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
+                 wrote before the run"
+            );
+            assert_eq!(
+                &got[run_hi..],
+                &want[run_hi..],
+                "{n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
+                 wrote past the run"
+            );
+        }
+    }
+    Ok(())
+}
+

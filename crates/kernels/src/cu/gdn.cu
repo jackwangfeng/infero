@@ -702,3 +702,379 @@ extern "C" __global__ void gdn_rollback_record4_f32(
         dst3[i] = src3[i];
     }
 }
+
+// Chunk-parallel gated delta rule. Same recurrence as `gdn_delta_rule_reg128_f32`
+// (`S *= exp(g_t)` before the rank-1 update, per the comment on that function),
+// reassociated so a block of `GDN_CHUNK` tokens is processed with block-wide
+// parallel matrix ops instead of one token at a time -- trading
+// `gdn_delta_rule_reg128_f32`'s O(seq_len) *sequential* steps for
+// O(seq_len / GDN_CHUNK) sequential chunk steps.
+//
+// **Measured, not just implemented, and the measurement is still a loss --
+// though a much smaller one than the first attempt, after real bugs got
+// found and fixed rather than accepted.** Correct (matches
+// `gdn_delta_rule_reg128_f32` to reference precision, see
+// `the_three_delta_rule_kernels_agree_with_each_other_and_the_reference` in
+// `tests/gated_delta.rs`), but still slower at the checkpoint's real prefill
+// shape (30552 tokens, 1 sequence, `examples/gdn_delta_bench.rs`):
+//
+//   212.5 ms  first working version (correct, unexamined for performance)
+//   121.1 ms  -- staged `q` in shared memory: the intra-chunk score loop
+//               read it from global once per (i, kk) pair, re-fetching the
+//               same row up to `GDN_CHUNK` times over (1.76x)
+//   112.4 ms  -- padded every 2-D shared buffer's row stride past a multiple
+//               of the 32-way bank count (`GDN_ROW_PAD`/`GDN_A_STRIDE`),
+//               removing worst-case bank conflicts on every cross-row access
+//               (1.08x)
+//   111.6 ms  -- `__syncwarp()` not `__syncthreads()` in the forward-sub
+//               loop, dividing/modding by the compile-time `GDN_CHUNK` not
+//               the runtime `C`, merging the load/cumsum barrier, hoisting
+//               `beta_k * exp(gc_k)` out of a loop that recomputed it
+//               `GDN_DK` times over -- four plausible-sounding fixes, each
+//               measured at approximately zero (this is the sum of all
+//               four, not four separate meaningful wins)
+//
+// against `gdn_delta_rule_reg128_f32`'s steady 27.8 ms -- a real, if
+// incomplete, 1.9x recovery from the fixes that worked, not the whole gap.
+// `ncu` (not a guess) on both kernels found neither the barrier count nor
+// occupancy explains the remainder: both launch the same 48-block grid
+// (one per head; this checkpoint's `n_kv_heads`-shaped ceiling, not
+// something either kernel chose) against this GPU's 188 SMs, and both cap
+// out at exactly 1 block/SM, 8 warps/SM, 16.67% theoretical occupancy --
+// `reg128` on its 161 registers/thread, this kernel on its ~89 KiB of
+// dynamic shared memory. Same grid-underutilization ceiling, same
+// occupancy, and `reg128` is still ~4x faster: the gap is genuine per-SM
+// throughput, not a synchronization or launch-configuration artifact --
+// `reg128` earns it the way its own comment documents (double-buffering,
+// four independent partial sums instead of one dependent chain, R=2's
+// register/occupancy trade, each individually measured), and this kernel
+// has none of that tuning yet.
+//
+// The one lever `reg128`'s architecture cannot use, that this one's
+// algorithm *could*: `reg128` is a pure sequential recurrence, permanently
+// bound to that same 48-block grid. This kernel's `W`/`U`/`A_intra`
+// decomposition exists specifically to separate a chunk's *state transition*
+// (genuinely sequential, but only `GDN_CHUNK`-cheap now) from its *output*
+// (an embarrassingly parallel function of that chunk's own incoming state,
+// once known) -- splitting those into two kernel launches (a cheap
+// sequential pass computing and storing every chunk's incoming state, then
+// an output pass gridded over `chunks * heads` instead of just `heads`)
+// could use far more than 48 blocks and escape this ceiling entirely,
+// something `reg128` structurally cannot do. Untried: it needs storing every
+// chunk's state (`nt / GDN_CHUNK` copies of a `dk * dv` matrix a head, real
+// VRAM, not free) and is a materially larger rewrite (two kernels, new
+// buffer lifetime) than a tuning pass, not something to start under a "just
+// push harder" mandate without saying so explicitly first.
+//
+// Not reachable through `DeltaVariant::Auto` -- correct is necessary, not
+// sufficient, and this doesn't clear the second bar yet. Kept (like
+// `gdn_delta_rule_smem_f32` above it) as a working, tested, independent
+// implementation checked against a real external reference, not as a
+// candidate for the fast path.
+//
+// The algorithm (chunk-local cumsum, the K K^T system matrix, its unit-lower-
+// triangular inverse via forward substitution, the WY-style `W`/`U`
+// reconstruction, and how the carried state combines with intra-chunk causal
+// terms) is checked line-for-line against the vendored `flash-linear-attention`
+// reference inside vLLM (`chunk.py`, `cumsum.py`, `chunk_scaled_dot_kkt.py`,
+// `solve_tril.py`, `wy_fast.py`, `chunk_delta_h.py`, `chunk_o.py`) rather than
+// re-derived from the paper from memory -- see the perf-gap memory doc for the
+// exact file/line citations this was built from. That reference's own
+// `FLA_CHUNK_SIZE` default is 64, but everything here is `float`, not `half`:
+// a first attempt staged `k`/`v`/`W` at half precision (same tradeoff this
+// engine's attention kernels make) and measured a real, if small, accuracy
+// loss against the reference -- not a reassociation artifact, an f16-storage
+// one, because this algorithm's forward-substitution inverse is *recursive*
+// (row `i` depends on every earlier row), so any rounding baked into `A` a
+// few rows in gets multiplied back in at every later row rather than staying
+// a fixed, bounded error the way it would in a single matmul. `GDN_CHUNK =
+// 32` (half the reference's) buys back the shared-memory room `float`
+// everywhere costs.
+//
+// State layout matches `gdn_delta_rule_reg128_f32` exactly (register-resident,
+// `R = 2` threads a column, thread `(j, part)` owns `S[j][part*64 .. part*64+63]`)
+// so the two kernels read/write the same state-buffer format; only what
+// happens to a chunk's worth of tokens between load and store differs. Unlike
+// that kernel this one is only instantiated for `dk = dv = 128`, hardcoded
+// (not templated) -- the shared-memory layout below is sized for exactly that.
+#define GDN_CHUNK 32
+#define GDN_DK 128
+#define GDN_DV 128
+// Padded row strides for every 2-D shared buffer below: GDN_DK/GDN_DV and
+// GDN_CHUNK are both exact multiples of the 32-way shared-memory bank count,
+// so an unpadded stride puts every row at the same bank -- worst-case,
+// 32-way conflicts on every cross-row access these loops do (A/A_intra's
+// k_i.k_j and q_i.k_j sweeps, W/U's and the state update's accumulation
+// over rows). This is the same failure mode ATTN_MMA_KPAD/ATTN_MMA_VPAD
+// exist to avoid in ops.cu's attention kernels, applied here after a
+// benchmark (not a hunch) showed it mattered: reintroducing `q` staging
+// alone cut this kernel's measured time on the real 30552-token shape by
+// 1.76x, and this bank-conflict fix on top of that is worth re-measuring
+// against, not assuming.
+#define GDN_ROW_PAD (GDN_DK + 4)
+#define GDN_A_STRIDE (GDN_CHUNK + 1)
+
+extern "C" __global__ __launch_bounds__(256) void gdn_chunk_delta_rule_f32(
+        float* __restrict__ out, float* __restrict__ state,
+        const float* __restrict__ qkv, const float* __restrict__ g,
+        const float* __restrict__ beta, const int* __restrict__ first_token,
+        const int* __restrict__ n_tok, int heads, int key_heads, int dk, int dv,
+        int stride, int q_off, int k_off, int v_off, int v_tiled) {
+    // `dk`/`dv` stay in the signature so the launcher pushes one argument
+    // list for every delta-rule kernel; this one is only ever built for 128.
+    (void)dk;
+    (void)dv;
+    const int head = blockIdx.x;
+    const int seq = blockIdx.y;
+    const int nt = n_tok[seq];
+    if (nt <= 0) return;
+    const int t0 = first_token[seq];
+    const int lane = threadIdx.x;  // 0..255
+    const int j = lane / 2;        // this thread's S column (value dim)
+    const int part = lane % 2;     // which half of the key dim it owns
+    const int i0 = part * 64;
+    const int khead = v_tiled ? (head % key_heads)
+                              : (head / (heads / key_heads));
+
+    // `q` IS staged, unlike an earlier version of this kernel's reasoning --
+    // it's read once per (i, kk) pair in the intra-chunk score loop below,
+    // and a fixed `i` is paired with up to `GDN_CHUNK` different `kk`, so
+    // reading it from global there re-fetches the same row up to `GDN_CHUNK`
+    // times over (measured as most of a real 7.6x slowdown against
+    // `gdn_delta_rule_reg128_f32`, together with the barrier count noted on
+    // the kernel comment -- caching it here was the fix, not accepting the
+    // loss). `GDN_CHUNK` dropped from the reference's 64 to 32 for `sk`/`sv`/
+    // `sW`/`sD`'s `float` precision (see the top comment) leaves the room.
+    extern __shared__ char gdn_chunk_smem[];
+    float* sk = (float*)gdn_chunk_smem;                // [GDN_CHUNK][GDN_ROW_PAD]
+    float* sq = sk + GDN_CHUNK * GDN_ROW_PAD;          // [GDN_CHUNK][GDN_ROW_PAD]
+    float* sv = sq + GDN_CHUNK * GDN_ROW_PAD;          // [GDN_CHUNK][GDN_ROW_PAD]
+    float* sgc = sv + GDN_CHUNK * GDN_ROW_PAD;         // [GDN_CHUNK], cumsum g
+    float* sbeta = sgc + GDN_CHUNK;                    // [GDN_CHUNK]
+    // beta_k * exp(gc_k), precomputed once below rather than inside the W/U
+    // loop's inner sum, which would otherwise recompute it GDN_DK (128)
+    // times over for every k -- once per output channel `d`, none of which
+    // it depends on. `__expf` isn't free, and this was a bigger cost than
+    // the barrier or bank-conflict fixes above combined.
+    float* sbg = sbeta + GDN_CHUNK;                    // [GDN_CHUNK]
+    // A, then (I+A)^-1 in place, then reused for the intra-chunk Q.K scores.
+    float* sA = sbg + GDN_CHUNK;                       // [GDN_CHUNK][GDN_A_STRIDE]
+    // W, then reused as the intra-chunk score matrix once W is dead.
+    float* sW = sA + GDN_CHUNK * GDN_A_STRIDE;           // [GDN_CHUNK][GDN_ROW_PAD]
+    // U, then the residual (`delta`) in place once U is dead.
+    float* sD = sW + GDN_CHUNK * GDN_ROW_PAD;            // [GDN_CHUNK][GDN_ROW_PAD]
+
+    float* S = state + ((size_t)seq * heads + head) * (size_t)GDN_DK * GDN_DV;
+    float sc[64];
+#pragma unroll
+    for (int r = 0; r < 64; ++r) sc[r] = S[(size_t)(i0 + r) * GDN_DV + j];
+
+    for (int c0 = 0; c0 < nt; c0 += GDN_CHUNK) {
+        const int C = min(GDN_CHUNK, nt - c0);
+
+        for (int idx = lane; idx < C * GDN_DK; idx += blockDim.x) {
+            const int r = idx / GDN_DK, d = idx % GDN_DK;
+            const float* row = qkv + (size_t)(t0 + c0 + r) * stride;
+            sk[r * GDN_ROW_PAD + d] = row[k_off + (size_t)khead * GDN_DK + d];
+            sq[r * GDN_ROW_PAD + d] = row[q_off + (size_t)khead * GDN_DK + d];
+        }
+        for (int idx = lane; idx < C * GDN_DV; idx += blockDim.x) {
+            const int r = idx / GDN_DV, d = idx % GDN_DV;
+            const float* row = qkv + (size_t)(t0 + c0 + r) * stride;
+            sv[r * GDN_ROW_PAD + d] = row[v_off + (size_t)head * GDN_DV + d];
+        }
+        if (lane < C) {
+            sbeta[lane] = beta[(size_t)(t0 + c0 + lane) * heads + head];
+        }
+        // Chunk-local inclusive cumsum of g. Serial, but at most GDN_CHUNK
+        // adds -- and independent of the K/V/Q/beta loading above (reads
+        // `g` fresh from global, writes only `sgc`, which nothing above
+        // touches), so it runs concurrently with it rather than after a
+        // barrier of its own; one `__syncthreads()` below covers both.
+        if (lane == 0) {
+            float acc = 0.0f;
+            for (int r = 0; r < C; ++r) {
+                acc += g[(size_t)(t0 + c0 + r) * heads + head];
+                sgc[r] = acc;
+            }
+        }
+        __syncthreads();
+
+        if (lane < C) {
+            sbg[lane] = sbeta[lane] * __expf(sgc[lane]);
+        }
+
+        // A[i][k] = beta_i * exp(gc_i - gc_k) * (k_i . k_k), strictly i > k;
+        // the system matrix `chunk_scaled_dot_kkt_fwd` builds (kkt.py:97-112).
+        //
+        // Divides and mods by `GDN_CHUNK`, not the runtime `C`: `C == GDN_CHUNK`
+        // for every chunk but a possibly-ragged last one, and a compile-time
+        // power-of-two divisor is a shift, where the same op against a
+        // runtime `C` is a genuine (slow) integer division -- paid on every
+        // one of `GDN_CHUNK * GDN_CHUNK` iterations, every chunk. The trip
+        // count grows to the fixed `GDN_CHUNK * GDN_CHUNK` too (previously
+        // `C * C`, shrinking on that same last chunk); the `i >= C || kk >=
+        // C` guard skips the now-out-of-range tail there, at the cost of a
+        // few wasted iterations on at most one chunk out of the whole run.
+        for (int idx = lane; idx < GDN_CHUNK * GDN_CHUNK; idx += blockDim.x) {
+            const int i = idx / GDN_CHUNK, kk = idx % GDN_CHUNK;
+            if (i >= C || kk >= C) continue;
+            float v = 0.0f;
+            if (i > kk) {
+                float dot = 0.0f;
+#pragma unroll
+                for (int d = 0; d < GDN_DK; ++d) {
+                    dot += sk[i * GDN_ROW_PAD + d] * sk[kk * GDN_ROW_PAD + d];
+                }
+                v = sbeta[i] * __expf(sgc[i] - sgc[kk]) * dot;
+            }
+            sA[i * GDN_A_STRIDE + kk] = v;
+        }
+        __syncthreads();
+
+        // Forward substitution for Ai = (I + A)^-1 (`solve_tril.py`'s actual
+        // recurrence, generalized from its 16x16 base case rather than its
+        // block-recursive merge, which is a Triton parallelism trick this
+        // doesn't need -- see the perf-gap memory doc). `I + A` is unit lower
+        // triangular (A's diagonal is exactly 0 by the `i > kk` mask above),
+        // so this never divides and is never singular. Row `i` depends on
+        // every earlier row, already finalized in a prior iteration; within
+        // a row, every column is independent (one thread each), so the
+        // barrier is once a row, not once a cell.
+        //
+        // `GDN_CHUNK` is exactly the warp size, and `lane < C` (`C <=
+        // GDN_CHUNK`) means only warp 0 ever does anything here -- so the
+        // per-row barrier only has to keep warp 0's own 32 lanes in step,
+        // not the whole block. `__syncwarp()` does that at a fraction of
+        // `__syncthreads()`'s cost (it doesn't wait for the seven idle
+        // warps, and doesn't cross the whole SM to do it); one
+        // `__syncthreads()` after the loop is enough to let those seven
+        // warps -- which raced through every iteration's `if` doing nothing
+        // -- catch up before anyone reads the finalized `sA`. This was worth
+        // finding: for the ~1000-chunk 30552-token shape, up to `GDN_CHUNK`
+        // block-wide barriers a chunk here alone was a meaningful share of
+        // why this kernel measured slower than `gdn_delta_rule_reg128_f32`
+        // rather than faster (see the top-of-kernel comment).
+        for (int i = 0; i < C; ++i) {
+            if (lane < C && lane <= i) {
+                const int kk = lane;
+                float acc = (i == kk) ? 1.0f : 0.0f;
+                for (int m = kk; m < i; ++m) {
+                    acc -= sA[i * GDN_A_STRIDE + m] * sA[m * GDN_A_STRIDE + kk];
+                }
+                sA[i * GDN_A_STRIDE + kk] = acc;
+            }
+            __syncwarp();
+        }
+        __syncthreads();
+
+        // W/U reconstruction (`wy_fast.py:91-116`): W folds the decay into K,
+        // U does not.
+        for (int idx = lane; idx < C * GDN_DK; idx += blockDim.x) {
+            const int i = idx / GDN_DK, d = idx % GDN_DK;
+            float wacc = 0.0f, uacc = 0.0f;
+            for (int kk = 0; kk <= i; ++kk) {
+                const float aik = sA[i * GDN_A_STRIDE + kk];
+                wacc += aik * sbg[kk] * sk[kk * GDN_ROW_PAD + d];
+                uacc += aik * sbeta[kk] * sv[kk * GDN_ROW_PAD + d];
+            }
+            sW[i * GDN_ROW_PAD + d] = wacc;
+            sD[i * GDN_ROW_PAD + d] = uacc;  // sD holds U for now
+        }
+        __syncthreads();
+
+        // History contribution against the OLD (pre-chunk) state `sc`:
+        // pred = W @ S_before^T (chunk_delta_h.py:174-197) and
+        // o_hist = exp(gc_i) * (Q @ S_before^T) (chunk_o.py:111-119), written
+        // straight to `out` as this token's first term. `delta` overwrites U
+        // in place -- kept UNDECAYED here (just `U - pred`), unlike
+        // `chunk_delta_h.py:216-221`'s `Δ *= exp(ḡ_last − ḡ_j)`: that forward
+        // -to-chunk-end decay only belongs in the *state* update below, which
+        // combines every token's delta at one common reference point. Folding
+        // it in here too (this kernel's first, wrong attempt) double-applies
+        // it wherever `A_intra` below also carries a `ḡ_i − ḡ_k` factor,
+        // overweighting every history/intra split — caught by
+        // `the_three_delta_rule_kernels_agree_with_each_other_and_the_reference`
+        // (13-token, single-chunk case) and confirmed against a from-scratch
+        // numpy re-derivation before touching this file again, not just
+        // patched until the one failing assertion went quiet.
+        for (int i = 0; i < C; ++i) {
+            float pp = 0.0f, oh = 0.0f;
+#pragma unroll
+            for (int r = 0; r < 64; ++r) {
+                pp += sc[r] * sW[i * GDN_ROW_PAD + i0 + r];
+                oh += sc[r] * sq[i * GDN_ROW_PAD + i0 + r];
+            }
+            pp += __shfl_xor_sync(0xffffffffu, pp, 1, 32);
+            oh += __shfl_xor_sync(0xffffffffu, oh, 1, 32);
+            if (part == 0) {
+                const float u = sD[i * GDN_ROW_PAD + j];
+                sD[i * GDN_ROW_PAD + j] = u - pp;
+                out[((size_t)(t0 + c0 + i) * heads + head) * GDN_DV + j] =
+                    __expf(sgc[i]) * oh;
+            }
+        }
+        __syncthreads();
+
+        // Intra-chunk causal scores, i >= k inclusive this time (unlike the
+        // system matrix above) -- `chunk_o.py:113,120,124-126`. `sW` (dead:
+        // read for the last time above) is reused for this, same byte size.
+        float* sAi2 = sW;
+        // Same fixed-trip-count, compile-time-divisor rewrite as the system
+        // matrix above, same reason.
+        for (int idx = lane; idx < GDN_CHUNK * GDN_CHUNK; idx += blockDim.x) {
+            const int i = idx / GDN_CHUNK, kk = idx % GDN_CHUNK;
+            if (i >= C || kk >= C) continue;
+            float v = 0.0f;
+            if (i >= kk) {
+                float dot = 0.0f;
+#pragma unroll
+                for (int d = 0; d < GDN_DK; ++d) {
+                    dot += sq[i * GDN_ROW_PAD + d] * sk[kk * GDN_ROW_PAD + d];
+                }
+                v = __expf(sgc[i] - sgc[kk]) * dot;
+            }
+            sAi2[i * GDN_A_STRIDE + kk] = v;
+        }
+        __syncthreads();
+
+        // O += (intra scores) @ delta (chunk_o.py:137), added onto the
+        // history term already sitting in `out`. No extra `scale` here: `q`
+        // arrives pre-scaled by the caller (see the comment on
+        // `gdn_delta_rule_f32` above) exactly like `gdn_delta_rule_reg128_f32`
+        // relies on, so the `1/sqrt(dk)` `chunk_o.py:160` applies is already
+        // folded into every dot product against `q` above.
+        for (int i = 0; i < C; ++i) {
+            if (part == 0) {
+                float acc = 0.0f;
+                for (int kk = 0; kk <= i; ++kk) {
+                    acc += sAi2[i * GDN_A_STRIDE + kk] * sD[kk * GDN_ROW_PAD + j];
+                }
+                out[((size_t)(t0 + c0 + i) * heads + head) * GDN_DV + j] += acc;
+            }
+        }
+        __syncthreads();
+
+        // State update for the next chunk: decay the whole chunk forward,
+        // then fold in this chunk's delta, each token's forwarded to the
+        // chunk's end first (chunk_delta_h.py:216-228,276-298) -- the one
+        // place `exp(ḡ_last − ḡ_t)` belongs (see the comment above `sD`'s
+        // history-term write). `S` is `[dv, dk]`; this is
+        // `S_before*exp(gc_last) + (delta .* exp(gc_last - gc))ᵀ @ K`.
+        //
+        const float decay_whole = __expf(sgc[C - 1]);
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            float acc = sc[r] * decay_whole;
+            for (int t = 0; t < C; ++t) {
+                const float dt = sD[t * GDN_ROW_PAD + j] * __expf(sgc[C - 1] - sgc[t]);
+                acc += dt * sk[t * GDN_ROW_PAD + i0 + r];
+            }
+            sc[r] = acc;
+        }
+        __syncthreads();  // before the next chunk overwrites sk/sv/sA/sW/sD
+    }
+
+#pragma unroll
+    for (int r = 0; r < 64; ++r) S[(size_t)(i0 + r) * GDN_DV + j] = sc[r];
+}

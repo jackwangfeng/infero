@@ -10,6 +10,10 @@
 //! so `out[t, r] = dot(w[r, :], x[t, :])`.
 
 pub mod awq;
+#[cfg(feature = "cutlass")]
+pub mod cutlass_fp8;
+#[cfg(feature = "cutlass")]
+pub use cutlass_fp8::CutlassWeight;
 pub mod fp8;
 pub mod gdn;
 pub mod turboquant;
@@ -2505,6 +2509,205 @@ impl Kernels {
             })?;
         Ok(wrote)
     }
+
+    /// Whether [`Self::attn_prefill`] would take this shape.
+    ///
+    /// The same tensor-core gate as [`Self::attn_decode`]'s MMA branch
+    /// (`INFERO_ATTN_MMA=1`, `d_head` a multiple of 16 up to 256, `group <=
+    /// 8`), which already guarantees two tokens' query groups fit one
+    /// sixteen-row MMA tile (`group * 2 <= 16`) — the minimum this kernel's
+    /// query tiling needs to buy anything over one token a block.
+    pub fn prefill_attention(&self, dims: &AttnDims) -> bool {
+        if !cfg!(feature = "cuda") {
+            return false;
+        }
+        static MMA_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*MMA_ENV.get_or_init(|| std::env::var("INFERO_ATTN_MMA").as_deref() == Ok("1")) {
+            return false;
+        }
+        let group = dims.n_heads / dims.n_kv_heads.max(1);
+        group >= 1
+            && group <= 8
+            && dims.n_heads == group * dims.n_kv_heads
+            && dims.d_head.is_multiple_of(16)
+            && dims.d_head <= 256
+    }
+
+    /// How the key range is cut up for [`Self::attn_prefill`] — the same
+    /// fill-the-device reasoning as [`Self::decode_chunks`], against the
+    /// tile grid rather than one block a token.
+    fn prefill_chunks(&self, n_kv_heads: usize, n_tiles: usize, kv_len: usize) -> (u32, u32) {
+        let blocks = (n_kv_heads * n_tiles).max(1) as u32;
+        let want = std::env::var("INFERO_DECODE_WANT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(self.dev.sm_count() * 4);
+        let chunks = want.div_ceil(blocks).clamp(1, 16);
+        let chunk = ((kv_len as u32).div_ceil(chunks)).next_multiple_of(32);
+        let chunks = (kv_len as u32).div_ceil(chunk.max(32)).max(1);
+        (chunks, chunk.max(32))
+    }
+
+    /// A query-tiled tensor-core attention pass for a contiguous run of one
+    /// sequence's tokens — [`Self::attn_decode`]'s MMA path routed a wide
+    /// prefill through a kernel built to answer one token a block, which
+    /// pays for the whole causal K/V range again for every token in the
+    /// run even though each only adds one key to its predecessor's range.
+    /// See `attn_prefill_mma_f32` in `ops.cu` for the shape this buys back.
+    ///
+    /// `run_base`/`run_tokens` describe the slice of `q`/`out` (and of
+    /// `batch`) this call covers: every token in `[run_base, run_base +
+    /// run_tokens)` must share one `seq_of` and increase `positions` by
+    /// exactly one from its predecessor, or a tile will read one sequence's
+    /// K/V slots for another's rows. Building that slice — splitting a batch
+    /// at sequence boundaries and gaps in `positions` — is the caller's job;
+    /// this call trusts it was done. `partial` must hold
+    /// [`Self::attn_partial_floats`]`(n_heads, d_head, run_tokens)` floats.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prefill(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        q: &View<'_, f32>,
+        k_cache: &View<'_, f16>,
+        v_cache: &View<'_, f16>,
+        batch: BatchLayout<'_>,
+        dims: AttnDims,
+        run_base: usize,
+        run_tokens: usize,
+        kv_len: usize,
+        scale: f32,
+        partial: &mut ViewMut<'_, f32>,
+    ) -> Result<()> {
+        anyhow::ensure!(self.prefill_attention(&dims), "attn_prefill: unsupported shape");
+        anyhow::ensure!(run_tokens >= 1, "attn_prefill: empty run");
+        let group = dims.n_heads / dims.n_kv_heads;
+        let tpw = (16 / group).max(1);
+        // `T` (the K/V tile width) must match `ATTN_MMA_PF_TILE` in `ops.cu` and
+        // be a multiple of `ATTN_MMA_WK` (16). Shrunk from `attn_decode`'s 64 to
+        // 32 so a block's Q staging (`NWARPS` 16-row slabs) can grow past
+        // `attn_decode`'s 4 warps without the two together exceeding this GPU's
+        // flat 101376-byte dynamic-shared-memory ceiling -- see the comment on
+        // `ATTN_MMA_PF_TILE`. Each extra warp is another independent MMA
+        // accumulator living entirely in that warp's own registers (never
+        // shared memory), so this is a safe amortization knob, not the
+        // per-subgroup-accumulator-in-shared-memory design that turned out to
+        // be unfixable (see the attn-prefill-rewrite-deadend memory).
+        const T: usize = 32;
+        const NWARPS: usize = 7;
+        // `ATTN_MMA_KPAD` (shared with attn_decode): row stride in bytes
+        // must stay a multiple of 16 for the kernel's `uint4` shared-memory
+        // accesses, i.e. `d_head + KPAD` a multiple of 8 halfwords -- 8 is
+        // the largest value smaller than attn_decode's that still clears
+        // that bar (tried 4: `CUDA_ERROR_MISALIGNED_ADDRESS`, caught by
+        // `attn_prefill_matches_the_three_kernels` before it ever reached
+        // the server). Do not shrink this without re-deriving the alignment.
+        const KPAD: usize = 8;
+        const VPAD: usize = 2;
+        // NWARPS=8 (VPAD=0 to fit) measured within noise of 7 on the real
+        // 30552-token prefill (11.1-11.3s both ways) -- one more warp isn't
+        // worth the tighter shared-memory margin and lost bank-conflict
+        // padding. 7 is the settled value.
+        let tile_tokens = NWARPS * tpw;
+        let n_tiles = run_tokens.div_ceil(tile_tokens);
+        let (n_chunks, chunk) = self.prefill_chunks(dims.n_kv_heads, n_tiles, kv_len);
+        anyhow::ensure!(
+            n_chunks <= 32,
+            "attn_prefill: {n_chunks} chunks past the partial buffer's 32"
+        );
+        let ms_off = (32 * dims.n_heads * run_tokens * dims.d_head) as i32;
+
+        let f = self.dev.kernels().get("infero_ops", ops_src(), "attn_prefill_mma_f32")?;
+        // `sq` is `NWARPS` sixteen-row slabs, one a warp; `sk`/`svt` are the
+        // block-shared K/V tile at width `T`.
+        let shared = (NWARPS * 16 * (dims.d_head + KPAD) * 2
+            + T * (dims.d_head + KPAD) * 2
+            + dims.d_head * (T + VPAD) * 2) as u32;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared)?;
+        }
+        let single = i32::from(n_chunks == 1);
+        let cfg = LaunchConfig {
+            grid_dim: (dims.n_kv_heads as u32, n_tiles as u32, n_chunks),
+            block_dim: (NWARPS as u32 * 32, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let (stride, h, kh, dh, ns, ck, kl, gi, tp, rb, rt) = (
+            batch.table_stride as i32,
+            dims.n_heads as i32,
+            dims.n_kv_heads as i32,
+            dims.d_head as i32,
+            dims.n_slots as i32,
+            chunk as i32,
+            kv_len as i32,
+            group as i32,
+            tpw as i32,
+            run_base as i32,
+            run_tokens as i32,
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(&mut *partial)
+            .arg(&ms_off)
+            .arg(&mut *out)
+            .arg(&single)
+            .arg(q)
+            .arg(k_cache)
+            .arg(v_cache)
+            .arg(batch.seq_of)
+            .arg(batch.positions)
+            .arg(batch.slot_table)
+            .arg(&stride)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ns)
+            .arg(&scale)
+            .arg(&ck)
+            .arg(&kl)
+            .arg(&gi)
+            .arg(&tp)
+            .arg(&rb)
+            .arg(&rt);
+        self.dev
+            .profile()
+            .time("attn_prefill", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("attn_prefill")?;
+                Ok(())
+            })?;
+        if single == 1 {
+            return Ok(());
+        }
+
+        let total = (run_tokens * dims.n_heads * dims.d_head) as u32;
+        let (nt, nc) = (run_tokens as i32, n_chunks as i32);
+        let part = partial.as_view();
+        let r = self
+            .dev
+            .kernels()
+            .get("infero_ops", ops_src(), "attn_flash_reduce_f32")?;
+        // `attn_flash_reduce_f32` indexes `out` from its own token 0, same as
+        // `partial`'s — this kernel's tokens start at `run_base`, so the
+        // reduce pass gets a window onto `out` rather than the whole buffer,
+        // or it would normalize into someone else's rows.
+        let run_elems = run_tokens * dims.n_heads * dims.d_head;
+        let out_off = run_base * dims.n_heads * dims.d_head;
+        let mut out_run = out.slice_mut(out_off..out_off + run_elems);
+        let mut rb2 = self.dev.stream().launch_builder(&r);
+        rb2.arg(&mut out_run)
+            .arg(&part)
+            .arg(&ms_off)
+            .arg(&h)
+            .arg(&dh)
+            .arg(&nt)
+            .arg(&nc);
+        self.dev
+            .profile()
+            .time("attn_prefill_reduce", self.dev.stream(), || {
+                unsafe { rb2.launch(elementwise(total)) }.context("attn_prefill_reduce")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
 
     /// Scores, softmax and the weighted sum in one pass over the KV range.
     ///

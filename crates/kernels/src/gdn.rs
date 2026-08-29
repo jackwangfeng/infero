@@ -84,6 +84,14 @@ pub enum DeltaVariant {
     /// resident block an SM, so every barrier stalls the whole SM. Needs the
     /// opt-in dynamic-shared attribute past 48 KiB, which at 128 by 128 it is.
     Shared,
+    /// `Reg`'s same register-resident state and thread layout, but a chunk of
+    /// up to 64 tokens is processed with block-wide parallel matrix ops
+    /// (`gdn_chunk_delta_rule_f32`) instead of one token at a time — see the
+    /// comment on that kernel for the algorithm (checked against vLLM's
+    /// vendored `flash-linear-attention` reference, not re-derived from the
+    /// paper). Requires `dk == dv == 128`, like `Reg`. Not reachable through
+    /// `Auto` yet — only by name, until it's benchmarked end to end.
+    Chunk,
 }
 
 impl DeltaVariant {
@@ -401,6 +409,11 @@ impl Kernels {
              and was asked for {dk}x{dv}; use DeltaVariant::Auto, which falls \
              back on its own"
         );
+        anyhow::ensure!(
+            chosen != DeltaVariant::Chunk || (dk == 128 && dv == 128),
+            "the chunked delta rule is instantiated for dk = dv = 128 and was \
+             asked for {dk}x{dv}"
+        );
         // Shared holds q and k for the token being consumed. The register
         // version double-buffers them so it needs one barrier a token instead
         // of two; the shared version puts the whole state after them.
@@ -415,6 +428,32 @@ impl Kernels {
                 dv.max(32),
                 (2 * dk + dk * dv) * f32_size,
             ),
+            // Must match `gdn_chunk_delta_rule_f32`'s shared-memory layout in
+            // `gdn.cu` exactly: `sk`+`sq`+`sv` (3 * 32 * `GDN_ROW_PAD` floats)
+            // + `sgc`+`sbeta`+`sbg` (3 * 32 floats) + `sA` (32 *
+            // `GDN_A_STRIDE` floats) + `sW`+`sD` (2 * 32 * `GDN_ROW_PAD`
+            // floats). Everything is `float`, not `__half` -- see the
+            // comment atop the kernel for why half precision measurably
+            // failed the reference comparison here (the forward-substitution
+            // inverse is recursive, so storage rounding compounds instead of
+            // staying a fixed error) and why the chunk length is 32, not the
+            // reference's 64: buying back the shared-memory room `float`
+            // everywhere costs. The row strides are padded past
+            // `dk`/`GDN_CHUNK` (both exact multiples of the 32-way
+            // shared-memory bank count) to avoid worst-case bank conflicts
+            // on every cross-row access -- see the kernel comment on
+            // `GDN_ROW_PAD`/`GDN_A_STRIDE`.
+            DeltaVariant::Chunk => {
+                const GDN_CHUNK: usize = 32;
+                let row_pad = dk + 4;
+                let a_stride = GDN_CHUNK + 1;
+                let kqv = 3 * GDN_CHUNK * row_pad * f32_size;
+                let gc_beta_bg = 3 * GDN_CHUNK * f32_size;
+                let a_mat = GDN_CHUNK * a_stride * f32_size;
+                let w = GDN_CHUNK * row_pad * f32_size;
+                let d = GDN_CHUNK * row_pad * f32_size;
+                ("gdn_chunk_delta_rule_f32", 2 * dv, kqv + gc_beta_bg + a_mat + w + d)
+            }
             _ => ("gdn_delta_rule_f32", dv.max(32), 2 * dk * f32_size),
         };
         let f = self.dev.kernels().get("infero_gdn", gdn_src(), name)?;

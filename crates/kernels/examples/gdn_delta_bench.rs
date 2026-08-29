@@ -45,7 +45,10 @@ fn pseudo_random(n: usize, seed: u64) -> Vec<f32> {
 
 /// label, kernel name, threads a block, dynamic shared bytes — matching what
 /// `Kernels::gdn_delta_rule_variant` launches for each.
-const VARIANTS: [(&str, DeltaVariant, &str, u32, usize); 3] = [
+const GDN_CHUNK: usize = 32;
+const GDN_ROW_PAD: usize = DK + 4;
+const GDN_A_STRIDE: usize = GDN_CHUNK + 1;
+const VARIANTS: [(&str, DeltaVariant, &str, u32, usize); 4] = [
     ("global", DeltaVariant::Global, "gdn_delta_rule_f32", 128, 2 * DK * 4),
     (
         "smem",
@@ -55,6 +58,13 @@ const VARIANTS: [(&str, DeltaVariant, &str, u32, usize); 3] = [
         (2 * DK + DK * DV) * 4,
     ),
     ("reg", DeltaVariant::Reg, "gdn_delta_rule_reg128_f32", 256, 4 * DK * 4),
+    (
+        "chunk",
+        DeltaVariant::Chunk,
+        "gdn_chunk_delta_rule_f32",
+        256,
+        3 * GDN_CHUNK * GDN_ROW_PAD * 4 + 3 * GDN_CHUNK * 4 + GDN_CHUNK * GDN_A_STRIDE * 4 + GDN_CHUNK * GDN_ROW_PAD * 4 + GDN_CHUNK * GDN_ROW_PAD * 4,
+    ),
 ];
 
 fn main() -> Result<()> {
@@ -97,6 +107,7 @@ fn main() -> Result<()> {
         ("decode, 1 seq", vec![1usize]),
         ("decode, 32 seqs", vec![1usize; 32]),
         ("prefill 512, 1 seq", vec![512usize]),
+        ("prefill 30552, 1 seq", vec![30552usize]),
     ] {
         let n_seqs = lens.len();
         let total: usize = lens.iter().sum();
