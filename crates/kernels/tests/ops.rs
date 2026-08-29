@@ -995,6 +995,135 @@ fn attn_prefill_matches_the_three_kernels() -> Result<()> {
                 "{n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
                  wrote past the run"
             );
+
+            // Same reference, the cp.async-pipelined kernel under test.
+            let mut got_pipe_d = stream.clone_htod(&want)?;
+            let mut part_pipe = stream.alloc_zeros::<f32>(Kernels::attn_partial_floats(
+                dims.n_heads,
+                dims.d_head,
+                run_tokens,
+            ))?;
+            k.attn_prefill_pipe(
+                &mut got_pipe_d.as_view_mut(),
+                &dq.as_view(),
+                &dk.as_view(),
+                &dv.as_view(),
+                batch,
+                dims,
+                pad,
+                run_tokens,
+                kv_len,
+                scale,
+                &mut part_pipe.as_view_mut(),
+            )?;
+            let got_pipe = stream.clone_dtoh(&got_pipe_d)?;
+            k.device().synchronize()?;
+            let (abs_p, at_p) = max_abs_diff(&got_pipe[run_lo..run_hi], &want[run_lo..run_hi]);
+            assert!(
+                abs_p < 2e-3,
+                "attn_prefill_pipe {n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
+                 max abs diff {abs_p} at {at_p} (got {}, want {})",
+                got_pipe[run_lo + at_p],
+                want[run_lo + at_p]
+            );
+            assert_eq!(
+                &got_pipe[..run_lo],
+                &want[..run_lo],
+                "attn_prefill_pipe {n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
+                 wrote before the run"
+            );
+            assert_eq!(
+                &got_pipe[run_hi..],
+                &want[run_hi..],
+                "attn_prefill_pipe {n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
+                 wrote past the run"
+            );
+
+            // Same reference, the natural-V-layout kernel.
+            let mut got_natv_d = stream.clone_htod(&want)?;
+            let mut part_natv = stream.alloc_zeros::<f32>(Kernels::attn_partial_floats(
+                dims.n_heads,
+                dims.d_head,
+                run_tokens,
+            ))?;
+            k.attn_prefill_natv(
+                &mut got_natv_d.as_view_mut(),
+                &dq.as_view(),
+                &dk.as_view(),
+                &dv.as_view(),
+                batch,
+                dims,
+                pad,
+                run_tokens,
+                kv_len,
+                scale,
+                &mut part_natv.as_view_mut(),
+            )?;
+            let got_natv = stream.clone_dtoh(&got_natv_d)?;
+            k.device().synchronize()?;
+            let (abs_nv, at_nv) = max_abs_diff(&got_natv[run_lo..run_hi], &want[run_lo..run_hi]);
+            assert!(
+                abs_nv < 2e-3,
+                "attn_prefill_natv {n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
+                 max abs diff {abs_nv} at {at_nv} (got {}, want {})",
+                got_natv[run_lo + at_nv],
+                want[run_lo + at_nv]
+            );
+            assert_eq!(
+                &got_natv[..run_lo],
+                &want[..run_lo],
+                "attn_prefill_natv {n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
+                 wrote before the run"
+            );
+            assert_eq!(
+                &got_natv[run_hi..],
+                &want[run_hi..],
+                "attn_prefill_natv {n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
+                 wrote past the run"
+            );
+
+            // Same reference, K and V both pipelined.
+            let mut got_pipev_d = stream.clone_htod(&want)?;
+            let mut part_pipev = stream.alloc_zeros::<f32>(Kernels::attn_partial_floats(
+                dims.n_heads,
+                dims.d_head,
+                run_tokens,
+            ))?;
+            k.attn_prefill_pipev(
+                &mut got_pipev_d.as_view_mut(),
+                &dq.as_view(),
+                &dk.as_view(),
+                &dv.as_view(),
+                batch,
+                dims,
+                pad,
+                run_tokens,
+                kv_len,
+                scale,
+                &mut part_pipev.as_view_mut(),
+            )?;
+            let got_pipev = stream.clone_dtoh(&got_pipev_d)?;
+            k.device().synchronize()?;
+            let (abs_pv, at_pv) = max_abs_diff(&got_pipev[run_lo..run_hi], &want[run_lo..run_hi]);
+            assert!(
+                abs_pv < 2e-3,
+                "attn_prefill_pipev {n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
+                 max abs diff {abs_pv} at {at_pv} (got {}, want {})",
+                got_pipev[run_lo + at_pv],
+                want[run_lo + at_pv]
+            );
+            assert_eq!(
+                &got_pipev[..run_lo],
+                &want[..run_lo],
+                "attn_prefill_pipev {n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
+                 wrote before the run"
+            );
+            assert_eq!(
+                &got_pipev[run_hi..],
+                &want[run_hi..],
+                "attn_prefill_pipev {n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
+                 wrote past the run"
+            );
         }
     }
     Ok(())

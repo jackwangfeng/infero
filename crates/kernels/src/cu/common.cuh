@@ -86,6 +86,34 @@ __device__ __forceinline__ float block_reduce_max(float v) {
     return result;
 }
 
+// ---- cp.async, global to shared without a register round trip -----------
+//
+// Same primitive as `mmq_cp_async16` in `mmq.cu` (kept separate there rather
+// than switched to call this, since that kernel's copy is already measured
+// and this one exists for a different kernel family) -- raw PTX so nothing
+// here needs `cuda_pipeline.h` and the module stays reachable from NVRTC.
+// `dst` must be 16-byte aligned, which is `cp.async.cg`'s own requirement,
+// not an added one.
+__device__ __forceinline__ void cp_async16(void* dst, const void* src,
+                                           bool pred) {
+#if __CUDA_ARCH__ >= 800
+    const unsigned s = (unsigned)__cvta_generic_to_shared(dst);
+    const int sz = pred ? 16 : 0;
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s),
+                 "l"(src), "r"(sz));
+#else
+    (void)dst; (void)src; (void)pred;
+#endif
+}
+
+#if __CUDA_ARCH__ >= 800
+#define CP_ASYNC_FENCE() asm volatile("cp.async.commit_group;\n" ::)
+#define CP_ASYNC_WAIT(N) asm volatile("cp.async.wait_group %0;\n" ::"n"(N))
+#else
+#define CP_ASYNC_FENCE() do {} while (0)
+#define CP_ASYNC_WAIT(N) do {} while (0)
+#endif
+
 // ---- ggml block layouts -------------------------------------------------
 // Field order and padding must match ggml-common.h exactly; these structs are
 // reinterpreted straight from the mapped GGUF file.

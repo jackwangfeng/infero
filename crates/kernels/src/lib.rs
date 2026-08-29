@@ -2708,6 +2708,402 @@ impl Kernels {
         Ok(())
     }
 
+    /// Same as [`Self::attn_prefill`], but `attn_prefill_mma_pipe_f32`
+    /// double-buffers the K half of each key-tile's staging through
+    /// `cp.async` one `ATTN_MMA_WK`-wide block ahead of what's being computed
+    /// on — see that kernel's doc comment in `ops.cu` for why V stays
+    /// synchronous and single-buffered, and why the tile width shrinks from
+    /// `T`(32) to `WK`(16) to pay for it. Kept alongside `attn_prefill`
+    /// rather than replacing it until this is measured, not just correct —
+    /// same reasoning as `gdn_delta_rule_smem_f32` and the chunked GDN kernel
+    /// staying in tree next to `reg128`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prefill_pipe(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        q: &View<'_, f32>,
+        k_cache: &View<'_, f16>,
+        v_cache: &View<'_, f16>,
+        batch: BatchLayout<'_>,
+        dims: AttnDims,
+        run_base: usize,
+        run_tokens: usize,
+        kv_len: usize,
+        scale: f32,
+        partial: &mut ViewMut<'_, f32>,
+    ) -> Result<()> {
+        anyhow::ensure!(self.prefill_attention(&dims), "attn_prefill_pipe: unsupported shape");
+        anyhow::ensure!(run_tokens >= 1, "attn_prefill_pipe: empty run");
+        let group = dims.n_heads / dims.n_kv_heads;
+        let tpw = (16 / group).max(1);
+        const NWARPS: usize = 7;
+        const KPAD: usize = 8;
+        const VPAD: usize = 2;
+        // The staging/compute granularity — `ATTN_MMA_WK` in `ops.cu`, not
+        // `attn_prefill`'s `T` — since this kernel processes one `WK`-wide
+        // block per iteration rather than `T`-wide with an inner sub-loop.
+        const WK: usize = 16;
+        let tile_tokens = NWARPS * tpw;
+        let n_tiles = run_tokens.div_ceil(tile_tokens);
+        let (n_chunks, chunk) = self.prefill_chunks(dims.n_kv_heads, n_tiles, kv_len);
+        anyhow::ensure!(
+            n_chunks <= 32,
+            "attn_prefill_pipe: {n_chunks} chunks past the partial buffer's 32"
+        );
+        let ms_off = (32 * dims.n_heads * run_tokens * dims.d_head) as i32;
+
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_ops", ops_src(), "attn_prefill_mma_pipe_f32")?;
+        // `sq` is `NWARPS` sixteen-row slabs; `sk0`+`sk1` are two `WK`-wide
+        // K buffers (their combined size equals `attn_prefill`'s single
+        // `T`-wide one, `T` == `2 * WK`); `svt` is a single `WK`-wide V
+        // buffer, half `attn_prefill`'s `T`-wide one — net, this uses *less*
+        // shared memory than `attn_prefill`, not more.
+        let shared = (NWARPS * 16 * (dims.d_head + KPAD) * 2
+            + 2 * WK * (dims.d_head + KPAD) * 2
+            + dims.d_head * (WK + VPAD) * 2) as u32;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared)?;
+        }
+        let single = i32::from(n_chunks == 1);
+        let cfg = LaunchConfig {
+            grid_dim: (dims.n_kv_heads as u32, n_tiles as u32, n_chunks),
+            block_dim: (NWARPS as u32 * 32, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let (stride, h, kh, dh, ns, ck, kl, gi, tp, rb, rt) = (
+            batch.table_stride as i32,
+            dims.n_heads as i32,
+            dims.n_kv_heads as i32,
+            dims.d_head as i32,
+            dims.n_slots as i32,
+            chunk as i32,
+            kv_len as i32,
+            group as i32,
+            tpw as i32,
+            run_base as i32,
+            run_tokens as i32,
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(&mut *partial)
+            .arg(&ms_off)
+            .arg(&mut *out)
+            .arg(&single)
+            .arg(q)
+            .arg(k_cache)
+            .arg(v_cache)
+            .arg(batch.seq_of)
+            .arg(batch.positions)
+            .arg(batch.slot_table)
+            .arg(&stride)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ns)
+            .arg(&scale)
+            .arg(&ck)
+            .arg(&kl)
+            .arg(&gi)
+            .arg(&tp)
+            .arg(&rb)
+            .arg(&rt);
+        self.dev
+            .profile()
+            .time("attn_prefill_pipe", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("attn_prefill_pipe")?;
+                Ok(())
+            })?;
+        if single == 1 {
+            return Ok(());
+        }
+
+        let total = (run_tokens * dims.n_heads * dims.d_head) as u32;
+        let (nt, nc) = (run_tokens as i32, n_chunks as i32);
+        let part = partial.as_view();
+        let r = self
+            .dev
+            .kernels()
+            .get("infero_ops", ops_src(), "attn_flash_reduce_f32")?;
+        let run_elems = run_tokens * dims.n_heads * dims.d_head;
+        let out_off = run_base * dims.n_heads * dims.d_head;
+        let mut out_run = out.slice_mut(out_off..out_off + run_elems);
+        let mut rb2 = self.dev.stream().launch_builder(&r);
+        rb2.arg(&mut out_run)
+            .arg(&part)
+            .arg(&ms_off)
+            .arg(&h)
+            .arg(&dh)
+            .arg(&nt)
+            .arg(&nc);
+        self.dev
+            .profile()
+            .time("attn_prefill_reduce", self.dev.stream(), || {
+                unsafe { rb2.launch(elementwise(total)) }.context("attn_prefill_reduce")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// Same as [`Self::attn_prefill`], but `attn_prefill_mma_natv_f32` stages
+    /// V in its natural `[key][dim]` layout instead of pre-transposing it —
+    /// a synchronous copy either way, this isolates whether that layout
+    /// change (a prerequisite for pipelining V through `cp.async`, which
+    /// cannot transpose) costs more in the PV product's now-unpacked
+    /// per-MMA reads than it saves in staging. See the kernel's doc comment
+    /// in `ops.cu` for the exact trade.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prefill_natv(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        q: &View<'_, f32>,
+        k_cache: &View<'_, f16>,
+        v_cache: &View<'_, f16>,
+        batch: BatchLayout<'_>,
+        dims: AttnDims,
+        run_base: usize,
+        run_tokens: usize,
+        kv_len: usize,
+        scale: f32,
+        partial: &mut ViewMut<'_, f32>,
+    ) -> Result<()> {
+        anyhow::ensure!(self.prefill_attention(&dims), "attn_prefill_natv: unsupported shape");
+        anyhow::ensure!(run_tokens >= 1, "attn_prefill_natv: empty run");
+        let group = dims.n_heads / dims.n_kv_heads;
+        let tpw = (16 / group).max(1);
+        const T: usize = 32;
+        const NWARPS: usize = 7;
+        const KPAD: usize = 8;
+        let tile_tokens = NWARPS * tpw;
+        let n_tiles = run_tokens.div_ceil(tile_tokens);
+        let (n_chunks, chunk) = self.prefill_chunks(dims.n_kv_heads, n_tiles, kv_len);
+        anyhow::ensure!(
+            n_chunks <= 32,
+            "attn_prefill_natv: {n_chunks} chunks past the partial buffer's 32"
+        );
+        let ms_off = (32 * dims.n_heads * run_tokens * dims.d_head) as i32;
+
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_ops", ops_src(), "attn_prefill_mma_natv_f32")?;
+        // `sq` is `NWARPS` sixteen-row slabs; `sk`/`sv` are both `T`-wide,
+        // `krow`-wide K/V tiles now — `sv` no longer needs `d_head`-wide rows
+        // the way the transposed `svt` did, so this kernel actually uses
+        // *less* shared memory than `attn_prefill`, not more.
+        let shared = (NWARPS * 16 * (dims.d_head + KPAD) * 2 + 2 * T * (dims.d_head + KPAD) * 2) as u32;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared)?;
+        }
+        let single = i32::from(n_chunks == 1);
+        let cfg = LaunchConfig {
+            grid_dim: (dims.n_kv_heads as u32, n_tiles as u32, n_chunks),
+            block_dim: (NWARPS as u32 * 32, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let (stride, h, kh, dh, ns, ck, kl, gi, tp, rb, rt) = (
+            batch.table_stride as i32,
+            dims.n_heads as i32,
+            dims.n_kv_heads as i32,
+            dims.d_head as i32,
+            dims.n_slots as i32,
+            chunk as i32,
+            kv_len as i32,
+            group as i32,
+            tpw as i32,
+            run_base as i32,
+            run_tokens as i32,
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(&mut *partial)
+            .arg(&ms_off)
+            .arg(&mut *out)
+            .arg(&single)
+            .arg(q)
+            .arg(k_cache)
+            .arg(v_cache)
+            .arg(batch.seq_of)
+            .arg(batch.positions)
+            .arg(batch.slot_table)
+            .arg(&stride)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ns)
+            .arg(&scale)
+            .arg(&ck)
+            .arg(&kl)
+            .arg(&gi)
+            .arg(&tp)
+            .arg(&rb)
+            .arg(&rt);
+        self.dev
+            .profile()
+            .time("attn_prefill_natv", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("attn_prefill_natv")?;
+                Ok(())
+            })?;
+        if single == 1 {
+            return Ok(());
+        }
+
+        let total = (run_tokens * dims.n_heads * dims.d_head) as u32;
+        let (nt, nc) = (run_tokens as i32, n_chunks as i32);
+        let part = partial.as_view();
+        let r = self
+            .dev
+            .kernels()
+            .get("infero_ops", ops_src(), "attn_flash_reduce_f32")?;
+        let run_elems = run_tokens * dims.n_heads * dims.d_head;
+        let out_off = run_base * dims.n_heads * dims.d_head;
+        let mut out_run = out.slice_mut(out_off..out_off + run_elems);
+        let mut rb2 = self.dev.stream().launch_builder(&r);
+        rb2.arg(&mut out_run)
+            .arg(&part)
+            .arg(&ms_off)
+            .arg(&h)
+            .arg(&dh)
+            .arg(&nt)
+            .arg(&nc);
+        self.dev
+            .profile()
+            .time("attn_prefill_reduce", self.dev.stream(), || {
+                unsafe { rb2.launch(elementwise(total)) }.context("attn_prefill_reduce")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// Same as [`Self::attn_prefill_natv`], but both K *and* V are
+    /// double-buffered through `cp.async` one `ATTN_MMA_WK`-wide block
+    /// ahead — `attn_prefill_pipe` could only pipeline K (V's transposed
+    /// layout blocked it); `attn_prefill_natv`'s natural V layout is a plain
+    /// copy, so `cp.async` can stage it the same way. Tests whether
+    /// prefetching *both* operands, not just half, is what the earlier
+    /// K-only attempt was missing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prefill_pipev(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        q: &View<'_, f32>,
+        k_cache: &View<'_, f16>,
+        v_cache: &View<'_, f16>,
+        batch: BatchLayout<'_>,
+        dims: AttnDims,
+        run_base: usize,
+        run_tokens: usize,
+        kv_len: usize,
+        scale: f32,
+        partial: &mut ViewMut<'_, f32>,
+    ) -> Result<()> {
+        anyhow::ensure!(self.prefill_attention(&dims), "attn_prefill_pipev: unsupported shape");
+        anyhow::ensure!(run_tokens >= 1, "attn_prefill_pipev: empty run");
+        let group = dims.n_heads / dims.n_kv_heads;
+        let tpw = (16 / group).max(1);
+        const NWARPS: usize = 7;
+        const KPAD: usize = 8;
+        const WK: usize = 16;
+        let tile_tokens = NWARPS * tpw;
+        let n_tiles = run_tokens.div_ceil(tile_tokens);
+        let (n_chunks, chunk) = self.prefill_chunks(dims.n_kv_heads, n_tiles, kv_len);
+        anyhow::ensure!(
+            n_chunks <= 32,
+            "attn_prefill_pipev: {n_chunks} chunks past the partial buffer's 32"
+        );
+        let ms_off = (32 * dims.n_heads * run_tokens * dims.d_head) as i32;
+
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_ops", ops_src(), "attn_prefill_mma_pipev_f32")?;
+        // `sq` is `NWARPS` sixteen-row slabs; `sk0`/`sk1`/`sv0`/`sv1` are
+        // four `WK`-wide, `krow`-wide buffers — comfortably less than
+        // `attn_prefill`'s single `T`-wide K tile plus its `d_head`-wide
+        // transposed V tile, since `T == 2 * WK` and natural-layout V is
+        // `krow`-wide rather than `d_head`-wide.
+        let shared = (NWARPS * 16 * (dims.d_head + KPAD) * 2 + 4 * WK * (dims.d_head + KPAD) * 2) as u32;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared)?;
+        }
+        let single = i32::from(n_chunks == 1);
+        let cfg = LaunchConfig {
+            grid_dim: (dims.n_kv_heads as u32, n_tiles as u32, n_chunks),
+            block_dim: (NWARPS as u32 * 32, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let (stride, h, kh, dh, ns, ck, kl, gi, tp, rb, rt) = (
+            batch.table_stride as i32,
+            dims.n_heads as i32,
+            dims.n_kv_heads as i32,
+            dims.d_head as i32,
+            dims.n_slots as i32,
+            chunk as i32,
+            kv_len as i32,
+            group as i32,
+            tpw as i32,
+            run_base as i32,
+            run_tokens as i32,
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(&mut *partial)
+            .arg(&ms_off)
+            .arg(&mut *out)
+            .arg(&single)
+            .arg(q)
+            .arg(k_cache)
+            .arg(v_cache)
+            .arg(batch.seq_of)
+            .arg(batch.positions)
+            .arg(batch.slot_table)
+            .arg(&stride)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ns)
+            .arg(&scale)
+            .arg(&ck)
+            .arg(&kl)
+            .arg(&gi)
+            .arg(&tp)
+            .arg(&rb)
+            .arg(&rt);
+        self.dev
+            .profile()
+            .time("attn_prefill_pipev", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("attn_prefill_pipev")?;
+                Ok(())
+            })?;
+        if single == 1 {
+            return Ok(());
+        }
+
+        let total = (run_tokens * dims.n_heads * dims.d_head) as u32;
+        let (nt, nc) = (run_tokens as i32, n_chunks as i32);
+        let part = partial.as_view();
+        let r = self
+            .dev
+            .kernels()
+            .get("infero_ops", ops_src(), "attn_flash_reduce_f32")?;
+        let run_elems = run_tokens * dims.n_heads * dims.d_head;
+        let out_off = run_base * dims.n_heads * dims.d_head;
+        let mut out_run = out.slice_mut(out_off..out_off + run_elems);
+        let mut rb2 = self.dev.stream().launch_builder(&r);
+        rb2.arg(&mut out_run)
+            .arg(&part)
+            .arg(&ms_off)
+            .arg(&h)
+            .arg(&dh)
+            .arg(&nt)
+            .arg(&nc);
+        self.dev
+            .profile()
+            .time("attn_prefill_reduce", self.dev.stream(), || {
+                unsafe { rb2.launch(elementwise(total)) }.context("attn_prefill_reduce")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
 
     /// Scores, softmax and the weighted sum in one pass over the KV range.
     ///
