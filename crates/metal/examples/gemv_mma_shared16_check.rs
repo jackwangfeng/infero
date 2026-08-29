@@ -4,7 +4,7 @@
 //!
 //! See the new kernel's doc comment in quant.metal for why this is being
 //! asked before a much larger rewrite: llama.cpp's own Q4_K prefill matmul
-//! uses a 64-row-by-32-token tile against tuili's 8-by-32, cooperatively
+//! uses a 64-row-by-32-token tile against infero's 8-by-32, cooperatively
 //! dequantized by all 128 threads in the threadgroup rather than serialized
 //! on one simdgroup. This checks the cheaper half of that hypothesis first
 //! -- does merely widening the row tile help even without also making the
@@ -12,10 +12,10 @@
 //! the much larger risk this session already took once on a kernel that
 //! won in isolation and lost in the real pipeline.
 //!
-//!     cargo run --release -p tuili-metal --example gemv_mma_shared16_check
+//!     cargo run --release -p infero-metal --example gemv_mma_shared16_check
 
 use anyhow::Result;
-use tuili_metal::{Device, LaunchConfig};
+use infero_metal::{Device, LaunchConfig};
 
 const COMMON: &str = include_str!("../../kernels/src/msl/common.metal");
 const QUANT: &str = include_str!("../../kernels/src/msl/quant.metal");

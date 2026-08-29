@@ -8,16 +8,16 @@
 //! `cu/gdn.cu`'s own measurements document for that gap every prefill and
 //! every decode step since the GDN port. `crates/kernels/tests/gated_delta.rs`
 //! is the existing cross-check for this kernel family but pulls in
-//! `tuili_model::qwen35`, which drags the workspace's CUDA-default feature
+//! `infero_model::qwen35`, which drags the workspace's CUDA-default feature
 //! unification in with it (a known, separate issue) -- so this reimplements
 //! the reference directly, small enough to trust by inspection: `S *=
 //! exp(g); kv = kᵀS; delta = (v - kv) * beta; S += k ⊗ delta; o = qᵀS`, with
 //! S read *after* its update, matching the note on `gdn_delta_rule_f32`.
 //!
-//!     cargo run --release -p tuili-metal --example gdn_reg128_check
+//!     cargo run --release -p infero-metal --example gdn_reg128_check
 
 use anyhow::Result;
-use tuili_metal::{Buf, Device, LaunchConfig};
+use infero_metal::{Buf, Device, LaunchConfig};
 
 const COMMON: &str = include_str!("../../kernels/src/msl/common.metal");
 const GDN: &str = include_str!("../../kernels/src/msl/gdn.metal");

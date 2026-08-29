@@ -9,10 +9,10 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use tower_http::cors::{Any, CorsLayer};
-use tuili_server::{Engine, routes};
+use infero_server::{Engine, routes};
 
 fn model_path() -> Option<PathBuf> {
-    let p = std::env::var("TUILI_TEST_GGUF")
+    let p = std::env::var("INFERO_TEST_GGUF")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -30,7 +30,7 @@ fn server() -> Option<SocketAddr> {
             path.to_str().unwrap(),
             1024,
             0,
-            tuili_model::KvCacheQuant::F16,
+            infero_model::KvCacheQuant::F16,
             usize::MAX,
             4,
             None,
@@ -408,9 +408,9 @@ fn a_shared_prompt_prefix_is_served_from_the_cache() {
         after["tokens_saved"].as_u64().unwrap() - before["tokens_saved"].as_u64().unwrap();
     assert!(hit_delta >= 1, "before={before} after={after}");
     assert!(
-        saved_delta >= tuili_server::prefix::BLOCK as u64,
+        saved_delta >= infero_server::prefix::BLOCK as u64,
         "expected at least one cached block ({}) reused: before={before} after={after}",
-        tuili_server::prefix::BLOCK
+        infero_server::prefix::BLOCK
     );
 }
 

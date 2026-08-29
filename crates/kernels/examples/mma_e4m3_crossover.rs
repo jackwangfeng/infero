@@ -6,15 +6,15 @@
 //! step (`n_tokens = k + 1 = 3`) actually runs at, to find the real
 //! crossover instead of guessing one.
 //!
-//!     cargo run --release -p tuili-kernels --example mma_e4m3_crossover
+//!     cargo run --release -p infero-kernels --example mma_e4m3_crossover
 //!
 //! Shape defaults to the fused FFN gate+up on the 27B: k = d_model = 5120,
 //! n = 2 * d_ff = 34816, both multiples of `mma_e4m3_block`'s `K_TILE = 256`.
 
 use anyhow::{Context, Result};
-use tuili_cuda::backend::{CAPTURE_RELAXED, GraphFlags};
-use tuili_cuda::Device;
-use tuili_kernels::Kernels;
+use infero_cuda::backend::{CAPTURE_RELAXED, GraphFlags};
+use infero_cuda::Device;
+use infero_kernels::Kernels;
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
@@ -58,7 +58,7 @@ fn main() -> Result<()> {
     let k = Kernels::new(dev.clone());
     let stream = dev.stream().clone();
 
-    let w_bytes = tuili_kernels::fp8::fp8_bytes(k_dim, n_dim);
+    let w_bytes = infero_kernels::fp8::fp8_bytes(k_dim, n_dim);
     let weights = pseudo_random_bytes(w_bytes, 1);
     let d_w = stream.clone_htod(&weights)?;
 
@@ -67,7 +67,7 @@ fn main() -> Result<()> {
     let d_x = stream.clone_htod(&x)?;
     let mut d_out = stream.alloc_zeros::<f32>(max_tokens * n_dim)?;
 
-    let scale_cols = k_dim.div_ceil(tuili_kernels::fp8::ACT_QUANT_GROUP);
+    let scale_cols = k_dim.div_ceil(infero_kernels::fp8::ACT_QUANT_GROUP);
     let mut d_xq = stream.alloc_zeros::<u8>(max_tokens * k_dim)?;
     let mut d_xs = stream.alloc_zeros::<f32>(max_tokens * scale_cols)?;
 

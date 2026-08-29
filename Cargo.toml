@@ -20,14 +20,14 @@ rust-version = "1.90"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-tuili-gguf = { path = "crates/gguf" }
-tuili-safetensors = { path = "crates/safetensors" }
-tuili-cuda = { path = "crates/cuda", default-features = false }
-tuili-metal = { path = "crates/metal" }
-tuili-gpu = { path = "crates/gpu", default-features = false }
-tuili-kernels = { path = "crates/kernels", default-features = false }
-tuili-tokenizer = { path = "crates/tokenizer" }
-tuili-model = { path = "crates/model", default-features = false }
+infero-gguf = { path = "crates/gguf" }
+infero-safetensors = { path = "crates/safetensors" }
+infero-cuda = { path = "crates/cuda", default-features = false }
+infero-metal = { path = "crates/metal" }
+infero-gpu = { path = "crates/gpu", default-features = false }
+infero-kernels = { path = "crates/kernels", default-features = false }
+infero-tokenizer = { path = "crates/tokenizer" }
+infero-model = { path = "crates/model", default-features = false }
 
 anyhow = "1"
 thiserror = "2"

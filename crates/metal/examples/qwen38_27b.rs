@@ -6,7 +6,7 @@
 //! decode path so nothing needs a GEMM.
 //!
 //! ```text
-//! cargo run --release -p tuili-metal --example qwen38_27b -- \
+//! cargo run --release -p infero-metal --example qwen38_27b -- \
 //!     models/Qwen3.8-27B-Q4_K_M.gguf --prompt "..."
 //! ```
 //!
@@ -18,9 +18,9 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
-use tuili_gguf::{GgmlType, Gguf};
-use tuili_metal::{Buf, Device, Function, LaunchConfig, View, ViewMut};
-use tuili_tokenizer::Tokenizer;
+use infero_gguf::{GgmlType, Gguf};
+use infero_metal::{Buf, Device, Function, LaunchConfig, View, ViewMut};
+use infero_tokenizer::Tokenizer;
 
 const COMMON: &str = include_str!("../../kernels/src/msl/common.metal");
 const OPS: &str = include_str!("../../kernels/src/msl/ops.metal");
@@ -418,8 +418,8 @@ struct Engine {
 impl Engine {
     fn f(&self, module: &'static str, name: &str) -> Result<Function> {
         let src = match module {
-            "tuili_ops" => &self.ops,
-            "tuili_quant" => &self.quant,
+            "infero_ops" => &self.ops,
+            "infero_quant" => &self.quant,
             _ => &self.gdn,
         };
         self.dev.kernels().get(module, src, name)
@@ -435,7 +435,7 @@ impl Engine {
             GgmlType::Q6K => "gemv_q6_K",
             other => return Err(anyhow!("no Metal mat-vec for {other:?}")),
         };
-        let f = self.f("tuili_quant", name)?;
+        let f = self.f("infero_quant", name)?;
         let (k, n, t) = (m.k as i32, m.n as i32, 1i32);
         let s = self.dev.stream();
         let mut b = s.launch_builder(&f);
@@ -456,7 +456,7 @@ impl Engine {
         d: usize,
         rows: u32,
     ) -> Result<()> {
-        let f = self.f("tuili_ops", "rms_norm_f32")?;
+        let f = self.f("infero_ops", "rms_norm_f32")?;
         let (d_i, eps) = (d as i32, self.cfg.eps);
         let s = self.dev.stream();
         let mut b = s.launch_builder(&f);
@@ -465,7 +465,7 @@ impl Engine {
     }
 
     fn add_assign(&self, out: &mut ViewMut<'_, f32>, v: &View<'_, f32>, n: usize) -> Result<()> {
-        let f = self.f("tuili_ops", "add_assign_f32")?;
+        let f = self.f("infero_ops", "add_assign_f32")?;
         let n_i = n as i32;
         let s = self.dev.stream();
         let mut b = s.launch_builder(&f);
@@ -493,7 +493,7 @@ impl Engine {
             &sess.xb.as_view(),
         )?;
         {
-            let f = self.f("tuili_ops", "silu_mul_split_f32")?;
+            let f = self.f("infero_ops", "silu_mul_split_f32")?;
             let (dff, total) = (cfg.d_ff as i32, cfg.d_ff as i32);
             let s = self.dev.stream();
             let mut b = s.launch_builder(&f);
@@ -531,7 +531,7 @@ impl Engine {
         // also runs, and gives a different model.
         self.gemv(&mut sess.qg.as_view_mut(), &l.q, &sess.xb.as_view())?;
         {
-            let f = self.f("tuili_gdn", "split_interleaved_f32")?;
+            let f = self.f("infero_gdn", "split_interleaved_f32")?;
             let (heads, dh) = (cfg.n_heads as i32, cfg.d_head as i32);
             let n = cfg.d_attn as i64;
             let mut b = s.launch_builder(&f);
@@ -551,7 +551,7 @@ impl Engine {
             (&mut sess.q, &l.q_norm, cfg.n_heads),
             (&mut sess.k, &l.k_norm, cfg.n_kv),
         ] {
-            let f = self.f("tuili_ops", "qk_norm_f32")?;
+            let f = self.f("infero_ops", "qk_norm_f32")?;
             let (h, dh) = (heads as i32, cfg.d_head as i32);
             let (stride, off, eps) = ((heads * cfg.d_head) as i32, 0i32, cfg.eps);
             let mut b = s.launch_builder(&f);
@@ -567,7 +567,7 @@ impl Engine {
 
         // Partial rotary: the first 64 of each 256-wide head rotate.
         for (buf, heads) in [(&mut sess.q, cfg.n_heads), (&mut sess.k, cfg.n_kv)] {
-            let f = self.f("tuili_ops", "rope_partial_f32")?;
+            let f = self.f("infero_ops", "rope_partial_f32")?;
             let (h, dh, rot) = (heads as i32, cfg.d_head as i32, cfg.rotary_dim as i32);
             let mut b = s.launch_builder(&f);
             b.arg(&buf.as_view_mut())
@@ -590,7 +590,7 @@ impl Engine {
         let plane = sess.max_pos * kv;
         let (lo, hi) = (slot * plane, (slot + 1) * plane);
         {
-            let f = self.f("tuili_ops", "store_kv_contig_f16")?;
+            let f = self.f("infero_ops", "store_kv_contig_f16")?;
             let (nkv, dh, p) = (cfg.n_kv as i32, cfg.d_head as i32, pos as i32);
             let mut b = s.launch_builder(&f);
             b.arg(&sess.kcache.slice_mut(lo..hi))
@@ -603,7 +603,7 @@ impl Engine {
             unsafe { b.launch(grid1(kv as u32, BLOCK))? };
         }
         {
-            let f = self.f("tuili_ops", "attn_decode_f32")?;
+            let f = self.f("infero_ops", "attn_decode_f32")?;
             let (nh, nkv, dh) = (cfg.n_heads as i32, cfg.n_kv as i32, cfg.d_head as i32);
             let kv_len = (pos + 1) as i32;
             let scale = 1.0f32 / (cfg.d_head as f32).sqrt();
@@ -621,7 +621,7 @@ impl Engine {
         }
         // The output gate, applied before o_proj, and sigmoid rather than SiLU.
         {
-            let f = self.f("tuili_gdn", "sigmoid_gate_f32")?;
+            let f = self.f("infero_gdn", "sigmoid_gate_f32")?;
             let n = cfg.d_attn as i64;
             let mut b = s.launch_builder(&f);
             b.arg(&sess.attn.as_view_mut()).arg(&sess.gate.as_view()).arg(&n);
@@ -657,7 +657,7 @@ impl Engine {
         {
             let cs_plane = cfg.qkv_width * (cfg.conv_k - 1);
             let (lo, hi) = (slot * cs_plane, (slot + 1) * cs_plane);
-            let f = self.f("tuili_gdn", "gdn_conv_f32")?;
+            let f = self.f("infero_gdn", "gdn_conv_f32")?;
             let (ch, kk) = (cfg.qkv_width as i32, cfg.conv_k as i32);
             let mut b = s.launch_builder(&f);
             b.arg(&sess.qkv.as_view_mut())
@@ -677,7 +677,7 @@ impl Engine {
             };
         }
         {
-            let f = self.f("tuili_gdn", "gdn_gate_decay_f32")?;
+            let f = self.f("infero_gdn", "gdn_gate_decay_f32")?;
             let (nt, heads, stride) = (1i32, cfg.lin_value_heads as i32, cfg.lin_value_heads as i32);
             let mut b = s.launch_builder(&f);
             b.arg(&sess.beta.as_view_mut())
@@ -692,7 +692,7 @@ impl Engine {
             unsafe { b.launch(grid1(cfg.lin_value_heads as u32, BLOCK))? };
         }
         {
-            let f = self.f("tuili_gdn", "gdn_qk_l2norm_f32")?;
+            let f = self.f("infero_gdn", "gdn_qk_l2norm_f32")?;
             let (kh, dk) = (cfg.lin_key_heads as i32, cfg.lin_dk as i32);
             let stride = cfg.qkv_width as i32;
             let (q_off, k_off) = (0i32, (cfg.lin_key_heads * cfg.lin_dk) as i32);
@@ -711,7 +711,7 @@ impl Engine {
         {
             let plane = cfg.lin_value_heads * dv * dv;
             let (lo, hi) = (slot * plane, (slot + 1) * plane);
-            let f = self.f("tuili_gdn", "gdn_delta_rule_f32")?;
+            let f = self.f("infero_gdn", "gdn_delta_rule_f32")?;
             let (heads, kh) = (cfg.lin_value_heads as i32, cfg.lin_key_heads as i32);
             let (dk, dvi) = (cfg.lin_dk as i32, dv as i32);
             let stride = cfg.qkv_width as i32;
@@ -748,7 +748,7 @@ impl Engine {
         // RMSNorm then the SiLU'd gate, in that order: `weight * normalized`
         // first, and only then times `silu(z)`.
         {
-            let f = self.f("tuili_gdn", "gdn_gated_rmsnorm_f32")?;
+            let f = self.f("infero_gdn", "gdn_gated_rmsnorm_f32")?;
             let (dvi, eps) = (dv as i32, cfg.eps);
             let mut b = s.launch_builder(&f);
             b.arg(&sess.gdn_norm.as_view_mut())
@@ -805,7 +805,7 @@ impl Engine {
                 "the embedding table is {:?}; only Q4_K has a row reader",
                 self.w.embd.ty
             );
-            let f = self.f("tuili_quant", "embed_row_q4_K")?;
+            let f = self.f("infero_quant", "embed_row_q4_K")?;
             let d = cfg.d_model as i32;
             let mut b = s.launch_builder(&f);
             b.arg(&sess.x.as_view_mut())
@@ -815,7 +815,7 @@ impl Engine {
             unsafe { b.launch(grid1(cfg.d_model as u32, BLOCK))? };
         }
 
-        let trace = std::env::var("TUILI_TRACE").is_ok();
+        let trace = std::env::var("INFERO_TRACE").is_ok();
         let rms = |v: &[f32]| -> f32 {
             (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt()
         };
@@ -1428,7 +1428,7 @@ mod host {
                 for i in 0..cfg.d_model {
                     x[i] += buf[i];
                 }
-                if std::env::var("TUILI_TRACE").is_ok() {
+                if std::env::var("INFERO_TRACE").is_ok() {
                     let r = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt();
                     eprintln!("  host layer {li:2} rms {r:11.4}");
                 }

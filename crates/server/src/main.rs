@@ -1,4 +1,4 @@
-//! tuili — a CUDA inference server for GGUF models, with an OpenAI-compatible API.
+//! infero — a CUDA inference server for GGUF models, with an OpenAI-compatible API.
 
 use std::net::SocketAddr;
 
@@ -6,10 +6,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
-use tuili_server::{engine, routes};
+use infero_server::{engine, routes};
 
 #[derive(Parser, Debug)]
-#[command(name = "tuili", about, version)]
+#[command(name = "infero", about, version)]
 struct Args {
     /// Path to a GGUF model file.
     #[arg(short, long)]
@@ -72,7 +72,7 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    let kv_quant = tuili_model::KvCacheQuant::parse(&args.kv_quant)?;
+    let kv_quant = infero_model::KvCacheQuant::parse(&args.kv_quant)?;
     let engine = engine::Engine::start(
         &args.model,
         args.ctx,

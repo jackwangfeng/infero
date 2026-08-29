@@ -8,9 +8,9 @@
 //! bit-identical, not merely close.
 
 use anyhow::Result;
-use tuili_cuda::Device;
-use tuili_kernels::awq::AwqTensor;
-use tuili_kernels::{Kernels, WeightType};
+use infero_cuda::Device;
+use infero_kernels::awq::AwqTensor;
+use infero_kernels::{Kernels, WeightType};
 
 /// AWQ codes that vary with the expert as well as with the position, so an
 /// expert read at the wrong offset produces different numbers rather than
@@ -83,7 +83,7 @@ fn an_expert_is_the_dense_matvec_at_an_offset() -> Result<()> {
                 }
                 .repack()?;
                 per_expert.push(match ty {
-                    WeightType::Q4G128T => tuili_kernels::awq::transpose_words(&packed, k, n),
+                    WeightType::Q4G128T => infero_kernels::awq::transpose_words(&packed, k, n),
                     _ => packed,
                 });
             }

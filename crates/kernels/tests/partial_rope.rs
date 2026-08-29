@@ -1,6 +1,6 @@
 //! The rotary kernels against the host reference for partial RoPE.
 //!
-//! The reference is `tuili_model::qwen35::{rope_tables, apply_partial_rope}`,
+//! The reference is `infero_model::qwen35::{rope_tables, apply_partial_rope}`,
 //! reached through a dev-dependency on the crate above this one. Cargo allows
 //! that cycle because it exists only for test targets. Copying the reference in
 //! here instead was the alternative and it is worse: two copies of a table whose
@@ -26,7 +26,7 @@
 mod common;
 
 use anyhow::Result;
-use tuili_model::qwen35::{apply_partial_rope, rope_tables};
+use infero_model::qwen35::{apply_partial_rope, rope_tables};
 
 use common::*;
 

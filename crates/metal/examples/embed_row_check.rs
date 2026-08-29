@@ -11,10 +11,10 @@
 //! the same redundancy `dequant_q4_K_f16_vec` (6acfeb2) fixed for the whole-
 //! matrix dequant, just never ported to the embedding gather.
 //!
-//!     cargo run --release -p tuili-metal --example embed_row_check
+//!     cargo run --release -p infero-metal --example embed_row_check
 
 use anyhow::Result;
-use tuili_metal::{Device, LaunchConfig};
+use infero_metal::{Device, LaunchConfig};
 
 const COMMON: &str = include_str!("../../kernels/src/msl/common.metal");
 const QUANT: &str = include_str!("../../kernels/src/msl/quant.metal");

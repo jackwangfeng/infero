@@ -1,12 +1,12 @@
-# 把 tuili 移植到 Apple GPU：设备抽象层与最小 kernel 集
+# 把 infero 移植到 Apple GPU：设备抽象层与最小 kernel 集
 
 2026-08-23
 
 ## 为什么
 
-tuili 是纯 CUDA 引擎。`crates/{kernels,model,server}` 无条件依赖 `tuili-cuda` +
+infero 是纯 CUDA 引擎。`crates/{kernels,model,server}` 无条件依赖 `infero-cuda` +
 `cudarc`（`driver`/`nvrtc`/`cublas`），feature 只有 `cuda-12`/`cuda-13`，没有可以
-关掉的开关。在 macOS 上 `cargo check -p tuili-cuda` 直接 panic 在 `build.rs:12`，
+关掉的开关。在 macOS 上 `cargo check -p infero-cuda` 直接 panic 在 `build.rs:12`，
 而 macOS 自 CUDA 10.2（2019）起就没有驱动，Apple Silicon 从来没有过。
 
 这份设计交付**一条能在 Apple GPU 上端到端跑出正确 logits 的路**，以及一个后续
@@ -27,7 +27,7 @@ cudarc 类型引用   kernels 454 · model 232 · server 0
 launch 站点       160
 ```
 
-`server` 和 `tui` 已经零 cudarc 引用，不在重构面内。`tuili-tui` 今天就能在 macOS
+`server` 和 `tui` 已经零 cudarc 引用，不在重构面内。`infero-tui` 今天就能在 macOS
 上编译（实测 12.98s）。
 
 ## 一、设备层的形状
@@ -75,8 +75,8 @@ occupancy 自动调优，网格配置先写死常量。
 **`model` 不加 `<B>` 类型参数，用 cfg 选类型别名。**
 
 ```rust
-#[cfg(feature = "cuda")]  pub type Gpu = tuili_cuda::CudaBackend;
-#[cfg(feature = "metal")] pub type Gpu = tuili_metal::MetalBackend;
+#[cfg(feature = "cuda")]  pub type Gpu = infero_cuda::CudaBackend;
+#[cfg(feature = "metal")] pub type Gpu = infero_metal::MetalBackend;
 pub type Slice<T> = <Gpu as Backend>::Slice<T>;
 ```
 
@@ -200,7 +200,7 @@ S1 是唯一有「改坏现有东西」风险的阶段，所以它的设计是**
 
 1. Mac 上 `forward.rs` 四个 case 在 Metal 通过（F16）
 2. Mac 上 Q8_0 构建对齐本机 F16 构建
-3. Mac 上 `cargo test -p tuili-kernels` 涉及的 kernel 全绿，其余按能力跳过
+3. Mac 上 `cargo test -p infero-kernels` 涉及的 kernel 全绿，其余按能力跳过
 4. lenserver 上 CUDA 全绿且逐位对上 S0 基线
 5. `examples/generate` 在 Metal 上出一段通顺文本
 
@@ -210,11 +210,11 @@ S1 是唯一有「改坏现有东西」风险的阶段，所以它的设计是**
   上限约 27 GB（`iogpu.wired_limit_mb` 可调）
 - **lenserver**（`ssh jeffwang@192.168.0.110`）：单卡 RTX A4000 16 GB（已用 4.4 GB），
   CUDA 13.1 驱动，**sm_86**。有 `mma.sync.m16n8k16`/`cp.async`/`ldmatrix`，
-  **没有 FP8**（需 sm_89+）也**没有 TMA**（需 sm_90+）。仓库在 `~/work/tuili`
+  **没有 FP8**（需 sm_89+）也**没有 TMA**（需 sm_90+）。仓库在 `~/work/infero`
 - 27B（29–51 GB）在 lenserver 上跑不了；FP8/TMA/27B 路径本来就不在这台的回归范围内
-- 模型文件在 lenserver `models/`（→ `/mnt/data/tuili-models`）：
+- 模型文件在 lenserver `models/`（→ `/mnt/data/infero-models`）：
   `qwen2.5-0.5b-instruct-fp16.gguf` 1.27 GB、`qwen2.5-0.5b-instruct-q8_0.gguf` 675 MB
-- 在 macOS 上给 CUDA crate 做编译检查：`TUILI_CUDA_DIR=<两个空目录> cargo check
+- 在 macOS 上给 CUDA crate 做编译检查：`INFERO_CUDA_DIR=<两个空目录> cargo check
   --workspace --all-targets` — 12.05s 通过。cudarc 开了 `dynamic-loading`，
   `libcuda` 是运行时 dlopen，编译期不链接
 

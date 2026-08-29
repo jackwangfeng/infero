@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""What does Marlin itself reach on this card, at the shapes tuili's GEMM runs?
+"""What does Marlin itself reach on this card, at the shapes infero's GEMM runs?
 
-tuili's `mmq` sits at 701 GB/s across a decode step and 1154 on `ffn_gate`
+infero's `mmq` sits at 701 GB/s across a decode step and 1154 on `ffn_gate`
 alone. Whether that is 60% of what the kernel design allows or 95% of it is not
-answerable from tuili's own numbers, and every variant tried against it has been
-measured against tuili's other variants rather than against the thing vLLM
+answerable from infero's own numbers, and every variant tried against it has been
+measured against infero's other variants rather than against the thing vLLM
 actually runs. This times that thing, on the same card, at the same shapes and
 the same token count.
 
@@ -60,7 +60,7 @@ def bench(k, n):
         run()
     torch.cuda.synchronize()
     secs = (time.perf_counter() - t0) / 50
-    # Quants plus one fp16 scale per group per column, which is what tuili's
+    # Quants plus one fp16 scale per group per column, which is what infero's
     # 68-bytes-per-128-weights also holds.
     payload = n * k * 0.5 + groups * n * 2
     return secs * 1e6, payload / secs / 1e9

@@ -1,15 +1,15 @@
 [package]
-name = "tuili-kernels"
+name = "infero-kernels"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-tuili-safetensors.workspace = true
-tuili-cuda = { workspace = true, optional = true }
-tuili-gpu.workspace = true
-tuili-gguf.workspace = true
+infero-safetensors.workspace = true
+infero-cuda = { workspace = true, optional = true }
+infero-gpu.workspace = true
+infero-gguf.workspace = true
 anyhow.workspace = true
 half.workspace = true
 tracing.workspace = true
@@ -17,17 +17,17 @@ cudarc = { version = "0.19", default-features = false, optional = true, features
 
 [dev-dependencies]
 # A dev-dependency on the crate above this one, so that the partial-rope kernel
-# tests can check against `tuili_model::qwen35`'s host reference rather than a
+# tests can check against `infero_model::qwen35`'s host reference rather than a
 # second copy of it that would drift. Cargo permits the cycle because it only
 # exists for test targets; the library itself still depends on nothing upward.
-tuili-model.workspace = true
+infero-model.workspace = true
 tracing-subscriber.workspace = true
 rand = "0.9"
 cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "cublas", "f16", "dynamic-loading"] }
 
 [features]
 default = ["cuda-13"]
-cuda = ["dep:tuili-cuda", "dep:cudarc", "tuili-gpu/cuda"]
-cuda-13 = ["cuda", "tuili-cuda/cuda-13", "cudarc/cuda-13010", "tuili-gpu/cuda-13"]
-cuda-12 = ["cuda", "tuili-cuda/cuda-12", "cudarc/cuda-12080", "tuili-gpu/cuda-12"]
-metal = ["tuili-gpu/metal"]
+cuda = ["dep:infero-cuda", "dep:cudarc", "infero-gpu/cuda"]
+cuda-13 = ["cuda", "infero-cuda/cuda-13", "cudarc/cuda-13010", "infero-gpu/cuda-13"]
+cuda-12 = ["cuda", "infero-cuda/cuda-12", "cudarc/cuda-12080", "infero-gpu/cuda-12"]
+metal = ["infero-gpu/metal"]

@@ -27,8 +27,8 @@
 //! attention model, and `bytes()` exists to be reported at startup.
 
 use anyhow::Result;
-use tuili_gpu::Buf;
-use tuili_gpu::Device;
+use infero_gpu::Buf;
+use infero_gpu::Device;
 
 use crate::SeqId;
 
@@ -148,13 +148,13 @@ impl GdnState {
 
     /// One linear layer's recurrent state for *every* sequence slot, which is
     /// what a single batched launch takes.
-    pub fn recurrent_layer_mut(&mut self, ordinal: usize) -> tuili_gpu::ViewMut<'_, f32> {
+    pub fn recurrent_layer_mut(&mut self, ordinal: usize) -> infero_gpu::ViewMut<'_, f32> {
         let n = self.shape.state_floats() * self.max_seqs;
         self.recurrent.slice_mut(ordinal * n..(ordinal + 1) * n)
     }
 
     /// One linear layer's convolution windows for every sequence slot.
-    pub fn conv_layer_mut(&mut self, ordinal: usize) -> tuili_gpu::ViewMut<'_, f32> {
+    pub fn conv_layer_mut(&mut self, ordinal: usize) -> infero_gpu::ViewMut<'_, f32> {
         let n = self.shape.conv_floats() * self.max_seqs;
         self.conv.slice_mut(ordinal * n..(ordinal + 1) * n)
     }
@@ -164,8 +164,8 @@ impl GdnState {
         &mut self,
         ordinal: usize,
     ) -> (
-        tuili_gpu::ViewMut<'_, f32>,
-        tuili_gpu::ViewMut<'_, f32>,
+        infero_gpu::ViewMut<'_, f32>,
+        infero_gpu::ViewMut<'_, f32>,
     ) {
         let rn = self.shape.state_floats() * self.max_seqs;
         let cn = self.shape.conv_floats() * self.max_seqs;
@@ -222,7 +222,7 @@ impl GdnState {
         // halves, the source wholly in one and the destination wholly in the
         // other, whichever way round they fall.
         let copy = |dev: &Device,
-                    buf: &mut tuili_gpu::Buf<f32>,
+                    buf: &mut infero_gpu::Buf<f32>,
                     from: std::ops::Range<usize>,
                     to: std::ops::Range<usize>|
          -> Result<()> {

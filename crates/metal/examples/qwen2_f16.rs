@@ -6,10 +6,10 @@
 //! the CUDA path against. It is not the engine -- there is no scheduler, no
 //! paged KV pool, no batching, and prefill walks the prompt one token at a time
 //! through the decode path so that no GEMM is needed at all. Folding this into
-//! `tuili-model` is the genericization step, and it is separate work.
+//! `infero-model` is the genericization step, and it is separate work.
 //!
 //! ```text
-//! cargo run --release -p tuili-metal --example qwen2_f16 -- \
+//! cargo run --release -p infero-metal --example qwen2_f16 -- \
 //!     models/qwen2.5-0.5b-instruct-fp16.gguf
 //! ```
 //!
@@ -20,9 +20,9 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
 use half::f16;
-use tuili_gguf::{Gguf, GgmlType};
-use tuili_tokenizer::Tokenizer;
-use tuili_metal::{Buf, Device, LaunchConfig, View, ViewMut};
+use infero_gguf::{Gguf, GgmlType};
+use infero_tokenizer::Tokenizer;
+use infero_metal::{Buf, Device, LaunchConfig, View, ViewMut};
 
 const COMMON_METAL: &str = include_str!("../../kernels/src/msl/common.metal");
 const OPS_METAL: &str = include_str!("../../kernels/src/msl/ops.metal");
@@ -294,12 +294,12 @@ fn grid1(n: u32, block: u32) -> LaunchConfig {
 }
 
 impl Engine {
-    fn f(&self, name: &str) -> Result<tuili_metal::Function> {
-        self.dev.kernels().get("tuili_ops", &ops_src(), name)
+    fn f(&self, name: &str) -> Result<infero_metal::Function> {
+        self.dev.kernels().get("infero_ops", &ops_src(), name)
     }
 
     fn gemv(&self, out: &mut ViewMut<'_, f32>, m: &Mat, x: &View<'_, f32>) -> Result<()> {
-        let f = self.dev.kernels().get("tuili_quant", &quant_src(), "gemv_f16")?;
+        let f = self.dev.kernels().get("infero_quant", &quant_src(), "gemv_f16")?;
         // The quant module's mat-vecs take `n_tokens`; this slice is batch one.
         let (k, n, t) = (m.k as i32, m.n as i32, 1i32);
         let s = self.dev.stream();
@@ -405,8 +405,8 @@ impl Engine {
             }?;
         }
 
-        // `TUILI_TRACE=1` reports the residual after each block, the same
-        // measurement `TUILI_LAYER_RMS` takes inside the engine -- so a
+        // `INFERO_TRACE=1` reports the residual after each block, the same
+        // measurement `INFERO_LAYER_RMS` takes inside the engine -- so a
         // known-good pass can be diffed against a suspect one layer by layer.
         // Only the first forward of the first prompt: the trace exists to be
         // diffed against another implementation's, and four fixture cases each
@@ -414,7 +414,7 @@ impl Engine {
         // dump while the engine's are from the first.
         static TRACED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
-        let trace = std::env::var_os("TUILI_TRACE").is_some()
+        let trace = std::env::var_os("INFERO_TRACE").is_some()
             && pos == 0
             && !TRACED.swap(true, std::sync::atomic::Ordering::Relaxed);
         let rms = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
@@ -507,7 +507,7 @@ impl Engine {
                 s.synchronize()?;
                 let r = |v: Vec<f32>| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
                 eprintln!("  example x_after_attn rms {:.9} first {:.9}", r(sess.x.to_vec()), sess.x.to_vec()[0]);
-                if let Ok(dir) = std::env::var("TUILI_PROBE_DUMP") {
+                if let Ok(dir) = std::env::var("INFERO_PROBE_DUMP") {
                     for (nm, v) in [
                         ("x_after_attn", sess.x.to_vec()),
                         ("o_proj_out", sess.proj.to_vec()),

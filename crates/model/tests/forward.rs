@@ -9,10 +9,10 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use serde::Deserialize;
-use tuili_cuda::Device;
-use tuili_gguf::Gguf;
-use tuili_model::{Model, Sampler, SamplingParams};
-use tuili_tokenizer::Tokenizer;
+use infero_cuda::Device;
+use infero_gguf::Gguf;
+use infero_model::{Model, Sampler, SamplingParams};
+use infero_tokenizer::Tokenizer;
 
 #[derive(Deserialize)]
 struct Fixtures {
@@ -37,7 +37,7 @@ fn workspace() -> PathBuf {
 /// F16 by default: comparing a quantized build against f32 reference logits
 /// would measure the quantizer, not the engine.
 fn model_path() -> Option<PathBuf> {
-    let p = std::env::var("TUILI_TEST_GGUF")
+    let p = std::env::var("INFERO_TEST_GGUF")
         .map(PathBuf::from)
         .unwrap_or_else(|_| workspace().join("models/qwen2.5-0.5b-instruct-fp16.gguf"));
     if !p.exists() {
@@ -193,9 +193,9 @@ fn chunked_prefill_is_seamless() -> Result<()> {
     // leak into a later test in this binary.
     // Safety: this test's `_gpu` lock keeps every other test in this file
     // from loading a model, hence from reading this var, while it is set.
-    unsafe { std::env::set_var("TUILI_BATCH_TOKENS", "128") };
+    unsafe { std::env::set_var("INFERO_BATCH_TOKENS", "128") };
     let loaded = setup!();
-    unsafe { std::env::remove_var("TUILI_BATCH_TOKENS") };
+    unsafe { std::env::remove_var("INFERO_BATCH_TOKENS") };
     let (mut model, tok) = loaded;
 
     let long = "The quick brown fox jumps over the lazy dog. ".repeat(40);
@@ -297,7 +297,7 @@ fn top_k(v: &[f32], k: usize) -> Vec<u32> {
 ///
 /// Per matmul the two agree to a cosine of 0.999994, but a decode step chains
 /// seven of them across every layer, so the question worth asking is what the
-/// logits look like after that. `TUILI_NO_MMVQ` forces the float path with
+/// logits look like after that. `INFERO_NO_MMVQ` forces the float path with
 /// everything else held fixed, which makes this a clean A/B.
 #[test]
 fn integer_decode_agrees_with_float_decode() -> Result<()> {
@@ -313,9 +313,9 @@ fn integer_decode_agrees_with_float_decode() -> Result<()> {
         // Safety: single-threaded here, and read once at load.
         unsafe {
             if float_path {
-                std::env::set_var("TUILI_NO_MMVQ", "1");
+                std::env::set_var("INFERO_NO_MMVQ", "1");
             } else {
-                std::env::remove_var("TUILI_NO_MMVQ");
+                std::env::remove_var("INFERO_NO_MMVQ");
             }
         }
         let mut model = Model::load(Device::new(0)?, &gguf, 512)?;

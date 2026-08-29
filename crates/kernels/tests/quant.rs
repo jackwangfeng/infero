@@ -10,8 +10,8 @@ mod common;
 use anyhow::{Context, Result};
 use half::f16;
 use std::path::PathBuf;
-use tuili_gguf::Gguf;
-use tuili_kernels::{Kernels, WeightType};
+use infero_gguf::Gguf;
+use infero_kernels::{Kernels, WeightType};
 
 use common::*;
 
@@ -616,14 +616,14 @@ fn the_split_q8_0_layout_matches_the_packed_one() -> Result<()> {
     assert_eq!(src.len(), kk * n);
 
     let packed = Loaded {
-        bytes: stream.clone_htod(&tuili_kernels::awq::quantize_f16_to_q8_0(&src, kk)?)?,
+        bytes: stream.clone_htod(&infero_kernels::awq::quantize_f16_to_q8_0(&src, kk)?)?,
         ty: WeightType::Q8_0,
         k: kk,
         n,
     };
     let split = Loaded {
         bytes: stream
-            .clone_htod(&tuili_kernels::awq::quantize_f16_to_q8_0_split(&src, kk)?)?,
+            .clone_htod(&infero_kernels::awq::quantize_f16_to_q8_0_split(&src, kk)?)?,
         ty: WeightType::Q8_0S,
         k: kk,
         n,

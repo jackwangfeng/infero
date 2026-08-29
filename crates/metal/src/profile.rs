@@ -30,7 +30,7 @@ pub struct Profile {
 impl Profile {
     pub fn new() -> Self {
         Self {
-            // Its own switch, not the CUDA side's `TUILI_PROFILE`.
+            // Its own switch, not the CUDA side's `INFERO_PROFILE`.
             //
             // There the two are the same variable because there they cost the
             // same: CUDA brackets a launch with events and reads them later, so
@@ -44,7 +44,7 @@ impl Profile {
             // split by 66 ms a round, which is exactly the quantity that split
             // exists to attribute. One variable for both made the cheap
             // measurement impossible to take.
-            enabled: AtomicBool::new(std::env::var("TUILI_METAL_PROFILE").is_ok()),
+            enabled: AtomicBool::new(std::env::var("INFERO_METAL_PROFILE").is_ok()),
             entries: Mutex::new(HashMap::new()),
         }
     }

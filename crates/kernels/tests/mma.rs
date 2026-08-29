@@ -8,8 +8,8 @@
 //! "close" is not a thing that exists.
 
 use anyhow::Result;
-use tuili_cuda::Device;
-use tuili_kernels::Kernels;
+use infero_cuda::Device;
+use infero_kernels::Kernels;
 
 /// Row-major `a` (16x32) times the transpose of row-major `b` (8x32).
 fn reference(a: &[i8], b: &[i8]) -> Vec<i32> {

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 
-use tuili_tui::client::{Event, stream_chat};
+use infero_tui::client::{Event, stream_chat};
 
 /// Serve one request, writing `chunks` as raw chunked-encoding bodies.
 fn serve(chunks: Vec<String>) -> String {

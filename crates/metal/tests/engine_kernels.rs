@@ -7,7 +7,7 @@
 //! the reference, because it is the one the fixture tests already vouch for.
 
 use anyhow::Result;
-use tuili_metal::{Device, LaunchConfig};
+use infero_metal::{Device, LaunchConfig};
 
 const COMMON: &str = include_str!("../../kernels/src/msl/common.metal");
 const OPS: &str = include_str!("../../kernels/src/msl/ops.metal");
@@ -214,7 +214,7 @@ fn a_norm_with_no_f16_copy_runs() -> Result<()> {
     let f = dev.kernels().get("mmvq", &mmvq(), "rms_norm_f16_f32")?;
     let mut b = s.launch_builder(&f);
     b.arg(&out.as_view_mut())
-        .arg(&tuili_metal::NullBuffer)
+        .arg(&infero_metal::NullBuffer)
         .arg(&dx.as_view())
         .arg(&dw.as_view())
         .arg(&d_i)

@@ -18,8 +18,8 @@
 //! Regenerate the capture:
 //!
 //!   python3 tools/capture_qwen35_mtp.py <model-dir> <out-dir> --tokens 32
-//!   TUILI_QWEN35_MTP_CAPTURE=<out-dir> \
-//!     cargo test -p tuili-model --test qwen35_mtp
+//!   INFERO_QWEN35_MTP_CAPTURE=<out-dir> \
+//!     cargo test -p infero-model --test qwen35_mtp
 //!
 //! Without the environment variable the capture-backed tests report as skipped
 //! rather than passing, because a silent skip is how a suite comes to be green
@@ -33,8 +33,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use tuili_model::qwen35::{self, sigmoid};
-use tuili_model::qwen35_mtp::*;
+use infero_model::qwen35::{self, sigmoid};
+use infero_model::qwen35_mtp::*;
 
 struct Capture {
     cfg: HashMap<String, f64>,
@@ -48,7 +48,7 @@ struct Capture {
 
 impl Capture {
     fn open() -> Option<Self> {
-        let dir = PathBuf::from(std::env::var("TUILI_QWEN35_MTP_CAPTURE").ok()?);
+        let dir = PathBuf::from(std::env::var("INFERO_QWEN35_MTP_CAPTURE").ok()?);
         let manifest: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap())
                 .unwrap();
@@ -151,7 +151,7 @@ fn with_capture(what: &str, body: impl FnOnce(&Capture)) {
     match Capture::open() {
         Some(c) => body(&c),
         None => eprintln!(
-            "SKIPPED {what}: set TUILI_QWEN35_MTP_CAPTURE to a directory written \
+            "SKIPPED {what}: set INFERO_QWEN35_MTP_CAPTURE to a directory written \
              by tools/capture_qwen35_mtp.py"
         ),
     }

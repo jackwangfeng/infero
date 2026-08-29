@@ -8,7 +8,7 @@
 //! arithmetic runs, not that it is the right arithmetic.
 //!
 //! The capture is weight-derived so it is not in git by default. Point the
-//! tests at one with `TUILI_QWEN35_CAPTURE=<dir>`, or drop it in
+//! tests at one with `INFERO_QWEN35_CAPTURE=<dir>`, or drop it in
 //! `fixtures/qwen35_capture`. Without it these report as skipped rather than
 //! passing, because a silent skip is how a suite comes to be green without
 //! checking anything.
@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use tuili_metal::{Device, LaunchConfig};
+use infero_metal::{Device, LaunchConfig};
 
 const COMMON: &str = include_str!("../../kernels/src/msl/common.metal");
 const OPS: &str = include_str!("../../kernels/src/msl/ops.metal");
@@ -37,7 +37,7 @@ struct Capture {
 
 impl Capture {
     fn open() -> Option<Self> {
-        let dir = std::env::var("TUILI_QWEN35_CAPTURE")
+        let dir = std::env::var("INFERO_QWEN35_CAPTURE")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/qwen35_capture")
@@ -91,7 +91,7 @@ macro_rules! capture {
         match Capture::open() {
             Some(c) => c,
             None => {
-                eprintln!("skipping: no capture (set TUILI_QWEN35_CAPTURE)");
+                eprintln!("skipping: no capture (set INFERO_QWEN35_CAPTURE)");
                 return Ok(());
             }
         }

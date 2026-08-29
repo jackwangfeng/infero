@@ -39,15 +39,15 @@
 //!
 //! The floor is worth its own note. It is an event pair plus a launch, so it
 //! overstates what these kernels cost in production, where the step is captured
-//! into a CUDA graph. Under `TUILI_PROFILE` every small kernel in the table
+//! into a CUDA graph. Under `INFERO_PROFILE` every small kernel in the table
 //! carries about 3 us that the graphed step does not pay — which means the
 //! profile's *shares* are right and its microseconds, for anything this small,
 //! are not.
 
 use anyhow::Result;
 use std::time::Instant;
-use tuili_cuda::Device;
-use tuili_kernels::Kernels;
+use infero_cuda::Device;
+use infero_kernels::Kernels;
 
 #[test]
 fn small_kernels_achieved_bandwidth() -> Result<()> {
@@ -80,7 +80,7 @@ fn small_kernels_achieved_bandwidth() -> Result<()> {
     let ff = stream.clone_htod(&vec![1.0f32; d_head / 2])?;
     let mut scores = stream.alloc_zeros::<f32>(n_heads * max_tokens * kv_len)?;
 
-    // Host time per launch, and — under `TUILI_PROFILE` — the device time the
+    // Host time per launch, and — under `INFERO_PROFILE` — the device time the
     // events actually attribute to the kernel. Back to back these kernels are
     // shorter than a launch costs, so the host number bottoms out around two
     // microseconds whatever the kernel does; the device number is the one that
@@ -209,7 +209,7 @@ fn report(label: &str, tokens: usize, t: (f64, f64), bytes: f64) {
     let dev_us = if device > 0.0 {
         format!("{:>7.2} us {:>5.0} GB/s", device * 1e6, bytes / device / 1e9)
     } else {
-        "        (no TUILI_PROFILE)".into()
+        "        (no INFERO_PROFILE)".into()
     };
     eprintln!(
         "  {label} @{tokens:>2}t  host {:>6.2} us | device {dev_us}  ({:.0} KiB)",

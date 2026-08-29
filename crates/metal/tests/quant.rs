@@ -11,8 +11,8 @@
 
 use anyhow::Result;
 use half::f16;
-use tuili_gguf::{GgmlType, Gguf};
-use tuili_metal::{Device, LaunchConfig};
+use infero_gguf::{GgmlType, Gguf};
+use infero_metal::{Device, LaunchConfig};
 
 const COMMON: &str = include_str!("../../kernels/src/msl/common.metal");
 const QUANT: &str = include_str!("../../kernels/src/msl/quant.metal");
@@ -22,7 +22,7 @@ fn src() -> String {
 }
 
 fn model() -> Option<Gguf> {
-    let p = std::env::var("TUILI_TEST_GGUF").unwrap_or_else(|_| {
+    let p = std::env::var("INFERO_TEST_GGUF").unwrap_or_else(|_| {
         format!(
             "{}/../../models/Qwen3.8-27B-Q4_K_M.gguf",
             env!("CARGO_MANIFEST_DIR")

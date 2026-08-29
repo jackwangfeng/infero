@@ -10,7 +10,7 @@
 //! The capture is weight-derived, so it is not in the repository. Regenerate it:
 //!
 //!   python3 tools/capture_qwen35_layers.py <model-dir> <out-dir> --tokens 12
-//!   TUILI_QWEN35_CAPTURE=<out-dir> cargo test -p tuili-model --test qwen35_capture
+//!   INFERO_QWEN35_CAPTURE=<out-dir> cargo test -p infero-model --test qwen35_capture
 //!
 //! Without the environment variable these tests report as skipped rather than
 //! passing, because a silent skip is how a suite comes to be green without
@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use tuili_model::qwen35::*;
+use infero_model::qwen35::*;
 
 /// A loaded capture: the manifest's config plus every dumped array.
 struct Capture {
@@ -29,7 +29,7 @@ struct Capture {
 
 impl Capture {
     fn open() -> Option<Self> {
-        let dir = PathBuf::from(std::env::var("TUILI_QWEN35_CAPTURE").ok()?);
+        let dir = PathBuf::from(std::env::var("INFERO_QWEN35_CAPTURE").ok()?);
         let manifest: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap())
                 .unwrap();
@@ -96,7 +96,7 @@ fn with_capture(what: &str, body: impl FnOnce(&Capture)) {
     match Capture::open() {
         Some(c) => body(&c),
         None => eprintln!(
-            "SKIPPED {what}: set TUILI_QWEN35_CAPTURE to a directory written by \
+            "SKIPPED {what}: set INFERO_QWEN35_CAPTURE to a directory written by \
              tools/capture_qwen35_layers.py"
         ),
     }

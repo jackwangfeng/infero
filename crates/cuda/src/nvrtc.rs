@@ -26,7 +26,7 @@ pub fn set_max_dynamic_shared(func: &Kernel, bytes: u32) -> Result<()> {
 
 /// Compiles `.cu` sources with NVRTC and remembers the result.
 ///
-/// Two layers of caching: PTX is written to `~/.cache/tuili/ptx` keyed by
+/// Two layers of caching: PTX is written to `~/.cache/infero/ptx` keyed by
 /// (source, arch, options) so a restart doesn't pay for NVRTC again, and loaded
 /// modules/functions are kept in memory so a launch is a hash lookup.
 pub struct KernelCache {
@@ -173,5 +173,5 @@ fn cache_dir() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .unwrap_or_else(std::env::temp_dir);
-    base.join("tuili/ptx")
+    base.join("infero/ptx")
 }

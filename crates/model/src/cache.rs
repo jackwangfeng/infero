@@ -15,10 +15,10 @@
 //! slots stay contiguous and a gather reads a whole head vector coalesced.
 
 use anyhow::{Context, Result};
-use tuili_gpu::{Buf, View, ViewMut};
+use infero_gpu::{Buf, View, ViewMut};
 use half::f16;
-use tuili_gpu::Device;
-use tuili_kernels::KvQuant;
+use infero_gpu::Device;
+use infero_kernels::KvQuant;
 
 use crate::config::Config;
 

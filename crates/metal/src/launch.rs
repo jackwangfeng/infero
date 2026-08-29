@@ -14,7 +14,7 @@ use crate::buffer::{Elem, View, ViewMut};
 use crate::device::Stream;
 
 /// Grid geometry, with CUDA's field names so the 160 call sites in
-/// `tuili-kernels` construct it unchanged.
+/// `infero-kernels` construct it unchanged.
 ///
 /// `grid_dim` is threadgroups, `block_dim` is threads per threadgroup --
 /// which is exactly what `dispatchThreadgroups:threadsPerThreadgroup:` takes,
@@ -201,11 +201,11 @@ impl LaunchBuilder {
             ));
         }
 
-        // `TUILI_METAL_TRACE=<kernel>` reports the geometry a dispatch was
+        // `INFERO_METAL_TRACE=<kernel>` reports the geometry a dispatch was
         // actually given, which is the only way to tell a wrong grid from a
         // wrong kernel when the numbers come out partially right.
         static TRACE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-        if let Some(want) = TRACE.get_or_init(|| std::env::var("TUILI_METAL_TRACE").ok()) {
+        if let Some(want) = TRACE.get_or_init(|| std::env::var("INFERO_METAL_TRACE").ok()) {
             if want == "*" || *want == self.func.name {
                 eprintln!(
                     "  dispatch {:<24} groups {:?} threads {:?} smem {} args {}",
@@ -217,12 +217,12 @@ impl LaunchBuilder {
         enc.dispatchThreadgroups_threadsPerThreadgroup(grid, group);
             Ok(())
         })?;
-        // `TUILI_METAL_SYNC` waits for every dispatch, which is the crudest
+        // `INFERO_METAL_SYNC` waits for every dispatch, which is the crudest
         // possible ordering guarantee and defeats the batching on purpose. If a
         // run is correct with it and wrong without, the problem is between
         // dispatches rather than inside a kernel.
         static SYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *SYNC.get_or_init(|| std::env::var_os("TUILI_METAL_SYNC").is_some()) {
+        if *SYNC.get_or_init(|| std::env::var_os("INFERO_METAL_SYNC").is_some()) {
             dev.batch().wait()?;
         }
         Ok(())

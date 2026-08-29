@@ -5,7 +5,7 @@
 //! string, because a Metal library is compiled whole.
 
 use anyhow::Result;
-use tuili_metal::Device;
+use infero_metal::Device;
 
 const COMMON: &str = include_str!("../../kernels/src/msl/common.metal");
 const OPS: &str = include_str!("../../kernels/src/msl/ops.metal");
@@ -20,7 +20,7 @@ fn every_kernel_compiles_and_resolves() -> Result<()> {
     // not force the rest to recompile.
     let units: &[(&'static str, String, &[&str])] = &[
         (
-            "tuili_ops",
+            "infero_ops",
             format!("{COMMON}\n{OPS}"),
             &[
                 "add_f32",
@@ -37,7 +37,7 @@ fn every_kernel_compiles_and_resolves() -> Result<()> {
             ],
         ),
         (
-            "tuili_quant",
+            "infero_quant",
             format!("{COMMON}\n{QUANT}"),
             &[
                 "gemv_f32",
@@ -50,7 +50,7 @@ fn every_kernel_compiles_and_resolves() -> Result<()> {
             ],
         ),
         (
-            "tuili_gdn",
+            "infero_gdn",
             format!("{COMMON}\n{GDN}"),
             &[
                 "gdn_conv_f32",
@@ -63,7 +63,7 @@ fn every_kernel_compiles_and_resolves() -> Result<()> {
             ],
         ),
         (
-            "tuili_sample",
+            "infero_sample",
             format!("{COMMON}\n{SAMPLE}"),
             &[
                 "argmax_partial_f32",

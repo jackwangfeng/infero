@@ -9,10 +9,10 @@
 //! around the placeholders. So the check here is a *difference*, which is the
 //! only thing that cannot be faked by a splice that did nothing.
 //!
-//!   cargo run --release -p tuili-model --example vision_end_to_end -- <model-dir>
+//!   cargo run --release -p infero-model --example vision_end_to_end -- <model-dir>
 
 use anyhow::{Context, Result};
-use tuili_model::{BatchItem, KvCacheQuant, Model};
+use infero_model::{BatchItem, KvCacheQuant, Model};
 
 /// A solid frame of one colour, `[H, W, 3]` u8 — the crudest possible image
 /// that still has content, and enough for a difference test.
@@ -40,9 +40,9 @@ fn split(h: usize, w: usize, left: [u8; 3], right: [u8; 3]) -> Vec<u8> {
 fn main() -> Result<()> {
     tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
     let dir = std::env::args().nth(1).expect("usage: vision_end_to_end <model-dir>");
-    let device: usize = std::env::var("TUILI_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let dev = tuili_cuda::Device::new(device)?;
-    let tok = tuili_tokenizer::Tokenizer::from_hf_dir(&dir)?;
+    let device: usize = std::env::var("INFERO_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let dev = infero_cuda::Device::new(device)?;
+    let tok = infero_tokenizer::Tokenizer::from_hf_dir(&dir)?;
 
     let mut model = Model::load_awq(dev, &dir, 4096, KvCacheQuant::F16, 8)?;
     // 1024 patches is a 512x512 image at patch 16, which is plenty for a solid
@@ -67,7 +67,7 @@ fn main() -> Result<()> {
     let mut answers = Vec::new();
     let mut feature_sums = Vec::new();
     for (label, pixels) in &images {
-        let frame = tuili_model::qwen35_vision_image::prepare_frame(
+        let frame = infero_model::qwen35_vision_image::prepare_frame(
             pixels, 224, 224, 3, th, tw, shape.patch, shape.merge,
         );
         let feats = model.encode_image(&frame)?;

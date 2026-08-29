@@ -1,8 +1,8 @@
-//! tuili-chat — a terminal client for the tuili server.
+//! infero-chat — a terminal client for the infero server.
 //!
 //! Talks to any OpenAI-compatible `/v1/chat/completions` endpoint over SSE.
 
-use tuili_tui::{app, client, ui};
+use infero_tui::{app, client, ui};
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -60,7 +60,7 @@ fn parse_args() -> Result<Args> {
             }
             "--help" | "-h" => {
                 println!(
-                    "tuili-chat — terminal client for an OpenAI-compatible server\n\n\
+                    "infero-chat — terminal client for an OpenAI-compatible server\n\n\
                        -H, --host <addr>         default 127.0.0.1:8080\n\
                        -m, --model <name>        default: whatever the server reports\n\
                        -s, --system <prompt>     prepend a system message\n\
@@ -89,8 +89,8 @@ fn main() -> Result<()> {
 
     let health = client::health(&args.addr).with_context(|| {
         format!(
-            "cannot reach a tuili server at {}\n\nStart one with:\n  \
-             tuili --model <model.gguf> --host {}",
+            "cannot reach a infero server at {}\n\nStart one with:\n  \
+             infero --model <model.gguf> --host {}",
             args.addr, args.addr
         )
     })?;
@@ -233,7 +233,7 @@ fn send(app: &mut App, model: &str) {
     let addr = app.addr.clone();
     let worker_cancel = cancel.clone();
     std::thread::Builder::new()
-        .name("tuili-chat-stream".into())
+        .name("infero-chat-stream".into())
         .spawn(move || client::stream_chat(&addr, request, worker_cancel, tx))
         .expect("spawning the request thread");
 

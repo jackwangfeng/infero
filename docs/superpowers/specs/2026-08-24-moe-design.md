@@ -105,7 +105,7 @@ residual makes the attention interior exactly twice the stream.
   illegal-address it eventually raised was the *next* step's embedding gather on
   a garbage sampled id — three layers downstream of the cause.
 
-The lesson worth keeping: `TUILI_AWQ_PACKED=1` made the NaN go away, which
+The lesson worth keeping: `INFERO_AWQ_PACKED=1` made the NaN go away, which
 looked like the transposed layout being wrong. It was not — the extended
 `q4g128` test passes at all three of this model's real shapes. The env var
 changed the *type*, which changed which path ran.
@@ -135,6 +135,6 @@ Measure it at step 1 and parallelize the repack with rayon if it is over two
 minutes — the work is per-tensor and embarrassingly parallel.
 
 **No speculation.** The MTP head belongs to the 27B checkpoint. `load_mtp_head`
-returns false here, so `TUILI_SPEC_K` turns itself off and the tok/s number from
+returns false here, so `INFERO_SPEC_K` turns itself off and the tok/s number from
 step 4 is a no-speculation number. Not a conflict, just not comparable to the
 27B's.

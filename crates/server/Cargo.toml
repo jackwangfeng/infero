@@ -1,20 +1,20 @@
 [package]
-name = "tuili-server"
+name = "infero-server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [lib]
-name = "tuili_server"
+name = "infero_server"
 path = "src/lib.rs"
 
 [[bin]]
-name = "tuili"
+name = "infero"
 path = "src/main.rs"
 
 [dependencies]
-tuili-model.workspace = true
+infero-model.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -24,9 +24,9 @@ tokio-stream = "0.1.19"
 clap = { version = "4.6.6", features = ["derive"] }
 futures = "0.3.34"
 tower-http = { version = "0.7.0", features = ["cors", "trace"] }
-tuili-gguf.workspace = true
-tuili-gpu.workspace = true
-tuili-tokenizer.workspace = true
+infero-gguf.workspace = true
+infero-gpu.workspace = true
+infero-tokenizer.workspace = true
 tokio = { version = "1.53.1", features = ["full"] }
 axum = { version = "0.8.9", features = ["macros"] }
 # Decoding a `data:` image URL: base64 for the envelope, `image` for the
@@ -39,10 +39,10 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 http-body-util = "0.1.4"
 hyper = { version = "1.11.0", features = ["client", "http1"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
-tuili-model.workspace = true
+infero-model.workspace = true
 
 [features]
 default = ["cuda-13"]
-cuda-13 = ["tuili-model/cuda-13", "tuili-gpu/cuda-13"]
-cuda-12 = ["tuili-model/cuda-12", "tuili-gpu/cuda-12"]
-metal = ["tuili-model/metal", "tuili-gpu/metal"]
+cuda-13 = ["infero-model/cuda-13", "infero-gpu/cuda-13"]
+cuda-12 = ["infero-model/cuda-12", "infero-gpu/cuda-12"]
+metal = ["infero-model/metal", "infero-gpu/metal"]

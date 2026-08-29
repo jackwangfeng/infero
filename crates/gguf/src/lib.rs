@@ -6,7 +6,7 @@
 //!
 //! ```no_run
 //! # fn main() -> anyhow::Result<()> {
-//! let f = tuili_gguf::Gguf::open("models/qwen2.5-0.5b-instruct-q8_0.gguf")?;
+//! let f = infero_gguf::Gguf::open("models/qwen2.5-0.5b-instruct-q8_0.gguf")?;
 //! println!("{} ({} tensors)", f.arch()?, f.tensors().len());
 //! let w = f.tensor("blk.0.attn_q.weight")?;
 //! println!("{} {:?} {}", w.name, w.dims, w.ty);

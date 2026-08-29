@@ -5,18 +5,18 @@
 //! meant four rounds of rebuild-and-retry, each revealing the next name. This
 //! reports the whole set at once, before any device memory is touched.
 //!
-//! It deliberately does not use `tuili_model`'s loader. Calling the loader would
+//! It deliberately does not use `infero_model`'s loader. Calling the loader would
 //! make this a second way to run the same code, which tells you nothing new; the
 //! point is an independent list of what the loader is *documented* to want,
 //! checked against what the file has. When the two disagree, one of them is
 //! wrong and both are worth reading.
 //!
-//!   cargo run --release -p tuili-safetensors --example tensor_inventory -- <dir>
+//!   cargo run --release -p infero-safetensors --example tensor_inventory -- <dir>
 
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result};
-use tuili_safetensors::Shards;
+use infero_safetensors::Shards;
 
 /// A projection can be stored several ways, and the loader accepts any of them:
 /// `.weight` for a plain or FP8 export, and the AWQ triple otherwise. Checking

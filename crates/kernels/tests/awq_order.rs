@@ -19,10 +19,10 @@
 //! correspond at all.
 
 use anyhow::Result;
-use tuili_safetensors::Shards;
+use infero_safetensors::Shards;
 
 const AWQ: &str = "/mnt/data/vllm-bench/llama8b-awq";
-const GGUF: &str = "/mnt/data/tuili-models/llama-3.1-8b-instruct-q4_k_m.gguf";
+const GGUF: &str = "/mnt/data/infero-models/llama-3.1-8b-instruct-q4_k_m.gguf";
 
 fn corr(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len() as f32;
@@ -44,7 +44,7 @@ fn the_nibble_permutation_is_the_one_the_packer_assumes() -> Result<()> {
         return Ok(());
     }
     let w = Shards::open_dir(AWQ)?;
-    let gguf = tuili_gguf::Gguf::open(GGUF)?;
+    let gguf = infero_gguf::Gguf::open(GGUF)?;
     let name = "model.layers.7.mlp.gate_proj";
     let qw = w.tensor(&format!("{name}.qweight"))?;
     let sc = w.tensor(&format!("{name}.scales"))?;
@@ -95,15 +95,15 @@ fn the_nibble_permutation_is_the_one_the_packer_assumes() -> Result<()> {
 }
 
 fn dequant_on_device(
-    gguf: &tuili_gguf::Gguf,
-    info: &tuili_gguf::TensorInfo,
+    gguf: &infero_gguf::Gguf,
+    info: &infero_gguf::TensorInfo,
     k: usize,
     rows: usize,
 ) -> Result<Vec<f32>> {
-    let dev = tuili_cuda::Device::new(0)?;
-    let kern = tuili_kernels::Kernels::new(dev.clone());
+    let dev = infero_cuda::Device::new(0)?;
+    let kern = infero_kernels::Kernels::new(dev.clone());
     let stream = dev.stream().clone();
-    let ty = tuili_kernels::WeightType::from_ggml(info.ty)?;
+    let ty = infero_kernels::WeightType::from_ggml(info.ty)?;
     let bytes = rows * k / ty.block_size() * ty.type_size();
     let w = stream.clone_htod(&gguf.data(info)[..bytes])?;
     let mut out = stream.alloc_zeros::<half::f16>(rows * k)?;

@@ -41,7 +41,7 @@ pub fn set_max_dynamic_shared(f: &Function, bytes: u32) -> anyhow::Result<()> {
 
 /// What the host is allowed to assume about this GPU.
 ///
-/// Mirrors `tuili_metal::Caps`. On CUDA every field is derived from the compute
+/// Mirrors `infero_metal::Caps`. On CUDA every field is derived from the compute
 /// capability, which is where the four `arch() >= 80` gates used to read it
 /// directly -- the capability name says *what* is being asked for, where the
 /// number said only which cards happen to have it.

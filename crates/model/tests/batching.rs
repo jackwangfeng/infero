@@ -6,8 +6,8 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use tuili_model::{BatchItem, KvCacheQuant, Model, Sampler, SamplingParams};
-use tuili_tokenizer::Tokenizer;
+use infero_model::{BatchItem, KvCacheQuant, Model, Sampler, SamplingParams};
+use infero_tokenizer::Tokenizer;
 
 const PROMPTS: &[&str] = &[
     "The capital of France is",
@@ -17,7 +17,7 @@ const PROMPTS: &[&str] = &[
 ];
 
 fn model_path() -> Option<PathBuf> {
-    let p = std::env::var("TUILI_TEST_GGUF")
+    let p = std::env::var("INFERO_TEST_GGUF")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -34,9 +34,9 @@ fn load() -> Result<Option<(Model, Tokenizer)>> {
     let Some(path) = model_path() else {
         return Ok(None);
     };
-    let gguf = tuili_gguf::Gguf::open(&path)?;
+    let gguf = infero_gguf::Gguf::open(&path)?;
     let tok = Tokenizer::from_gguf(&gguf)?;
-    let model = Model::load_quantized(tuili_cuda::Device::new(0)?, &gguf, 512, KvCacheQuant::F16)?;
+    let model = Model::load_quantized(infero_cuda::Device::new(0)?, &gguf, 512, KvCacheQuant::F16)?;
     Ok(Some((model, tok)))
 }
 

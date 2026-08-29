@@ -6,8 +6,8 @@
 //! the reference side rather than a new layout to derive.
 
 use anyhow::Result;
-use tuili_cuda::Device;
-use tuili_kernels::Kernels;
+use infero_cuda::Device;
+use infero_kernels::Kernels;
 
 /// Bit for bit what `e4m3_to_f32` in `fp8.cu` does — the one definition lives
 /// there, this is a from-scratch second copy so the test does not validate a

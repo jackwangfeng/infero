@@ -59,7 +59,7 @@ FP8_BRANCH = '''    let projection_bytes = |prefix: &str| -> Result<(Vec<u8>, We
         // plausible size and wrong meaning.
         if let Some(t) = w.get(&format!("{prefix}.weight")) {
             let (n, k) = (t.shape[0], t.shape[1]);
-            let halves: Vec<half::f16> = if t.dtype == tuili_safetensors::Dtype::F8E4M3 {
+            let halves: Vec<half::f16> = if t.dtype == infero_safetensors::Dtype::F8E4M3 {
                 // Block-scaled FP8. The scale grid is 128x128 and
                 // `dequant_f8_to_f16` validates that the grid matches the
                 // quants, which is the check that catches a transposed or

@@ -15,7 +15,7 @@
 //! just moving a length counter.
 
 use anyhow::{Context, Result};
-use tuili_gpu::{View, ViewMut, LaunchConfig, KernelArg};
+use infero_gpu::{View, ViewMut, LaunchConfig, KernelArg};
 
 use crate::{Kernels, REDUCE_BLOCK, gdn_src};
 
@@ -120,7 +120,7 @@ impl Kernels {
     /// about. Non-zero here means the optimization did not happen.
     #[cfg(feature = "cuda")]
     pub fn gdn_kernel_registers(&self, name: &str) -> Result<(i32, i32, i32)> {
-        let f = self.dev.kernels().get("tuili_gdn", gdn_src(), name)?;
+        let f = self.dev.kernels().get("infero_gdn", gdn_src(), name)?;
         Ok((f.num_regs()?, f.shared_size_bytes()?, f.local_size_bytes()?))
     }
 
@@ -128,9 +128,9 @@ impl Kernels {
     /// a given block size and dynamic shared request.
     #[cfg(feature = "cuda")]
     pub fn gdn_occupancy_blocks(&self, name: &str, threads: u32, dynamic: usize) -> Result<u32> {
-        let f = self.dev.kernels().get("tuili_gdn", gdn_src(), name)?;
+        let f = self.dev.kernels().get("infero_gdn", gdn_src(), name)?;
         if dynamic > 48 * 1024 {
-            tuili_gpu::set_max_dynamic_shared(&f, dynamic as u32)?;
+            infero_gpu::set_max_dynamic_shared(&f, dynamic as u32)?;
         }
         Ok(f.occupancy_max_active_blocks_per_multiprocessor(threads, dynamic, None)?)
     }
@@ -163,7 +163,7 @@ impl Kernels {
         debug_assert!(state.len() >= seqs.n_seqs * channels * (k - 1));
         debug_assert!(w.len() >= channels * k);
 
-        let f = self.dev.kernels().get("tuili_gdn", gdn_src(), "gdn_conv_f32")?;
+        let f = self.dev.kernels().get("infero_gdn", gdn_src(), "gdn_conv_f32")?;
         const BLOCK: u32 = 128;
         let cfg = LaunchConfig {
             grid_dim: (
@@ -218,7 +218,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_gdn", gdn_src(), "gdn_gate_decay_f32")?;
+            .get("infero_gdn", gdn_src(), "gdn_gate_decay_f32")?;
         const BLOCK: u32 = 256;
         let cfg = LaunchConfig {
             grid_dim: ((n as u32).div_ceil(BLOCK), 1, 1),
@@ -270,7 +270,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_gdn", gdn_src(), "gdn_qk_l2norm_f32")?;
+            .get("infero_gdn", gdn_src(), "gdn_qk_l2norm_f32")?;
         let cfg = LaunchConfig {
             grid_dim: ((n_tokens * key_heads) as u32, 1, 1),
             block_dim: (REDUCE_BLOCK, 1, 1),
@@ -417,12 +417,12 @@ impl Kernels {
             ),
             _ => ("gdn_delta_rule_f32", dv.max(32), 2 * dk * f32_size),
         };
-        let f = self.dev.kernels().get("tuili_gdn", gdn_src(), name)?;
+        let f = self.dev.kernels().get("infero_gdn", gdn_src(), name)?;
         // Past 48 KiB a block the dynamic size is opt-in, and a launch that
         // asks for more without it fails with an invalid-value error rather
         // than falling back to something smaller.
         if shared > 48 * 1024 {
-            tuili_gpu::set_max_dynamic_shared(&f, shared as u32).with_context(|| {
+            infero_gpu::set_max_dynamic_shared(&f, shared as u32).with_context(|| {
                 format!(
                     "the shared-memory delta rule wants {shared} bytes a block \
                      for a {dk}x{dv} state, which this device will not give it"
@@ -484,7 +484,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_gdn", gdn_src(), "gdn_gated_rmsnorm_f32")?;
+            .get("infero_gdn", gdn_src(), "gdn_gated_rmsnorm_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (rows as u32, 1, 1),
             block_dim: (REDUCE_BLOCK, 1, 1),
@@ -523,7 +523,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_gdn", gdn_src(), "split_interleaved_f32")?;
+            .get("infero_gdn", gdn_src(), "split_interleaved_f32")?;
         const BLOCK: u32 = 256;
         let cfg = LaunchConfig {
             grid_dim: ((n as u32).div_ceil(BLOCK), 1, 1),
@@ -558,7 +558,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_gdn", gdn_src(), "sigmoid_gate_f32")?;
+            .get("infero_gdn", gdn_src(), "sigmoid_gate_f32")?;
         const BLOCK: u32 = 256;
         let cfg = LaunchConfig {
             grid_dim: ((n as u32).div_ceil(BLOCK), 1, 1),
@@ -593,7 +593,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_gdn", gdn_src(), "gdn_rollback_stage2_f32")?;
+            .get("infero_gdn", gdn_src(), "gdn_rollback_stage2_f32")?;
         const BLOCK: u32 = 256;
         let total = (n0 + n1) as u32;
         let cfg = LaunchConfig {
@@ -635,7 +635,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_gdn", gdn_src(), "gdn_rollback_record4_f32")?;
+            .get("infero_gdn", gdn_src(), "gdn_rollback_record4_f32")?;
         const BLOCK: u32 = 256;
         let total = (n0 + n1 + n2 + n3) as u32;
         let cfg = LaunchConfig {

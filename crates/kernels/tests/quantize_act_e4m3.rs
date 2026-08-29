@@ -8,8 +8,8 @@
 //! hide a scale computed one group over or an off-by-one in the reduction.
 
 use anyhow::Result;
-use tuili_cuda::Device;
-use tuili_kernels::Kernels;
+use infero_cuda::Device;
+use infero_kernels::Kernels;
 
 const GROUP: usize = 128;
 

@@ -1,6 +1,6 @@
 //! Block-scaled FP8: the mat-vec and the on-device expansion.
 //!
-//! The oracle is `tuili_safetensors::Tensor::dequant_f8_to_f16`, which has eight
+//! The oracle is `infero_safetensors::Tensor::dequant_f8_to_f16`, which has eight
 //! tests of its own against the format's defined bit patterns and was checked
 //! against a real 27B tensor and an independent Python computation. So these
 //! compare a kernel against something already established rather than against a
@@ -16,8 +16,8 @@ mod common;
 use anyhow::Result;
 use common::*;
 use half::f16;
-use tuili_kernels::fp8::{FP8_BLOCK, fp8_bytes, scale_grid};
-use tuili_safetensors::{Dtype, Tensor};
+use infero_kernels::fp8::{FP8_BLOCK, fp8_bytes, scale_grid};
+use infero_safetensors::{Dtype, Tensor};
 
 /// Two block-rows by three block-columns, so the grid is 2x3 and both indices
 /// matter. A single block row would make a transposed lookup invisible.
@@ -47,11 +47,11 @@ fn packed(quants: &[u8], scales: &[f32]) -> Vec<u8> {
 }
 
 fn packed_dims(quants: &[u8], scales: &[f32], k: usize, n: usize) -> Vec<u8> {
-    let mut v = tuili_kernels::fp8::repack_rows(quants, k, n).expect("repack");
+    let mut v = infero_kernels::fp8::repack_rows(quants, k, n).expect("repack");
     for s in scales {
         v.extend_from_slice(&s.to_le_bytes());
     }
-    assert_eq!(v.len(), tuili_kernels::fp8::fp8_bytes(k, n));
+    assert_eq!(v.len(), infero_kernels::fp8::fp8_bytes(k, n));
     v
 }
 
@@ -156,7 +156,7 @@ fn the_matvec_matches_the_verified_host_dequantizer() -> Result<()> {
         for r in 0..N {
             let s = scales[(r / FP8_BLOCK) * (K / FP8_BLOCK)];
             for c in 0..K {
-                m[r * K + c] = tuili_safetensors::e4m3_value(quants[r * K + c]) * s;
+                m[r * K + c] = infero_safetensors::e4m3_value(quants[r * K + c]) * s;
             }
         }
         reference_matvec(&m, &x)
@@ -175,7 +175,7 @@ fn the_matvec_matches_the_verified_host_dequantizer() -> Result<()> {
             for c in 0..K {
                 let i = (c / FP8_BLOCK) * (N / FP8_BLOCK) + r / FP8_BLOCK;
                 let s = scales[i.min(scales.len() - 1)];
-                m[r * K + c] = tuili_safetensors::e4m3_value(quants[r * K + c]) * s;
+                m[r * K + c] = infero_safetensors::e4m3_value(quants[r * K + c]) * s;
             }
         }
         reference_matvec(&m, &x)
@@ -361,7 +361,7 @@ fn the_batched_matvec_agrees_with_the_single_token_one() -> Result<()> {
     // *dispatch* threshold sits — the two are separate numbers and the kernel
     // has to be right at all of them.
     for n_tokens in [2usize, 5, 8, 9, 17, 32] {
-        let saved = std::env::var("TUILI_FP8_BATCH_MAX").ok();
+        let saved = std::env::var("INFERO_FP8_BATCH_MAX").ok();
         let _ = saved;
         // Distinct rows, so a token's partial landing in another token's slot
         // shows up rather than cancelling.
@@ -444,7 +444,7 @@ fn the_batched_matvec_declines_a_batch_it_cannot_hold() -> Result<()> {
     let scales = vec![1.0f32; scale_grid(K, N)];
     let buf = packed(&quants, &scales);
     let d_w = stream.clone_htod(&buf)?;
-    let too_many = tuili_kernels::fp8::batched_matvec_limit() + 1;
+    let too_many = infero_kernels::fp8::batched_matvec_limit() + 1;
     let x = vec![0.0f32; too_many * K];
     let d_x = stream.clone_htod(&x)?;
     let mut out = stream.alloc_zeros::<f32>(too_many * N)?;

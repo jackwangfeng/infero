@@ -12,7 +12,7 @@
 //!
 //! ```no_run
 //! # fn main() -> anyhow::Result<()> {
-//! let w = tuili_safetensors::Shards::open_dir("models/llama-3.1-8b-awq")?;
+//! let w = infero_safetensors::Shards::open_dir("models/llama-3.1-8b-awq")?;
 //! let t = w.tensor("model.layers.0.self_attn.q_proj.qweight")?;
 //! println!("{:?} {:?} {} bytes", t.dtype, t.shape, t.data.len());
 //! # Ok(()) }

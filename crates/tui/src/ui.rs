@@ -43,7 +43,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let h = &app.health;
     let mut spans = vec![
-        Span::styled(" tuili ", Style::default().fg(Color::Black).bg(ASSISTANT)),
+        Span::styled(" infero ", Style::default().fg(Color::Black).bg(ASSISTANT)),
         Span::raw(" "),
         Span::styled(&h.model, Style::default().add_modifier(Modifier::BOLD)),
     ];

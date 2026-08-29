@@ -14,12 +14,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
-use tuili_gpu::Device;
-use tuili_gguf::Gguf;
-use tuili_model::{KvCacheQuant, Model, SamplingParams};
+use infero_gpu::Device;
+use infero_gguf::Gguf;
+use infero_model::{KvCacheQuant, Model, SamplingParams};
 
 use crate::scheduler::{Scheduler, make_pool};
-use tuili_tokenizer::Tokenizer;
+use infero_tokenizer::Tokenizer;
 
 /// One decoded image, waiting for the scheduler thread to run it through the
 /// tower.
@@ -150,7 +150,7 @@ impl Engine {
         // make the second row nearly free the way CUDA's MMA does (see
         // `dcbcdf4`, `f9fdd31`) — there, k=1 is break-even to negative, so it
         // defaults off instead.
-        let spec_k: usize = std::env::var("TUILI_SPEC_K")
+        let spec_k: usize = std::env::var("INFERO_SPEC_K")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(if cfg!(feature = "metal") { 0 } else { 1 });
@@ -195,7 +195,7 @@ impl Engine {
             // The GGUF file states its own dominant type; a safetensors
             // checkpoint does not, so ask the loaded weights. The fallback used
             // to be the literal "AWQ-INT4", which was true of every
-            // safetensors model tuili could load and is now a lie: an FP8
+            // safetensors model infero could load and is now a lie: an FP8
             // checkpoint reported itself as INT4 while running FP8 kernels.
             // Nothing computed from this — the dispatch reads `WeightType` —
             // but a status line that names the wrong encoding is worse than one
@@ -251,7 +251,7 @@ impl Engine {
         // token it needs to buy 0.6 to pay for itself.
         //
         // Both are fixable and neither is fixed here, so the default is the
-        // shallowest draft that still wins. `TUILI_SPEC_K=0` turns it off. Read
+        // shallowest draft that still wins. `INFERO_SPEC_K=0` turns it off. Read
         // above, where it sizes the logits buffer.
         // No `is_dir()` guard any more: the head may be a sidecar GGUF beside a
         // single-file model, and `enable_speculation` is what knows the
@@ -287,7 +287,7 @@ impl Engine {
         // A dedicated OS thread, not a tokio task: the forward pass blocks on
         // CUDA and would otherwise stall the runtime.
         std::thread::Builder::new()
-            .name("tuili-inference".into())
+            .name("infero-inference".into())
             .spawn(move || worker.run(rx))
             .context("spawning the inference thread")?;
 

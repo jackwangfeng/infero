@@ -4,11 +4,11 @@
 //! cost is tens of microseconds, no amount of kernel tuning matters — the fix
 //! is to launch less. This measures the floor.
 //!
-//!     cargo run --release -p tuili-kernels --example launch_overhead
+//!     cargo run --release -p infero-kernels --example launch_overhead
 
 use anyhow::Result;
-use tuili_cuda::Device;
-use tuili_kernels::Kernels;
+use infero_cuda::Device;
+use infero_kernels::Kernels;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("warn").init();

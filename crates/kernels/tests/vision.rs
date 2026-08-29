@@ -1,7 +1,7 @@
 //! The Qwen3.5 vision-tower kernels against the host reference, and through it
 //! against a capture of the reference implementation on the real checkpoint.
 //!
-//! The reference is `tuili_model::qwen35_vision`, reached through a
+//! The reference is `infero_model::qwen35_vision`, reached through a
 //! dev-dependency on the crate above this one — the same arrangement
 //! `partial_rope.rs` uses, and for the same reason: a second copy of a layout
 //! whose whole difficulty is which axis goes where will eventually disagree with
@@ -33,8 +33,8 @@
 //!
 //!   /home/jeff/vllm312/bin/python tools/capture_qwen35_vision.py \
 //!       /home/jeff/models/qwen38-27b-fp8 <out-dir>
-//!   TUILI_QWEN35_VISION_CAPTURE=<out-dir> \
-//!       cargo test --release -p tuili-kernels --test vision
+//!   INFERO_QWEN35_VISION_CAPTURE=<out-dir> \
+//!       cargo test --release -p infero-kernels --test vision
 //!
 //! Without the variable the capture-driven tests report SKIPPED rather than
 //! passing, because a silent skip is how a suite comes to be green without
@@ -47,9 +47,9 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use half::f16;
-use tuili_kernels::vision::{VisionShape, VisionSegments};
-use tuili_model::qwen35_vision as vref;
-use tuili_model::qwen35_vision::VisionDims;
+use infero_kernels::vision::{VisionShape, VisionSegments};
+use infero_model::qwen35_vision as vref;
+use infero_model::qwen35_vision::VisionDims;
 
 use common::*;
 
@@ -91,7 +91,7 @@ struct Capture {
 
 impl Capture {
     fn open() -> Option<Self> {
-        let dir = PathBuf::from(std::env::var("TUILI_QWEN35_VISION_CAPTURE").ok()?);
+        let dir = PathBuf::from(std::env::var("INFERO_QWEN35_VISION_CAPTURE").ok()?);
         // Whitespace-stripped so the scanner above sees `"key":value` with
         // nothing between them.
         let raw = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
@@ -248,7 +248,7 @@ fn with_capture(what: &str, body: impl FnOnce(&Capture) -> Result<()>) -> Result
         Some(c) => body(&c),
         None => {
             eprintln!(
-                "SKIPPED {what}: set TUILI_QWEN35_VISION_CAPTURE to a directory \
+                "SKIPPED {what}: set INFERO_QWEN35_VISION_CAPTURE to a directory \
                  written by tools/capture_qwen35_vision.py"
             );
             Ok(())
@@ -738,7 +738,7 @@ fn the_qkv_kernel_rotates_half_pairs_and_leaves_v_alone() -> Result<()> {
 /// boundaries. Shared by the tests below.
 #[allow(clippy::too_many_arguments)]
 fn run_attn(
-    k: &tuili_kernels::Kernels,
+    k: &infero_kernels::Kernels,
     q: &[f32],
     kk: &[f32],
     v: &[f32],
@@ -1775,15 +1775,15 @@ fn splicing_replaces_each_placeholder_with_the_next_feature_row() -> Result<()> 
 
         // The ids really are this checkpoint's, not Qwen2-VL's.
         assert_eq!(
-            tuili_kernels::vision::IMAGE_TOKEN_ID as usize,
+            infero_kernels::vision::IMAGE_TOKEN_ID as usize,
             c.u("image_token_id")
         );
         assert_eq!(
-            tuili_kernels::vision::VIDEO_TOKEN_ID as usize,
+            infero_kernels::vision::VIDEO_TOKEN_ID as usize,
             c.u("video_token_id")
         );
 
-        let dst = tuili_kernels::vision::splice_targets(&ids, tokens)?;
+        let dst = infero_kernels::vision::splice_targets(&ids, tokens)?;
         let ddst = stream.clone_htod(&dst)?;
         let dfeat = stream.clone_htod(&feats)?;
         // A sentinel everywhere, so an untouched row is visible.
@@ -1829,7 +1829,7 @@ fn splicing_replaces_each_placeholder_with_the_next_feature_row() -> Result<()> 
             .map(|&t| if t == vref::IMAGE_TOKEN_ID { 151_655 } else { t })
             .collect();
         assert!(
-            tuili_kernels::vision::splice_targets(&old_ids, tokens).is_err(),
+            infero_kernels::vision::splice_targets(&old_ids, tokens).is_err(),
             "splice_targets accepted a sequence whose placeholders were written \
              with Qwen2-VL's 151655; the counts do not match and it must refuse, \
              or the image features go into the void quietly"
@@ -1844,7 +1844,7 @@ fn splicing_replaces_each_placeholder_with_the_next_feature_row() -> Result<()> 
 /// accumulated in f32 — what `gemm_f16` actually computes.
 ///
 /// Only the arithmetic is re-done here; every layout decision in the comparison
-/// chain below still comes from `tuili_model::qwen35_vision`.
+/// chain below still comes from `infero_model::qwen35_vision`.
 fn linear16(x: &[f32], w: &[f32], b: &[f32], rows: usize, k: usize, n: usize) -> Vec<f32> {
     let xh = as_f16(x);
     let wh = as_f16(w);
@@ -2051,10 +2051,10 @@ fn the_whole_tower_matches_the_host_reference() -> Result<()> {
     }
 
     // ---- the device -----------------------------------------------------
-    let geo = tuili_kernels::vision::VisionGeometry::new(
+    let geo = infero_kernels::vision::VisionGeometry::new(
         &k, &shape, &cu, &pids, &interp_idx, &interp_wts,
     )?;
-    let mut scratch = tuili_kernels::vision::VisionScratch::new(k.device(), &shape, n)?;
+    let mut scratch = infero_kernels::vision::VisionScratch::new(k.device(), &shape, n)?;
 
     let dframe = stream.clone_htod(&frame)?;
     let mut dpix32 = stream.alloc_zeros::<f32>(n * d.patch_dim())?;
@@ -2097,7 +2097,7 @@ fn the_whole_tower_matches_the_host_reference() -> Result<()> {
         }
     }
     let blocks = (0..d.depth)
-        .map(|b| tuili_kernels::vision::VisionBlockWeights {
+        .map(|b| infero_kernels::vision::VisionBlockWeights {
             norm1_w: norms[b * 8].as_view(),
             norm1_b: norms[b * 8 + 1].as_view(),
             norm2_w: norms[b * 8 + 2].as_view(),
@@ -2112,7 +2112,7 @@ fn the_whole_tower_matches_the_host_reference() -> Result<()> {
             fc2_b: norms[b * 8 + 7].as_view(),
         })
         .collect();
-    let weights = tuili_kernels::vision::VisionWeights {
+    let weights = infero_kernels::vision::VisionWeights {
         patch_embed_w: dpatch_w.as_view(),
         patch_embed_b: dpatch_b.as_view(),
         pos_embed: dtable.as_view(),
@@ -2125,7 +2125,7 @@ fn the_whole_tower_matches_the_host_reference() -> Result<()> {
         merger_fc2_b: dm_fc2_b.as_view(),
     };
 
-    tuili_kernels::vision::vision_forward(&k, &shape, &weights, &geo, &mut scratch)?;
+    infero_kernels::vision::vision_forward(&k, &shape, &weights, &geo, &mut scratch)?;
     let got_h = stream.clone_dtoh(&scratch.last_hidden())?;
     let got_f = stream.clone_dtoh(&scratch.features())?;
     k.device().synchronize()?;
@@ -2216,12 +2216,12 @@ fn the_real_shape_runs_and_is_worth_timing() -> Result<()> {
     let m_fc2_w = stream.alloc_zeros::<f16>(shape.out_hidden * wide)?;
     let m_fc2_b = stream.alloc_zeros::<f32>(shape.out_hidden)?;
 
-    let weights = tuili_kernels::vision::VisionWeights {
+    let weights = infero_kernels::vision::VisionWeights {
         patch_embed_w: patch_w.as_view(),
         patch_embed_b: norm.as_view(),
         pos_embed: table.as_view(),
         blocks: (0..shape.depth)
-            .map(|_| tuili_kernels::vision::VisionBlockWeights {
+            .map(|_| infero_kernels::vision::VisionBlockWeights {
                 norm1_w: norm.as_view(),
                 norm1_b: norm.as_view(),
                 norm2_w: norm.as_view(),
@@ -2252,14 +2252,14 @@ fn the_real_shape_runs_and_is_worth_timing() -> Result<()> {
         let host_dims = VisionDims::QWEN35_27B;
         let pids = vref::vision_position_ids(&grids, shape.merge);
         let (idx, wts) = vref::pos_embed_taps(&grids, host_dims.grid_per_side(), shape.merge);
-        let geo = tuili_kernels::vision::VisionGeometry::new(&k, &shape, &cu, &pids, &idx, &wts)?;
-        let mut scratch = tuili_kernels::vision::VisionScratch::new(k.device(), &shape, n)?;
+        let geo = infero_kernels::vision::VisionGeometry::new(&k, &shape, &cu, &pids, &idx, &wts)?;
+        let mut scratch = infero_kernels::vision::VisionScratch::new(k.device(), &shape, n)?;
 
         // Once to warm the caches and force every NVRTC compile, then timed.
-        tuili_kernels::vision::vision_forward(&k, &shape, &weights, &geo, &mut scratch)?;
+        infero_kernels::vision::vision_forward(&k, &shape, &weights, &geo, &mut scratch)?;
         k.device().synchronize()?;
         let started = std::time::Instant::now();
-        tuili_kernels::vision::vision_forward(&k, &shape, &weights, &geo, &mut scratch)?;
+        infero_kernels::vision::vision_forward(&k, &shape, &weights, &geo, &mut scratch)?;
         k.device().synchronize()?;
         let ms = started.elapsed().as_secs_f64() * 1e3;
 
@@ -2279,7 +2279,7 @@ fn the_real_shape_runs_and_is_worth_timing() -> Result<()> {
             n as f64 / ms
         );
         // Guessing at which kernel is slow has a poor record in this project, so
-        // ask. `TUILI_PROFILE` serializes the stream and times each launch.
+        // ask. `INFERO_PROFILE` serializes the stream and times each launch.
         if k.device().profile().enabled() {
             eprintln!("{label}:\n{}", k.device().profile().report());
             k.device().profile().reset();

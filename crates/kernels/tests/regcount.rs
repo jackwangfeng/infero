@@ -13,8 +13,8 @@
 //! `mmqf2w4s2` fits more blocks than the integer kernel that beats it.
 
 use anyhow::Result;
-use tuili_cuda::Device;
-use tuili_kernels::Kernels;
+use infero_cuda::Device;
+use infero_kernels::Kernels;
 
 /// sm_86: 64K registers and 100 KiB of shared memory per SM.
 fn blocks_per_sm(regs: i32, smem: i32, warps: i32) -> i32 {
@@ -67,7 +67,7 @@ fn the_gemm_shapes_still_fit_more_than_one_block_per_sm() -> Result<()> {
         ("mmqg1w8s2_2_q4_g128", 8),
     ];
     for (name, warps) in shapes {
-        let (regs, smem) = kern.kernel_registers("tuili_mmq", name)?;
+        let (regs, smem) = kern.kernel_registers("infero_mmq", name)?;
         let blocks = blocks_per_sm(regs, smem, warps);
         eprintln!("  {name:24} {regs:>4} regs {smem:>6} B smem -> {blocks} blocks/SM");
         // One block per SM is the cliff this kernel keeps falling off: every
@@ -86,7 +86,7 @@ fn the_gemm_shapes_still_fit_more_than_one_block_per_sm() -> Result<()> {
 /// spills. See the note above `MMQ_Y_SET` in `mmq.cu`.
 #[test]
 fn the_wide_row_group_shapes_and_their_registers() -> anyhow::Result<()> {
-    let dev = match tuili_cuda::Device::new(0) {
+    let dev = match infero_cuda::Device::new(0) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("skipping: no cuda device ({e})");
@@ -96,7 +96,7 @@ fn the_wide_row_group_shapes_and_their_registers() -> anyhow::Result<()> {
     let kern = Kernels::new(dev);
     for v in ["mmqy1w8s2_2", "mmqy2w8s2_2", "mmqy4w8s2_2"] {
         let name = format!("{v}_q4_g128");
-        let (regs, smem) = kern.kernel_registers("tuili_mmq", &name)?;
+        let (regs, smem) = kern.kernel_registers("infero_mmq", &name)?;
         eprintln!("  {v:<14} {regs:>4} regs  {smem:>6} B static smem");
     }
     Ok(())
@@ -112,7 +112,7 @@ fn the_wide_row_group_shapes_and_their_registers() -> anyhow::Result<()> {
 /// at the same height".
 #[test]
 fn what_caps_the_blocks_an_sm() -> anyhow::Result<()> {
-    let dev = match tuili_cuda::Device::new(0) {
+    let dev = match infero_cuda::Device::new(0) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("skipping: no cuda device ({e})");
@@ -126,13 +126,13 @@ fn what_caps_the_blocks_an_sm() -> anyhow::Result<()> {
         ("mmqy1w8s2_q4_g128", 256u32, 1usize, 2usize),
         ("mmqy1w8s2_2_q4_g128", 256, 2, 2),
     ] {
-        let (regs, _) = kern.kernel_registers("tuili_mmq", name)?;
-        let stride: usize = std::env::var("TUILI_XF_STRIDE")
+        let (regs, _) = kern.kernel_registers("infero_mmq", name)?;
+        let stride: usize = std::env::var("INFERO_XF_STRIDE")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(544);
         let dynamic = stages * tiles * 16 * stride;
-        let blocks = kern.occupancy_blocks("tuili_mmq", name, threads, dynamic)?;
+        let blocks = kern.occupancy_blocks("infero_mmq", name, threads, dynamic)?;
         eprintln!(
             "  {name:<24} {regs:>3} regs  {:>5} B dynamic  -> {blocks} blocks/SM              ({} SMs, {} resident blocks)",
             dynamic,

@@ -8,8 +8,8 @@
 //! Compare it against the gather it replaces, element for element.
 
 use anyhow::Result;
-use tuili_cuda::Device;
-use tuili_kernels::Kernels;
+use infero_cuda::Device;
+use infero_kernels::Kernels;
 
 #[test]
 fn ldmatrix_loads_the_same_fragment_as_the_scalar_gather() -> Result<()> {

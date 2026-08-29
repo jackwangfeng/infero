@@ -14,24 +14,24 @@
 //! * one draft step, whose memory bound is the head's 810 MiB plus the
 //!   vocabulary projection.
 //!
-//! Run it again with `TUILI_PROFILE=1` for the per-kernel breakdown inside those
+//! Run it again with `INFERO_PROFILE=1` for the per-kernel breakdown inside those
 //! numbers. That serializes the stream and disables graph capture, so the totals
 //! move — it answers "which kernel" and not "how long".
 //!
-//!   cargo run --release -p tuili-model --example spec_profile -- <model-dir>
+//!   cargo run --release -p infero-model --example spec_profile -- <model-dir>
 
 use anyhow::{Context, Result};
-use tuili_model::{BatchItem, KvCacheQuant, Model};
+use infero_model::{BatchItem, KvCacheQuant, Model};
 
 const REPS: usize = 12;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt().with_max_level(tracing::Level::WARN).init();
     let dir = std::env::args().nth(1).expect("usage: spec_profile <model-dir>");
-    let device: usize = std::env::var("TUILI_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let device: usize = std::env::var("INFERO_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let k: usize = std::env::var("K").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
-    let dev = tuili_cuda::Device::new(device)?;
-    let tok = tuili_tokenizer::Tokenizer::from_hf_dir(&dir)?;
+    let dev = infero_cuda::Device::new(device)?;
+    let tok = infero_tokenizer::Tokenizer::from_hf_dir(&dir)?;
     // `k + 1` logit rows for the verification pass, and the drafter wants at
     // least that many rows of its own. Wider than that so the width sweep below
     // can price a tree draft's verification: a `B`-by-`D` tree costs
@@ -141,7 +141,7 @@ fn main() -> Result<()> {
     // draft at position P against a cache that reaches nowhere near P is refused
     // — see `MtpHead::prime`. So: prime over the whole prompt once, untimed,
     // which is what the first round of a real request does.
-    let mut sampler = tuili_model::Sampler::new(tuili_model::SamplingParams {
+    let mut sampler = infero_model::Sampler::new(infero_model::SamplingParams {
         temperature: 0.7,
         seed: Some(7),
         ..Default::default()
@@ -156,7 +156,7 @@ fn main() -> Result<()> {
         let it = BatchItem::new(s2, &prompt);
         model.forward_batch_device(std::slice::from_ref(&it), &mut p2)?;
         let first = argmax(model.logits_host()?);
-        let feed = tuili_model::spec::DraftFeed::after_prefill(&prompt, first);
+        let feed = infero_model::spec::DraftFeed::after_prefill(&prompt, first);
         model.draft_with_head_sampled(k, &feed, &mut sampler, &history)?;
 
         // One decode step, so `mtp_hidden` holds one row at a known position,
@@ -166,7 +166,7 @@ fn main() -> Result<()> {
         let second = argmax(model.logits_host()?);
         history.push(first);
         let pos = p2.len(s2) - 1;
-        let feed = tuili_model::spec::DraftFeed {
+        let feed = infero_model::spec::DraftFeed {
             rows: 0..1,
             positions: vec![pos],
             shifted: vec![second],
@@ -327,7 +327,7 @@ fn main() -> Result<()> {
             )?;
             model.device().profile().snapshot()
         };
-        let lookup = |v: &Vec<(&'static str, tuili_cuda::profile::Entry)>, k: &str| {
+        let lookup = |v: &Vec<(&'static str, infero_cuda::profile::Entry)>, k: &str| {
             v.iter().find(|(n, _)| *n == k).map(|(_, e)| *e)
         };
         let mut names: Vec<&'static str> = many.iter().map(|(n, _)| *n).collect();

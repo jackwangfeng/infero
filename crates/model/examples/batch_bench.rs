@@ -4,12 +4,12 @@
 //! than `n` steps with one. This measures that directly, with the prompts
 //! already in the pool so nothing but decode is timed.
 //!
-//!     cargo run --release -p tuili-model --example batch_bench -- model.gguf
+//!     cargo run --release -p infero-model --example batch_bench -- model.gguf
 
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use tuili_model::{BatchItem, KvCacheQuant, Model};
+use infero_model::{BatchItem, KvCacheQuant, Model};
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("warn").init();
@@ -24,19 +24,19 @@ fn main() -> Result<()> {
 
     // The KV cache is 24% of a batch-32 step's memory traffic at this context
     // length, so how it is stored is part of what this measures.
-    let kv = match std::env::var("TUILI_KV").as_deref() {
+    let kv = match std::env::var("INFERO_KV").as_deref() {
         Ok("tq2") => KvCacheQuant::Tq2,
         Ok("tq4") => KvCacheQuant::Tq4,
         Ok("tq8") => KvCacheQuant::Tq8,
         _ => KvCacheQuant::F16,
     };
 
-    let dev = tuili_cuda::Device::new(0)?;
+    let dev = infero_cuda::Device::new(0)?;
     // A directory is an AWQ checkpoint, a file is a GGUF.
     let mut model = if std::path::Path::new(&path).is_dir() {
         Model::load_awq(dev, &path, 2048, kv, 128)?
     } else {
-        let gguf = tuili_gguf::Gguf::open(&path)?;
+        let gguf = infero_gguf::Gguf::open(&path)?;
         Model::load_quantized(dev, &gguf, 2048, kv)?
     };
 
@@ -47,10 +47,10 @@ fn main() -> Result<()> {
     );
 
     let mut baseline = 0.0f64;
-    // `TUILI_BATCHES=8,32,64` overrides. Continuous batching means a server
+    // `INFERO_BATCHES=8,32,64` overrides. Continuous batching means a server
     // under load runs wider than any fixed number here, and the tensor-core
     // GEMM is only defined up to `MMQ_MAX_TOKENS`.
-    let batches: Vec<usize> = match std::env::var("TUILI_BATCHES") {
+    let batches: Vec<usize> = match std::env::var("INFERO_BATCHES") {
         Ok(v) => v.split(',').filter_map(|s| s.trim().parse().ok()).collect(),
         Err(_) => vec![1, 2, 4, 8, 16, 32],
     };
@@ -61,7 +61,7 @@ fn main() -> Result<()> {
         // Fill each sequence's history.
         let filler: Vec<u32> = (0..ctx).map(|i| (1000 + i % 5000) as u32).collect();
         for &seq in &seqs {
-            for chunk in filler.chunks(tuili_model::MAX_BATCH_TOKENS) {
+            for chunk in filler.chunks(infero_model::MAX_BATCH_TOKENS) {
                 model.forward_batch(&[BatchItem::without_logits(seq, chunk)], &mut pool)?;
             }
         }

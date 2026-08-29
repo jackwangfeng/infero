@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decode speed and multi-turn continuity against a running tuili server.
+"""Decode speed and multi-turn continuity against a running infero server.
 
 The multi-turn check is the one that matters for this model: 48 of its 64
 blocks carry recurrent state that is overwritten in place, so a second turn

@@ -6,8 +6,8 @@
 use std::path::PathBuf;
 
 use serde::Deserialize;
-use tuili_gguf::Gguf;
-use tuili_tokenizer::{ChatMessage, Tokenizer};
+use infero_gguf::Gguf;
+use infero_tokenizer::{ChatMessage, Tokenizer};
 
 #[derive(Deserialize)]
 struct Fixtures {
@@ -64,8 +64,8 @@ const MODELS: &[(&str, &str)] = &[
 fn workspace_models() -> Vec<(String, Tokenizer, Fixtures)> {
     // A single override still works, and then it is paired with whichever
     // fixture the caller names.
-    if let Ok(p) = std::env::var("TUILI_TEST_GGUF") {
-        let name = std::env::var("TUILI_TEST_FIXTURE")
+    if let Ok(p) = std::env::var("INFERO_TEST_GGUF") {
+        let name = std::env::var("INFERO_TEST_FIXTURE")
             .unwrap_or_else(|_| "qwen2.5-0.5b-instruct".to_string());
         return open(&PathBuf::from(p), &name).into_iter().collect();
     }

@@ -1,10 +1,10 @@
 //! The Apple-GPU device layer.
 //!
-//! This crate is shaped like the subset of `cudarc` that `tuili-kernels` uses,
+//! This crate is shaped like the subset of `cudarc` that `infero-kernels` uses,
 //! on purpose: the same method names in the same order, so that
 //!
 //! ```ignore
-//! let f = dev.kernels().get("tuili_ops", ops_src(), "rms_norm_f32")?;
+//! let f = dev.kernels().get("infero_ops", ops_src(), "rms_norm_f32")?;
 //! let mut b = dev.stream().launch_builder(&f);
 //! b.arg(out).arg(x).arg(weight).arg(&d_i).arg(&eps_f);
 //! unsafe { b.launch(cfg) }?;

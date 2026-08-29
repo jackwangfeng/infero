@@ -8,7 +8,7 @@
 //! second tensor's quants and still produce plausible-looking numbers.
 
 use anyhow::Result;
-use tuili_kernels::awq::{AwqTensor, concat_t, transpose_words, transposable, unpack_row_t};
+use infero_kernels::awq::{AwqTensor, concat_t, transpose_words, transposable, unpack_row_t};
 
 /// A deterministic AWQ tensor of the given shape.
 fn awq(k: usize, n: usize, seed: usize) -> Vec<u8> {

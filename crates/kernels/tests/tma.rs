@@ -20,7 +20,7 @@
 
 use anyhow::{Context, Result};
 use cudarc::driver::{sys, DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg};
-use tuili_cuda::Device;
+use infero_cuda::Device;
 
 /// `CUtensorMap` is 128 opaque bytes that must reach the kernel by value.
 #[repr(C, align(64))]
@@ -132,7 +132,7 @@ fn tma_bulk_tensor_loads_a_tile() -> Result<()> {
 
     let f = dev
         .kernels()
-        .get("tuili_tma_probe", SRC, "tma_tile_sum")
+        .get("infero_tma_probe", SRC, "tma_tile_sum")
         .context("compiling the TMA probe")?;
     let mut out = stream.alloc_zeros::<f32>(1)?;
     let (bx, by, tb) = (0i32, 0i32, TILE_BYTES as i32);
@@ -496,7 +496,7 @@ fn tma_streams_weights_against_the_cp_async_probe() -> Result<()> {
         .replace("BOX_ROWS_", &box_rows.to_string())
         .replace("STAGES_", &stages.to_string());
     let module: &'static str = Box::leak(
-        format!("tuili_tma_pipe_{box_in}_{box_rows}_{stages}").into_boxed_str(),
+        format!("infero_tma_pipe_{box_in}_{box_rows}_{stages}").into_boxed_str(),
     );
     let leaked: &'static str = Box::leak(src.into_boxed_str());
     for kernel in ["tma_stream_sum", "tma_stream_mma"] {
@@ -510,7 +510,7 @@ fn tma_streams_weights_against_the_cp_async_probe() -> Result<()> {
             continue;
         }
     };
-    if let Err(e) = tuili_cuda::set_max_dynamic_shared(&f, shared as u32) {
+    if let Err(e) = infero_cuda::set_max_dynamic_shared(&f, shared as u32) {
         eprintln!("  box {box_in}x{box_rows}, {stages} stages: {} KiB refused ({e})", shared >> 10);
         continue;
     }
@@ -667,7 +667,7 @@ fn the_128b_swizzle_is_undone_by_xor_with_the_row() -> Result<()> {
 
     let f = dev
         .kernels()
-        .get("tuili_tma_swz", SWIZZLE_SRC, "tma_swizzle_check")
+        .get("infero_tma_swz", SWIZZLE_SRC, "tma_swizzle_check")
         .context("compiling the swizzle check")?;
     let mut bad = stream.alloc_zeros::<i32>(1)?;
     let (rr, cc) = (rows as i32, chunks as i32);

@@ -6,14 +6,14 @@
 //! staging shows up in seconds, and reports effective bandwidth against the
 //! quantized weight volume, which is the number that says how much is left.
 //!
-//!     cargo run --release -p tuili-model --example gemm_bench -- model.gguf [tensor]
+//!     cargo run --release -p infero-model --example gemm_bench -- model.gguf [tensor]
 
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use tuili_cuda::Device;
-use tuili_gguf::Gguf;
-use tuili_kernels::{Kernels, WeightType};
+use infero_cuda::Device;
+use infero_gguf::Gguf;
+use infero_kernels::{Kernels, WeightType};
 
 const TOKENS: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
 
@@ -68,11 +68,11 @@ fn main() -> Result<()> {
     }
 
     for (m, kn) in [
-        ("tuili_mmq", "mmq_q4_K"),
-        ("tuili_mmq", "mmqw8_q4_K"),
-        ("tuili_mmq", "mmqw8_2_q4_K"),
-        ("tuili_mmvq", "mmvq_q4_K"),
-        ("tuili_ops", "attn_scores_gqa_f32"),
+        ("infero_mmq", "mmq_q4_K"),
+        ("infero_mmq", "mmqw8_q4_K"),
+        ("infero_mmq", "mmqw8_2_q4_K"),
+        ("infero_mmvq", "mmvq_q4_K"),
+        ("infero_ops", "attn_scores_gqa_f32"),
     ] {
         if let Ok((mt, bv)) = kern.kernel_limits(m, kn) {
             println!("  {kn:<22} 寄存器允许的最大 block = {mt:>4} 线程  (sm_{bv})");

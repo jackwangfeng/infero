@@ -1,6 +1,6 @@
 //! `mma_f8_block` timed two ways: eager (one launch, one sync each) and
 //! captured in a CUDA graph and replayed, the way the live server actually
-//! runs a decode step. `ncu` needs `TUILI_NO_GRAPH=1` to profile at all —
+//! runs a decode step. `ncu` needs `INFERO_NO_GRAPH=1` to profile at all —
 //! graph capture does not survive its replay mechanism — so every stall
 //! reason it names was measured in a mode the server never uses. This
 //! answers the question that leaves open: does the eager-mode stall this
@@ -8,7 +8,7 @@
 //! actually cost anything once the kernel runs inside a graph, or does the
 //! graph already hide it?
 //!
-//!     cargo run --release -p tuili-kernels --example mma_f8_graph_bench
+//!     cargo run --release -p infero-kernels --example mma_f8_graph_bench
 //!
 //! Shape is GatedDeltaNet's fused `in_proj_qkv`+`in_proj_z` on the 27B:
 //! k = d_model = 5120, n = conv_channels + value_dim = 16384, the widest
@@ -17,9 +17,9 @@
 //! measures timing, not numerics, which `tests/fp8_matvec.rs` already covers.
 
 use anyhow::{Context, Result};
-use tuili_cuda::backend::{CAPTURE_RELAXED, GraphFlags};
-use tuili_cuda::Device;
-use tuili_kernels::Kernels;
+use infero_cuda::backend::{CAPTURE_RELAXED, GraphFlags};
+use infero_cuda::Device;
+use infero_kernels::Kernels;
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
@@ -70,7 +70,7 @@ fn main() -> Result<()> {
     let k = Kernels::new(dev.clone());
     let stream = dev.stream().clone();
 
-    let w_bytes = tuili_kernels::fp8::fp8_bytes(k_dim, n_dim);
+    let w_bytes = infero_kernels::fp8::fp8_bytes(k_dim, n_dim);
     let weights = pseudo_random_bytes(w_bytes, 1);
     let x = pseudo_random_f32(n_tokens * k_dim, 2);
 

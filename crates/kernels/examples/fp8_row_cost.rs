@@ -8,7 +8,7 @@
 //! measured *slower*. Their obituaries are on `fp8::BATCH_KERNELS`.
 //!
 //! So: measure the kernel on its own, at the 27B's widest projection, and take
-//! pieces away. `TUILI_FP8_STRIP` selects what the kernel skips:
+//! pieces away. `INFERO_FP8_STRIP` selects what the kernel skips:
 //!
 //! ```text
 //!   (unset)   everything
@@ -30,12 +30,12 @@
 //! and should have been the tell. A decode step streams 29.6 GB and caches none
 //! of it, so the probe rotates through enough copies to evict.
 //!
-//!     cargo run --release -p tuili-kernels --example fp8_row_cost
+//!     cargo run --release -p infero-kernels --example fp8_row_cost
 
 use anyhow::Result;
-use tuili_cuda::Device;
-use tuili_kernels::Kernels;
-use tuili_kernels::fp8::{FP8_BLOCK, fp8_bytes, repack_rows, scale_grid};
+use infero_cuda::Device;
+use infero_kernels::Kernels;
+use infero_kernels::fp8::{FP8_BLOCK, fp8_bytes, repack_rows, scale_grid};
 
 /// Does the tensor-core kernel's rate depend on the output width?
 ///
@@ -66,7 +66,7 @@ const REPS: usize = 40;
 fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("warn").init();
     let dev = Device::new(
-        std::env::var("TUILI_DEVICE")
+        std::env::var("INFERO_DEVICE")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
@@ -105,7 +105,7 @@ fn main() -> Result<()> {
         (COPIES * buf.len()) >> 20
     );
 
-    let strip = std::env::var("TUILI_FP8_STRIP").unwrap_or_default();
+    let strip = std::env::var("INFERO_FP8_STRIP").unwrap_or_default();
     println!(
         "  [{N}, {K}] FP8, {} MiB of weights, block {FP8_BLOCK}, strip={:?}",
         (N * K) >> 20,

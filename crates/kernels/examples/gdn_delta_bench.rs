@@ -8,7 +8,7 @@
 //! state can live while a chunk is consumed, at the shapes a served step
 //! actually issues.
 //!
-//!     cargo run --release -p tuili-kernels --example gdn_delta_bench
+//!     cargo run --release -p infero-kernels --example gdn_delta_bench
 //!
 //! One thing this harness has to get right, and got wrong first: a single
 //! sequence's state is 3 MiB, which fits this card's 4 MiB L2, so timing the
@@ -17,9 +17,9 @@
 //! rotates through that many buffers and each launch starts cold.
 
 use anyhow::Result;
-use tuili_cuda::Device;
-use tuili_kernels::Kernels;
-use tuili_kernels::gdn::{DeltaVariant, SeqLayout};
+use infero_cuda::Device;
+use infero_kernels::Kernels;
+use infero_kernels::gdn::{DeltaVariant, SeqLayout};
 
 /// The 27B's linear-attention shape: `linear_num_value_heads = 48`,
 /// `linear_num_key_heads = 16`, `linear_{key,value}_head_dim = 128`.

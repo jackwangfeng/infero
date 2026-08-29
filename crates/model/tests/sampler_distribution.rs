@@ -10,7 +10,7 @@
 //! So `distribution` and `sample_with_draw` share one implementation, and these
 //! tests are what says the extraction did not change what the sampler does.
 
-use tuili_model::{Sampler, SamplingParams};
+use infero_model::{Sampler, SamplingParams};
 
 /// Deterministic logits with a wide dynamic range, so top-k and top-p both bite.
 fn logits(n: usize, seed: u64) -> Vec<f32> {

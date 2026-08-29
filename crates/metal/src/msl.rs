@@ -29,7 +29,7 @@ pub struct Modules {
     /// Fast path for `get`'s hot call, keyed by `src`'s address and length
     /// instead of its content.
     ///
-    /// Every real caller is one of `tuili-kernels`'s `*_src()` functions, each
+    /// Every real caller is one of `infero-kernels`'s `*_src()` functions, each
     /// a `OnceLock<String>` -- so the `&str` `get` receives is the same
     /// backing allocation, at the same address, for the rest of the process,
     /// and hashing its ~20-45 KiB of MSL text to prove that on every one of a
@@ -37,7 +37,7 @@ pub struct Modules {
     /// launch overhead (measured: `examples/launch_overhead.rs`). Address
     /// identity is exactly as sound as content identity when the content
     /// never moves, and cheaper than reading it. A miss here (the
-    /// `TUILI_METAL_TRACE`-style `#define`-prepended source used for a
+    /// `INFERO_METAL_TRACE`-style `#define`-prepended source used for a
     /// stripped-down measurement build is a *different* `String`, not the
     /// cached one) falls through to the slow, hash-verified path below and
     /// repopulates this one -- so a real content change is still caught, just

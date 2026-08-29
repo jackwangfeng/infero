@@ -21,7 +21,7 @@ mod image;
 
 use std::path::PathBuf;
 
-use tuili_model::qwen35_vision::{self as vref, VisionDims};
+use infero_model::qwen35_vision::{self as vref, VisionDims};
 
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")

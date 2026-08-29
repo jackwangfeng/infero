@@ -31,7 +31,7 @@
 
 use std::collections::HashMap;
 
-use tuili_model::{KvPool, SeqId};
+use infero_model::{KvPool, SeqId};
 
 /// Tokens per cached block.
 ///

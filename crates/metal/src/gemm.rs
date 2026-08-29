@@ -19,7 +19,7 @@
 //! pass is `n_tokens * n` elements -- 8.9 MB at the widest prefill shape here --
 //! against a GEMM that just read hundreds of megabytes, so it is not where the
 //! time goes. It does mean the accumulator is f16 where CUDA's is f32; see the
-//! note on `gemm_f16` in `tuili-kernels` for what that costs.
+//! note on `gemm_f16` in `infero-kernels` for what that costs.
 //!
 //! **It encodes onto a command buffer, not an encoder.** See
 //! `Batch::encode_on_buffer`.
@@ -158,10 +158,10 @@ pub(crate) fn gemm_f16(
 
 /// Widening the f16 result, which MPS will not do in the matmul.
 ///
-/// Carried here rather than in `tuili-kernels` with the model's kernels because
+/// Carried here rather than in `infero-kernels` with the model's kernels because
 /// that is where it belongs: it exists only to paper over one API's insistence
 /// that its three matrices share a data type, and no forward pass should have to
-/// know about it. The metal crate cannot depend on `tuili-kernels` -- the arrow
+/// know about it. The metal crate cannot depend on `infero-kernels` -- the arrow
 /// points the other way -- so it brings its own fifteen lines.
 const WIDEN_MSL: &str = r#"
 #include <metal_stdlib>
@@ -234,7 +234,7 @@ pub fn gemm_f16_to_f32(
     // this backend uses and the one `add_assign` was silently breaking.
     let f = dev
         .kernels()
-        .get("tuili_metal_gemm", WIDEN_MSL, "gemm_widen_f16_f32")?;
+        .get("infero_metal_gemm", WIDEN_MSL, "gemm_widen_f16_f32")?;
     let ni = need as i32;
     let src = out16.slice(..need);
     let mut b2 = dev.stream().launch_builder(&f);

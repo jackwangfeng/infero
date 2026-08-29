@@ -4,7 +4,7 @@
 //! accepted and ignored so that existing clients work unmodified.
 
 use serde::{Deserialize, Serialize};
-use tuili_model::SamplingParams;
+use infero_model::SamplingParams;
 
 fn default_true() -> bool {
     true
@@ -152,7 +152,7 @@ pub struct InToolCall {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct InToolCallFunction {
     pub name: String,
-    /// A JSON string on the wire, per OpenAI's spec — `tuili_tokenizer`'s
+    /// A JSON string on the wire, per OpenAI's spec — `infero_tokenizer`'s
     /// `ToolCallFunction::arguments` wants the parsed object instead; see
     /// `routes::to_chat_message`.
     pub arguments: String,

@@ -143,7 +143,7 @@ impl Read for BodyReader {
 
 /// GET `/health`, so the header can say what is actually loaded.
 ///
-/// Only tuili answers that with a body. vLLM and llama.cpp return a bare 200,
+/// Only infero answers that with a body. vLLM and llama.cpp return a bare 200,
 /// so a failure to parse it is not a failure to reach a server — fall back to
 /// `/v1/models`, which every OpenAI-compatible server serves, and show what it
 /// reports. The header then carries fewer fields rather than the client
@@ -170,7 +170,7 @@ pub fn health(addr: &str) -> Result<Health> {
     }
 }
 
-/// What `/v1/models` can tell us about a server that is not tuili.
+/// What `/v1/models` can tell us about a server that is not infero.
 fn foreign_health(addr: &str) -> Result<Health> {
     let mut body = send(addr, "GET", "/v1/models", None)?;
     let status = body.status;

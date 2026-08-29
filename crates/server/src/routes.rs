@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures::Stream;
 use tokio::sync::mpsc;
-use tuili_tokenizer::{
+use infero_tokenizer::{
     ChatMessage, ContentPart as TplPart, ToolCall as TplToolCall,
     ToolCallFunction as TplToolCallFunction,
 };
@@ -120,7 +120,7 @@ async fn models(State(engine): State<Arc<Engine>>) -> impl IntoResponse {
             id: engine.info.id.clone(),
             object: "model",
             created: now_secs(),
-            owned_by: "tuili",
+            owned_by: "infero",
             quantization: engine.info.quant.clone(),
             context_length: engine.info.context_length,
             max_seq: engine.info.max_seq,

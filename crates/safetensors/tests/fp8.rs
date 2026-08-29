@@ -10,7 +10,7 @@
 
 use anyhow::Result;
 use half::f16;
-use tuili_safetensors::{Dtype, Tensor};
+use infero_safetensors::{Dtype, Tensor};
 
 /// Hand-decoded E4M3 bytes. Sign is bit 7, the exponent is bits 6..3 biased by
 /// 7, the mantissa is bits 2..0 over eight. `exp == 0` is subnormal.

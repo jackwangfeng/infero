@@ -3,7 +3,7 @@
 //! `GEMM_THRESHOLD_DEFAULT` (16, non-CUDA) was measured "through the 27B,
 //! one chunk each" -- a whole-model sweep dominated by Q4_K FFN bytes, not a
 //! per-weight-type measurement -- and Q4_K later got its own override
-//! (`TUILI_Q4K_MMA_MAX`) once that stopped being good enough for it
+//! (`INFERO_Q4K_MMA_MAX`) once that stopped being good enough for it
 //! specifically. Q8_0 (every GDN and attention projection: `in_proj_qkv`,
 //! `in_proj_ba`, `out_proj`, `wq`/`wk`/`wv`/`wo`) still shares the Q4_K-tuned
 //! knob and has never been checked on its own. If its real crossover is
@@ -12,10 +12,10 @@
 //! tokens) for matrices that would have been faster on the plain batched
 //! `gemv_q8_0` mat-vec.
 //!
-//!     cargo run --release -p tuili-metal --example gemv_q8_0_threshold_check
+//!     cargo run --release -p infero-metal --example gemv_q8_0_threshold_check
 
 use anyhow::Result;
-use tuili_metal::{Device, LaunchConfig};
+use infero_metal::{Device, LaunchConfig};
 
 const COMMON: &str = include_str!("../../kernels/src/msl/common.metal");
 const QUANT: &str = include_str!("../../kernels/src/msl/quant.metal");
@@ -115,7 +115,7 @@ fn bench(dev: &Device, quant: &str, label: &str, k: usize, n: usize, rng: &mut R
                 };
                 let x16: Vec<half::f16> = x_host.iter().map(|&v| half::f16::from_f32(v)).collect();
                 let d_x16 = s.clone_htod(&x16)?;
-                tuili_metal::backend::gemm_f16_to_f32(
+                infero_metal::backend::gemm_f16_to_f32(
                     dev,
                     &mut out_gemm.as_view_mut(),
                     &d_x16.as_view(),

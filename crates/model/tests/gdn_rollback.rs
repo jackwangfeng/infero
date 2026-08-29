@@ -11,7 +11,7 @@
 //! So every number below comes out of `Kernels::gdn_conv`,
 //! `Kernels::gdn_gate_decay`, `Kernels::gdn_qk_l2norm` and
 //! `Kernels::gdn_delta_rule`, and the rollback is driven through
-//! [`tuili_model::spec::GdnRollback`] itself rather than a copy of it. A test
+//! [`infero_model::spec::GdnRollback`] itself rather than a copy of it. A test
 //! that reimplemented the replay would be checking its own reading of the
 //! layout — which is the mistake this repository has already paid for twice, most
 //! recently with an RMSNorm form that the reference and the capture got wrong in
@@ -25,11 +25,11 @@
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
-use tuili_cuda::Device;
-use tuili_kernels::gdn::SeqLayout;
-use tuili_kernels::Kernels;
-use tuili_model::config::LinearAttnConfig;
-use tuili_model::spec::{GdnRollback, GdnTap};
+use infero_cuda::Device;
+use infero_kernels::gdn::SeqLayout;
+use infero_kernels::Kernels;
+use infero_model::config::LinearAttnConfig;
+use infero_model::spec::{GdnRollback, GdnTap};
 
 /// Candidate tokens one verification pass carries: `k = 4`, deliberately more
 /// than the `k = 2` the notes recommend, so that every acceptance count from 0

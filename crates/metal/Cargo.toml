@@ -1,15 +1,15 @@
 [package]
-name = "tuili-metal"
+name = "infero-metal"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 # The Apple-GPU half of the device layer. Deliberately shaped like the subset of
-# `cudarc` that `tuili-kernels` uses -- same method names, same argument order,
+# `cudarc` that `infero-kernels` uses -- same method names, same argument order,
 # same `LaunchConfig` field names -- so that the 160 launch sites in that crate
 # compile against either backend without a line of change. See
-# `docs/superpowers/specs/2026-08-23-tuili-metal-port-design.md`.
+# `docs/superpowers/specs/2026-08-23-infero-metal-port-design.md`.
 
 [dependencies]
 anyhow.workspace = true
@@ -32,14 +32,14 @@ tracing-subscriber.workspace = true
 # The vertical-slice example reads a real GGUF and checks itself against the
 # same logits fixture the CUDA tests use. Dev-only: the library itself knows
 # nothing about models.
-tuili-gguf.workspace = true
-tuili-tokenizer.workspace = true
+infero-gguf.workspace = true
+infero-tokenizer.workspace = true
 serde_json = "1"
 # Dev-only and therefore fine to depend "backwards" on the crate that depends
 # on this one: `launch_overhead.rs` wants the real `Kernels::add`/`rms_norm`
 # call path, not a hand-rolled launch, to measure what production code
 # actually pays per dispatch.
-tuili-kernels = { workspace = true, features = ["metal"] }
+infero-kernels = { workspace = true, features = ["metal"] }
 
 [[example]]
 name = "qwen2_f16"

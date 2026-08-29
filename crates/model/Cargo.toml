@@ -1,20 +1,20 @@
 [package]
-name = "tuili-model"
+name = "infero-model"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-tuili-safetensors.workspace = true
-tuili-gguf.workspace = true
-tuili-cuda = { workspace = true, optional = true }
-tuili-gpu.workspace = true
+infero-safetensors.workspace = true
+infero-gguf.workspace = true
+infero-cuda = { workspace = true, optional = true }
+infero-gpu.workspace = true
 anyhow.workspace = true
 half.workspace = true
 tracing.workspace = true
 cudarc = { version = "0.19.9", default-features = false, optional = true, features = ["std", "driver", "nvrtc", "cublas", "f16", "dynamic-loading"] }
-tuili-kernels.workspace = true
+infero-kernels.workspace = true
 rand = "0.9"
 serde_json = "1"
 
@@ -22,11 +22,11 @@ serde_json = "1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tracing-subscriber.workspace = true
-tuili-tokenizer.workspace = true
+infero-tokenizer.workspace = true
 
 [features]
 default = ["cuda-13"]
-cuda = ["dep:tuili-cuda", "dep:cudarc", "tuili-kernels/cuda", "tuili-gpu/cuda"]
-cuda-13 = ["cuda", "tuili-kernels/cuda-13", "tuili-cuda/cuda-13", "cudarc/cuda-13010", "tuili-gpu/cuda-13"]
-cuda-12 = ["cuda", "tuili-kernels/cuda-12", "tuili-cuda/cuda-12", "cudarc/cuda-12080", "tuili-gpu/cuda-12"]
-metal = ["tuili-kernels/metal", "tuili-gpu/metal"]
+cuda = ["dep:infero-cuda", "dep:cudarc", "infero-kernels/cuda", "infero-gpu/cuda"]
+cuda-13 = ["cuda", "infero-kernels/cuda-13", "infero-cuda/cuda-13", "cudarc/cuda-13010", "infero-gpu/cuda-13"]
+cuda-12 = ["cuda", "infero-kernels/cuda-12", "infero-cuda/cuda-12", "cudarc/cuda-12080", "infero-gpu/cuda-12"]
+metal = ["infero-kernels/metal", "infero-gpu/metal"]

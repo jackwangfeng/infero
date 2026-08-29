@@ -10,9 +10,9 @@
 //! So: check that the per-sequence view and the per-layer view describe the
 //! same bytes, and that resetting one sequence leaves the others untouched.
 
-use tuili_cuda::Device;
-use tuili_model::SeqId;
-use tuili_model::gdn_state::{GdnShape, GdnState};
+use infero_cuda::Device;
+use infero_model::SeqId;
+use infero_model::gdn_state::{GdnShape, GdnState};
 
 fn device() -> Option<Device> {
     Device::new(0).ok()

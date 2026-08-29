@@ -585,8 +585,8 @@ mod tests {
 
 // ---- device side --------------------------------------------------------
 
-use tuili_gpu::Buf;
-use tuili_gpu::Device;
+use infero_gpu::Buf;
+use infero_gpu::Device;
 
 /// How the KV cache is stored.
 ///

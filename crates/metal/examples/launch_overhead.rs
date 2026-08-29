@@ -10,14 +10,14 @@
 //! (`Vec<Arg>` per launch, a `Vec<u8>` heap allocation per scalar argument)
 //! this crate's own `LaunchBuilder` adds on top of it?
 //!
-//! The twin of `tuili-kernels/examples/launch_overhead.rs`, which measures
+//! The twin of `infero-kernels/examples/launch_overhead.rs`, which measures
 //! the same thing on CUDA.
 //!
-//!     cargo run --release -p tuili-metal --example launch_overhead
+//!     cargo run --release -p infero-metal --example launch_overhead
 
 use anyhow::Result;
-use tuili_kernels::Kernels;
-use tuili_metal::Device;
+use infero_kernels::Kernels;
+use infero_metal::Device;
 
 fn main() -> Result<()> {
     let dev = Device::new(0)?;

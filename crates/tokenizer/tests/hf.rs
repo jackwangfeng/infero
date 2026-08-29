@@ -7,10 +7,10 @@
 //! id placed at the wrong index, still decodes back to the input.
 
 use anyhow::Result;
-use tuili_tokenizer::Tokenizer;
+use infero_tokenizer::Tokenizer;
 
 const HF: &str = "/mnt/data/vllm-bench/llama8b-awq";
-const GGUF: &str = "/mnt/data/tuili-models/llama-3.1-8b-instruct-q4_k_m.gguf";
+const GGUF: &str = "/mnt/data/infero-models/llama-3.1-8b-instruct-q4_k_m.gguf";
 
 #[test]
 fn the_hf_reader_agrees_with_the_gguf_one() -> Result<()> {
@@ -19,7 +19,7 @@ fn the_hf_reader_agrees_with_the_gguf_one() -> Result<()> {
         return Ok(());
     }
     let hf = Tokenizer::from_hf_dir(HF)?;
-    let gg = Tokenizer::from_gguf(&tuili_gguf::Gguf::open(GGUF)?)?;
+    let gg = Tokenizer::from_gguf(&infero_gguf::Gguf::open(GGUF)?)?;
 
     assert_eq!(hf.vocab_size(), gg.vocab_size());
     assert_eq!(hf.pretokenizer(), gg.pretokenizer());

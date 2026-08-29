@@ -5,7 +5,7 @@
 //! here are about which object a field is read from. Shapes taken from
 //! Qwen3.8-27B, which is the checkpoint that made the nesting matter.
 
-use tuili_model::Config;
+use infero_model::Config;
 
 /// The shape of a multimodal config: an outer object naming the wrapper and
 /// carrying the vision tower, with the text model's dimensions inside.
@@ -110,7 +110,7 @@ fn tied_embeddings_falls_back_to_the_inner_object() {
     assert!(Config::from_hf(&j, "m").unwrap().tied_embeddings);
 }
 
-/// A flat config — every model tuili loaded before this one — must keep
+/// A flat config — every model infero loaded before this one — must keep
 /// parsing from the top level.
 #[test]
 fn a_flat_config_still_reads_from_the_top_level() {
@@ -148,7 +148,7 @@ fn the_attention_width_is_the_head_product_not_d_model() {
     assert_ne!(cfg.d_attn(), cfg.d_model, "the point of the test");
 }
 
-/// And where the two widths do coincide — every model tuili loaded before this
+/// And where the two widths do coincide — every model infero loaded before this
 /// one — `d_attn` must agree with `d_model` rather than drifting.
 #[test]
 fn the_two_widths_still_agree_on_a_conventional_model() {
@@ -282,7 +282,7 @@ fn partial_rotary_factor_is_read_from_either_location() {
 }
 
 /// No factor anywhere means the whole head rotates. This is the regression
-/// guard for every model tuili already runs: `rotary_dim` has to default to
+/// guard for every model infero already runs: `rotary_dim` has to default to
 /// `d_head` exactly, in both config shapes and in the GGUF path.
 #[test]
 fn the_rotary_width_defaults_to_the_whole_head() {

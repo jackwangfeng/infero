@@ -10,8 +10,8 @@ mod common;
 
 use anyhow::Result;
 use common::*;
-use tuili_kernels::fp8::{ACT_QUANT_GROUP, FP8_BLOCK, fp8_bytes};
-use tuili_safetensors::{Dtype, Tensor};
+use infero_kernels::fp8::{ACT_QUANT_GROUP, FP8_BLOCK, fp8_bytes};
+use infero_safetensors::{Dtype, Tensor};
 
 // Two 128-row scale blocks by four 128-column scale blocks, and two k-tiles
 // of `mma_e4m3_block`'s own `K_TILE = 256` — enough for the scale-grid
@@ -45,7 +45,7 @@ fn pseudo_random_f32(n: usize, seed: u64, scale: f32) -> Vec<f32> {
 }
 
 fn packed(quants: &[u8], scales: &[f32], k: usize, n: usize) -> Vec<u8> {
-    let mut v = tuili_kernels::fp8::repack_rows(quants, k, n).expect("repack");
+    let mut v = infero_kernels::fp8::repack_rows(quants, k, n).expect("repack");
     for s in scales {
         v.extend_from_slice(&s.to_le_bytes());
     }

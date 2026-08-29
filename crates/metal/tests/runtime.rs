@@ -10,7 +10,7 @@
 //! place.
 
 use anyhow::Result;
-use tuili_metal::{Device, LaunchConfig};
+use infero_metal::{Device, LaunchConfig};
 
 /// `add_f32` from `crates/kernels/src/cu/ops.cu`, transliterated.
 ///
@@ -69,7 +69,7 @@ fn a_device_opens_and_reports_itself() -> Result<()> {
     assert_eq!(caps.simd_width, 32, "the ported reductions assume 32 lanes");
 
     // Nothing hand-written for tensor cores, FP8 or TMA exists on this backend,
-    // and the dispatch in `tuili-model` reads exactly these to route around it.
+    // and the dispatch in `infero-model` reads exactly these to route around it.
     assert!(!caps.int_tensor_gemm);
     assert!(!caps.fp8);
     assert!(!caps.tma);
@@ -98,7 +98,7 @@ fn a_dispatch_adds_two_vectors() -> Result<()> {
     let db = s.memcpy_stod(&b)?;
     let mut dout = s.alloc_zeros::<f32>(n)?;
 
-    let f = dev.kernels().get("tuili_ops", OPS, "add_f32")?;
+    let f = dev.kernels().get("infero_ops", OPS, "add_f32")?;
     let n_i = n as i32;
     let mut lb = s.launch_builder(&f);
     lb.arg(&dout.as_view_mut())
@@ -129,7 +129,7 @@ fn a_view_offset_binds_the_window_the_host_asked_for() -> Result<()> {
     let (lo, hi) = (256usize, 768usize);
 
     let mut buf = s.alloc_zeros::<f32>(n)?;
-    let f = dev.kernels().get("tuili_ops", OPS, "fill_iota_f32")?;
+    let f = dev.kernels().get("infero_ops", OPS, "fill_iota_f32")?;
     let len_i = (hi - lo) as i32;
     {
         let win = buf.slice_mut(lo..hi);
@@ -157,7 +157,7 @@ fn a_missing_kernel_names_itself() -> Result<()> {
     let dev = Device::new(0)?;
     let err = dev
         .kernels()
-        .get("tuili_ops", OPS, "no_such_kernel")
+        .get("infero_ops", OPS, "no_such_kernel")
         .unwrap_err()
         .to_string();
     assert!(err.contains("no_such_kernel"), "unhelpful error: {err}");
@@ -178,7 +178,7 @@ fn a_compile_error_surfaces_rather_than_aborting() -> Result<()> {
 
 #[test]
 fn a_module_recompiles_when_its_source_changes() -> Result<()> {
-    // The NVRTC cache is keyed on source because `TUILI_FP8_STRIP` prepends
+    // The NVRTC cache is keyed on source because `INFERO_FP8_STRIP` prepends
     // defines that change what the kernel does; a stripped build must never be
     // served from a cache entry built from the serving source. Same rule here.
     let dev = Device::new(0)?;

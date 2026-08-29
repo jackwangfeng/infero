@@ -2435,7 +2435,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
-name = "tuili-cuda"
+name = "infero-cuda"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2448,7 +2448,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tuili-gguf"
+name = "infero-gguf"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2459,15 +2459,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "tuili-gpu"
+name = "infero-gpu"
 version = "0.1.0"
 dependencies = [
- "tuili-cuda",
- "tuili-metal",
+ "infero-cuda",
+ "infero-metal",
 ]
 
 [[package]]
-name = "tuili-kernels"
+name = "infero-kernels"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2476,15 +2476,15 @@ dependencies = [
  "rand 0.9.5",
  "tracing",
  "tracing-subscriber",
- "tuili-cuda",
- "tuili-gguf",
- "tuili-gpu",
- "tuili-model",
- "tuili-safetensors",
+ "infero-cuda",
+ "infero-gguf",
+ "infero-gpu",
+ "infero-model",
+ "infero-safetensors",
 ]
 
 [[package]]
-name = "tuili-metal"
+name = "infero-metal"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2499,13 +2499,13 @@ dependencies = [
  "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",
- "tuili-gguf",
- "tuili-kernels",
- "tuili-tokenizer",
+ "infero-gguf",
+ "infero-kernels",
+ "infero-tokenizer",
 ]
 
 [[package]]
-name = "tuili-model"
+name = "infero-model"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2516,16 +2516,16 @@ dependencies = [
  "serde_json",
  "tracing",
  "tracing-subscriber",
- "tuili-cuda",
- "tuili-gguf",
- "tuili-gpu",
- "tuili-kernels",
- "tuili-safetensors",
- "tuili-tokenizer",
+ "infero-cuda",
+ "infero-gguf",
+ "infero-gpu",
+ "infero-kernels",
+ "infero-safetensors",
+ "infero-tokenizer",
 ]
 
 [[package]]
-name = "tuili-safetensors"
+name = "infero-safetensors"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2536,7 +2536,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tuili-server"
+name = "infero-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2555,14 +2555,14 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
- "tuili-gguf",
- "tuili-gpu",
- "tuili-model",
- "tuili-tokenizer",
+ "infero-gguf",
+ "infero-gpu",
+ "infero-model",
+ "infero-tokenizer",
 ]
 
 [[package]]
-name = "tuili-tokenizer"
+name = "infero-tokenizer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2573,12 +2573,12 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
- "tuili-gguf",
+ "infero-gguf",
  "unicode-normalization",
 ]
 
 [[package]]
-name = "tuili-tui"
+name = "infero-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",

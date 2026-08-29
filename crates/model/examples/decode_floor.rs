@@ -14,15 +14,15 @@
 //! Takes either a GGUF file or an AWQ checkpoint directory, so the two
 //! formats can be compared on the one number that decides a decode step.
 //!
-//!     cargo run --release -p tuili-model --example decode_floor -- model.gguf
-//!     cargo run --release -p tuili-model --example decode_floor -- llama8b-awq/
+//!     cargo run --release -p infero-model --example decode_floor -- model.gguf
+//!     cargo run --release -p infero-model --example decode_floor -- llama8b-awq/
 
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use tuili_cuda::Device;
-use tuili_gguf::Gguf;
-use tuili_kernels::{Kernels, WeightType};
+use infero_cuda::Device;
+use infero_gguf::Gguf;
+use infero_kernels::{Kernels, WeightType};
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("warn").init();
@@ -45,7 +45,7 @@ fn main() -> Result<()> {
     if std::path::Path::new(&path).is_dir() {
         // AWQ: repacked into Q4_G128 the way the loader would, so what this
         // measures is the format as the engine would actually read it.
-        let w = tuili_safetensors::Shards::open_dir(&path)?;
+        let w = infero_safetensors::Shards::open_dir(&path)?;
         let n_layers = (0..)
             .take_while(|i| w.contains(&format!("model.layers.{i}.self_attn.q_proj.qweight")))
             .count();
@@ -64,7 +64,7 @@ fn main() -> Result<()> {
                 let p = format!("model.layers.{l}.{name}");
                 let qw = w.tensor(&format!("{p}.qweight"))?;
                 let (k, n) = (qw.shape[0], qw.shape[1] * 8);
-                let packed = tuili_kernels::awq::AwqTensor {
+                let packed = infero_kernels::awq::AwqTensor {
                     qweight: qw.as_i32()?,
                     qzeros: w.tensor(&format!("{p}.qzeros"))?.as_i32()?,
                     scales: w.tensor(&format!("{p}.scales"))?.as_f16()?,
@@ -83,14 +83,14 @@ fn main() -> Result<()> {
         // AWQ leaves the vocab projection in f16 — 1.05 GB, a fifth of the
         // step, at 141 GB/s through the float mat-vec. Quantizing it at load
         // halves the bytes and moves it onto the integer path. Set
-        // `TUILI_F16_HEAD=1` to measure it as the checkpoint ships it.
+        // `INFERO_F16_HEAD=1` to measure it as the checkpoint ships it.
         let head = w.tensor("lm_head.weight")?;
-        let raw = std::env::var_os("TUILI_F16_HEAD").is_some();
+        let raw = std::env::var_os("INFERO_F16_HEAD").is_some();
         let (hw, hty) = if raw {
             (head.data.to_vec(), WeightType::F16)
         } else {
             (
-                tuili_kernels::awq::quantize_f16_to_q8_0(head.as_f16()?, head.shape[1])?,
+                infero_kernels::awq::quantize_f16_to_q8_0(head.as_f16()?, head.shape[1])?,
                 WeightType::Q8_0,
             )
         };
@@ -187,7 +187,7 @@ fn main() -> Result<()> {
     }
     dev.synchronize()?;
 
-    let graphed = std::env::var_os("TUILI_NO_GRAPH").is_none();
+    let graphed = std::env::var_os("INFERO_NO_GRAPH").is_none();
     let graph = if graphed {
         stream.begin_capture(
             cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
@@ -213,7 +213,7 @@ fn main() -> Result<()> {
     let head_bytes = mats.last().map_or(0, |m| m.w.len());
     let layer_bytes = bytes - head_bytes;
 
-    let reps: usize = std::env::var("TUILI_FLOOR_REPS")
+    let reps: usize = std::env::var("INFERO_FLOOR_REPS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);

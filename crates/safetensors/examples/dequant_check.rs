@@ -7,11 +7,11 @@
 //! actual tensor, print values a reference implementation can be asked about
 //! independently, and print the block boundary where a stride error would show.
 //!
-//!   cargo run --release -p tuili-safetensors --example dequant_check -- \
+//!   cargo run --release -p infero-safetensors --example dequant_check -- \
 //!     <model-dir> <tensor-name>
 
 use anyhow::{Context, Result, bail};
-use tuili_safetensors::Shards;
+use infero_safetensors::Shards;
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);

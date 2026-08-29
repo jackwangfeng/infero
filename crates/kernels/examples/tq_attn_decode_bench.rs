@@ -1,7 +1,7 @@
 //! `tq_attn_decode_f32` in isolation, for `ncu` to profile without a live
 //! server's CUDA-graph-captured decode step in the way.
 //!
-//!     cargo run --release -p tuili-kernels --example tq_attn_decode_bench
+//!     cargo run --release -p infero-kernels --example tq_attn_decode_bench
 //!
 //! Shapes match the 27B: 24 query heads, 4 KV heads (group 6), 256-wide
 //! heads. Data is pseudo-random, not real TurboQuant codes — this measures
@@ -10,8 +10,8 @@
 
 use anyhow::Result;
 use half::f16;
-use tuili_cuda::Device;
-use tuili_kernels::{AttnDims, BatchLayout, Kernels};
+use infero_cuda::Device;
+use infero_kernels::{AttnDims, BatchLayout, Kernels};
 
 const N_HEADS: usize = 24;
 const N_KV_HEADS: usize = 4;
@@ -111,8 +111,8 @@ fn main() -> Result<()> {
         table_stride: KV_LEN,
     };
 
-    // Warm-up, then a timed loop — `dev.profile()` needs `TUILI_PROFILE`/
-    // `TUILI_METAL_PROFILE`-style opt-in on this backend too, so this just
+    // Warm-up, then a timed loop — `dev.profile()` needs `INFERO_PROFILE`/
+    // `INFERO_METAL_PROFILE`-style opt-in on this backend too, so this just
     // brackets with a host clock and a synchronize instead.
     for _ in 0..3 {
         k.tq_attn_decode(

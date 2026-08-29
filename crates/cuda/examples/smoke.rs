@@ -1,13 +1,13 @@
 //! End-to-end check that the GPU path works: NVRTC compiles, a kernel runs on
 //! half precision data, and cuBLAS is callable.
 //!
-//!     cargo run -p tuili-cuda --example smoke
+//!     cargo run -p infero-cuda --example smoke
 
 use anyhow::Result;
 use cudarc::cublas::{Gemm, GemmConfig};
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use half::f16;
-use tuili_cuda::Device;
+use infero_cuda::Device;
 
 const SRC: &str = r#"
 #include <cuda_fp16.h>

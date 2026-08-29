@@ -39,7 +39,7 @@ pub fn softplus(x: f32) -> f32 {
 /// Depthwise causal convolution over time, one weight row per channel.
 ///
 /// `x` is `[t_len, channels]` row-major — token-major, which is how activations
-/// already sit in tuili. The reference transposes to `[channels, t_len]` and
+/// already sit in infero. The reference transposes to `[channels, t_len]` and
 /// calls `F.conv1d` with `padding = k - 1` then truncates to the first `t_len`
 /// outputs; that combination is exactly a causal window, so this reads the
 /// window directly and skips the transpose.

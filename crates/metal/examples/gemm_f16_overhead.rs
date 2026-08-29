@@ -23,10 +23,10 @@
 //! specifically small M, and N was never undersized to begin with at 17408.
 //! `w_gate_up`-style fusion is not the fix for Q4_K.
 //!
-//!     cargo run --release -p tuili-metal --example gemm_f16_overhead
+//!     cargo run --release -p infero-metal --example gemm_f16_overhead
 
 use anyhow::Result;
-use tuili_metal::Device;
+use infero_metal::Device;
 
 fn ms(mut f: impl FnMut() -> Result<()>, iters: usize) -> Result<f64> {
     f()?;
@@ -69,7 +69,7 @@ fn main() -> Result<()> {
         let mut c = s.alloc_zeros::<f32>(n_tokens * n)?;
         let t = ms(
             || {
-                tuili_metal::backend::gemm_f16_to_f32(&dev, &mut c.as_view_mut(), &a.as_view(), &b.as_view(), n_tokens, k, n)?;
+                infero_metal::backend::gemm_f16_to_f32(&dev, &mut c.as_view_mut(), &a.as_view(), &b.as_view(), n_tokens, k, n)?;
                 s.synchronize()
             },
             20,

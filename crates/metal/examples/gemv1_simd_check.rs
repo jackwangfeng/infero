@@ -9,10 +9,10 @@
 //! never needing to combine results across more than one row is the leading
 //! suspect (see the doc comment on `gemv1_simd_q4_K` in quant.metal).
 //!
-//!     cargo run --release -p tuili-metal --example gemv1_simd_check
+//!     cargo run --release -p infero-metal --example gemv1_simd_check
 
 use anyhow::Result;
-use tuili_metal::{Device, LaunchConfig};
+use infero_metal::{Device, LaunchConfig};
 
 const COMMON: &str = include_str!("../../kernels/src/msl/common.metal");
 const QUANT: &str = include_str!("../../kernels/src/msl/quant.metal");

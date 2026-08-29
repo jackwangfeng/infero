@@ -9,13 +9,13 @@
 //! within a tile -- faster past eight tokens. This checks both: the wide
 //! kernel's output against the deployed one's, bit-for-bit tolerance aside,
 //! and the wall time each takes at token counts spanning the gap between
-//! `TUILI_MMA_MIN` (8) and `GEMM_THRESHOLD_DEFAULT` (48) where prefill
+//! `INFERO_MMA_MIN` (8) and `GEMM_THRESHOLD_DEFAULT` (48) where prefill
 //! currently lives.
 //!
-//!     cargo run --release -p tuili-metal --example gemv_mma_wide_check
+//!     cargo run --release -p infero-metal --example gemv_mma_wide_check
 
 use anyhow::Result;
-use tuili_metal::{Device, LaunchConfig};
+use infero_metal::{Device, LaunchConfig};
 
 const COMMON: &str = include_str!("../../kernels/src/msl/common.metal");
 const QUANT: &str = include_str!("../../kernels/src/msl/quant.metal");

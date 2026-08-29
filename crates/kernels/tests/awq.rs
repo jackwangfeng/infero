@@ -11,11 +11,11 @@
 //! not at all. That is a test the format can fail.
 
 use anyhow::Result;
-use tuili_kernels::awq::{AwqTensor, unpack_row};
-use tuili_safetensors::Shards;
+use infero_kernels::awq::{AwqTensor, unpack_row};
+use infero_safetensors::Shards;
 
 const AWQ: &str = "/mnt/data/vllm-bench/llama8b-awq";
-const GGUF: &str = "/mnt/data/tuili-models/llama-3.1-8b-instruct-q4_k_m.gguf";
+const GGUF: &str = "/mnt/data/infero-models/llama-3.1-8b-instruct-q4_k_m.gguf";
 
 /// Pearson correlation, which is what "the same weights, quantized twice"
 /// should show and a column permutation should not.
@@ -40,7 +40,7 @@ fn awq_repacking_agrees_with_the_same_model_in_gguf() -> Result<()> {
         return Ok(());
     }
     let w = Shards::open_dir(AWQ)?;
-    let gguf = tuili_gguf::Gguf::open(GGUF)?;
+    let gguf = infero_gguf::Gguf::open(GGUF)?;
     // Enough output channels to correlate over, without dequantizing 4096 rows
     // of a reference implementation written for clarity rather than speed.
     const ROWS: usize = 512;
@@ -121,13 +121,13 @@ fn awq_repacking_agrees_with_the_same_model_in_gguf() -> Result<()> {
 /// each with a 6-bit scale and 6-bit minimum packed into twelve bytes and
 /// scaled by two f16 factors.
 fn dequantize_gguf_rows(
-    gguf: &tuili_gguf::Gguf,
-    info: &tuili_gguf::TensorInfo,
+    gguf: &infero_gguf::Gguf,
+    info: &infero_gguf::TensorInfo,
     k: usize,
     rows: usize,
 ) -> Result<Vec<f32>> {
     anyhow::ensure!(
-        info.ty == tuili_gguf::GgmlType::Q4K,
+        info.ty == infero_gguf::GgmlType::Q4K,
         "{} is {}, this reference only does Q4_K",
         info.name,
         info.ty

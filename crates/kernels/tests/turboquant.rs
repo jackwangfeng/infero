@@ -9,8 +9,8 @@ mod common;
 
 use anyhow::Result;
 use half::f16;
-use tuili_kernels::turboquant::{Codebook, DEFAULT_SEED, DeviceTables, KvQuant, Tables};
-use tuili_kernels::{AttnDims, BatchLayout, Kernels};
+use infero_kernels::turboquant::{Codebook, DEFAULT_SEED, DeviceTables, KvQuant, Tables};
+use infero_kernels::{AttnDims, BatchLayout, Kernels};
 
 use common::*;
 

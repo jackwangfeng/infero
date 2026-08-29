@@ -11,9 +11,9 @@
 //! about selection rather than about randomness.
 
 use anyhow::Result;
-use tuili_gpu::Device;
-use tuili_kernels::Kernels;
-use tuili_model::{Sampler, SamplingParams};
+use infero_gpu::Device;
+use infero_kernels::Kernels;
+use infero_model::{Sampler, SamplingParams};
 
 /// A vocabulary big enough for the bitset to span many words and for the
 /// strided block scan to wrap, without making the test slow.
@@ -410,7 +410,7 @@ fn the_device_survivors_match_the_host_distribution() -> Result<()> {
                 rows,
                 VOCAB,
                 stride,
-                Some(tuili_kernels::Survivors {
+                Some(infero_kernels::Survivors {
                     id: &mut id_v,
                     p: &mut p_v,
                     len: &mut l_v,
@@ -578,7 +578,7 @@ fn the_split_sampler_agrees_with_the_single_block_one() -> Result<()> {
                 rows,
                 VOCAB,
                 stride,
-                Some(tuili_kernels::Survivors {
+                Some(infero_kernels::Survivors {
                     id: &mut i,
                     p: &mut p,
                     len: &mut l,
@@ -616,7 +616,7 @@ fn the_split_sampler_agrees_with_the_single_block_one() -> Result<()> {
                 VOCAB,
                 stride,
                 params.top_k,
-                Some(tuili_kernels::Survivors {
+                Some(infero_kernels::Survivors {
                     id: &mut i,
                     p: &mut p,
                     len: &mut l,

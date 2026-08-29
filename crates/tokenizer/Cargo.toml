@@ -1,12 +1,12 @@
 [package]
-name = "tuili-tokenizer"
+name = "infero-tokenizer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-tuili-gguf.workspace = true
+infero-gguf.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 fancy-regex = "0.14"

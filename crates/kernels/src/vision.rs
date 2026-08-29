@@ -38,7 +38,7 @@
 //! is load-bearing rather than cosmetic.
 
 use anyhow::{Context, Result};
-use tuili_gpu::{Buf, View, ViewMut, LaunchConfig, KernelArg};
+use infero_gpu::{Buf, View, ViewMut, LaunchConfig, KernelArg};
 use half::f16;
 
 use crate::{ELEMENTWISE_BLOCK, Kernels, REDUCE_BLOCK, vision_src};
@@ -53,7 +53,7 @@ const VISION_ATTN_THREADS: u32 = 256;
 const VISION_ATTN_BK: usize = 32;
 
 /// The vision tower's shape. A local copy rather than a re-export of
-/// `tuili_model::qwen35_vision::VisionDims`, because that crate is a
+/// `infero_model::qwen35_vision::VisionDims`, because that crate is a
 /// dev-dependency of this one (for the tests) and not a dependency of the
 /// library.
 #[derive(Clone, Copy, Debug)]
@@ -138,7 +138,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_vision", vision_src(), "vision_layer_norm_f32")?;
+            .get("infero_vision", vision_src(), "vision_layer_norm_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (rows as u32, 1, 1),
             block_dim: (REDUCE_BLOCK, 1, 1),
@@ -182,7 +182,7 @@ impl Kernels {
         } else {
             "vision_gelu_tanh_f32"
         };
-        let f = self.dev.kernels().get("tuili_vision", vision_src(), name)?;
+        let f = self.dev.kernels().get("infero_vision", vision_src(), name)?;
         let cfg = LaunchConfig {
             grid_dim: ((n as u32).div_ceil(ELEMENTWISE_BLOCK).max(1), 1, 1),
             block_dim: (ELEMENTWISE_BLOCK, 1, 1),
@@ -226,7 +226,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_vision", vision_src(), "vision_rope_tables_f32")?;
+            .get("infero_vision", vision_src(), "vision_rope_tables_f32")?;
         let total = (n * rope_dim) as u32;
         let cfg = LaunchConfig {
             grid_dim: (total.div_ceil(ELEMENTWISE_BLOCK).max(1), 1, 1),
@@ -282,7 +282,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_vision", vision_src(), "vision_qkv_rope_f32")?;
+            .get("infero_vision", vision_src(), "vision_qkv_rope_f32")?;
         let total = (n * heads * head_dim / 2) as u32;
         let cfg = LaunchConfig {
             grid_dim: (total.div_ceil(ELEMENTWISE_BLOCK).max(1), 1, 1),
@@ -338,7 +338,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_vision", vision_src(), "vision_attn_f32")?;
+            .get("infero_vision", vision_src(), "vision_attn_f32")?;
         // Two key tiles and one query tile, each row padded by one float.
         let shared = (2 * VISION_ATTN_BK + VISION_ATTN_BQ) * (head_dim + 1);
         let cfg = LaunchConfig {
@@ -412,7 +412,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_vision", vision_src(), "vision_patchify_f32")?;
+            .get("infero_vision", vision_src(), "vision_patchify_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (
                 (total as u32).div_ceil(ELEMENTWISE_BLOCK).max(1),
@@ -476,7 +476,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_vision", vision_src(), "vision_add_pos_embed_f32")?;
+            .get("infero_vision", vision_src(), "vision_add_pos_embed_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (n as u32, 1, 1),
             block_dim: (ELEMENTWISE_BLOCK, 1, 1),
@@ -513,7 +513,7 @@ impl Kernels {
         let f = self
             .dev
             .kernels()
-            .get("tuili_vision", vision_src(), "vision_splice_f32")?;
+            .get("infero_vision", vision_src(), "vision_splice_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (n_features as u32, 1, 1),
             block_dim: (ELEMENTWISE_BLOCK, 1, 1),
@@ -579,9 +579,9 @@ pub struct VisionSegments {
 
 impl VisionSegments {
     /// `cu` is the cumulative segment boundary list, `[0, l0, l0+l1, ...]` —
-    /// what `tuili_model::qwen35_vision::cu_seqlens` returns. One segment a
+    /// what `infero_model::qwen35_vision::cu_seqlens` returns. One segment a
     /// frame, not a grid entry: a `t`-frame video is `t` segments.
-    pub fn new(dev: &tuili_gpu::Device, cu: &[usize]) -> Result<Self> {
+    pub fn new(dev: &infero_gpu::Device, cu: &[usize]) -> Result<Self> {
         anyhow::ensure!(
             cu.first() == Some(&0),
             "cu_seqlens must start at 0; got {:?}",
@@ -612,7 +612,7 @@ impl VisionSegments {
 /// Everything about one call's geometry that the device needs: the rotary
 /// tables, the position-embedding taps, and the attention segmentation.
 ///
-/// The host arrays come from `tuili_model::qwen35_vision` — `cu_seqlens`,
+/// The host arrays come from `infero_model::qwen35_vision` — `cu_seqlens`,
 /// `vision_position_ids`, `pos_embed_taps` — rather than being recomputed here.
 /// One copy of the block-order arithmetic, and it is the copy the capture tests
 /// check.
@@ -752,7 +752,7 @@ pub struct VisionScratch {
 }
 
 impl VisionScratch {
-    pub fn new(dev: &tuili_gpu::Device, shape: &VisionShape, max_patches: usize) -> Result<Self> {
+    pub fn new(dev: &infero_gpu::Device, shape: &VisionShape, max_patches: usize) -> Result<Self> {
         anyhow::ensure!(
             max_patches.is_multiple_of(shape.merge_unit()),
             "the merger folds {} patches into a token, so a call's patch count \

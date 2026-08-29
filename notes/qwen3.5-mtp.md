@@ -258,7 +258,7 @@ embedding 那一行天然小——这个 checkpoint 的 embedding 行 RMS 约 0.
 **71.0%**。**截断前缀不是 oracle**——头吃的是最终 hidden，没有捷径。`--prefix-layers`
 只用于冒烟，manifest 会记 `prefix_truncated`，Rust 测试会直接拒绝这样的 capture。
 
-## tuili 的调度设计
+## infero 的调度设计
 
 ### 尺寸与代价
 
@@ -455,5 +455,5 @@ batch，`n` 走的是设备端的 `num_accepted_tokens`。也就是说
 python3 tools/capture_qwen35_mtp.py /home/jeff/models/qwen38-27b-fp8 <out> --tokens 32
 #   全部 64 层，流式一层一层加载，峰值内存是一层而不是六十四层
 #   加 --dump-layer-weights 会多写 1.7 GB，用来把 mtp_head 端到端跑起来
-TUILI_QWEN35_MTP_CAPTURE=<out> cargo test -p tuili-model --test qwen35_mtp
+INFERO_QWEN35_MTP_CAPTURE=<out> cargo test -p infero-model --test qwen35_mtp
 ```

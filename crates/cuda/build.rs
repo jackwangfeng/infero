@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-env-changed=TUILI_CUDA_DIR");
+    println!("cargo:rerun-if-env-changed=INFERO_CUDA_DIR");
 
     let dir = resolve_cuda_dir();
     let lib = dir.join("lib");
@@ -10,7 +10,7 @@ fn main() {
 
     if !lib.is_dir() || !include.is_dir() {
         panic!(
-            "CUDA userspace not found at {}\nrun ./scripts/setup-cuda.sh (or set TUILI_CUDA_DIR)",
+            "CUDA userspace not found at {}\nrun ./scripts/setup-cuda.sh (or set INFERO_CUDA_DIR)",
             dir.display()
         );
     }
@@ -22,12 +22,12 @@ fn main() {
 
     // NVRTC compiles kernels at runtime and needs the CUDA headers on its
     // include path (cuda_fp16.h, cuda_bf16.h, ...).
-    println!("cargo:rustc-env=TUILI_CUDA_INCLUDE={}", include.display());
-    println!("cargo:rustc-env=TUILI_CUDA_LIB={}", lib.display());
+    println!("cargo:rustc-env=INFERO_CUDA_INCLUDE={}", include.display());
+    println!("cargo:rustc-env=INFERO_CUDA_LIB={}", lib.display());
 }
 
 fn resolve_cuda_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("TUILI_CUDA_DIR") {
+    if let Ok(d) = std::env::var("INFERO_CUDA_DIR") {
         return PathBuf::from(d);
     }
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());

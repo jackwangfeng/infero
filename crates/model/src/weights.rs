@@ -13,11 +13,11 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tuili_gpu::{Buf, View};
-use tuili_gpu::PinnedHostSlice;
-use tuili_gpu::Device;
-use tuili_gguf::{GgmlType, Gguf, TensorInfo};
-use tuili_kernels::WeightType;
+use infero_gpu::{Buf, View};
+use infero_gpu::PinnedHostSlice;
+use infero_gpu::Device;
+use infero_gguf::{GgmlType, Gguf, TensorInfo};
+use infero_kernels::WeightType;
 
 use crate::config::Config;
 
@@ -239,7 +239,7 @@ impl LayerBlob {
 /// The softmax-attention half of a block.
 ///
 /// Its own struct because Qwen3.5 has blocks that do not have one: 48 of its 64
-/// layers mix with a recurrence instead. Before that every model tuili loaded
+/// layers mix with a recurrence instead. Before that every model infero loaded
 /// had exactly one kind of block, so these fields sat directly on `Layer` and
 /// the forward pass could reach them unconditionally.
 pub struct AttnWeights {
@@ -256,7 +256,7 @@ pub struct AttnWeights {
     /// the attention biases play the role these replaced.
     pub q_norm: Option<Vector>,
     pub k_norm: Option<Vector>,
-    /// `q`, `k` and `v` stacked along `n`, under `TUILI_FUSE_FFN`. One matmul
+    /// `q`, `k` and `v` stacked along `n`, under `INFERO_FUSE_FFN`. One matmul
     /// and a scatter instead of three; see `stacked` in `load_awq`.
     pub w_qkv: Option<Matrix>,
     /// `k` and `v` stacked along `n`, GGUF-only: `w_qkv` needs `wq` the same
@@ -287,7 +287,7 @@ pub struct GdnWeights {
     /// `[d_model, value_heads]` — the per-head write strength.
     pub in_proj_b: Matrix,
     /// `in_proj_qkv` and `in_proj_z` stacked along the output, when both are
-    /// FP8 over the same `k` and land on a whole [`tuili_kernels::fp8::FP8_BLOCK`]
+    /// FP8 over the same `k` and land on a whole [`infero_kernels::fp8::FP8_BLOCK`]
     /// each — every GQA shape seen so far. One launch instead of two on a pair
     /// that, run separately, are 640 and 384 blocks against 188 SMs: 56% and
     /// 34% achieved occupancy by `ncu`, neither register- nor shared-memory-
@@ -334,7 +334,7 @@ pub struct DenseFfn {
     pub w_gate: Matrix,
     pub w_up: Matrix,
     pub w_down: Matrix,
-    /// `gate` and `up` stacked along `n`, under `TUILI_FUSE_FFN`. One matmul
+    /// `gate` and `up` stacked along `n`, under `INFERO_FUSE_FFN`. One matmul
     /// instead of two; see `stacked` in `load_awq`.
     pub w_gate_up: Option<Matrix>,
 }
@@ -415,7 +415,7 @@ pub struct Weights {
     pub output: Option<Matrix>,
     /// The same matrix in [`WeightType::Q8_0S`], for the batched path.
     ///
-    /// Only the AWQ loader builds it, because only there does tuili choose the
+    /// Only the AWQ loader builds it, because only there does infero choose the
     /// vocab projection's layout. Held *as well as* `output`: the batch-1
     /// mat-vec reads the packed form, and teaching it the split one is a
     /// separate change from proving the split one is faster. 532 MiB on an 8B
@@ -452,7 +452,7 @@ impl Weights {
         // The offloaded path is untouched: a streamed layer is copied into
         // page-locked host memory by `pack_layer`, which is a different question
         // from where the resident ones live.
-        let mapped = tuili_gpu::map_file(dev, f.path())?.map(Arc::new);
+        let mapped = infero_gpu::map_file(dev, f.path())?.map(Arc::new);
         let mapped = mapped.as_ref();
         if mapped.is_some() {
             tracing::info!("checkpoint aliased into device memory; no upload");
@@ -687,7 +687,7 @@ impl Weights {
             output_norm,
             output,
             // A GGUF file's vocab projection comes in whatever the file chose;
-            // the split layout is only for the one tuili quantizes itself.
+            // the split layout is only for the one infero quantizes itself.
             output_split: None,
             rope_freqs,
             device_bytes,
@@ -863,7 +863,7 @@ impl Weights {
 ///
 /// Qwen3.5 stores most of its norm weights as a *delta from one*:
 /// `Qwen3_5RMSNorm` initializes to zeros and computes
-/// `normalized * (1 + weight)`, where every other model tuili loads initializes
+/// `normalized * (1 + weight)`, where every other model infero loads initializes
 /// to ones and computes `weight * normalized`. Adding the one here, at load,
 /// means every norm kernel stays as it is — the alternative was a variant of
 /// `rms_norm` and `qk_norm` each.
@@ -937,7 +937,7 @@ fn norm_offset(arch: &str, name: &str) -> f32 {
 /// vLLM's special case, and keeps working if a future export quantizes it.
 pub fn load_mtp(
     dev: &Device,
-    w: &tuili_safetensors::Shards,
+    w: &infero_safetensors::Shards,
     cfg: &Config,
 ) -> Result<Option<MtpWeights>> {
     let present = w.get("mtp.fc.weight").is_some();
@@ -1020,7 +1020,7 @@ pub fn load_mtp(
         // f16 GEMM and the mat-vec both want: `k` is the contraction dimension
         // and one row of the weight is contiguous.
         let (n, k) = (t.shape[0], t.shape[1]);
-        if t.dtype == tuili_safetensors::Dtype::F8E4M3 {
+        if t.dtype == infero_safetensors::Dtype::F8E4M3 {
             // Kept as FP8, like the text model's projections, and for the same
             // two reasons. This used to dequantize to f16 here — the strategy
             // the text side abandoned — which doubled the head's bytes from
@@ -1034,14 +1034,14 @@ pub fn load_mtp(
                     format!("{name}.weight is FP8, which is meaningless without its block scales")
                 })?;
             let scales = scales_t.to_f32()?;
-            let want = tuili_kernels::fp8::scale_grid(k, n);
+            let want = infero_kernels::fp8::scale_grid(k, n);
             anyhow::ensure!(
                 scales.len() == want,
                 "{name}'s scale grid has {} entries; an [{n}, {k}] matrix wants {want}",
                 scales.len()
             );
-            let mut bytes = Vec::with_capacity(tuili_kernels::fp8::fp8_bytes(k, n));
-            bytes.extend_from_slice(&tuili_kernels::fp8::repack_rows(t.data, k, n)?);
+            let mut bytes = Vec::with_capacity(infero_kernels::fp8::fp8_bytes(k, n));
+            bytes.extend_from_slice(&infero_kernels::fp8::repack_rows(t.data, k, n)?);
             for v in &scales {
                 bytes.extend_from_slice(&v.to_le_bytes());
             }
@@ -1211,11 +1211,11 @@ fn stacked2_gguf(dev: &Device, f: &Gguf, a: &str, b: &str, total: &mut usize) ->
 /// whose output is fed to an argmax over 128k logits.
 pub fn load_awq(
     dev: &Device,
-    w: &tuili_safetensors::Shards,
+    w: &infero_safetensors::Shards,
     cfg: &Config,
     freq_factors: &[f32],
 ) -> Result<Weights> {
-    use tuili_kernels::awq::{AwqTensor, quantize_f16_to_q8_0};
+    use infero_kernels::awq::{AwqTensor, quantize_f16_to_q8_0};
 
     let started = std::time::Instant::now();
     let mut device_bytes = 0usize;
@@ -1284,7 +1284,7 @@ pub fn load_awq(
         // plausible size and wrong meaning.
         if let Some(t) = w.get(&format!("{prefix}.weight")) {
             let (n, k) = (t.shape[0], t.shape[1]);
-            if t.dtype == tuili_safetensors::Dtype::F8E4M3 {
+            if t.dtype == infero_safetensors::Dtype::F8E4M3 {
                 // Keep the FP8 bytes and carry the scale grid with them, rather
                 // than expanding here. Expanding is correct and was the first
                 // version; it doubles what a decode step has to read, and the
@@ -1298,13 +1298,13 @@ pub fn load_awq(
                     .tensor(&format!("{prefix}.weight_scale_inv"))
                     .with_context(|| format!("{prefix} is FP8 but has no scale grid"))?;
                 let scales = scales_t.to_f32()?;
-                let want = tuili_kernels::fp8::scale_grid(k, n);
+                let want = infero_kernels::fp8::scale_grid(k, n);
                 anyhow::ensure!(
                     scales.len() == want,
                     "{prefix}'s scale grid has {} entries; an [{n}, {k}] matrix \
                      at block {} wants {want}",
                     scales.len(),
-                    tuili_kernels::fp8::FP8_BLOCK,
+                    infero_kernels::fp8::FP8_BLOCK,
                 );
                 // Permuted, not copied: every FP8 kernel reads four interleaved
                 // rows as one 16-byte load, which is what took the batched
@@ -1323,12 +1323,12 @@ pub fn load_awq(
                 // threads — 3.6 s measured against this copy's 25.7 s of the
                 // 27B's ~60 s load. Reusing it and only growing it for the
                 // scale tail turns that second full pass into nothing.
-                let mut bytes = tuili_kernels::fp8::repack_rows(t.data, k, n)?;
+                let mut bytes = infero_kernels::fp8::repack_rows(t.data, k, n)?;
                 bytes.reserve_exact(scales.len() * 4);
                 for v in &scales {
                     bytes.extend_from_slice(&v.to_le_bytes());
                 }
-                debug_assert_eq!(bytes.len(), tuili_kernels::fp8::fp8_bytes(k, n));
+                debug_assert_eq!(bytes.len(), infero_kernels::fp8::fp8_bytes(k, n));
                 return Ok((bytes, WeightType::F8E4M3, k, n));
             }
             let halves: Vec<half::f16> = if false {
@@ -1373,15 +1373,15 @@ pub fn load_awq(
         // The transposed layout, which the f16 tensor-core GEMM reads as one
         // aligned 16-byte fragment per lane rather than four four-byte words.
         // Worth 11% on the GEMM at 32 tokens and 5.8% on the decode step, with
-        // the mat-vec level at a batch of one. `TUILI_AWQ_PACKED=1` keeps the
+        // the mat-vec level at a batch of one. `INFERO_AWQ_PACKED=1` keeps the
         // old blocks, which is how the two are A/B-ed; `transposable` rejects a
         // row length whose stride would not land the quants on 16 bytes, and
         // every real projection width passes it.
         static PACKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*PACKED.get_or_init(|| std::env::var_os("TUILI_AWQ_PACKED").is_some())
-            && tuili_kernels::awq::transposable(k)
+        if !*PACKED.get_or_init(|| std::env::var_os("INFERO_AWQ_PACKED").is_some())
+            && infero_kernels::awq::transposable(k)
         {
-            let t = tuili_kernels::awq::transpose_words(&packed, k, n);
+            let t = infero_kernels::awq::transpose_words(&packed, k, n);
             return Ok((t, WeightType::Q4G128T, k, n));
         }
         Ok((packed, WeightType::Q4G128, k, n))
@@ -1400,7 +1400,7 @@ pub fn load_awq(
     // On by default since it was measured end to end rather than on the GEMM
     // alone: a batch-32 step's matmuls fall from 110.5 ms to 96.8 over twenty
     // steps and its launches from 225 to 129, worth 4.4% of the served
-    // throughput on a Blackwell RTX PRO 6000. `TUILI_FUSE_FFN=0` puts the three
+    // throughput on a Blackwell RTX PRO 6000. `INFERO_FUSE_FFN=0` puts the three
     // narrow matmuls back.
     //
     // It costs VRAM: the stacked copies are held *as well as* the originals,
@@ -1415,7 +1415,7 @@ pub fn load_awq(
     // card that cannot spare that would rather have the KV cache. Whatever the
     // decision, it is logged — a throughput number that moved by 4% because the
     // loader quietly declined is the kind of thing that costs a day.
-    let fuse_ffn = match std::env::var("TUILI_FUSE_FFN").as_deref() {
+    let fuse_ffn = match std::env::var("INFERO_FUSE_FFN").as_deref() {
         Ok("0") => false,
         Ok(_) => true,
         Err(_) => {
@@ -1458,7 +1458,7 @@ pub fn load_awq(
         if ty_a != WeightType::Q4G128T || ty_b != ty_a || k_b != k {
             return Ok(None);
         }
-        let c = tuili_kernels::awq::concat_t(&ba, n_a, &bb, n_b, k);
+        let c = infero_kernels::awq::concat_t(&ba, n_a, &bb, n_b, k);
         Ok(Some(upload(&c, ty_a, k, n_a + n_b, total)?))
     };
     let stacked3 = |a: &str, b: &str, cc: &str, total: &mut usize| -> Result<Option<Matrix>> {
@@ -1477,20 +1477,20 @@ pub fn load_awq(
         // divisor of `FP8_BLOCK`), but a checkpoint that does not still gets
         // a correct, merely unfused, load rather than a wrong one.
         if ty == WeightType::F8E4M3 {
-            if !n_a.is_multiple_of(tuili_kernels::fp8::FP8_BLOCK)
-                || !n_b.is_multiple_of(tuili_kernels::fp8::FP8_BLOCK)
-                || !n_c.is_multiple_of(tuili_kernels::fp8::FP8_BLOCK)
+            if !n_a.is_multiple_of(infero_kernels::fp8::FP8_BLOCK)
+                || !n_b.is_multiple_of(infero_kernels::fp8::FP8_BLOCK)
+                || !n_c.is_multiple_of(infero_kernels::fp8::FP8_BLOCK)
             {
                 return Ok(None);
             }
-            let abc = tuili_kernels::fp8::concat3(&ba, n_a, &bb, n_b, &bc, n_c, k);
+            let abc = infero_kernels::fp8::concat3(&ba, n_a, &bb, n_b, &bc, n_c, k);
             return Ok(Some(upload(&abc, ty, k, n_a + n_b + n_c, total)?));
         }
         if ty != WeightType::Q4G128T {
             return Ok(None);
         }
-        let ab = tuili_kernels::awq::concat_t(&ba, n_a, &bb, n_b, k);
-        let abc = tuili_kernels::awq::concat_t(&ab, n_a + n_b, &bc, n_c, k);
+        let ab = infero_kernels::awq::concat_t(&ba, n_a, &bb, n_b, k);
+        let abc = infero_kernels::awq::concat_t(&ab, n_a + n_b, &bc, n_c, k);
         Ok(Some(upload(&abc, ty, k, n_a + n_b + n_c, total)?))
     };
     // Two FP8 matrices over the same `k`, stacked the way `stacked3` stacks
@@ -1507,12 +1507,12 @@ pub fn load_awq(
         if ty != WeightType::F8E4M3
             || ty_b != ty
             || k_b != k
-            || !n_a.is_multiple_of(tuili_kernels::fp8::FP8_BLOCK)
-            || !n_b.is_multiple_of(tuili_kernels::fp8::FP8_BLOCK)
+            || !n_a.is_multiple_of(infero_kernels::fp8::FP8_BLOCK)
+            || !n_b.is_multiple_of(infero_kernels::fp8::FP8_BLOCK)
         {
             return Ok(None);
         }
-        let ab = tuili_kernels::fp8::concat2(&ba, n_a, &bb, n_b, k);
+        let ab = infero_kernels::fp8::concat2(&ba, n_a, &bb, n_b, k);
         Ok(Some(upload(&ab, ty, k, n_a + n_b, total)?))
     };
 
@@ -1587,7 +1587,7 @@ pub fn load_awq(
     } else {
         let h = w.tensor("lm_head.weight")?;
         let (n, k) = (h.shape[0], h.shape[1]);
-        // `TUILI_LM_HEAD=f16` keeps the matrix as it came, which prices the Q8_0
+        // `INFERO_LM_HEAD=f16` keeps the matrix as it came, which prices the Q8_0
         // path against twice the bytes. On a card with a small L2 the quantized
         // path reads 558 MB at 90 GB/s, and the question is whether that is the
         // bytes or the layout: a Q8_0 block is 34 bytes, so its quants are only
@@ -1601,7 +1601,7 @@ pub fn load_awq(
         // `to_f16` returns a borrow for them and its BF16 branch was never
         // exercised by a model known to produce sane output. Log the first few
         // converted values so they can be checked against the file directly.
-        if std::env::var_os("TUILI_LM_HEAD_PROBE").is_some() {
+        if std::env::var_os("INFERO_LM_HEAD_PROBE").is_some() {
             let head: Vec<f32> = halves.iter().take(8).map(|x| f32::from(*x)).collect();
             tracing::info!(
                 dtype = ?h.dtype,
@@ -1610,7 +1610,7 @@ pub fn load_awq(
                 "lm_head probe: first 8 converted values"
             );
         }
-        if std::env::var("TUILI_LM_HEAD").as_deref() == Ok("f16") {
+        if std::env::var("INFERO_LM_HEAD").as_deref() == Ok("f16") {
             tracing::info!(mib = (halves.len() * 2) >> 20, "vocab projection kept f16");
             // Safety: f16 is a transparent u16, so the halves are already the
             // little-endian byte layout the device wants; the view does not
@@ -1630,8 +1630,8 @@ pub fn load_awq(
         }
     };
     // And the split layout for the batched path, when there is room for both.
-    // `TUILI_LM_HEAD=packed` keeps only the packed one, which is the A/B.
-    let output_split = match (&output, std::env::var("TUILI_LM_HEAD").as_deref()) {
+    // `INFERO_LM_HEAD=packed` keeps only the packed one, which is the A/B.
+    let output_split = match (&output, std::env::var("INFERO_LM_HEAD").as_deref()) {
         (Some(o), Ok("packed")) => {
             let _ = o;
             None
@@ -1642,7 +1642,7 @@ pub fn load_awq(
             let free = dev.mem_info().map(|(f, _)| f).unwrap_or(0);
             let want = n * k * 17 / 16;
             if want * 3 < free {
-                let q = tuili_kernels::awq::quantize_f16_to_q8_0_split(h.to_f16()?.as_ref(), k)
+                let q = infero_kernels::awq::quantize_f16_to_q8_0_split(h.to_f16()?.as_ref(), k)
                     .context("quantizing lm_head, split")?;
                 tracing::info!(mib = q.len() >> 20, "vocab projection also split");
                 Some(upload(&q, WeightType::Q8_0S, k, n, &mut device_bytes)?)
@@ -2078,14 +2078,14 @@ fn to_f32(bytes: &[u8], info: &TensorInfo) -> Result<Vec<f32>> {
 
 /// The vision tower's 333 tensors, owned.
 ///
-/// [`tuili_kernels::vision::VisionWeights`] is all borrowed views, so something
+/// [`infero_kernels::vision::VisionWeights`] is all borrowed views, so something
 /// has to hold the allocations; this is it. Everything is f16 or f32 with no
 /// quantized path, and that is not an omission: the whole tower sits in the
 /// checkpoint's `modules_to_not_convert`, so there are no `weight_scale_inv`
 /// tensors to read and a block-dequantizing branch here would be dead code
 /// pretending to be generality.
 pub struct VisionTower {
-    pub shape: tuili_kernels::vision::VisionShape,
+    pub shape: infero_kernels::vision::VisionShape,
     pub cfg: crate::config::VisionConfig,
     patch_embed_w: Buf<half::f16>,
     patch_embed_b: Vector,
@@ -2117,15 +2117,15 @@ struct VisionBlock {
 
 impl VisionTower {
     /// Borrowed views in the shape the kernels take.
-    pub fn weights(&self) -> tuili_kernels::vision::VisionWeights<'_> {
-        tuili_kernels::vision::VisionWeights {
+    pub fn weights(&self) -> infero_kernels::vision::VisionWeights<'_> {
+        infero_kernels::vision::VisionWeights {
             patch_embed_w: self.patch_embed_w.as_view(),
             patch_embed_b: self.patch_embed_b.as_view(),
             pos_embed: self.pos_embed.as_view(),
             blocks: self
                 .blocks
                 .iter()
-                .map(|b| tuili_kernels::vision::VisionBlockWeights {
+                .map(|b| infero_kernels::vision::VisionBlockWeights {
                     norm1_w: b.norm1_w.as_view(),
                     norm1_b: b.norm1_b.as_view(),
                     norm2_w: b.norm2_w.as_view(),
@@ -2171,7 +2171,7 @@ impl VisionTower {
 /// lists.
 pub fn load_vision(
     dev: &Device,
-    w: &tuili_safetensors::Shards,
+    w: &infero_safetensors::Shards,
     cfg: &Config,
 ) -> Result<Option<VisionTower>> {
     let present = w.get("model.visual.patch_embed.proj.weight").is_some();
@@ -2256,7 +2256,7 @@ pub fn load_vision(
     }
 
     let tower = VisionTower {
-        shape: tuili_kernels::vision::VisionShape {
+        shape: infero_kernels::vision::VisionShape {
             depth: vc.depth,
             hidden: vc.hidden,
             heads: vc.heads,
@@ -2366,7 +2366,7 @@ pub fn load_mtp_gguf(dev: &Device, f: &Gguf, cfg: &Config) -> Result<Option<MtpW
 
     let started = std::time::Instant::now();
     let mut bytes = 0usize;
-    let mapped = tuili_gpu::map_file(dev, f.path())?.map(Arc::new);
+    let mapped = infero_gpu::map_file(dev, f.path())?.map(Arc::new);
     let mapped = mapped.as_ref();
     let layer = Layer {
         attn_norm: upload_vector(dev, f, &t("attn_norm.weight"), &mut bytes)?,

@@ -15,10 +15,10 @@
 //! CPU reference catches a wrong *algorithm*, not the specific rounding this
 //! GPU path already commits to.
 //!
-//!     cargo run --release -p tuili-metal --example attn_decode_fused_check
+//!     cargo run --release -p infero-metal --example attn_decode_fused_check
 
 use anyhow::Result;
-use tuili_metal::{Device, LaunchConfig};
+use infero_metal::{Device, LaunchConfig};
 
 const COMMON: &str = include_str!("../../kernels/src/msl/common.metal");
 const OPS: &str = include_str!("../../kernels/src/msl/ops.metal");

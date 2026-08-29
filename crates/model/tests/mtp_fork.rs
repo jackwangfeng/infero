@@ -12,10 +12,10 @@
 //! only when a fixture happens to be present.
 
 use anyhow::Result;
-use tuili_cuda::Device;
-use tuili_kernels::Kernels;
-use tuili_model::mtp::{HeadDims, MtpHead};
-use tuili_model::weights::{AttnWeights, DenseFfn, Layer, Matrix, MtpWeights};
+use infero_cuda::Device;
+use infero_kernels::Kernels;
+use infero_model::mtp::{HeadDims, MtpHead};
+use infero_model::weights::{AttnWeights, DenseFfn, Layer, Matrix, MtpWeights};
 
 /// Small but not degenerate: more than one kv head so the head expansion is
 /// exercised, and a rotary dimension short of `d_head` the way the 27B's is.
@@ -47,7 +47,7 @@ fn synth(dev: &Device, dims: HeadDims) -> Result<(MtpWeights, Matrix)> {
         let v: Vec<half::f16> = (0..k * n).map(|_| half::f16::from_f32(next() * 0.3)).collect();
         Matrix::upload_f16(dev, &v, k, n)
     };
-    let mut vec1 = |n: usize| -> Result<tuili_model::weights::Vector> {
+    let mut vec1 = |n: usize| -> Result<infero_model::weights::Vector> {
         let v: Vec<f32> = (0..n).map(|_| 1.0 + next() * 0.1).collect();
         Ok(dev.stream().clone_htod(&v)?)
     };

@@ -50,10 +50,10 @@
 //! `crates/model/tests/spec.rs` measures what it would save.
 
 use anyhow::{Context, Result};
-use tuili_gpu::{Buf, View};
-use tuili_gpu::Device;
-use tuili_kernels::Kernels;
-use tuili_kernels::gdn::SeqLayout;
+use infero_gpu::{Buf, View};
+use infero_gpu::Device;
+use infero_kernels::Kernels;
+use infero_kernels::gdn::SeqLayout;
 
 use crate::config::LinearAttnConfig;
 use crate::qwen35_mtp::{Accepted, accept_greedy};
@@ -398,7 +398,7 @@ impl GdnRollback {
         )
     }
 
-    pub fn state_scratch_mut(&mut self) -> tuili_gpu::ViewMut<'_, f32> {
+    pub fn state_scratch_mut(&mut self) -> infero_gpu::ViewMut<'_, f32> {
         self.state_scratch.as_view_mut()
     }
 
@@ -424,13 +424,13 @@ impl GdnRollback {
     pub fn replay_layer(
         &mut self,
         dev: &Device,
-        kern: &tuili_kernels::Kernels,
+        kern: &infero_kernels::Kernels,
         ordinal: usize,
         keep: usize,
         seqs: &SeqLayout<'_>,
         conv_w: &View<'_, f32>,
-        state: &mut tuili_gpu::ViewMut<'_, f32>,
-        conv: &mut tuili_gpu::ViewMut<'_, f32>,
+        state: &mut infero_gpu::ViewMut<'_, f32>,
+        conv: &mut infero_gpu::ViewMut<'_, f32>,
     ) -> Result<()> {
         anyhow::ensure!(keep <= self.rows, "keeping {keep} of {} rows", self.rows);
         let la = self.la;

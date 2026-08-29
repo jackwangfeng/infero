@@ -13,10 +13,10 @@
 //! flight -- wins. `gemv_mma_multisg_q4_K` gives four simdgroups their own
 //! tile each, decoding independent rows with no data sharing between them.
 //!
-//!     cargo run --release -p tuili-metal --example gemv_mma_multisg_check
+//!     cargo run --release -p infero-metal --example gemv_mma_multisg_check
 
 use anyhow::Result;
-use tuili_metal::{Device, LaunchConfig};
+use infero_metal::{Device, LaunchConfig};
 
 const COMMON: &str = include_str!("../../kernels/src/msl/common.metal");
 const QUANT: &str = include_str!("../../kernels/src/msl/quant.metal");

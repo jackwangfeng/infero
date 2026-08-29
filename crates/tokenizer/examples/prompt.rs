@@ -1,10 +1,10 @@
 //! Print the prompt a model's own chat template produces.
 //!
-//!     cargo run -p tuili-tokenizer --example prompt -- <model.gguf> "hello"
+//!     cargo run -p infero-tokenizer --example prompt -- <model.gguf> "hello"
 
 use anyhow::{Context, Result};
-use tuili_gguf::Gguf;
-use tuili_tokenizer::{ChatMessage, Tokenizer};
+use infero_gguf::Gguf;
+use infero_tokenizer::{ChatMessage, Tokenizer};
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);

@@ -6,9 +6,9 @@
 //! bytes, and both against the CPU's reading of the format.
 
 use anyhow::Result;
-use tuili_cuda::Device;
-use tuili_kernels::awq::{AwqTensor, unpack_row};
-use tuili_kernels::{Kernels, WeightType};
+use infero_cuda::Device;
+use infero_kernels::awq::{AwqTensor, unpack_row};
+use infero_kernels::{Kernels, WeightType};
 
 /// A tensor in AWQ's own layout, built from known codes so the expected answer
 /// is arithmetic rather than another implementation of the same thing.
@@ -409,7 +409,7 @@ fn the_lop3_dequant_puts_every_weight_at_the_k_it_claims() -> Result<()> {
     // Row 0's single block. `unpack_row` is the CPU's own reading of the pack,
     // which is what the rest of this file checks the kernels against.
     let want = unpack_row(&packed, k, 0);
-    let dw = stream.clone_htod(&packed[..tuili_kernels::awq::BLOCK_BYTES])?;
+    let dw = stream.clone_htod(&packed[..infero_kernels::awq::BLOCK_BYTES])?;
     let mut out = stream.alloc_zeros::<f32>(128)?;
     kern.deq4_f16_probe(&mut out.as_view_mut(), &dw.as_view())?;
     let got = stream.clone_dtoh(&out)?;
@@ -519,7 +519,7 @@ fn the_f16_gemm_tracks_the_dequantized_weights() -> Result<()> {
 /// one 16-byte chunk. Scales after, one `__half2` per block. Same total bytes
 /// as the 68-byte packed blocks, and every block 64-byte aligned where the
 /// packed ones are not.
-use tuili_kernels::awq::{transpose_words, unpack_row_t};
+use infero_kernels::awq::{transpose_words, unpack_row_t};
 
 /// The transposed layout against the same weights dequantized.
 ///
@@ -555,7 +555,7 @@ fn the_transposed_weight_layout_gives_the_same_answer() -> Result<()> {
         (2048, 512),
         (4096, 2048),
     ] {
-        assert!(tuili_kernels::awq::transposable(k));
+        assert!(infero_kernels::awq::transposable(k));
         let (qweight, qzeros, scales) = synthetic(k, n, 128);
         let packed = AwqTensor {
             qweight: &qweight,

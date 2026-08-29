@@ -76,7 +76,7 @@ inv_freq = 1.0 / (base ** (torch.arange(0, 64, 2).float() / 64))   # 32 个频�
 注意除的是 64 不是 256——这**不是**「256 维频率表的前 64 维」，是压缩到 64 维的另一张表。
 旋转采用 `rotate_half` 的非交错布局（配对是 `(i, i+32)`），维度 `[64, 256)` 原样透传。
 
-q_norm/k_norm 是 `[256]` 的 per-head RMSNorm，在 RoPE 之前——这条 tuili 已经有了。
+q_norm/k_norm 是 `[256]` 的 per-head RMSNorm，在 RoPE 之前——这条 infero 已经有了。
 
 捕获时顺手落下一条不依赖实现的不变量：**把所有位置整体平移一个常数，注意力输出必须逐位不变**
 （`full` 与 `full_far` 的 `attn_out_pre_gate` 完全相同，位置 0..11 对 130000..130011）。
@@ -145,7 +145,7 @@ out = out_proj(o.reshape(T, 6144))
   比 full attention 的 KV 便宜得多，但它不随 token 增长，是固定开销。
 - conv 状态：`[10240, 3]` / 序列 / 层。
 - `mamba_ssm_dtype = float32`：状态必须 f32，不能省成 f16。
-- 状态是就地更新的，这和 tuili 现在的 KV pool（append-only）语义不同；CUDA graph
+- 状态是就地更新的，这和 infero 现在的 KV pool（append-only）语义不同；CUDA graph
   捕获/重放时状态缓冲区必须地址稳定。
 
 ## MTP

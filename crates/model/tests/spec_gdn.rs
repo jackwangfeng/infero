@@ -23,9 +23,9 @@
 
 use anyhow::Result;
 use half::f16;
-use tuili_cuda::Device;
-use tuili_model::weights::{AttnWeights, DenseFfn, GdnWeights, Layer, Matrix, Weights};
-use tuili_model::{BatchItem, Config, KvCacheQuant, KvPool, Model, SeqId};
+use infero_cuda::Device;
+use infero_model::weights::{AttnWeights, DenseFfn, GdnWeights, Layer, Matrix, Weights};
+use infero_model::{BatchItem, Config, KvCacheQuant, KvPool, Model, SeqId};
 
 /// Long enough for a polluted recurrent state to show up in the argmax.
 const STEPS: usize = 24;
@@ -96,7 +96,7 @@ fn synthetic_model(dev: &Device, cfg: &Config) -> Result<Model> {
             .collect();
         Matrix::upload_f16(dev, &v, k, n)
     };
-    let vec_at = |n: usize, centre: f32, spread: f32| -> Result<tuili_model::weights::Vector> {
+    let vec_at = |n: usize, centre: f32, spread: f32| -> Result<infero_model::weights::Vector> {
         let v: Vec<f32> = (0..n).map(|_| centre + spread * rng.next()).collect();
         Ok(dev.stream().clone_htod(&v)?)
     };

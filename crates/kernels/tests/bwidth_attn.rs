@@ -2,7 +2,7 @@
 //!
 //! `scripts/flash_attn_bandwidth.py` times `vllm_flash_attn` at batch 32, 512
 //! of history, 32 query heads over 8 KV heads of 128: **58.1 us a layer, 1156
-//! GB/s of KV**. This runs tuili's path at the same shape so the two are one
+//! GB/s of KV**. This runs infero's path at the same shape so the two are one
 //! command apart, and reports the same denominator — K and V once each, which
 //! is the floor any correct kernel pays.
 //!
@@ -16,23 +16,23 @@
 //! `flash_attn_bandwidth.py` did, and it is why they agreed at 57.7 us against
 //! 58.1 while the engine's own trace showed 67.7 us against 48.8 for the same
 //! two kernels. In a real step each layer's cache is cold — 2.1 GB of them per
-//! model — so the L2-warm number flatters tuili's path and hides the gap.
+//! model — so the L2-warm number flatters infero's path and hides the gap.
 //!
 //! So the caches are cycled: four of them, 268 MB in all, which does not fit,
 //! and each launch reads one that has been evicted since it was last touched.
-//! `TUILI_ATTN_POOLS=1` puts the warm measurement back for comparison.
+//! `INFERO_ATTN_POOLS=1` puts the warm measurement back for comparison.
 
 use anyhow::Result;
 use std::time::Instant;
-use tuili_cuda::Device;
-use tuili_kernels::{AttnDims, BatchLayout, Kernels};
+use infero_cuda::Device;
+use infero_kernels::{AttnDims, BatchLayout, Kernels};
 
 const BATCH: usize = 32;
 /// The engine's own median, read off the grid dimensions of 31k traced
-/// launches, is 384 rather than the 512 this file first used; `TUILI_ATTN_HIST`
+/// launches, is 384 rather than the 512 this file first used; `INFERO_ATTN_HIST`
 /// sweeps it, because a kernel that wins at one history can lose at another.
 fn history() -> usize {
-    std::env::var("TUILI_ATTN_HIST")
+    std::env::var("INFERO_ATTN_HIST")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(512)
@@ -67,12 +67,12 @@ fn decode_attention_at_the_vllm_shape() -> Result<()> {
         n_tokens: BATCH,
     };
     // How a sequence's history is laid out in the pool. vLLM pages its cache
-    // sixteen tokens at a time, so consecutive keys are a 4 KB run; tuili hands
+    // sixteen tokens at a time, so consecutive keys are a 4 KB run; infero hands
     // out one slot per token, and what the pool has left when a sequence needs
     // one is whatever the sequences that finished before it gave back. The two
     // ends of that are worth measuring separately, because a 256-byte row is
     // the smallest thing DRAM likes and a run of them is not the same request.
-    let page: usize = std::env::var("TUILI_ATTN_PAGE")
+    let page: usize = std::env::var("INFERO_ATTN_PAGE")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
@@ -88,7 +88,7 @@ fn decode_attention_at_the_vllm_shape() -> Result<()> {
     let seq_of: Vec<i32> = (0..BATCH as i32).collect();
     let positions: Vec<i32> = vec![hist as i32 - 1; BATCH];
 
-    let pools: usize = std::env::var("TUILI_ATTN_POOLS")
+    let pools: usize = std::env::var("INFERO_ATTN_POOLS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4);

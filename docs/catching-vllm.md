@@ -34,7 +34,7 @@ to find — the 1.23 ms the trace below reports was node-level tracing overhead,
 and that entry stands corrected.
 
 Both engines were re-measured at the end, on the same box, minutes apart:
-tuili 4599 / 4603 / 4593 / 4604 / 4594, vLLM 5387 / 5477 / 5391. Take the
+infero 4599 / 4603 / 4593 / 4604 / 4594, vLLM 5387 / 5477 / 5391. Take the
 *plateau*, not the first run: throughput climbs over the first two or three
 benches — 4518, 4545, 4599 — because a decode graph is captured per
 `(tokens, kv bucket)` pair and a cold cache pays for the captures.
@@ -50,7 +50,7 @@ The previous edition of this file pointed at two targets and both were
 artifacts of how they were measured. Before trusting any number here, know
 which of these it is:
 
-* **`TUILI_PROFILE` puts a CUDA event pair around every launch and serializes
+* **`INFERO_PROFILE` puts a CUDA event pair around every launch and serializes
   the stream.** A one-thread, one-store kernel measures **3.44 us** under it.
   So every small kernel in that profile carries about 3.4 us that a graphed step
   does not pay, and the *shares* it reports are right while its microseconds,
@@ -66,7 +66,7 @@ which of these it is:
   kernel takes 29.6 us inside its own engine.
 
 * **Both engines ramp. Compare plateau to plateau, and say how many runs
-  each took.** tuili climbs over two or three benches because a decode graph is
+  each took.** infero climbs over two or three benches because a decode graph is
   captured per `(tokens, kv bucket)`; vLLM climbs too, and further — six
   distinct-prompt runs back to back read 5320, 5387, 5369, 5420, 5458, 5472. A
   three-run measurement of it landed at 5248, and comparing this engine's
@@ -83,7 +83,7 @@ which of these it is:
   `cargo` was not on the `PATH` of a non-interactive shell, and the filter ate
   the message. Two A/B runs then measured a binary from before the change and
   agreed to three digits — which is what a null result looks like, and was the
-  only reason I checked the timestamp. Compare `ls -l target/release/tuili`
+  only reason I checked the timestamp. Compare `ls -l target/release/infero`
   against the source mtime before believing a remote number.
 
 The measurement that settles arguments is `nsys` on both engines under the same
@@ -96,7 +96,7 @@ graph tracing (the same server steps at 7.71 ms without `nsys` and 8.72 with).
 Both engines, `~/bench.py` at 32 clients, 512 tokens a request, traced with
 `nsys profile -t cuda --cuda-graph-trace=node` and summarized per decode step:
 
-| per step | tuili | vLLM |
+| per step | infero | vLLM |
 |---|---:|---:|
 | layer GEMMs | 3.617 ms | 3.290 ms |
 | attention | ~1.50 | 1.065 |
@@ -113,7 +113,7 @@ in that order. There is no single thing to fix.
 Against the machine rather than against vLLM: a step reads 4.24 GB of weights
 and about 1.7 GB of KV. The measured ceiling for the weight read is **1440
 GB/s** (`attn_kv_probe`, and `bwidth.rs`'s 16-byte probe agrees once L2 is
-discounted). tuili's GEMMs run at 955 GB/s of weights, vLLM's Marlin at 1063.
+discounted). infero's GEMMs run at 955 GB/s of weights, vLLM's Marlin at 1063.
 **Both engines are two thirds of the way to the memory wall**, which is where
 the remaining 1.5 ms a step is, and neither is close to taking it.
 
@@ -136,7 +136,7 @@ output byte-identical:
 | `f32_to_f16` and `add_assign` four elements a thread | ~0.16 ms a step |
 
 The fused projections are now the default (`weights.rs`), enabled whenever the
-stacked copies fit in a third of free VRAM; `TUILI_FUSE_FFN=0` restores the
+stacked copies fit in a third of free VRAM; `INFERO_FUSE_FFN=0` restores the
 three narrow matmuls. They cost 2 GiB on an 8B model because the originals are
 kept for the batch-1 mat-vec. Dropping them means teaching the mat-vec to read a
 column range of a stacked matrix, whose scales live past all of its quants —
@@ -162,7 +162,7 @@ contiguous and the tile load becomes one `uint4`:
 | the phase, served | 6.17 -> 3.53 ms | 0.728 -> 0.489 ms |
 | throughput | 956 -> 1059 (+11%) | 4529 -> 4697 (+3.7%) |
 
-Both A/Bs are one binary against `TUILI_LM_HEAD=packed`, which still selects the
+Both A/Bs are one binary against `INFERO_LM_HEAD=packed`, which still selects the
 old form. The A4000 pays four times more for the same mistake because its L2 is
 4 MB against 128, which is the general shape of this: **the small card exposes
 layout, the big card hides it.** Two of the three landed wins this session were
@@ -175,7 +175,7 @@ the way `Q4G128T`'s is skipped.
 
 Worth noting what the *other* engine spends here: vLLM keeps `lm_head` in f16
 and reads 1.05 GB a step against this path's 532 MiB. The vocab projection is a
-phase tuili wins on bytes and was losing on layout, and the remaining 1186 vs
+phase infero wins on bytes and was losing on layout, and the remaining 1186 vs
 1265 GB/s against `q4_g128t` is the last of it. Going further would mean a
 4-bit head, which trades quality for a number — not the same kind of win.
 
@@ -263,7 +263,7 @@ was worth re-running. It still loses, by 7%: 4533 tok/s against 4890.
 The reason is the one the old note missed. 376 is `sm_count * 2` exactly, so the
 striped grid is two full waves. 448 is two full waves plus a third that is 38%
 occupied, and a ragged tail wave costs more than the memset it saves. Which is
-also why `TUILI_MMQ_BPS` sweeps to 2 and nothing else: the constant is not about
+also why `INFERO_MMQ_BPS` sweeps to 2 and nothing else: the constant is not about
 occupancy in the abstract, it is about the grid dividing the device.
 
 Removing the memset therefore needs ordered accumulation — Marlin's per-tile
@@ -292,7 +292,7 @@ chain — and refuse the lock path unless `iters >= k_tiles`, which bounds a row
 group to two contributors. Correct at every shape, no hang, and 3.3% slower:
 4848 tok/s against 5012.
 
-The locks were not what cost it. The same binary with `TUILI_MMQ_LOCKS=0` — the
+The locks were not what cost it. The same binary with `INFERO_MMQ_LOCKS=0` — the
 reordering kept, the memset back — measures 4862, so the two-pass run is worth
 **-3% on its own**, against the 2.2% the memsets cost. `MMQ_Y_LOADW` carries a
 k-tile of weights across row-group iterations and a second pass restarts that
@@ -321,7 +321,7 @@ memset timestamps rather than over `nsys`'s summary:
 So the graph is doing its job and there is no scheduling win to find. The
 corollary matters more: the whole difference to vLLM is *kernel time*, which is
 also why the memset costs what it does — 0.12 ms a step of bytes, not of
-launches. `TUILI_MMQ_NO_ZERO=1` prices the pair: removing 130 nodes and their
+launches. `INFERO_MMQ_NO_ZERO=1` prices the pair: removing 130 nodes and their
 bytes is worth 0.109 ms, of which the bytes are 0.098, so a graph node costs
 about **0.08 us** here, not 1.3.
 
@@ -366,7 +366,7 @@ transpose is on top of the padding.
 
 Attention reads 1.15 ms a step of f16 KV, so a 4-bit cache would cut about
 0.85 ms — 13% of the step, which would put this engine past vLLM's f16 number.
-tuili has the option (`--kv-quant tq4`), and it measures **2540 tok/s against
+infero has the option (`--kv-quant tq4`), and it measures **2540 tok/s against
 5012**. The output is fine; the kernel is not. Quantized KV takes a different
 decode path, and that path has had none of the work `attn_decode_gqa_f32` has
 had, so it gives back twice what the bytes save.
@@ -405,7 +405,7 @@ where three sessions of attention work have been aimed.
 Also retired, in the same measurement session: **the KV page size**. The
 hypothesis was that one-token slots make a gather where vLLM's sixteen-token
 blocks make a 4 KB run, and that `attn_kv_probe`'s 46.6 us therefore measures
-this engine's layout rather than the card. Swept with `TUILI_ATTN_PAGE` at
+this engine's layout rather than the card. Swept with `INFERO_ATTN_PAGE` at
 batch 32 and history 512: probe 46.7 / 46.6 / 46.6 / 46.6 / 46.6 / 46.6 for
 pages of 1 / 8 / 16 / 32 / 64 / 512, and the kernel 59.0 / 58.0 / 58.0 / 58.3 /
 58.5 / 58.2. Flat. A key is 256 bytes — already the granularity DRAM wants — and
@@ -454,10 +454,10 @@ shared prompt, both engines, back to back:
 
 | | same prompt | distinct prompts |
 |---|---:|---:|
-| tuili | 4691 | 4691 |
+| infero | 4691 | 4691 |
 | vLLM | 5398 | 5248 (-2.8%) |
 
-So the sharing is worth 2.8% to vLLM and nothing to tuili, and the gap on the
+So the sharing is worth 2.8% to vLLM and nothing to infero, and the gap on the
 fairer load is **1.12x**. The reason the effect is small is that concurrent
 sequences do not dedupe mid-flight: a block is looked up when a *new* request
 prefills, not while thirty-two sequences are already running. Worth knowing
@@ -480,7 +480,7 @@ every idea about it before the idea is tried.
 
 `attn_decode_mma_f32`, the tensor-core version, is *worth 7% on an A4000 and
 costs 7.4% here* (4342/4361 tok/s against 4697, layers 6.56 ms against 6.06). It
-stays opt-in behind `TUILI_ATTN_MMA=1`, now for two reasons rather than one — it
+stays opt-in behind `INFERO_ATTN_MMA=1`, now for two reasons rather than one — it
 also breaks batch invariance, since P is f16 for the tensor core. Which way the
 arithmetic trade goes evidently depends on the card, so the entry that priced
 `m16n8k16` at 3% was pricing it on the wrong machine.
@@ -513,7 +513,7 @@ the sites listed above; do not re-run them.
   kernels. It is *insensitive to the split count* — 256 blocks of 128 threads
   already saturate — so the missing 23% is not parallelism. It is that both
   paths interleave arithmetic with their loads and the probe does not.
-* **Porting more of Marlin.** tuili's GEMM is faster than `marlin_gemm` on five
+* **Porting more of Marlin.** infero's GEMM is faster than `marlin_gemm` on five
   of the six shapes a layer uses *in a warm-L2 microbenchmark*; in the engine,
   cold, it is 10% slower than Marlin overall. The microbenchmark ranking is not
   the engine's.
@@ -526,14 +526,14 @@ the sites listed above; do not re-run them.
   striped partition's blocks-per-SM constant was swept from 2 to 48 and the
   fitted 4 is still best. The vocab projection's warp count was swept and 8 is
   still best.
-* **CUDA graph instantiation.** `TUILI_GRAPH_MODE` prices it: `autofree` 8.46 ms
+* **CUDA graph instantiation.** `INFERO_GRAPH_MODE` prices it: `autofree` 8.46 ms
   a step, `plain` plus an explicit `upload()` 8.60, and
   `INSTANTIATE_FLAG_UPLOAD` is rejected by the driver. Dropping the graph costs
   0.8 ms a step, so it is paying; the 721 us gap that prompted the experiment is
   mostly the node-level tracing that measured it.
 * **`mmq`'s batch scaling.** Understood, not fixed; the four candidate fixes
   ruled out by measurement are unchanged from the last edition.
-* **Compressing the KV cache.** It is a third of a step's traffic and tuili
+* **Compressing the KV cache.** It is a third of a step's traffic and infero
   has TurboQuant built in, so `--kv-quant tq8` looked like half a millisecond
   for free. It measures **2300 tok/s against 4392**: the rotation and the decode
   cost far more than the bandwidth saves. Not a lever, at any precision.
@@ -541,7 +541,7 @@ the sites listed above; do not re-run them.
   straddle row-group boundaries, and a straddling run has to `atomicAdd` into an
   output that therefore has to be zeroed first — 128 memsets and 170 MB a step,
   none of which appears in a kernel profile. Sizing the grid to the row groups
-  makes every run whole and removes both. It loses 15% (`TUILI_MMQ_ALIGNED=1`
+  makes every run whole and removes both. It loses 15% (`INFERO_MMQ_ALIGNED=1`
   re-runs it): `gate_up` goes from 752 blocks to 224, and the block count is
   worth more than the atomics and the memset together.
 * **Q8_1 activations in the new pipeline** (`mmqe_*`, already in the tree) are
@@ -549,9 +549,9 @@ the sites listed above; do not re-run them.
   tokens — 16 KB against 8.7 of weights — and 1.125 bytes an element instead of
   2 does not pay for the ten instructions an int8 A-fragment costs. Sixteen
   warps, which halves the same traffic by covering twice the rows, is level.
-* **The KV cache's page size.** vLLM pages sixteen tokens at a time and tuili
+* **The KV cache's page size.** vLLM pages sixteen tokens at a time and infero
   hands out one slot per token, which looked like it would matter for a
-  256-byte row. `TUILI_ATTN_PAGE` prices it: 1-token and 16-token pages are
+  256-byte row. `INFERO_ATTN_PAGE` prices it: 1-token and 16-token pages are
   within noise of each other at every history. Only a fully contiguous history
   helps, and only the fused kernel, and only at short histories.
 
@@ -650,7 +650,7 @@ not close the gap; the first one does, and it is the hard one.
 * **The vocab projection, 0.34 ms.** 717 us to read 532 MiB is 780 GB/s, and
   the reason is in the comment on `mmq_load_w_q8_0`: a Q8_0 block is 34 bytes,
   so its quants are only ever halfword-aligned and the kernel reads them **two
-  bytes at a time** — the exact defect that cost `attn_output` 2.4x. tuili
+  bytes at a time** — the exact defect that cost `attn_output` 2.4x. infero
   quantizes this matrix itself at load, so the layout is ours to choose: split
   the quants from the scales the way `Q4_G128T` does and the loads widen to
   sixteen bytes. It needs a weight type, a repack, a `mmq_load_w_q8_0s`, and an
@@ -665,9 +665,9 @@ not close the gap; the first one does, and it is the hard one.
   them. Sixteen MMA instructions a tile against about two hundred and thirty.
   A 4-of-16 row utilization wastes three quarters of the tensor core, which
   `mmqnm_*` established is free anyway.
-* **The step's own idle, ~0.4 ms.** tuili's GPU is idle 5.6% of a served step
+* **The step's own idle, ~0.4 ms.** infero's GPU is idle 5.6% of a served step
   against vLLM's 1.7%. vLLM prepares step *n+1* while the GPU runs step *n*;
-  tuili synchronizes on the sampled tokens every step.
+  infero synchronizes on the sampled tokens every step.
 * **Sampling, 0.08 ms.** 176 us to read 16 MB of logits is 94 GB/s.
 
 ## What the arithmetic says about catching up
@@ -893,7 +893,7 @@ at 2.9, and eleven separate isolations do not say why.
 
 ## Running it
 
-Remote box, GPU 3. tuili lives in `~/tuili`, the load generator is `~/bench.py`,
+Remote box, GPU 3. infero lives in `~/infero`, the load generator is `~/bench.py`,
 vLLM starts with `~/run_vllm3.sh` on port 8232. `nsys` is at
 `/usr/local/cuda/bin/nsys`; `ncu` is there too and refuses to run without
 `ERR_NVGPUCTRPERM` cleared, so every kernel-level finding here comes from
@@ -901,9 +901,9 @@ timing, not counters.
 
 Three traps, all of which cost measurement rounds:
 
-* **`TUILI_PROFILE` disables CUDA graph capture**, because per-kernel events
+* **`INFERO_PROFILE` disables CUDA graph capture**, because per-kernel events
   cannot coexist with it. A throughput number measured under it is ~40% low.
-  Use `TUILI_STEP_TIMING` for host-side step timing and `TUILI_PROFILE` only
+  Use `INFERO_STEP_TIMING` for host-side step timing and `INFERO_PROFILE` only
   for per-kernel shares — and subtract 3.4 us a launch before believing one.
 * **The end-to-end harness is noisy to about ±5%.** `batch_bench` is worse: it
   could not resolve the 4.4% the fused projections are worth. Anything below

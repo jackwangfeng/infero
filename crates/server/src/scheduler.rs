@@ -19,8 +19,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
-use tuili_model::{BatchItem, KvPool, Model, Sampler, SeqId, VisionFeatures};
-use tuili_tokenizer::Tokenizer;
+use infero_model::{BatchItem, KvPool, Model, Sampler, SeqId, VisionFeatures};
+use infero_tokenizer::Tokenizer;
 
 use crate::engine::{Event, FinishReason, PendingImage, Request};
 use crate::stop::split_at_stop;
@@ -73,7 +73,7 @@ struct Running {
     /// prefill's own hidden states — and `None` again after any step that did
     /// not go through the speculative path, since a plain decode step leaves the
     /// drafter's cache a token behind.
-    spec_feed: Option<tuili_model::spec::DraftFeed>,
+    spec_feed: Option<infero_model::spec::DraftFeed>,
     /// Set once the drafter's cache has fallen behind this sequence and cannot
     /// be caught up. Latched, so the explanation is logged once rather than per
     /// step, and so the check that follows it stays cheap.
@@ -127,7 +127,7 @@ pub struct Scheduler {
     t_step: f64,
     t_gap: f64,
     /// How many tokens a speculative round drafts. Zero when off, and this is
-    /// the round-to-round value under `TUILI_ADAPTIVE_SPEC` -- see
+    /// the round-to-round value under `INFERO_ADAPTIVE_SPEC` -- see
     /// `spec_k_max` for the ceiling `enable_speculation` actually provisioned.
     spec_k: usize,
     /// What `enable_speculation` sized the GDN rollback journal for.
@@ -135,8 +135,8 @@ pub struct Scheduler {
     /// without a reallocation; going higher would need one, which is why
     /// this is a ceiling rather than something adaptive mode also moves.
     spec_k_max: usize,
-    /// On when `TUILI_ADAPTIVE_SPEC` asks for it. Off leaves `spec_k` at
-    /// whatever `TUILI_SPEC_K` set, which is the behaviour every measurement
+    /// On when `INFERO_ADAPTIVE_SPEC` asks for it. Off leaves `spec_k` at
+    /// whatever `INFERO_SPEC_K` set, which is the behaviour every measurement
     /// in this file's history was taken against.
     adaptive_spec: bool,
     /// Exponential moving average of a round's emitted tokens (`1..=k+1`),
@@ -183,12 +183,12 @@ impl Scheduler {
             waiting: VecDeque::new(),
             running: Vec::new(),
             steps: 0,
-            // A separate switch from `TUILI_PROFILE`: that one turns on
+            // A separate switch from `INFERO_PROFILE`: that one turns on
             // per-kernel CUDA events, which cannot coexist with graph capture,
             // so it can only ever report an ungraphed step. This one is pure
             // host-side wall clock and leaves the graphs alone.
-            profile: std::env::var_os("TUILI_PROFILE").is_some()
-                || std::env::var_os("TUILI_STEP_TIMING").is_some(),
+            profile: std::env::var_os("INFERO_PROFILE").is_some()
+                || std::env::var_os("INFERO_STEP_TIMING").is_some(),
             t_issue: 0.0,
             t_sample: 0.0,
             t_advance: 0.0,
@@ -196,12 +196,12 @@ impl Scheduler {
             t_gap: 0.0,
             last_end: None,
             window: 0,
-            // Speculation is off unless a head is installed and `TUILI_SPEC_K`
+            // Speculation is off unless a head is installed and `INFERO_SPEC_K`
             // asks for it. Zero means off, which is also what a checkpoint
             // without an MTP head leaves it at.
             spec_k: 0,
             spec_k_max: 0,
-            adaptive_spec: std::env::var_os("TUILI_ADAPTIVE_SPEC").is_some(),
+            adaptive_spec: std::env::var_os("INFERO_ADAPTIVE_SPEC").is_some(),
             spec_ema_accept: None,
             spec_k_cooldown: 0,
             spec_steps: 0,
@@ -300,8 +300,8 @@ impl Scheduler {
         &self.pool
     }
 
-    /// Where a step's wall time went, under `TUILI_PROFILE` or
-    /// `TUILI_STEP_TIMING`.
+    /// Where a step's wall time went, under `INFERO_PROFILE` or
+    /// `INFERO_STEP_TIMING`.
     ///
     /// The GPU profile answers "which kernel", which stops being the question
     /// once the server is slower than the model. It is not, any more: at a
@@ -414,7 +414,7 @@ impl Scheduler {
             cached = self.model.mtp_head().map(|h| h.cached()),
             "speculative round"
         );
-        // A round's three parts, timed separately under `TUILI_STEP_TIMING`.
+        // A round's three parts, timed separately under `INFERO_STEP_TIMING`.
         // The whole is measurable end to end and the verification pass is
         // measurable on its own, so what this adds is the *difference* — the
         // drafting and the bookkeeping — which at k=3 was 9.7 ms of a 50.8 ms
@@ -445,7 +445,7 @@ impl Scheduler {
         self.running[idx].spec_rounds += 1;
         self.running[idx].spec_emitted += outcome.tokens.len() as u64;
 
-        // `TUILI_ADAPTIVE_SPEC`: fold this round's yield into the running
+        // `INFERO_ADAPTIVE_SPEC`: fold this round's yield into the running
         // average and let it move `spec_k` toward whatever the average says a
         // draft this deep is worth — up to `spec_k_max`, never past it, since
         // that is what `enable_speculation` sized the GDN rollback journal
@@ -623,12 +623,12 @@ impl Scheduler {
             .iter()
             .map(|i| self.running[*i].sampler.next_draw())
             .collect();
-        let specs: Vec<tuili_model::RowSample> = rows
+        let specs: Vec<infero_model::RowSample> = rows
             .iter()
             .zip(&draws)
             .map(|(i, d)| {
                 let p = self.running[*i].sampler.params();
-                tuili_model::RowSample {
+                infero_model::RowSample {
                     temperature: p.temperature,
                     top_p: p.top_p,
                     top_k: p.top_k as u32,
@@ -715,7 +715,7 @@ impl Scheduler {
                         pending
                     });
                 }
-                self.running[*idx].spec_feed = Some(tuili_model::spec::DraftFeed {
+                self.running[*idx].spec_feed = Some(infero_model::spec::DraftFeed {
                     rows: 0..len,
                     positions: (from..from + len).collect(),
                     shifted,
@@ -832,7 +832,7 @@ impl Scheduler {
             .model
             .vision_resize(img.height, img.width, self.vision_max_patches)
             .context("sizing the image for the vision tower")?;
-        let frame = tuili_model::qwen35_vision_image::prepare_frame(
+        let frame = infero_model::qwen35_vision_image::prepare_frame(
             &img.rgb, img.height, img.width, 3, th, tw, shape.patch, shape.merge,
         );
         let feats = self
@@ -1338,18 +1338,18 @@ pub fn make_pool(model: &Model, max_seqs: usize, slots: Option<usize>) -> Result
 
 /// The MTP sidecar beside a GGUF model, if there is one.
 ///
-/// `TUILI_MTP` names it outright. Otherwise this looks in the model's own
+/// `INFERO_MTP` names it outright. Otherwise this looks in the model's own
 /// directory for a single `mtp*.gguf`, which is what llama.cpp's conversion
 /// produces and what the ggml-org repacks ship. Two of them is ambiguous rather
 /// than a reason to guess, so it takes neither and speculation stays off — a
 /// user with two heads should say which.
 fn mtp_sidecar(model: &str) -> Option<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("TUILI_MTP") {
+    if let Ok(p) = std::env::var("INFERO_MTP") {
         let p = std::path::PathBuf::from(p);
         if p.is_file() {
             return Some(p);
         }
-        tracing::warn!(path = %p.display(), "TUILI_MTP does not name a file");
+        tracing::warn!(path = %p.display(), "INFERO_MTP does not name a file");
         return None;
     }
     let path = std::path::Path::new(model);
@@ -1375,7 +1375,7 @@ fn mtp_sidecar(model: &str) -> Option<std::path::PathBuf> {
         n => {
             tracing::warn!(
                 count = n,
-                "several mtp*.gguf beside the model; name one with TUILI_MTP"
+                "several mtp*.gguf beside the model; name one with INFERO_MTP"
             );
             None
         }

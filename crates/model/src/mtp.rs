@@ -43,10 +43,10 @@
 //! drafter's cache length after `n` rows is what a one-behind cache would be.
 
 use anyhow::{Context, Result};
-use tuili_gpu::{Buf, View, ViewMut};
+use infero_gpu::{Buf, View, ViewMut};
 use half::f16;
-use tuili_gpu::Device;
-use tuili_kernels::{AttnDims, BatchLayout, Kernels, WeightType};
+use infero_gpu::Device;
+use infero_kernels::{AttnDims, BatchLayout, Kernels, WeightType};
 
 use crate::weights::{Matrix, MtpWeights};
 
@@ -1137,7 +1137,7 @@ impl MtpHead {
                 n,
                 stride,
                 top_k,
-                Some(tuili_kernels::Survivors {
+                Some(infero_kernels::Survivors {
                     id: &mut id_v,
                     p: &mut p_v,
                     len: &mut len_v,
@@ -1315,7 +1315,7 @@ impl crate::Model {
         dir: impl AsRef<std::path::Path>,
         max_draft_rows: usize,
     ) -> anyhow::Result<bool> {
-        let shards = tuili_safetensors::Shards::open_dir(dir.as_ref())?;
+        let shards = infero_safetensors::Shards::open_dir(dir.as_ref())?;
         let Some(w) = crate::weights::load_mtp(&self.dev, &shards, &self.cfg)? else {
             return Ok(false);
         };
@@ -1350,7 +1350,7 @@ impl crate::Model {
         path: impl AsRef<std::path::Path>,
         max_draft_rows: usize,
     ) -> anyhow::Result<bool> {
-        let f = tuili_gguf::Gguf::open(path.as_ref())?;
+        let f = infero_gguf::Gguf::open(path.as_ref())?;
         let Some(w) = crate::weights::load_mtp_gguf(&self.dev, &f, &self.cfg)? else {
             return Ok(false);
         };
@@ -1720,7 +1720,7 @@ fn matmul(
     // checkpoint. Same two paths `Model::matmul_pre` takes and for the same
     // reasons: at one token a mat-vec is the right kernel shape, and at a few
     // tokens reading each weight once beats expanding the matrix.
-    if w.ty == tuili_kernels::WeightType::F8E4M3 {
+    if w.ty == infero_kernels::WeightType::F8E4M3 {
         // Tensor cores whenever they will take the shape, which is every token
         // count up to eight and any `k` that is a multiple of the scale block.
         // The table is on the same branch in `Model::matmul_pre`.

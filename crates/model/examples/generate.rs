@@ -1,6 +1,6 @@
 //! Generate text from a GGUF model on the GPU.
 //!
-//!     cargo run --release -p tuili-model --example generate -- \
+//!     cargo run --release -p infero-model --example generate -- \
 //!         models/qwen2.5-0.5b-instruct-q8_0.gguf "Explain RoPE in one sentence."
 //!
 //! Options: `--raw` skips the chat template, `--greedy` fixes the sampler,
@@ -10,10 +10,10 @@ use std::io::Write;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use tuili_cuda::Device;
-use tuili_gguf::Gguf;
-use tuili_model::{KvCacheQuant, Model, Sampler, SamplingParams};
-use tuili_tokenizer::{ChatMessage, Tokenizer};
+use infero_cuda::Device;
+use infero_gguf::Gguf;
+use infero_model::{KvCacheQuant, Model, Sampler, SamplingParams};
+use infero_tokenizer::{ChatMessage, Tokenizer};
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()

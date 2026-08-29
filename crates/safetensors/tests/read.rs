@@ -6,7 +6,7 @@
 //! payload lands inside its shard.
 
 use anyhow::Result;
-use tuili_safetensors::{Dtype, Shards};
+use infero_safetensors::{Dtype, Shards};
 
 const DIR: &str = "/mnt/data/vllm-bench/llama8b-awq";
 

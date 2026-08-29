@@ -26,11 +26,11 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use tuili_model::mtp::{HeadDims, MtpHead};
-use tuili_model::spec::DraftFeed;
-use tuili_model::weights::{AttnWeights, DenseFfn, Layer, Matrix, MtpWeights};
-use tuili_model::{BatchItem, KvCacheQuant, KvPool, Model, SeqId};
-use tuili_tokenizer::Tokenizer;
+use infero_model::mtp::{HeadDims, MtpHead};
+use infero_model::spec::DraftFeed;
+use infero_model::weights::{AttnWeights, DenseFfn, Layer, Matrix, MtpWeights};
+use infero_model::{BatchItem, KvCacheQuant, KvPool, Model, SeqId};
+use infero_tokenizer::Tokenizer;
 
 const PROMPT: &str = "The capital of France is Paris, and the capital of Japan is";
 
@@ -51,10 +51,10 @@ fn load(name: &str, max_logit_rows: usize) -> Result<Option<(Model, Tokenizer)>>
     let Some(path) = gguf_path(name) else {
         return Ok(None);
     };
-    let gguf = tuili_gguf::Gguf::open(&path)?;
+    let gguf = infero_gguf::Gguf::open(&path)?;
     let tok = Tokenizer::from_gguf(&gguf)?;
     let model = Model::load_full(
-        tuili_cuda::Device::new(0)?,
+        infero_cuda::Device::new(0)?,
         &gguf,
         512,
         KvCacheQuant::F16,
@@ -436,8 +436,8 @@ fn the_mtp_head_drives_the_loop_without_changing_the_output() -> Result<()> {
 /// is to exercise the plumbing, not to survive an overflow. The values are
 /// deterministic so a failure is reproducible.
 fn synthetic_head_branched(
-    dev: &tuili_cuda::Device,
-    cfg: &tuili_model::Config,
+    dev: &infero_cuda::Device,
+    cfg: &infero_model::Config,
     max_rows: usize,
     max_seq: usize,
     branches: usize,
@@ -453,7 +453,7 @@ fn synthetic_head_branched(
         let v: Vec<half::f16> = (0..k * n).map(|_| half::f16::from_f32(next())).collect();
         Matrix::upload_f16(dev, &v, k, n)
     };
-    let vec1 = |n: usize| -> Result<tuili_model::weights::Vector> {
+    let vec1 = |n: usize| -> Result<infero_model::weights::Vector> {
         let v: Vec<f32> = (0..n).map(|_| 1.0 + next()).collect();
         Ok(dev.stream().clone_htod(&v)?)
     };
@@ -496,8 +496,8 @@ fn synthetic_head_branched(
 
 /// The same, one branch, which is what the linear draft wants.
 fn synthetic_head(
-    dev: &tuili_cuda::Device,
-    cfg: &tuili_model::Config,
+    dev: &infero_cuda::Device,
+    cfg: &infero_model::Config,
     max_rows: usize,
     max_seq: usize,
 ) -> Result<MtpHead> {
@@ -690,7 +690,7 @@ fn a_tree_of_width_one_drafts_what_the_linear_path_drafts() -> Result<()> {
     let pending = prime(&mut model, &mut pool, seq, &prompt)?;
     let feed = DraftFeed::after_prefill(&prompt, pending);
 
-    let sp = tuili_model::SamplingParams {
+    let sp = infero_model::SamplingParams {
         temperature: 0.8,
         top_p: 0.95,
         top_k: 32,
@@ -698,11 +698,11 @@ fn a_tree_of_width_one_drafts_what_the_linear_path_drafts() -> Result<()> {
         ..Default::default()
     };
     let linear = {
-        let mut s = tuili_model::Sampler::new(sp.clone());
+        let mut s = infero_model::Sampler::new(sp.clone());
         model.draft_with_head_sampled(K, &feed, &mut s, &prompt)?
     };
     let tree = {
-        let mut s = tuili_model::Sampler::new(sp.clone());
+        let mut s = infero_model::Sampler::new(sp.clone());
         model.draft_tree(&[1; K], &feed, &mut s, &prompt)?
     };
 
@@ -774,7 +774,7 @@ fn a_two_wide_tree_is_well_formed() -> Result<()> {
     let seq = pool.alloc().unwrap();
     let pending = prime(&mut model, &mut pool, seq, &prompt)?;
     let feed = DraftFeed::after_prefill(&prompt, pending);
-    let mut s = tuili_model::Sampler::new(tuili_model::SamplingParams {
+    let mut s = infero_model::Sampler::new(infero_model::SamplingParams {
         temperature: 0.9,
         top_p: 0.95,
         top_k: 32,

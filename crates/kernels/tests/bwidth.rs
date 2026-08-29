@@ -2,14 +2,14 @@
 //!
 //! # Against Marlin itself
 //!
-//! Every variant in this file has been measured against tuili's other variants,
+//! Every variant in this file has been measured against infero's other variants,
 //! which cannot say whether the kernel is near its ceiling or far from it. So
 //! vLLM's `marlin_gemm` was timed directly, on the same Blackwell RTX PRO 6000,
 //! at these shapes and 32 tokens, with the flags the deployed server uses
 //! (`should_use_atomic_add_reduce` returns false unless
 //! `VLLM_MARLIN_USE_ATOMIC_ADD` is set, and it is not). Microseconds:
 //!
-//! | shape                    | tuili `mmqy1w8s2` | Marlin |
+//! | shape                    | infero `mmqy1w8s2` | Marlin |
 //! |--------------------------|-------------------|--------|
 //! | `attn_k`   4096 x 1024   |  **8.5**          |  27.6  |
 //! | `attn_q`   4096 x 4096   | **14.7**          |  27.5  |
@@ -38,7 +38,7 @@
 //! free: `mmqnm_*`, which is `mmqf_*` with the MMAs deleted, matches it to the
 //! digit at both widths on Blackwell (20.8 against 20.8 us at 8 tokens, 29.2
 //! against 29.4 at 32), so the old finding survives the kernel getting twice as
-//! fast. And it is not the token-tile count: forcing `TUILI_MMQ_TILES=1` at a
+//! fast. And it is not the token-tile count: forcing `INFERO_MMQ_TILES=1` at a
 //! batch of 32 measured 3128 tok/s against the default's 3635.
 //!
 //! What does grow is the activation traffic. Every block re-reads the
@@ -73,8 +73,8 @@
 
 use anyhow::Result;
 use std::time::Instant;
-use tuili_cuda::Device;
-use tuili_kernels::Kernels;
+use infero_cuda::Device;
+use infero_kernels::Kernels;
 
 #[test]
 fn wide_weight_loads_are_worth_measuring_before_repacking() -> Result<()> {
@@ -128,9 +128,9 @@ fn wide_weight_loads_are_worth_measuring_before_repacking() -> Result<()> {
         }
 
         for tokens in [8usize, 32] {
-            // `TUILI_MMQ_VARIANTS=a,b` swaps the list, which is how a new
+            // `INFERO_MMQ_VARIANTS=a,b` swaps the list, which is how a new
             // shape gets compared against the default without an edit.
-            let names = std::env::var("TUILI_MMQ_VARIANTS")
+            let names = std::env::var("INFERO_MMQ_VARIANTS")
                 .unwrap_or_else(|_| "mmqy1w8s2,mmqy2w8s2".into());
             for variant in names.split(',') {
                 let f16 = variant.starts_with("mmqf") || variant.starts_with("mmqz") || variant.starts_with("mmqy") || variant.starts_with("mmqk") || variant.starts_with("mmqc") || variant.starts_with("mmqn")
@@ -154,7 +154,7 @@ fn wide_weight_loads_are_worth_measuring_before_repacking() -> Result<()> {
                             variant,
                             &mut out.slice_mut(..tokens * n),
                             &w.as_view(),
-                            tuili_kernels::WeightType::Q4G128,
+                            infero_kernels::WeightType::Q4G128,
                             &x.slice(..tokens * Kernels::q8_1_bytes(k)),
                             k,
                             n,
@@ -253,7 +253,7 @@ fn the_vocab_projection_in_both_encodings() -> Result<()> {
                 "mmq",
                 &mut out.as_view_mut(),
                 &w8.as_view(),
-                tuili_kernels::WeightType::Q8_0,
+                infero_kernels::WeightType::Q8_0,
                 &x.as_view(),
                 k,
                 n,
@@ -277,7 +277,7 @@ fn the_vocab_projection_in_both_encodings() -> Result<()> {
                     v,
                     &mut out.as_view_mut(),
                     &ws.as_view(),
-                    tuili_kernels::WeightType::Q8_0S,
+                    infero_kernels::WeightType::Q8_0S,
                     &x.as_view(),
                     k,
                     n,
@@ -333,8 +333,8 @@ fn the_weight_read_against_the_same_bytes_coalesced() -> Result<()> {
     // a launch's bytes possibly resident from four launches ago, and that would
     // make this probe warmer than the kernel it is the ceiling for. The kernel
     // reads 4.24 GB a step and nothing of it is ever resident.
-    // `TUILI_MMQ_PROBE_POOLS` says how many.
-    let pools: usize = std::env::var("TUILI_MMQ_PROBE_POOLS")
+    // `INFERO_MMQ_PROBE_POOLS` says how many.
+    let pools: usize = std::env::var("INFERO_MMQ_PROBE_POOLS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4);
@@ -344,9 +344,9 @@ fn the_weight_read_against_the_same_bytes_coalesced() -> Result<()> {
     let mut sink = stream.alloc_zeros::<f32>(1 << 20)?;
     // The probe runs at full occupancy — eight blocks of eight warps an SM — and
     // the GEMM runs at 2.9 blocks, because its 34 KB activation ring says so.
-    // `TUILI_MMQ_PROBE_BLOCKS` matches the probe to the kernel, which is the
+    // `INFERO_MMQ_PROBE_BLOCKS` matches the probe to the kernel, which is the
     // only remaining candidate for the 23% between them.
-    let blocks = std::env::var("TUILI_MMQ_PROBE_BLOCKS")
+    let blocks = std::env::var("INFERO_MMQ_PROBE_BLOCKS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(dev.sm_count() * 8);
@@ -376,7 +376,7 @@ fn the_weight_read_against_the_same_bytes_coalesced() -> Result<()> {
         let secs = t0.elapsed().as_secs_f64() / 20.0;
         eprintln!(
             "  {:>28}  {:>7.1} us  {:>5.0} GB/s",
-            std::env::var("TUILI_MMQ_PROBE").unwrap_or_else(|_| "as the kernel reads".into()),
+            std::env::var("INFERO_MMQ_PROBE").unwrap_or_else(|_| "as the kernel reads".into()),
             secs * 1e6,
             payload / secs / 1e9
         );
@@ -393,9 +393,9 @@ fn the_weight_read_against_the_same_bytes_coalesced() -> Result<()> {
 /// trace was measuring something else. This asks the kernel directly, at the
 /// shapes and the batch width the engine actually runs.
 ///
-/// Four buffers cycled, so no launch reads a resident matrix. `TUILI_MMQ_BPS`
-/// and `TUILI_MMQ_VARIANT` are read by the kernel launcher, so a sweep is
-/// `for b in 1 2 4 8; do TUILI_MMQ_BPS=$b cargo test ...`.
+/// Four buffers cycled, so no launch reads a resident matrix. `INFERO_MMQ_BPS`
+/// and `INFERO_MMQ_VARIANT` are read by the kernel launcher, so a sweep is
+/// `for b in 1 2 4 8; do INFERO_MMQ_BPS=$b cargo test ...`.
 #[test]
 fn each_projection_at_its_own_shape() -> Result<()> {
     let dev = match Device::new(0) {
@@ -407,9 +407,9 @@ fn each_projection_at_its_own_shape() -> Result<()> {
     };
     let kern = Kernels::new(dev.clone());
     let stream = dev.stream();
-    // `TUILI_MMQ_TOKENS=16` puts the f16 family on one token tile, which halves
+    // `INFERO_MMQ_TOKENS=16` puts the f16 family on one token tile, which halves
     // the activation ring and is the only way the deep weight rings fit at all.
-    let tokens: usize = std::env::var("TUILI_MMQ_TOKENS")
+    let tokens: usize = std::env::var("INFERO_MMQ_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(32);
@@ -435,7 +435,7 @@ fn each_projection_at_its_own_shape() -> Result<()> {
         // group is the one knob that cuts the activation re-reads — they scale
         // with the row-group count and the weights do not — so ask every shape
         // at every row-group width the family instantiates.
-        let chosen = Kernels::mmq_f16_variant_for_shape(tuili_kernels::WeightType::Q4G128T, n)
+        let chosen = Kernels::mmq_f16_variant_for_shape(infero_kernels::WeightType::Q4G128T, n)
             .unwrap_or("mmqy1w8s2");
         // `mmqc*` is the weight ring — weights staged through shared by
         // `cp.async` instead of read into registers — which is the one mechanism

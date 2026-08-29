@@ -13,7 +13,7 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
-use tuili_gguf::Gguf;
+use infero_gguf::Gguf;
 
 use bpe::Bpe;
 use bytelevel::ByteLevel;
@@ -692,7 +692,7 @@ mod tests {
     /// unflagged added token survives encoding decides whether the model is
     /// prompted with the marker it was trained on or with three ordinary pieces.
     fn synthetic_hf_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("tuili-tok-{name}"));
+        let dir = std::env::temp_dir().join(format!("infero-tok-{name}"));
         std::fs::create_dir_all(&dir).unwrap();
         let bl = ByteLevel::new();
         let mut vocab = serde_json::Map::new();

@@ -7,7 +7,7 @@
 //! takes the *same* capture — the head's fifteen weight tensors, the 32 real
 //! tokens' embeddings, and the text model's final hidden state, all of it from
 //! `/home/jeff/models/qwen38-27b-fp8` — uploads the weights as the loader would,
-//! runs [`tuili_model::mtp::MtpHead`] over the real kernels, and compares against
+//! runs [`infero_model::mtp::MtpHead`] over the real kernels, and compares against
 //! the reference's own `output`.
 //!
 //! Every number here is therefore checked against the real 27B weights. What is
@@ -20,7 +20,7 @@
 //!
 //!   python3 tools/capture_qwen35_mtp.py <model-dir> <out> --tokens 32 \
 //!       --dump-layer-weights
-//!   TUILI_QWEN35_MTP_CAPTURE=<out> cargo test -p tuili-model \
+//!   INFERO_QWEN35_MTP_CAPTURE=<out> cargo test -p infero-model \
 //!       --test qwen35_mtp_device
 //!
 //! The two draft tests additionally want the text model's `lm_head` and
@@ -34,10 +34,10 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use half::f16;
-use tuili_cuda::Device;
-use tuili_kernels::Kernels;
-use tuili_model::mtp::{HeadDims, MtpHead};
-use tuili_model::weights::{AttnWeights, DenseFfn, Layer, Matrix, MtpWeights};
+use infero_cuda::Device;
+use infero_kernels::Kernels;
+use infero_model::mtp::{HeadDims, MtpHead};
+use infero_model::weights::{AttnWeights, DenseFfn, Layer, Matrix, MtpWeights};
 
 static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -56,7 +56,7 @@ struct Capture {
 
 impl Capture {
     fn open() -> Option<Self> {
-        let dir = PathBuf::from(std::env::var("TUILI_QWEN35_MTP_CAPTURE").ok()?);
+        let dir = PathBuf::from(std::env::var("INFERO_QWEN35_MTP_CAPTURE").ok()?);
         let manifest: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap())
                 .unwrap();
@@ -181,7 +181,7 @@ fn with_capture(what: &str, body: impl FnOnce(&Capture) -> Result<()>) -> Result
         }
         None => {
             eprintln!(
-                "SKIPPED {what}: set TUILI_QWEN35_MTP_CAPTURE to a directory \
+                "SKIPPED {what}: set INFERO_QWEN35_MTP_CAPTURE to a directory \
                  written by tools/capture_qwen35_mtp.py"
             );
             Ok(())
@@ -223,7 +223,7 @@ fn head_from_capture_width(
     let dims = c.dims();
     let d = dims.d_model;
     let offset = if reading == Reading::PlainNorms { 0.0 } else { 1.0 };
-    let norm = |name: &str| -> Result<tuili_model::weights::Vector> {
+    let norm = |name: &str| -> Result<infero_model::weights::Vector> {
         let v: Vec<f32> = c.get(name).iter().map(|x| x + offset).collect();
         Ok(dev.stream().clone_htod(&v)?)
     };
@@ -702,7 +702,7 @@ fn bf16_bytes(v: &[f32]) -> Vec<u8> {
 /// the subnormal range; asking the same table the loader will read cannot
 /// disagree with it, which is the property a fixture wants.
 fn e4m3_table() -> Vec<f32> {
-    let dir = std::env::temp_dir().join("tuili_e4m3_probe");
+    let dir = std::env::temp_dir().join("infero_e4m3_probe");
     std::fs::create_dir_all(&dir).unwrap();
     let codes: Vec<u8> = (0..=255u8).collect();
     write_safetensors(
@@ -717,7 +717,7 @@ fn e4m3_table() -> Vec<f32> {
             ),
         ],
     );
-    let shards = tuili_safetensors::Shards::open_dir(&dir).unwrap();
+    let shards = infero_safetensors::Shards::open_dir(&dir).unwrap();
     let t = shards.tensor("t.weight").unwrap();
     let s = shards.tensor("t.weight_scale_inv").unwrap();
     t.dequant_f8_to_f16(&s, 128)
@@ -782,7 +782,7 @@ fn the_loader_adds_one_to_exactly_the_norms_that_are_stored_as_deltas() -> Resul
         (0..n).flat_map(|_| 1.0f32.to_le_bytes()).collect()
     };
 
-    let dir = std::env::temp_dir().join("tuili_mtp_loader_fixture");
+    let dir = std::env::temp_dir().join("infero_mtp_loader_fixture");
     std::fs::create_dir_all(&dir).unwrap();
     let mut tensors: Vec<(&str, &str, Vec<usize>, Vec<u8>)> = Vec::new();
     // The three head-specific norms and the layer's two, plus the per-head ones.
@@ -857,17 +857,17 @@ fn the_loader_adds_one_to_exactly_the_norms_that_are_stored_as_deltas() -> Resul
             },
         })
     };
-    let shards = tuili_safetensors::Shards::open_dir(&dir).unwrap();
+    let shards = infero_safetensors::Shards::open_dir(&dir).unwrap();
 
-    let read = |v: &tuili_model::weights::Vector| -> Vec<f32> {
+    let read = |v: &infero_model::weights::Vector| -> Vec<f32> {
         let out = dev.stream().clone_dtoh(v).unwrap();
         dev.synchronize().unwrap();
         out
     };
     let mut loaded = Vec::new();
     for arch in ["qwen3_5", "llama"] {
-        let cfg = tuili_model::Config::from_hf(&config(arch), "fixture")?;
-        let head = tuili_model::weights::load_mtp(&dev, &shards, &cfg)?
+        let cfg = infero_model::Config::from_hf(&config(arch), "fixture")?;
+        let head = infero_model::weights::load_mtp(&dev, &shards, &cfg)?
             .expect("the fixture carries mtp.fc.weight");
         loaded.push((
             arch,
@@ -918,7 +918,7 @@ fn the_loader_adds_one_to_exactly_the_norms_that_are_stored_as_deltas() -> Resul
     // and a draft step reads the head once, so its bytes are its cost.
     assert_eq!(
         l.wk.ty,
-        tuili_kernels::WeightType::F8E4M3,
+        infero_kernels::WeightType::F8E4M3,
         "the head's projections should reach the device as FP8"
     );
 
@@ -932,13 +932,13 @@ fn the_loader_adds_one_to_exactly_the_norms_that_are_stored_as_deltas() -> Resul
     let got = dev.stream().clone_dtoh(&view)?;
     dev.synchronize()?;
     let (kn, kk) = (kv_heads * d_head, d);
-    let mut want = tuili_kernels::fp8::repack_rows(&fp8(kn, kk, 2), kk, kn)?;
-    for _ in 0..tuili_kernels::fp8::scale_grid(kk, kn) {
+    let mut want = infero_kernels::fp8::repack_rows(&fp8(kn, kk, 2), kk, kn)?;
+    for _ in 0..infero_kernels::fp8::scale_grid(kk, kn) {
         want.extend_from_slice(&1.0f32.to_le_bytes());
     }
     assert_eq!(
         got.len(),
-        tuili_kernels::fp8::fp8_bytes(kk, kn),
+        infero_kernels::fp8::fp8_bytes(kk, kn),
         "the buffer is not the size the layout implies"
     );
     assert_eq!(got, want, "k_proj's bytes are not the repacked layout");

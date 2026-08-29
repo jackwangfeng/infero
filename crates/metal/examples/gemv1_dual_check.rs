@@ -29,10 +29,10 @@
 //! it is not one anywhere tried, and specifically not at `w_kv`'s own
 //! shape. Not wired into `Kernels::gemv` on the strength of this.
 //!
-//!     cargo run --release -p tuili-metal --example gemv1_dual_check
+//!     cargo run --release -p infero-metal --example gemv1_dual_check
 
 use anyhow::Result;
-use tuili_metal::{Device, LaunchConfig};
+use infero_metal::{Device, LaunchConfig};
 
 const COMMON: &str = include_str!("../../kernels/src/msl/common.metal");
 const QUANT: &str = include_str!("../../kernels/src/msl/quant.metal");

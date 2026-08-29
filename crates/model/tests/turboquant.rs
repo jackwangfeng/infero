@@ -9,10 +9,10 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use tuili_cuda::Device;
-use tuili_gguf::Gguf;
-use tuili_model::{KvCacheQuant, Model, Sampler, SamplingParams};
-use tuili_tokenizer::Tokenizer;
+use infero_cuda::Device;
+use infero_gguf::Gguf;
+use infero_model::{KvCacheQuant, Model, Sampler, SamplingParams};
+use infero_tokenizer::Tokenizer;
 
 /// Enough prompts, and varied enough, that a two-point difference between
 /// settings is not just which token happened to be near a tie.
@@ -36,7 +36,7 @@ const PROMPTS: &[&str] = &[
 ];
 
 fn model_path() -> Option<PathBuf> {
-    let p = std::env::var("TUILI_TEST_GGUF")
+    let p = std::env::var("INFERO_TEST_GGUF")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))

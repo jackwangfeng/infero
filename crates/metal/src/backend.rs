@@ -1,7 +1,7 @@
 //! The neutral names, pointed at Metal.
 //!
-//! The same surface `tuili_cuda::backend` exports, so `tuili-kernels` and
-//! `tuili-model` compile against either without naming a vendor.
+//! The same surface `infero_cuda::backend` exports, so `infero-kernels` and
+//! `infero-model` compile against either without naming a vendor.
 
 pub use crate::buffer::{Buf, CopyDst, CopySrc, View, ViewMut};
 pub use crate::device::{Device, Stream};

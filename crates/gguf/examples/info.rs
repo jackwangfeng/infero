@@ -1,10 +1,10 @@
 //! Dump a GGUF file's metadata and tensor table.
 //!
-//!     cargo run -p tuili-gguf --example info -- models/qwen2.5-0.5b-instruct-q8_0.gguf
-//!     cargo run -p tuili-gguf --example info -- <file> --tensors
+//!     cargo run -p infero-gguf --example info -- models/qwen2.5-0.5b-instruct-q8_0.gguf
+//!     cargo run -p infero-gguf --example info -- <file> --tensors
 
 use anyhow::{Context, Result};
-use tuili_gguf::Gguf;
+use infero_gguf::Gguf;
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);

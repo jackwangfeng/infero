@@ -14,7 +14,7 @@ use crate::msl::Modules;
 /// The CUDA side answers the same questions from `arch()`: `>= 80` means the
 /// integer tensor cores exist, `>= 89` FP8, `>= 90` TMA. Apple GPUs have none
 /// of those, so every capability that gates a hand-written tensor-core kernel
-/// reads false here and the dispatch in `tuili-model` routes around it through
+/// reads false here and the dispatch in `infero-model` routes around it through
 /// the path it already has for pre-Ampere cards.
 #[derive(Debug, Clone, Copy)]
 pub struct Caps {
@@ -38,7 +38,7 @@ pub struct Caps {
 
 /// A Metal device, its queue, and the compiled-module cache.
 ///
-/// Cloning is cheap and shares everything, matching `tuili_cuda::Device`.
+/// Cloning is cheap and shares everything, matching `infero_cuda::Device`.
 #[derive(Clone)]
 pub struct Device {
     inner: Arc<Inner>,
@@ -100,7 +100,7 @@ impl Device {
                 queue,
                 caps,
                 name,
-                cores: std::env::var("TUILI_METAL_CORES")
+                cores: std::env::var("INFERO_METAL_CORES")
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(32),
@@ -166,7 +166,7 @@ impl Device {
     ///
     /// Metal exposes no core count -- there is no `MTLDevice` property for it,
     /// and the CUDA `multiProcessorCount` it stands in for has no counterpart.
-    /// So this is a *default*, overridable with `TUILI_METAL_CORES`, and the
+    /// So this is a *default*, overridable with `INFERO_METAL_CORES`, and the
     /// eight call sites that read it all use it the same way: `sm_count() * k`
     /// as a target block count. Being wrong by a factor of two changes a tile
     /// count, not an answer.

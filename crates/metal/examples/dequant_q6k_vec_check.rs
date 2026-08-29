@@ -7,10 +7,10 @@
 //! `GEMV_BODY_Q6_K` already gives one thread, instead of re-deriving `qh[l]`
 //! and the nibble unpacks fresh in four separate threads.
 //!
-//!     cargo run --release -p tuili-metal --example dequant_q6k_vec_check
+//!     cargo run --release -p infero-metal --example dequant_q6k_vec_check
 
 use anyhow::Result;
-use tuili_metal::{Device, LaunchConfig};
+use infero_metal::{Device, LaunchConfig};
 
 const COMMON: &str = include_str!("../../kernels/src/msl/common.metal");
 const QUANT: &str = include_str!("../../kernels/src/msl/quant.metal");

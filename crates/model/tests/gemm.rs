@@ -3,7 +3,7 @@
 //! `gemm_f16` exists so that prefill reads the weights once instead of once per
 //! four tokens. The question it has to answer is not "is a matmul correct" but
 //! "does it agree with the kernel it replaces" -- and the mat-vec is already
-//! checked against a host dequantisation in `tuili-metal`'s `quant` tests, so
+//! checked against a host dequantisation in `infero-metal`'s `quant` tests, so
 //! agreement here chains onto that.
 //!
 //! It also pins the two things a GEMM wiring gets wrong: which operand is
@@ -13,8 +13,8 @@
 
 use anyhow::Result;
 use half::f16;
-use tuili_gpu::Device;
-use tuili_kernels::{Kernels, WeightType};
+use infero_gpu::Device;
+use infero_kernels::{Kernels, WeightType};
 
 fn kernels() -> Result<Kernels> {
     Ok(Kernels::new(Device::new(0)?))

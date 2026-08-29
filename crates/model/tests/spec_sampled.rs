@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use tuili_model::{Sampler, SamplingParams};
+use infero_model::{Sampler, SamplingParams};
 
 fn params(temperature: f32, top_p: f32, top_k: usize, rep: f32) -> SamplingParams {
     SamplingParams {
@@ -107,7 +107,7 @@ fn the_composition_of_draft_and_acceptance_is_a_draw_from_the_target() {
                     target.iter().map(|(t, p)| (*t, *p as f32)).collect();
                 let qdist: Vec<(u32, f32)> =
                     draft.iter().map(|(t, p)| (*t, *p as f32)).collect();
-                tuili_model::Model::draw_residual(&tdist, 1.0, &qdist, next())
+                infero_model::Model::draw_residual(&tdist, 1.0, &qdist, next())
             };
             *counts.entry(emitted).or_default() += 1;
         }
@@ -239,7 +239,7 @@ fn the_multi_candidate_composition_is_a_draw_from_the_target() {
                     })
                     .collect();
                 let draws: Vec<f64> = (0..b).map(|_| next()).collect();
-                let (_, emitted) = tuili_model::Model::accept_multi(
+                let (_, emitted) = infero_model::Model::accept_multi(
                     &tvec,
                     1.0,
                     &qvec,
@@ -319,7 +319,7 @@ fn the_multi_candidate_composition_is_a_draw_from_the_target() {
                         }
                     }
                     let e = emitted.unwrap_or_else(|| {
-                        tuili_model::Model::draw_residual(&tvec, 1.0, &qvec, next2())
+                        infero_model::Model::draw_residual(&tvec, 1.0, &qvec, next2())
                     });
                     *naive.entry(e).or_default() += 1;
                 }

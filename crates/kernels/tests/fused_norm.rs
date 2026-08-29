@@ -7,8 +7,8 @@
 //! quantized bytes exactly — not the dequantized values.
 
 use anyhow::Result;
-use tuili_cuda::Device;
-use tuili_kernels::Kernels;
+use infero_cuda::Device;
+use infero_kernels::Kernels;
 
 #[test]
 fn fused_norm_and_quantize_matches_the_two_kernels() -> Result<()> {

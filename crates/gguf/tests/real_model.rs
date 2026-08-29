@@ -1,14 +1,14 @@
 //! Parses a real GGUF file if one has been downloaded.
 //!
 //! Skipped (not failed) when `models/` is empty, so `cargo test` works on a
-//! fresh clone. Point `TUILI_TEST_GGUF` at any file to use a different one.
+//! fresh clone. Point `INFERO_TEST_GGUF` at any file to use a different one.
 
 use std::path::PathBuf;
 
-use tuili_gguf::{GgmlType, Gguf};
+use infero_gguf::{GgmlType, Gguf};
 
 fn model_path() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("TUILI_TEST_GGUF") {
+    if let Ok(p) = std::env::var("INFERO_TEST_GGUF") {
         return Some(PathBuf::from(p));
     }
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models");

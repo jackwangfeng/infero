@@ -4,7 +4,7 @@
 //! Host-only, like `config_nesting.rs` — a config parse needs no device. Shapes
 //! taken from Qwen3-30B-A3B, the checkpoint this was written against.
 
-use tuili_model::Config;
+use infero_model::Config;
 
 /// Qwen3-MoE's config, with room to override the sparsity fields.
 fn qwen3_moe_shaped(overrides: serde_json::Value) -> serde_json::Value {

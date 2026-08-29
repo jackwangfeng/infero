@@ -2,7 +2,7 @@
 //! `config.json`.
 
 use anyhow::{Context, Result, bail};
-use tuili_gguf::Gguf;
+use infero_gguf::Gguf;
 
 /// Architectures whose block structure matches the one in `Model::forward`:
 /// pre-norm RMSNorm, GQA attention, SwiGLU MLP.
@@ -53,7 +53,7 @@ pub struct Config {
     pub rope_theta: f32,
     /// How many of each head's dimensions the rotary embedding touches.
     ///
-    /// `d_head` for every model tuili loaded before Qwen3.5, which is why this
+    /// `d_head` for every model infero loaded before Qwen3.5, which is why this
     /// was not a field. Qwen3.5 rotates `int(head_dim * partial_rotary_factor)`
     /// = 64 of its 256 and passes the remaining 192 through untouched, and the
     /// frequency exponent is normalized by *this* width rather than by `d_head`
@@ -68,7 +68,7 @@ pub struct Config {
     /// Rotary pairing: `2i` with `2i+1` rather than `i` with `i + d/2`.
     pub interleaved_rope: bool,
     /// Set when some of this model's blocks mix with a recurrence rather than
-    /// with attention. `None` for every model tuili loaded before Qwen3.5.
+    /// with attention. `None` for every model infero loaded before Qwen3.5.
     pub linear_attn: Option<LinearAttnConfig>,
     /// Whether the attention blocks carry an output gate, which makes `q_proj`
     /// twice as wide.
@@ -97,7 +97,7 @@ pub struct Config {
     /// The vision tower, when the checkpoint carries one.
     pub vision: Option<VisionConfig>,
     /// Set when this model's FFN is a mixture of experts. `None` for every
-    /// model tuili loaded before Qwen3-30B-A3B.
+    /// model infero loaded before Qwen3-30B-A3B.
     pub moe: Option<MoeConfig>,
 }
 
@@ -136,7 +136,7 @@ impl MoeConfig {
 /// The vision tower's dimensions, and the ids that reserve room for its output.
 ///
 /// Read from `vision_config` rather than taken from
-/// [`tuili_kernels::vision::VisionShape::QWEN35_27B`]: that constant is this
+/// [`infero_kernels::vision::VisionShape::QWEN35_27B`]: that constant is this
 /// checkpoint's numbers, and a loader that reached for it would give a different
 /// tower the 27B's depth and hidden size and produce a shape error deep inside
 /// the tensor loop instead of at the config.
@@ -447,7 +447,7 @@ impl Config {
             .as_u64()
             .map_or(d_model / n_heads, |v| v as usize);
         // `d_head * n_heads` used to have to equal `d_model`, and for every
-        // model tuili had loaded before Qwen3.8 it did. Qwen3.8 breaks it: 24
+        // model infero had loaded before Qwen3.8 it did. Qwen3.8 breaks it: 24
         // heads of 256 is 6144 against a 5120-wide residual, so the attention
         // block widens on the way in and narrows on the way out. The forward
         // pass now carries `d_attn()` separately from `d_model`, so there is

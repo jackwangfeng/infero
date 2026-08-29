@@ -1,6 +1,6 @@
 //! The CUDA-shaped surface Metal does not have.
 //!
-//! Three subsystems in `tuili-model` are CUDA-only and stay that way: layer
+//! Three subsystems in `infero-model` are CUDA-only and stay that way: layer
 //! offload, CUDA graph capture, and the per-phase event timers. Between them
 //! they touch 78 sites in `model/src/lib.rs`, so gating each one would bury a
 //! hot file in `#[cfg]` -- which is the opposite of how this repository reads.

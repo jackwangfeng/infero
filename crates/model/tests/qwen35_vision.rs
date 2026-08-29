@@ -21,8 +21,8 @@
 //!
 //!   /home/jeff/vllm312/bin/python tools/capture_qwen35_vision.py \
 //!       /home/jeff/models/qwen38-27b-fp8 <out-dir>
-//!   TUILI_QWEN35_VISION_CAPTURE=<out-dir> \
-//!       cargo test -p tuili-model --test qwen35_vision
+//!   INFERO_QWEN35_VISION_CAPTURE=<out-dir> \
+//!       cargo test -p infero-model --test qwen35_vision
 //!
 //! Without the environment variable these tests report as skipped rather than
 //! passing, because a silent skip is how a suite comes to be green without
@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use tuili_model::qwen35_vision::*;
+use infero_model::qwen35_vision::*;
 
 // ------------------------------------------------------------------ plumbing
 
@@ -42,7 +42,7 @@ struct Capture {
 
 impl Capture {
     fn open() -> Option<Self> {
-        let dir = PathBuf::from(std::env::var("TUILI_QWEN35_VISION_CAPTURE").ok()?);
+        let dir = PathBuf::from(std::env::var("INFERO_QWEN35_VISION_CAPTURE").ok()?);
         let manifest: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap())
                 .unwrap();
@@ -144,7 +144,7 @@ fn with_capture(what: &str, body: impl FnOnce(&Capture)) {
     match Capture::open() {
         Some(c) => body(&c),
         None => eprintln!(
-            "SKIPPED {what}: set TUILI_QWEN35_VISION_CAPTURE to a directory \
+            "SKIPPED {what}: set INFERO_QWEN35_VISION_CAPTURE to a directory \
              written by tools/capture_qwen35_vision.py"
         ),
     }

@@ -1,7 +1,7 @@
 //! The subset of ggml types the kernels can decode.
 
 use anyhow::{Result, bail};
-use tuili_gguf::GgmlType;
+use infero_gguf::GgmlType;
 
 /// A weight encoding with a matching CUDA decoder.
 ///
@@ -27,7 +27,7 @@ pub enum WeightType {
     /// `k` contiguous int8 a row, then one `f16` scale per 32. Same bytes, and
     /// the same values in the same order — but a row's quants are one run, so the
     /// tile loader reads sixteen at a time where a 34-byte block forces two. Only
-    /// the vocab projection uses it, because it is the one matrix tuili quantizes
+    /// the vocab projection uses it, because it is the one matrix infero quantizes
     /// itself and so the only one whose layout is ours to choose.
     Q8_0S,
     /// [`WeightType::Q4G128`] with the 4-byte words inside each nibble run

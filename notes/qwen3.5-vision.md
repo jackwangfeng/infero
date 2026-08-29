@@ -529,6 +529,6 @@ last_hidden  逐行方差 min 2.19e+1  median 2.46e+3  max 1.59e+4
 patch 顺序的任何排列都给同样的答案，位置嵌入也看不出被用到。
 
 测试 `crates/model/tests/qwen35_vision.rs`，26 个，
-gate 在 `TUILI_QWEN35_VISION_CAPTURE` 上，未设置时报 skip 而不是通过。
+gate 在 `INFERO_QWEN35_VISION_CAPTURE` 上，未设置时报 skip 而不是通过。
 **每一个钉布局的检查都同时断言另一种合理读法不成立**（`assert_discriminates`
 要求偏离超过张量自身峰值的 1%），否则通过只说明"某种算术跑了"。

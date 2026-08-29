@@ -14,9 +14,9 @@
 //! up.
 
 use anyhow::Result;
-use tuili_cuda::Device;
-use tuili_model::config::LinearAttnConfig;
-use tuili_model::spec::GdnRollback;
+use infero_cuda::Device;
+use infero_model::config::LinearAttnConfig;
+use infero_model::spec::GdnRollback;
 
 fn la() -> LinearAttnConfig {
     LinearAttnConfig {
@@ -40,7 +40,7 @@ fn replay_never_touches_another_sequences_conv_window() -> Result<()> {
         return Ok(());
     };
     let la = la();
-    let kern = tuili_kernels::Kernels::new(dev.clone());
+    let kern = infero_kernels::Kernels::new(dev.clone());
     let width = la.conv_channels();
     let conv_floats = width * (la.conv_kernel - 1);
     let state_floats = la.value_heads * la.key_head_dim * la.value_head_dim;
@@ -75,7 +75,7 @@ fn replay_never_touches_another_sequences_conv_window() -> Result<()> {
     // Unused when `keep == 0`: `replay_layer` returns before the kernels
     // that would read either array.
     let placeholder = stream.clone_htod(&vec![0i32; MAX_SEQS])?;
-    let seqs = tuili_kernels::gdn::SeqLayout {
+    let seqs = infero_kernels::gdn::SeqLayout {
         first_token: &placeholder.as_view(),
         n_tokens: &placeholder.as_view(),
         n_seqs: MAX_SEQS,

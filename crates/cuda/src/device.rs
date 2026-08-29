@@ -55,7 +55,7 @@ impl Device {
         //
         // Safety: this hands cross-stream ordering back to us, and there is
         // exactly one place that needs it — the CPU-offload weight streaming in
-        // `tuili-model`, which already synchronises its copy stream against the
+        // `infero-model`, which already synchronises its copy stream against the
         // compute stream with explicit events rather than relying on this.
         unsafe { ctx.disable_event_tracking() };
 
@@ -92,7 +92,7 @@ impl Device {
         &self.kernels
     }
 
-    /// Per-kernel timing, active only under `TUILI_PROFILE`.
+    /// Per-kernel timing, active only under `INFERO_PROFILE`.
     pub fn profile(&self) -> &crate::Profile {
         &self.profile
     }
@@ -100,7 +100,7 @@ impl Device {
     /// Streaming multiprocessors on this device.
     ///
     /// A kernel's grid has to be at least this many blocks before the GPU is
-    /// even nominally busy, and the tile shapes in `tuili-kernels` were sized
+    /// even nominally busy, and the tile shapes in `infero-kernels` were sized
     /// against a 48-SM card. On a 188-SM one the same matrix produces the same
     /// number of blocks and leaves most of the machine idle, so anything that
     /// reports throughput should report this too.

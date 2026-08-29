@@ -1,5 +1,5 @@
 [package]
-name = "tuili-safetensors"
+name = "infero-safetensors"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

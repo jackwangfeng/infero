@@ -1,5 +1,5 @@
 //! The GatedDeltaNet kernels, against the host reference in
-//! `tuili_model::qwen35`.
+//! `infero_model::qwen35`.
 //!
 //! The reference is not a reimagining of these kernels — it is checked, stage by
 //! stage, against a capture of `transformers`' own Qwen3.5 implementation
@@ -17,7 +17,7 @@ mod common;
 
 use anyhow::Result;
 use common::*;
-use tuili_model::qwen35;
+use infero_model::qwen35;
 
 /// The 27B's linear-attention shape, small enough to run quickly: the real
 /// checkpoint has 16 key heads, 48 value heads and dk = dv = 128.
@@ -68,7 +68,7 @@ fn the_conv_matches_the_reference_and_carries_its_window() -> Result<()> {
     let mut d_out = stream.alloc_zeros::<f32>(t_len * channels)?;
     let mut d_state = stream.alloc_zeros::<f32>(channels * (CONV_K - 1))?;
 
-    let seqs = tuili_kernels::gdn::SeqLayout {
+    let seqs = infero_kernels::gdn::SeqLayout {
         first_token: &d_first.as_view(),
         n_tokens: &d_ntok.as_view(),
         n_seqs: 1,
@@ -118,7 +118,7 @@ fn the_conv_matches_the_reference_and_carries_its_window() -> Result<()> {
         let n = stream.clone_htod(&[count as i32])?;
         let chunk = stream.clone_htod(&x[start * channels..(start + count) * channels])?;
         let mut piece = stream.alloc_zeros::<f32>(count * channels)?;
-        let s = tuili_kernels::gdn::SeqLayout {
+        let s = infero_kernels::gdn::SeqLayout {
             first_token: &f.as_view(),
             n_tokens: &n.as_view(),
             n_seqs: 1,
@@ -289,7 +289,7 @@ fn the_delta_rule_matches_the_reference() -> Result<()> {
     let mut d_out = stream.alloc_zeros::<f32>(t_len * VAL_HEADS * DV)?;
     let mut d_state = stream.alloc_zeros::<f32>(VAL_HEADS * DK * DV)?;
 
-    let seqs = tuili_kernels::gdn::SeqLayout {
+    let seqs = infero_kernels::gdn::SeqLayout {
         first_token: &d_first.as_view(),
         n_tokens: &d_ntok.as_view(),
         n_seqs: 1,
@@ -379,7 +379,7 @@ fn the_recurrence_carries_state_across_calls() -> Result<()> {
             let f = stream.clone_htod(&[0i32])?;
             let n = stream.clone_htod(&[count as i32])?;
             let mut out = stream.alloc_zeros::<f32>(count * VAL_HEADS * DV)?;
-            let seqs = tuili_kernels::gdn::SeqLayout {
+            let seqs = infero_kernels::gdn::SeqLayout {
                 first_token: &f.as_view(),
                 n_tokens: &n.as_view(),
                 n_seqs: 1,
@@ -468,7 +468,7 @@ fn two_sequences_in_one_batch_keep_separate_state() -> Result<()> {
         &mut state.slice_mut(2 * VAL_HEADS * DK * DV..3 * VAL_HEADS * DK * DV),
     )?;
 
-    let seqs = tuili_kernels::gdn::SeqLayout {
+    let seqs = infero_kernels::gdn::SeqLayout {
         first_token: &first.as_view(),
         n_tokens: &ntok.as_view(),
         n_seqs: 3,
@@ -514,7 +514,7 @@ fn two_sequences_in_one_batch_keep_separate_state() -> Result<()> {
         let n = stream.clone_htod(&[len as i32])?;
         let mut alone = stream.alloc_zeros::<f32>(len * VAL_HEADS * DV)?;
         let mut alone_state = stream.alloc_zeros::<f32>(VAL_HEADS * DK * DV)?;
-        let one = tuili_kernels::gdn::SeqLayout {
+        let one = infero_kernels::gdn::SeqLayout {
             first_token: &f.as_view(),
             n_tokens: &n.as_view(),
             n_seqs: 1,
@@ -780,12 +780,12 @@ fn the_split_is_per_head_not_per_half() -> Result<()> {
 // which no output check can see.
 // ---------------------------------------------------------------------------
 
-use tuili_kernels::gdn::DeltaVariant;
+use infero_kernels::gdn::DeltaVariant;
 
 /// Run the delta rule over `chunks` of one sequence with a named variant,
 /// returning the concatenated output and the final state.
 fn run_variant(
-    k: &tuili_kernels::Kernels,
+    k: &infero_kernels::Kernels,
     row: &[f32],
     g: &[f32],
     beta: &[f32],
@@ -805,7 +805,7 @@ fn run_variant(
         let f = stream.clone_htod(&[0i32])?;
         let n = stream.clone_htod(&[count as i32])?;
         let mut out = stream.alloc_zeros::<f32>(count * VAL_HEADS * DV)?;
-        let seqs = tuili_kernels::gdn::SeqLayout {
+        let seqs = infero_kernels::gdn::SeqLayout {
             first_token: &f.as_view(),
             n_tokens: &n.as_view(),
             n_seqs: 1,
@@ -923,7 +923,7 @@ fn the_fallback_kernels_keep_sequences_apart_and_idle_slots_untouched() -> Resul
         let sentinel = vec![-12345.0f32; per_seq];
         stream.memcpy_htod(&sentinel, &mut state.slice_mut(2 * per_seq..3 * per_seq))?;
 
-        let seqs = tuili_kernels::gdn::SeqLayout {
+        let seqs = infero_kernels::gdn::SeqLayout {
             first_token: &first.as_view(),
             n_tokens: &ntok.as_view(),
             n_seqs: 3,
@@ -1044,7 +1044,7 @@ fn a_non_square_head_shape_falls_back_and_still_matches_the_reference() -> Resul
     let d_ntok = stream.clone_htod(&[t_len as i32])?;
     let mut d_out = stream.alloc_zeros::<f32>(t_len * val_dim)?;
     let mut d_state = stream.alloc_zeros::<f32>(heads * dk * dv)?;
-    let seqs = tuili_kernels::gdn::SeqLayout {
+    let seqs = infero_kernels::gdn::SeqLayout {
         first_token: &d_first.as_view(),
         n_tokens: &d_ntok.as_view(),
         n_seqs: 1,

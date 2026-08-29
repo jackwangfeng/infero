@@ -2,7 +2,7 @@
 //!
 //! Exists because guessing at which kernel is slow has a poor track record in
 //! this project: three rounds of tuning the float mat-vec bought 1.8x, and one
-//! look at the actual algorithm bought 9x. Enabled by `TUILI_PROFILE`, off it
+//! look at the actual algorithm bought 9x. Enabled by `INFERO_PROFILE`, off it
 //! costs an atomic load per launch.
 //!
 //! Timing is by CUDA events around each launch, so it measures device time
@@ -33,7 +33,7 @@ pub struct Profile {
 
 impl Profile {
     pub fn new(ctx: &std::sync::Arc<CudaContext>) -> Result<Self> {
-        let enabled = std::env::var_os("TUILI_PROFILE").is_some();
+        let enabled = std::env::var_os("INFERO_PROFILE").is_some();
         let events = if enabled {
             // Timing events, unlike the disable-timing ones used elsewhere.
             Some((
@@ -44,7 +44,7 @@ impl Profile {
             None
         };
         if enabled {
-            tracing::warn!("TUILI_PROFILE set: kernels are timed and the stream serializes");
+            tracing::warn!("INFERO_PROFILE set: kernels are timed and the stream serializes");
         }
         Ok(Self {
             enabled: AtomicBool::new(enabled),
@@ -109,7 +109,7 @@ impl Profile {
         let rows = self.snapshot();
         let total: f64 = rows.iter().map(|(_, e)| e.millis).sum();
         if rows.is_empty() {
-            return "no kernels timed (set TUILI_PROFILE)".into();
+            return "no kernels timed (set INFERO_PROFILE)".into();
         }
         let mut out = format!(
             "{:<22} {:>10} {:>10} {:>9} {:>8}\n",
