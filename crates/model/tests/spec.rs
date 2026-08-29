@@ -133,7 +133,7 @@ fn speculative(
     while out.len() <= want {
         let proposal = draft(step, pending);
         assert_eq!(proposal.len(), k, "the drafter changed its mind about k");
-        let outcome = model.verify_draft(seq, &mut pool, pending, &proposal)?;
+        let outcome = model.verify_draft(seq, &mut pool, pending, &proposal, 0)?;
         assert!(
             !outcome.tokens.is_empty(),
             "a verification step emitted nothing, which would livelock"
@@ -305,7 +305,7 @@ fn a_rejected_draft_returns_its_kv_slots_and_leaves_the_length_alone() -> Result
     // A draft that cannot be accepted: three copies of a token the model would
     // not choose after `pending`.
     let doomed = vec![pending.wrapping_add(11) % 150_000; k];
-    let outcome = model.verify_draft(seq, &mut pool, pending, &doomed)?;
+    let outcome = model.verify_draft(seq, &mut pool, pending, &doomed, 0)?;
     assert_eq!(outcome.accepted, 0, "the doomed draft was accepted");
     assert_eq!(outcome.tokens.len(), 1);
 
@@ -397,7 +397,7 @@ fn the_mtp_head_drives_the_loop_without_changing_the_output() -> Result<()> {
                 "the head drafted token {t}, past the vocabulary"
             );
         }
-        let outcome = model.verify_draft(seq, &mut pool, pending, &draft)?;
+        let outcome = model.verify_draft(seq, &mut pool, pending, &draft, 0)?;
         accepted_total += outcome.accepted;
         drafted_total += outcome.drafted;
         pending = *outcome.tokens.last().unwrap();
@@ -476,6 +476,7 @@ fn synthetic_head_branched(
                 q_norm: Some(vec1(dims.d_head)?),
                 k_norm: Some(vec1(dims.d_head)?),
                 w_qkv: None,
+                w_kv: None,
                 output_gate: true,
             }),
             gdn: None,
@@ -550,7 +551,7 @@ fn a_real_drafter_reaches_a_useful_acceptance_length() -> Result<()> {
             fed = argmax(drafter.logits_host()?);
             proposal.push(fed);
         }
-        let outcome = target.verify_draft(seq, &mut pool, pending, &proposal)?;
+        let outcome = target.verify_draft(seq, &mut pool, pending, &proposal, 0)?;
         lengths.push(outcome.tokens.len());
         // Roll the drafter back to the accepted prefix: it consumed `pending`
         // plus `k` proposals, and only `pending` plus the accepted ones survive.
@@ -642,6 +643,7 @@ fn priming_the_drafter_across_a_gap_is_an_error() -> Result<()> {
         rows: 0..1,
         positions: vec![hole],
         shifted: vec![pending],
+        mrope: None,
     };
     let err = model
         .draft_with_head(K, &gapped)

@@ -34,6 +34,12 @@ axum = { version = "0.8.9", features = ["macros"] }
 # surface this exposes to request bodies as small as it can be.
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+# Video decode goes through `ffmpeg`/`ffprobe` subprocesses (see
+# `src/video.rs`'s module note for why, over a codec crate), and they need a
+# real seekable file rather than a pipe. `tempfile` rather than a hand-built
+# path in `/tmp`: this box is shared with other users, and a predictable temp
+# filename there is a symlink-attack vector.
+tempfile = "3"
 
 [dev-dependencies]
 http-body-util = "0.1.4"

@@ -382,6 +382,15 @@ impl Kernels {
     /// `min(t, n_frames - 1)`, so a still image sees the same pixels in both
     /// taps, which is what the processor's `expand` does.
     #[allow(clippy::too_many_arguments)]
+    /// `grid_t` temporal-patch groups in one launch -- `frames` is one
+    /// contiguous `[grid_t * n_frames, C, H, W]` buffer (`PreparedClip
+    /// ::planar`'s own layout), group `ti`'s own frames starting at `ti *
+    /// n_frames` along that axis, and `out`/`out_h` are `grid_t` group-sized
+    /// blocks back to back -- what the host used to build by launching this
+    /// `grid_t` times into offset slices of the same buffers; see the CUDA
+    /// source's own comment on `vision_patchify_f32` for why one launch
+    /// computes the identical thing. `grid_t = 1` (a still image, or a video
+    /// clip processed one group at a time) is this at its previous shape.
     pub fn vision_patchify(
         &self,
         out: &mut ViewMut<'_, f32>,
@@ -391,6 +400,7 @@ impl Kernels {
         height: usize,
         width: usize,
         shape: &VisionShape,
+        grid_t: usize,
     ) -> Result<()> {
         anyhow::ensure!(
             height.is_multiple_of(shape.patch * shape.merge)
@@ -402,12 +412,14 @@ impl Kernels {
             shape.patch * shape.merge,
             shape.patch * shape.merge
         );
+        anyhow::ensure!(grid_t > 0, "grid_t must be positive");
         let (gh, gw) = (height / shape.patch, width / shape.patch);
         let pd = shape.patch_dim();
-        let total = gh * gw * pd;
+        let group_total = gh * gw * pd;
+        let total = group_total * grid_t;
         debug_assert!(out.len() >= total && out_h.len() >= total);
         let frame_elems = shape.in_channels * height * width;
-        debug_assert!(frames.len() >= n_frames * frame_elems);
+        debug_assert!(frames.len() >= grid_t * n_frames * frame_elems);
 
         let f = self
             .dev
@@ -430,7 +442,7 @@ impl Kernels {
             shape.temporal_patch as i32,
             shape.merge as i32,
         );
-        let (g_h, g_w) = (gh as i32, gw as i32);
+        let (g_h, g_w, g_t) = (gh as i32, gw as i32, grid_t as i32);
         let mut bl = self.dev.stream().launch_builder(&f);
         bl.arg(out)
             .arg(out_h)
@@ -444,7 +456,8 @@ impl Kernels {
             .arg(&tp)
             .arg(&m)
             .arg(&g_h)
-            .arg(&g_w);
+            .arg(&g_w)
+            .arg(&g_t);
         self.dev
             .profile()
             .time("vision_patchify", self.dev.stream(), || {
@@ -737,6 +750,12 @@ pub struct VisionWeights<'a> {
 /// boundary changes nothing about the result.
 pub struct VisionScratch {
     max_patches: usize,
+    /// `vision_patchify`'s f32 output, which nothing downstream reads --
+    /// `vision_forward` takes `pixels_h` -- but the kernel writes both
+    /// unconditionally. Scratch-owned so a caller does not pay a fresh
+    /// `max_patches`-sized allocation every request for output nobody uses;
+    /// see `Model::encode_clip`.
+    pixels_f32: Buf<f32>,
     pixels_h: Buf<f16>,
     hidden: Buf<f32>,
     normed: Buf<f32>,
@@ -767,6 +786,7 @@ impl VisionScratch {
         let wide_n = shape.intermediate.max(shape.merged() / shape.merge_unit());
         Ok(Self {
             max_patches,
+            pixels_f32: s.alloc_zeros::<f32>(n * shape.patch_dim())?,
             pixels_h: s.alloc_zeros::<f16>(n * shape.patch_dim())?,
             hidden: s.alloc_zeros::<f32>(n * d)?,
             normed: s.alloc_zeros::<f32>(n * d)?,
@@ -798,6 +818,17 @@ impl VisionScratch {
     /// produces patches some other way than [`Kernels::vision_patchify`].
     pub fn pixels_h_mut(&mut self) -> ViewMut<'_, f16> {
         self.pixels_h.as_view_mut()
+    }
+
+    /// Both of [`Kernels::vision_patchify`]'s output views at once -- one
+    /// method, so the two mutable borrows of `self` (which two separate
+    /// accessor calls could not reconcile) come from a single call instead.
+    pub fn patchify_views(&mut self) -> (ViewMut<'_, f32>, ViewMut<'_, f16>) {
+        (self.pixels_f32.as_view_mut(), self.pixels_h.as_view_mut())
+    }
+
+    pub fn max_patches(&self) -> usize {
+        self.max_patches
     }
 }
 

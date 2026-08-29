@@ -78,6 +78,10 @@ fn small_kernels_achieved_bandwidth() -> Result<()> {
     let positions: Vec<i32> = vec![kv_len as i32 - 1; max_tokens];
     let dpos = stream.clone_htod(&positions)?;
     let ff = stream.clone_htod(&vec![1.0f32; d_head / 2])?;
+    // `mrope_axis` all zero, `pos_stride: 1`: the plain scalar-position rope
+    // this benchmark measures, unaffected by M-RoPE's arithmetic being present
+    // in the kernel now. See `Kernels::rope_qk_partial`'s doc comment.
+    let axis0 = stream.clone_htod(&vec![0i32; d_head / 2])?;
     let mut scores = stream.alloc_zeros::<f32>(n_heads * max_tokens * kv_len)?;
 
     // Host time per launch, and — under `INFERO_PROFILE` — the device time the
@@ -155,6 +159,8 @@ fn small_kernels_achieved_bandwidth() -> Result<()> {
                 &mut kk.slice_mut(..tokens * kv_dim),
                 &dpos.slice(..tokens),
                 &ff.as_view(),
+                &axis0.as_view(),
+                1,
                 tokens,
                 n_heads,
                 n_kv_heads,

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use axum::Json;
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -19,8 +20,15 @@ use infero_tokenizer::{
 };
 
 use crate::api::*;
-use crate::engine::{self, Engine, Event, FinishReason, PendingImage, Request};
+use crate::engine::{self, Engine, Event, FinishReason, PendingImage, PendingVideo, Request};
 use crate::tool_call;
+
+/// Above `crate::video`'s own 64 MiB base64-payload check (with room for the
+/// rest of the JSON envelope) -- axum's `Json` extractor defaults to 2 MiB
+/// and would otherwise reject a real video's request body with a bare 413
+/// before that check, or this module's own error messages, ever ran. The
+/// same default silently capped any image over ~1.5 MiB too.
+const MAX_BODY_BYTES: usize = 80 * 1024 * 1024;
 
 pub fn router(engine: Arc<Engine>) -> Router {
     Router::new()
@@ -28,6 +36,7 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(engine)
 }
 
@@ -128,30 +137,32 @@ async fn models(State(engine): State<Arc<Engine>>) -> impl IntoResponse {
     })
 }
 
-/// Build the tokenizer-facing message from a client's, keeping image and text
-/// parts in the order the client sent them.
+/// Build the tokenizer-facing message from a client's, keeping image, video,
+/// and text parts in the order the client sent them.
 ///
-/// A message with no image stays on the flat-text path — `m.text()`, exactly
-/// as before this existed — so nothing about a plain-text conversation
-/// changes shape because vision support exists at all. Order matters once
-/// there is an image: a caption before it and a question after it are only
-/// the same request if the template sees them on the sides it rendered them
-/// on, which is why this walks `content`'s parts directly instead of
-/// flattening to text and splicing a marker back in.
+/// A message with no image or video stays on the flat-text path — `m.text()`,
+/// exactly as before either existed — so nothing about a plain-text
+/// conversation changes shape because vision support exists at all. Order
+/// matters once there is a vision part: a caption before it and a question
+/// after it are only the same request if the template sees them on the sides
+/// it rendered them on, which is why this walks `content`'s parts directly
+/// instead of flattening to text and splicing a marker back in.
 fn to_chat_message(m: &Message) -> Result<ChatMessage, ApiError> {
-    let mut msg = if m.image_urls().is_empty() {
+    let mut msg = if m.image_urls().is_empty() && m.video_urls().is_empty() {
         ChatMessage::new(&m.role, m.text())
     } else {
         let Some(Content::Parts(parts)) = &m.content else {
-            // `image_urls()` only returns entries from `Content::Parts`, so
-            // reaching here means a message has neither shape it claims to.
-            unreachable!("a message with image parts has Content::Parts");
+            // `image_urls()`/`video_urls()` only return entries from
+            // `Content::Parts`, so reaching here means a message has neither
+            // shape it claims to.
+            unreachable!("a message with vision parts has Content::Parts");
         };
         let tpl_parts = parts
             .iter()
-            .map(|p| match &p.image_url {
-                Some(u) => TplPart::image(u.url.clone()),
-                None => TplPart::text(p.text.clone().unwrap_or_default()),
+            .map(|p| match (&p.image_url, &p.video_url) {
+                (Some(u), _) => TplPart::image(u.url.clone()),
+                (_, Some(u)) => TplPart::video(u.url.clone()),
+                (None, None) => TplPart::text(p.text.clone().unwrap_or_default()),
             })
             .collect();
         ChatMessage::with_parts(&m.role, tpl_parts)
@@ -220,17 +231,32 @@ async fn chat_completions(
         ApiError::bad_request("this model has no chat template; use /v1/completions instead")
     })?;
 
-    // One image per request for now: `BatchItem::vision` — what actually
-    // carries a tower's output into a forward pass — takes a single
+    // One vision item per request for now: `BatchItem::vision` — what
+    // actually carries a tower's output into a forward pass — takes a single
     // `VisionFeatures`, and stitching several into one splice is a real
-    // feature this does not have yet. Refusing a second image is better than
-    // silently dropping it, which is what would happen otherwise.
+    // feature this does not have yet. That includes mixing an image with a
+    // video: the tower would produce two `VisionFeatures` for one splice slot,
+    // silently dropping one, so a request carrying both is refused the same
+    // way a second image already is.
     let image_urls: Vec<&str> = req.messages.iter().flat_map(Message::image_urls).collect();
+    let video_urls: Vec<&VideoUrl> = req.messages.iter().flat_map(Message::video_urls).collect();
     if image_urls.len() > 1 {
         return Err(ApiError::bad_request(format!(
             "this request has {} images; only one is supported per request",
             image_urls.len()
         )));
+    }
+    if video_urls.len() > 1 {
+        return Err(ApiError::bad_request(format!(
+            "this request has {} videos; only one is supported per request",
+            video_urls.len()
+        )));
+    }
+    if !image_urls.is_empty() && !video_urls.is_empty() {
+        return Err(ApiError::bad_request(
+            "this request has both an image and a video; only one vision \
+             item is supported per request",
+        ));
     }
     // Decoding is pure CPU work — no model needed — so it happens here rather
     // than on the scheduler thread. What the scheduler does with the pixels
@@ -243,6 +269,19 @@ async fn chat_completions(
         .transpose()
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?
         .map(|d| PendingImage { rgb: d.rgb, height: d.height, width: d.width });
+    let pending_video = match video_urls.first() {
+        Some(v) => Some(
+            crate::video::decode_video_data_url(
+                &v.url,
+                engine.video_max_frames,
+                v.fps.unwrap_or(engine.video_target_fps),
+            )
+            .await
+            .map_err(|e| ApiError::bad_request(format!("{e:#}")))?,
+        ),
+        None => None,
+    }
+    .map(|d| PendingVideo { frames: d.frames, height: d.height, width: d.width, timestamps: d.timestamps });
 
     let tools_value = resolve_tools(&req)?;
     let messages: Vec<ChatMessage> = req
@@ -298,6 +337,7 @@ async fn chat_completions(
     let rx = engine.submit(Request {
         prompt: tokens,
         pending_image,
+        pending_video,
         params,
         max_tokens,
         stop,
@@ -405,6 +445,7 @@ async fn completions(
     let rx = engine.submit(Request {
         prompt: tokens,
         pending_image: None,
+        pending_video: None,
         params,
         max_tokens,
         stop,

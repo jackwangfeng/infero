@@ -76,6 +76,13 @@ pub struct DraftFeed {
     pub positions: Vec<usize>,
     /// For each row, the token that follows it.
     pub shifted: Vec<u32>,
+    /// Token-major `[T, H, W]` M-RoPE positions for these rows (`3 *
+    /// positions.len()` entries), when the target model has M-RoPE and this
+    /// feed's rows might be mid-image -- which only a prefill's rows ever
+    /// are. `None` otherwise, including for every decode-phase feed: see
+    /// `MtpHead::run`'s doc comment for why a decode-phase row never needs
+    /// one.
+    pub mrope: Option<Vec<i32>>,
 }
 
 impl DraftFeed {
@@ -95,6 +102,12 @@ impl DraftFeed {
             rows: 0..prompt.len(),
             positions: (0..prompt.len()).collect(),
             shifted,
+            // This constructor assumes the whole prompt went through in one
+            // pass and has no way to know whether it carried an image; every
+            // real caller with M-RoPE builds a `DraftFeed` by hand instead
+            // (see `crates/server/src/scheduler.rs`), which is where a real
+            // `mrope` array comes from.
+            mrope: None,
         }
     }
 }
@@ -579,12 +592,19 @@ impl Model {
     /// Afterwards the sequence holds `accepted + 1` new tokens: the accepted
     /// drafts plus `pending` itself. The last token in [`SpecOutcome::tokens`] is
     /// the next step's `pending` and is deliberately *not* in the cache.
+    ///
+    /// `mrope_delta`: every candidate here is a decode-phase token -- past
+    /// the prompt, so never mid-image -- and gets the same affine M-RoPE
+    /// treatment a plain decode step does: all three axes equal
+    /// `pool.len(seq) + k + mrope_delta`. Zero for a model or sequence
+    /// without M-RoPE; the caller reads it off `Running::mrope_delta`.
     pub fn verify_draft(
         &mut self,
         seq: SeqId,
         pool: &mut KvPool,
         pending: u32,
         draft: &[u32],
+        mrope_delta: i32,
     ) -> Result<SpecOutcome> {
         let n = draft.len() + 1;
         anyhow::ensure!(
@@ -603,7 +623,10 @@ impl Model {
             r.arm(seq.0, n)?;
         }
         let rows = {
-            let item = BatchItem::new(seq, &candidates);
+            let item = BatchItem {
+                mrope_delta,
+                ..BatchItem::new(seq, &candidates)
+            };
             // Every candidate's logits, not just the last: `logits[j]` is the
             // target's own prediction for the token after candidate `j`, and the
             // acceptance rule reads all of them.
@@ -636,6 +659,9 @@ impl Model {
             rows: 0..keep,
             positions: (len_before..len_before + keep).collect(),
             shifted,
+            // Decode-phase rows: T=H=W always here, so the scalar path
+            // `prime` falls back to on `None` is already correct.
+            mrope: None,
         };
         debug_assert_eq!(feed.shifted.len(), feed.positions.len());
         Ok(SpecOutcome {
@@ -660,6 +686,9 @@ impl Model {
     /// the tokens before it, drafts included, and the repetition penalty reads
     /// that window. Scoring every position against the prompt's window would
     /// silently mis-measure both sides.
+    ///
+    /// `mrope_delta`: see [`Self::verify_draft`]'s doc comment -- same
+    /// reasoning, these candidates are decode-phase too.
     pub fn verify_draft_sampled(
         &mut self,
         seq: SeqId,
@@ -668,6 +697,7 @@ impl Model {
         draft: &[crate::mtp::Drafted],
         sampler: &mut crate::Sampler,
         history: &[u32],
+        mrope_delta: i32,
     ) -> Result<SpecOutcome> {
         let n = draft.len() + 1;
         anyhow::ensure!(
@@ -691,7 +721,10 @@ impl Model {
             r.arm(seq.0, n)?;
         }
         let rows = {
-            let item = BatchItem::new(seq, &candidates);
+            let item = BatchItem {
+                mrope_delta,
+                ..BatchItem::new(seq, &candidates)
+            };
             let r = self.forward_batch_rows(std::slice::from_ref(&item), pool, &[n]);
             if let (true, Some(j)) = (r.is_err(), self.gdn_rollback.as_mut()) {
                 j.disarm();
@@ -824,6 +857,9 @@ impl Model {
             rows: 0..keep,
             positions: (len_before..len_before + keep).collect(),
             shifted,
+            // Decode-phase rows: T=H=W always here, so the scalar path
+            // `prime` falls back to on `None` is already correct.
+            mrope: None,
         };
         Ok(SpecOutcome {
             tokens,

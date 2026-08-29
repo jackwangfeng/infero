@@ -35,6 +35,20 @@ pub struct PendingImage {
     pub width: usize,
 }
 
+/// Sampled, decoded frames of one video, waiting for the scheduler thread to
+/// resize and run them through the tower. Same reasoning as `PendingImage`:
+/// the decode (`ffmpeg`/`ffprobe` subprocesses, see `crate::video`) is pure
+/// CPU work with no need of the model, so it happens in the async HTTP
+/// handler.
+pub struct PendingVideo {
+    /// Interleaved `[height, width, 3]` per sampled frame, in playback order.
+    pub frames: Vec<Vec<u8>>,
+    pub height: usize,
+    pub width: usize,
+    /// One timestamp a temporal-patch group; see `crate::video::DecodedClip`.
+    pub timestamps: Vec<f64>,
+}
+
 /// What a client asked the model to do.
 pub struct Request {
     pub prompt: Vec<u32>,
@@ -42,6 +56,10 @@ pub struct Request {
     /// unexpanded to its real token count — see `crate::scheduler::admit`,
     /// which is where that expansion and the tower's forward pass happen.
     pub pending_image: Option<PendingImage>,
+    /// The video equivalent of `pending_image`. Mutually exclusive with it —
+    /// `crate::routes` refuses a request that carries both, since
+    /// `Running::vision` has room for one tower output, not one of each.
+    pub pending_video: Option<PendingVideo>,
     pub params: SamplingParams,
     pub max_tokens: usize,
     /// Text sequences that end the generation, excluded from the output.
@@ -81,6 +99,16 @@ pub enum Event {
 pub struct Engine {
     jobs: mpsc::UnboundedSender<Request>,
     pub info: ModelInfo,
+    /// The operator's ceiling on how many frames a video request may be
+    /// sampled down to -- `crate::video::decode_video_data_url`'s
+    /// `max_frames` argument, applied in the async HTTP handler before a
+    /// request ever reaches the scheduler.
+    pub video_max_frames: usize,
+    /// The sampling density a video request gets when it does not set its
+    /// own `video_url.fps` -- `crate::video::decode_video_data_url`'s
+    /// `target_fps` argument, resolved in the HTTP handler (see
+    /// `routes::chat_completions`) before decode ever starts.
+    pub video_target_fps: f64,
     tokenizer: Arc<Tokenizer>,
     in_flight: Arc<AtomicU64>,
     served: Arc<AtomicU64>,
@@ -125,6 +153,9 @@ impl Engine {
         max_seqs: usize,
         kv_slots: Option<usize>,
         vision_max_patches: usize,
+        video_max_frames: usize,
+        video_target_fps: f64,
+        video_dedup_threshold: f64,
     ) -> Result<Arc<Self>> {
         // A directory is a Hugging Face checkpoint, a file is a GGUF.
         let awq = std::path::Path::new(path).is_dir();
@@ -227,6 +258,7 @@ impl Engine {
 
         let mut scheduler = Scheduler::new(model, pool, tokenizer.clone());
         scheduler.set_vision_max_patches(vision_max_patches);
+        scheduler.set_video_dedup_threshold(video_dedup_threshold);
         // Speculation, when the checkpoint has a head.
         //
         // On by default at k = 1, which is measured rather than chosen: it is
@@ -294,6 +326,8 @@ impl Engine {
         Ok(Arc::new(Self {
             jobs,
             info,
+            video_max_frames,
+            video_target_fps,
             tokenizer,
             in_flight,
             served,

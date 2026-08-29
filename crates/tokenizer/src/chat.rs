@@ -84,6 +84,8 @@ pub struct ContentPart {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_url: Option<ImageUrl>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_url: Option<ImageUrl>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -93,7 +95,7 @@ pub struct ImageUrl {
 
 impl ContentPart {
     pub fn text(s: impl Into<String>) -> Self {
-        Self { kind: "text", text: Some(s.into()), image_url: None }
+        Self { kind: "text", text: Some(s.into()), image_url: None, video_url: None }
     }
 
     /// A placeholder marking where an image goes. `url` is carried through for
@@ -106,6 +108,29 @@ impl ContentPart {
             kind: "image_url",
             text: None,
             image_url: Some(ImageUrl { url: url.into() }),
+            video_url: None,
+        }
+    }
+
+    /// A placeholder marking where a video goes.
+    ///
+    /// `kind: "video"`, not `"video_url"` — this checkpoint's own
+    /// `chat_template.jinja` branches on `'video' in item or item.type ==
+    /// 'video'` for the video case, with **no** `'video_url' in item`
+    /// fallback the way the image branch has for `'image_url' in item`. Read
+    /// off the real template, not assumed from the image pattern: mirroring
+    /// image's naming here would silently emit no placeholder at all, since
+    /// neither of the template's two conditions would match a `video_url`
+    /// key with `type: "video_url"`. The wire API (`server::api::ContentPart`)
+    /// still calls its field `video_url`, matching the OpenAI-ish convention
+    /// clients expect; the translation into this literal `"video"` kind
+    /// happens once, in `server::routes::to_chat_message`.
+    pub fn video(url: impl Into<String>) -> Self {
+        Self {
+            kind: "video",
+            text: None,
+            image_url: None,
+            video_url: Some(ImageUrl { url: url.into() }),
         }
     }
 }

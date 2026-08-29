@@ -61,6 +61,14 @@ pub struct Config {
     /// mistakes run to completion and cost long-range retrieval only, which is
     /// the hardest kind of wrong to attribute.
     pub rotary_dim: usize,
+    /// How the `rotary_dim/2` rope frequencies split across a text-plus-image
+    /// sequence's three position axes (time, height, width), interleaved by
+    /// `i % 3` — Qwen3.5's `mrope_section`. `None` for every model without a
+    /// vision tower and for a vision request never (plain text always gets
+    /// the same value on all three axes, so the split is a no-op there). See
+    /// `qwen35_vision::llm_position_ids`/`interleaved_mrope_axis` and
+    /// `notes/mrope-and-video.md`.
+    pub mrope_section: Option<[usize; 3]>,
     /// Linear RoPE scaling; 1.0 unless the model was trained with it.
     pub rope_freq_scale: f32,
     /// True when the output projection reuses the embedding matrix.
@@ -268,7 +276,22 @@ impl Config {
 
         let key = |s: &str| format!("{arch}.{s}");
         let arch_owned = arch.clone();
-        let n_layers = f.usize(&key("block_count"))?;
+        let block_count = f.usize(&key("block_count"))?;
+        // llama.cpp/unsloth GGUFs can embed the MTP speculative-decoding head
+        // as the last `nextn_predict_layers` blocks of this same file (see
+        // `load_mtp_gguf` in weights.rs) instead of shipping it as a separate
+        // sidecar. Those blocks are not ordinary decoder layers -- counting
+        // them as such feeds a stray full-attention layer into every forward
+        // pass and corrupts every token, which is exactly what a checkpoint
+        // like `Qwen3.8-27B-Q8_0.gguf` (`block_count = 65`,
+        // `nextn_predict_layers = 1`) does if this is skipped.
+        let mtp_layers = f.usize(&key("nextn_predict_layers")).unwrap_or(0);
+        let n_layers = block_count.checked_sub(mtp_layers).with_context(|| {
+            format!(
+                "{arch}.nextn_predict_layers = {mtp_layers} exceeds \
+                 {arch}.block_count = {block_count}"
+            )
+        })?;
         let d_model = f.usize(&key("embedding_length"))?;
         let n_heads = f.usize(&key("attention.head_count"))?;
         let n_kv_heads = f.usize(&key("attention.head_count_kv")).unwrap_or(n_heads);
@@ -352,6 +375,10 @@ impl Config {
             rotary_dim: f
                 .usize(&key("rope.dimension_count"))
                 .unwrap_or(d_head),
+            // No GGUF conversion in the wild carries a Qwen3.5 vision tower
+            // (see `vision: None` below), so there is nothing that would ever
+            // populate this from GGUF metadata.
+            mrope_section: None,
             rope_freq_scale: f
                 .f32(&key("rope.scaling.factor"))
                 .map(|s| if s > 0.0 { 1.0 / s } else { 1.0 })
@@ -365,10 +392,13 @@ impl Config {
             // it -- a config cannot silently change the arithmetic.
             attn_output_gate: linear_attn.is_some(),
             linear_attn,
-            // Likewise for the MTP head: no GGUF conversion carries one, and
-            // guessing a depth would build a drafter out of tensors that are
-            // not there.
-            mtp_layers: 0,
+            // Set from `nextn_predict_layers` above when the file embeds an
+            // MTP head; zero (the common case) when it does not. Nothing in
+            // the GGUF loading path consults this today -- `load_mtp_gguf`
+            // gets the head's depth from the file's own metadata key rather
+            // than from `cfg` (see its doc comment) -- but it belongs here
+            // rather than staying a silent lie now that the file can say so.
+            mtp_layers,
             // No GGUF in the wild carries a Qwen3.5 vision tower, and if one
             // did its dimensions would need names in the GGUF metadata
             // vocabulary rather than a `vision_config` object.
@@ -502,6 +532,50 @@ impl Config {
             );
         }
 
+        // M-RoPE: a vision checkpoint's `rope_parameters` carries a second
+        // pair of keys alongside `rope_theta`/`partial_rotary_factor`, saying
+        // how the `rotary_dim/2` frequencies split across a spliced
+        // sequence's three position axes. Absent means every request --
+        // vision-capable checkpoint or not -- keeps today's one-axis
+        // behaviour; `qwen35_vision::llm_position_ids` gives plain text the
+        // same value on all three axes anyway, so this is additive, not a
+        // mode switch.
+        let mrope_section = match rope["mrope_section"].as_array() {
+            Some(a) if a.len() == 3 => {
+                let axes: Option<Vec<usize>> =
+                    a.iter().map(|v| v.as_u64().map(|x| x as usize)).collect();
+                axes.map(|v| [v[0], v[1], v[2]])
+            }
+            Some(a) => anyhow::bail!(
+                "mrope_section has {} entries, expected exactly 3 (time, height, width)",
+                a.len()
+            ),
+            None => None,
+        };
+        if let Some(section) = mrope_section {
+            let total: usize = section.iter().sum();
+            anyhow::ensure!(
+                total == rotary_dim / 2,
+                "mrope_section {section:?} sums to {total}, but rotary_dim {rotary_dim} \
+                 has {} frequencies to split across time/height/width; every frequency \
+                 needs an axis or the rope table and the axis map disagree about how \
+                 wide the rotation is",
+                rotary_dim / 2
+            );
+            // Qwen2-VL and Qwen2.5-VL read the same field as a *chunked*
+            // layout -- `[0..section[0])` time, `[section[0]..+section[1])`
+            // height, the rest width. Qwen3.5 interleaves by `i % 3` instead;
+            // both readings consume the same shape and only diverge once an
+            // image is in context, which is the worst place for this to be
+            // silently wrong. Refuse rather than guess.
+            anyhow::ensure!(
+                rope["mrope_interleaved"].as_bool().unwrap_or(false),
+                "mrope_interleaved is false or absent: that is the Qwen2-VL/2.5-VL \
+                 chunked axis layout, which this build does not implement -- only \
+                 the interleaved (`i % 3`) reading Qwen3.5 trained with"
+            );
+        }
+
         Ok(Self {
             arch,
             name: name.to_string(),
@@ -516,6 +590,7 @@ impl Config {
             rms_eps: dims["rms_norm_eps"].as_f64().unwrap_or(1e-5) as f32,
             rope_theta,
             rotary_dim,
+            mrope_section,
             // Llama 3's scaling is per-dimension rather than a single factor;
             // it arrives through `rope_freq_factors` instead. A plain linear
             // `factor` would go here.

@@ -390,6 +390,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
 
 [[package]]
+name = "crossbeam-deque"
+version = "0.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5181e0de7b61eb03a81e347d6dd8797bae9da5146707b51077e2d71a54ec0ceb"
+dependencies = [
+ "crossbeam-epoch",
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-epoch"
+version = "0.9.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-utils"
+version = "0.8.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
+
+[[package]]
 name = "crossterm"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -600,6 +625,12 @@ dependencies = [
  "regex-automata",
  "regex-syntax",
 ]
+
+[[package]]
+name = "fastrand"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "fdeflate"
@@ -965,6 +996,162 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "79cf5c93f93228cf8efb3ba362535fb11199ac548a09ce117c9b1adc3030d706"
 dependencies = [
  "rustversion",
+]
+
+[[package]]
+name = "infero-cuda"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "half",
+ "libloading 0.8.9",
+ "thiserror 2.0.20",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "infero-gguf"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "half",
+ "memmap2",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "infero-gpu"
+version = "0.1.0"
+dependencies = [
+ "infero-cuda",
+ "infero-metal",
+]
+
+[[package]]
+name = "infero-kernels"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "half",
+ "infero-cuda",
+ "infero-gguf",
+ "infero-gpu",
+ "infero-model",
+ "infero-safetensors",
+ "rand 0.9.5",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "infero-metal"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "half",
+ "infero-gguf",
+ "infero-kernels",
+ "infero-tokenizer",
+ "libc",
+ "memmap2",
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
+ "objc2-metal-performance-shaders",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "infero-model"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "half",
+ "infero-cuda",
+ "infero-gguf",
+ "infero-gpu",
+ "infero-kernels",
+ "infero-safetensors",
+ "infero-tokenizer",
+ "rand 0.9.5",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "infero-safetensors"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "half",
+ "memmap2",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "infero-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "clap",
+ "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "image",
+ "infero-gguf",
+ "infero-gpu",
+ "infero-model",
+ "infero-tokenizer",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "infero-tokenizer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fancy-regex 0.14.0",
+ "infero-gguf",
+ "minijinja",
+ "minijinja-contrib",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "tracing",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "infero-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "ratatui",
+ "serde_json",
+ "unicode-width",
 ]
 
 [[package]]
@@ -1809,6 +1996,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "rayon"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
+dependencies = [
+ "either",
+ "rayon-core",
+]
+
+[[package]]
+name = "rayon-core"
+version = "1.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
+dependencies = [
+ "crossbeam-deque",
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2122,6 +2329,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263"
 
 [[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.4.3",
+ "once_cell",
+ "rustix",
+ "windows-sys",
+]
+
+[[package]]
 name = "termina"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2433,160 +2653,6 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
-
-[[package]]
-name = "infero-cuda"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cudarc",
- "half",
- "libloading 0.8.9",
- "thiserror 2.0.20",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "infero-gguf"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "half",
- "memmap2",
- "thiserror 2.0.20",
- "tracing",
-]
-
-[[package]]
-name = "infero-gpu"
-version = "0.1.0"
-dependencies = [
- "infero-cuda",
- "infero-metal",
-]
-
-[[package]]
-name = "infero-kernels"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cudarc",
- "half",
- "rand 0.9.5",
- "tracing",
- "tracing-subscriber",
- "infero-cuda",
- "infero-gguf",
- "infero-gpu",
- "infero-model",
- "infero-safetensors",
-]
-
-[[package]]
-name = "infero-metal"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "half",
- "libc",
- "memmap2",
- "objc2",
- "objc2-foundation",
- "objc2-metal",
- "objc2-metal-performance-shaders",
- "serde_json",
- "thiserror 2.0.20",
- "tracing",
- "tracing-subscriber",
- "infero-gguf",
- "infero-kernels",
- "infero-tokenizer",
-]
-
-[[package]]
-name = "infero-model"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cudarc",
- "half",
- "rand 0.9.5",
- "serde",
- "serde_json",
- "tracing",
- "tracing-subscriber",
- "infero-cuda",
- "infero-gguf",
- "infero-gpu",
- "infero-kernels",
- "infero-safetensors",
- "infero-tokenizer",
-]
-
-[[package]]
-name = "infero-safetensors"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "half",
- "memmap2",
- "serde_json",
- "tracing",
-]
-
-[[package]]
-name = "infero-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64",
- "clap",
- "futures",
- "http-body-util",
- "hyper",
- "hyper-util",
- "image",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "infero-gguf",
- "infero-gpu",
- "infero-model",
- "infero-tokenizer",
-]
-
-[[package]]
-name = "infero-tokenizer"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "fancy-regex 0.14.0",
- "minijinja",
- "minijinja-contrib",
- "rustc-hash",
- "serde",
- "serde_json",
- "tracing",
- "infero-gguf",
- "unicode-normalization",
-]
-
-[[package]]
-name = "infero-tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "crossterm",
- "ratatui",
- "serde_json",
- "unicode-width",
-]
 
 [[package]]
 name = "typenum"

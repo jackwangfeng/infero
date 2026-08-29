@@ -111,6 +111,9 @@ fn main() -> Result<()> {
                 tokens: &ids,
                 wants_logits: true,
                 vision: Some(&feats),
+                vision_row_offset: 0,
+                mrope: None,
+                mrope_delta: 0,
             };
             model.forward_batch_device(std::slice::from_ref(&item), &mut pool)?;
         }

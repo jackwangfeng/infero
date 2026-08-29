@@ -7,6 +7,17 @@ use anyhow::Result;
 use infero_gpu::Device;
 use infero_kernels::Kernels;
 
+/// A zero-filled M-RoPE axis map of `n` entries. Paired with `pos_stride: 1`
+/// at any rope launcher's `mrope_axis`/`pos_stride` arguments, this reproduces
+/// the plain-scalar-position arithmetic exactly: `positions[token * 1 + 0]`
+/// is `positions[token]`, bit for bit.
+pub fn scalar_axis(
+    stream: &std::sync::Arc<infero_gpu::Stream>,
+    n: usize,
+) -> Result<infero_gpu::Buf<i32>> {
+    Ok(stream.clone_htod(&vec![0i32; n])?)
+}
+
 pub fn kernels() -> Result<Kernels> {
     // cudarc hands out the device's primary context, so tests running in
     // parallel share one context and one stream rather than fighting over

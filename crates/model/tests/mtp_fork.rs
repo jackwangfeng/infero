@@ -30,6 +30,7 @@ fn dims() -> HeadDims {
         eps: 1e-6,
         rope_theta: 10_000.0,
         vocab: 96,
+        mrope_section: None,
     }
 }
 
@@ -70,6 +71,7 @@ fn synth(dev: &Device, dims: HeadDims) -> Result<(MtpWeights, Matrix)> {
                 q_norm: Some(vec1(dims.d_head)?),
                 k_norm: Some(vec1(dims.d_head)?),
                 w_qkv: None,
+                w_kv: None,
                 output_gate: true,
             }),
             gdn: None,
@@ -122,7 +124,7 @@ fn two_branches_at_one_position_keep_their_own_keys() -> Result<()> {
         let (w, embed) = synth(&dev, dm)?;
         // Room for the prefix plus one forked slot a branch.
         let mut head = MtpHead::new(&dev, w, dm, PREFIX.max(branches), PREFIX + branches, branches)?;
-        head.step(&kern, &embed, &ids, &positions, &hidden.as_view())?;
+        head.step(&kern, &embed, &ids, &positions, &hidden.as_view(), None)?;
         let rows = run(&mut head, &embed)?;
         rows.into_iter()
             .map(|r| head.logits_row(&kern, &embed, r).map(|v| v.to_vec()))

@@ -142,6 +142,7 @@ fn synthetic_model(dev: &Device, cfg: &Config) -> Result<Model> {
                     q_norm: Some(vec_at(cfg.d_head, 1.0, 0.1)?),
                     k_norm: Some(vec_at(cfg.d_head, 1.0, 0.1)?),
                     w_qkv: None,
+                    w_kv: None,
                     output_gate: true,
                 }),
                 None,
@@ -170,6 +171,7 @@ fn synthetic_model(dev: &Device, cfg: &Config) -> Result<Model> {
         output: Some(m(d, vocab, 0.5)?),
         output_split: None,
         rope_freqs: dev.stream().clone_htod(&vec![1.0f32; cfg.rotary_dim / 2])?,
+        mrope_axis: dev.stream().clone_htod(&vec![0i32; cfg.rotary_dim / 2])?,
         device_bytes: 0,
         host_bytes: 0,
         max_blob_bytes: 0,
@@ -255,7 +257,7 @@ fn speculate(
                 }
             })
             .collect();
-        let outcome = model.verify_draft(seq, &mut pool, pending, &proposal)?;
+        let outcome = model.verify_draft(seq, &mut pool, pending, &proposal, 0)?;
         accepted += outcome.accepted;
         pending = *outcome.tokens.last().unwrap();
         out.extend(outcome.tokens);
@@ -336,7 +338,7 @@ fn a_prefill_chunk_the_width_of_a_verification_pass_keeps_its_own_graph() -> Res
                 if j == 0 { right } else { right.wrapping_add(37) % 256 }
             })
             .collect();
-        let outcome = model.verify_draft(seq, &mut pool, pending, &proposal)?;
+        let outcome = model.verify_draft(seq, &mut pool, pending, &proposal, 0)?;
         pending = *outcome.tokens.last().unwrap();
         out.extend(outcome.tokens);
     }

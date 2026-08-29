@@ -35,6 +35,9 @@ fn server() -> Option<SocketAddr> {
             4,
             None,
             4096,
+            16,
+            infero_server::video::DEFAULT_TARGET_FPS,
+            0.0,
         )
         .expect("starting engine");
         let app = routes::router(engine).layer(
@@ -259,6 +262,34 @@ fn completions_honour_stop_sequences() {
     assert!(!text.contains('8'), "stop sequence leaked: {text:?}");
     assert!(text.contains('6'), "stopped too early: {text:?}");
     assert_eq!(v["choices"][0]["finish_reason"], "stop");
+}
+
+/// axum's `Json` extractor defaults to a 2 MiB body limit; `routes::router`
+/// raises it to 80 MiB (see its own comment) specifically so a base64 video
+/// payload does not get a bare 413 before this crate's own, more precise
+/// size checks (`crate::video`'s 64 MiB) ever run. A prompt this large is
+/// refused anyway -- it is far longer than the 1024-token test server's
+/// context, and that refusal is this crate's own 500 (`Event::Failed`
+/// refusals are not yet split from real server errors -- a separate, known
+/// gap, not this test's concern) -- but it has to be *that* refusal, with a
+/// structured `error` body, not axum's bare 413, to prove the body actually
+/// reached the handler.
+#[test]
+fn a_body_over_two_mebibytes_is_not_413d_by_the_default_axum_limit() {
+    let addr = addr!();
+    let prompt: String = "hello ".repeat(400_000); // ~2.4 MiB
+    assert!(prompt.len() > 2 * 1024 * 1024);
+    let (status, body) = post(
+        addr,
+        "/v1/completions",
+        serde_json::json!({
+            "prompt": prompt,
+            "max_tokens": 1
+        }),
+    );
+    assert_ne!(status, 413, "the router's body limit did not take effect: {body}");
+    let v = json(&body);
+    assert!(v["error"]["message"].as_str().unwrap().contains("does not fit"), "{body}");
 }
 
 #[test]
@@ -505,6 +536,79 @@ fn more_than_one_image_is_refused() {
         }),
     );
     assert_eq!(status, 400, "{body}");
+}
+
+/// Regression test for a real bug found this session: a video whose
+/// placeholder run spans more than one frame-group, chunked across several
+/// prefill steps, spliced the *wrong* `VisionFeatures` rows into later
+/// chunks. The cause was `BatchItem::vision_row_offset` being computed from
+/// prompt-*position* arithmetic (`from - vision_at`) rather than a count of
+/// actual pad-token occurrences -- correct for a still image (one contiguous
+/// placeholder run) but wrong for any video with more than one frame-group,
+/// because `<T.T seconds>` text and `vision_start`/`vision_end` sit *between*
+/// groups, not just around the whole run. The bug only reproduced when a
+/// video's placeholder run needed more than one prefill step (a short clip,
+/// or a small `batch_tokens`, never hit it) -- which is exactly the case
+/// chunking exists for, and exactly what this test forces by requesting
+/// several seconds of a synthetic clip at `--max-seqs 4`'s ~256-token
+/// `batch_tokens` here. Skipped (not failed) if the shared model has no
+/// vision tower, or if `ffmpeg` is not on `PATH` to synthesize the clip --
+/// this deliberately does not depend on a checked-in video asset.
+#[test]
+fn a_multi_group_video_survives_chunked_prefill() {
+    let addr = addr!();
+    if !json(&get(addr, "/health").1)["has_vision"].as_bool().unwrap_or(false) {
+        eprintln!("skipping: this model has no vision tower");
+        return;
+    }
+    let Some(path) = synth_multiscene_video() else {
+        eprintln!("skipping: could not synthesize a test video (is ffmpeg on PATH?)");
+        return;
+    };
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let url = format!("data:video/mp4;base64,{b64}");
+    let (status, body) = post(
+        addr,
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "video_url", "video_url": {"url": url, "fps": 6.0}},
+                    {"type": "text", "text": "describe this briefly"}
+                ]
+            }],
+            "max_tokens": 5,
+            "temperature": 0
+        }),
+    );
+    assert_eq!(status, 200, "{body}");
+    let v = json(&body);
+    assert!(
+        !v["choices"][0]["message"]["content"].as_str().unwrap_or("").is_empty(),
+        "{body}"
+    );
+}
+
+/// A short synthetic clip whose content actually changes over time (a moving
+/// test pattern, not a solid colour), so a real number of sampled frame-groups
+/// end up genuinely different from one another -- generated with `ffmpeg`'s
+/// `testsrc` source rather than checked into the repo. `None` if `ffmpeg`
+/// itself is not available, which the caller treats as "skip", not "fail".
+fn synth_multiscene_video() -> Option<PathBuf> {
+    let path = std::env::temp_dir().join("infero_test_multiscene.mp4");
+    let ok = std::process::Command::new("ffmpeg")
+        .args([
+            "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x320:rate=8:duration=10",
+            "-pix_fmt", "yuv420p",
+        ])
+        .arg(&path)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    ok.then_some(path)
 }
 
 /// A remote URL is refused with a message naming why, not fetched — this

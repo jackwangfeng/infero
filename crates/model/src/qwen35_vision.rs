@@ -228,6 +228,39 @@ pub fn linear(x: &[f32], w: &[f32], b: &[f32], rows: usize, in_dim: usize, out_d
 
 // -------------------------------------------------------------- preprocessing
 
+/// How many temporal-patch groups a `frames`-frame clip folds into, and the
+/// patch budget each group gets out of a whole-clip `max_patches`.
+///
+/// Pulled out of `Model::vision_resize_video` so the arithmetic is testable
+/// without a loaded tower: it is plain division, but it is the one line that
+/// makes a video resize different from resizing one frame `grid_t` times
+/// independently -- dividing the budget *before* calling `smart_resize`
+/// keeps a clip's total patches within `max_patches` by construction, where
+/// resizing each frame-group to the *whole* budget would multiply it by
+/// `grid_t` and only be caught later, if at all, by whatever refuses an
+/// over-budget clip downstream.
+///
+/// `None` for zero frames (nothing to resize) or a budget too small to give
+/// every group at least one full `merge_unit` block -- less than that and
+/// there is no whole merge block left for `smart_resize`'s own `min_pixels`
+/// floor to land on.
+pub fn video_resize_budget(
+    frames: usize,
+    temporal_patch: usize,
+    merge_unit: usize,
+    max_patches: usize,
+) -> Option<(usize, usize)> {
+    if frames == 0 || temporal_patch == 0 {
+        return None;
+    }
+    let grid_t = frames.div_ceil(temporal_patch);
+    let per_group = max_patches / grid_t;
+    if per_group < merge_unit {
+        return None;
+    }
+    Some((grid_t, per_group))
+}
+
 /// The dynamic-resolution rule, from `qwen2_vl.image_processing_qwen2_vl
 /// .smart_resize`.
 ///
@@ -339,6 +372,57 @@ pub fn patchify(
         }
     }
     (out, gh, gw)
+}
+
+/// [`patchify`] generalized to a multi-frame clip: `planar` is `[frames, C, H,
+/// W]`, frames back to back (`qwen35_vision_image::PreparedClip::planar`'s
+/// layout), `frames` always even. Temporal patch group `ti` reads its two
+/// taps from frames `2*ti` and `2*ti + 1` -- `patchify`'s still-image case is
+/// the degenerate `frames == 2` clip whose two frames happen to be identical,
+/// which is exactly why that function does not need this one's frame index
+/// and duplicates the single frame across both taps instead.
+///
+/// Returns `(patches, grid_t, grid_h, grid_w)`; `patches` is
+/// `[grid_t * grid_h * grid_w, patch_dim]`, one temporal group's patches
+/// after another, matching [`Grid`]'s own `t` outermost convention.
+pub fn patchify_clip(
+    planar: &[f32],
+    frames: usize,
+    height: usize,
+    width: usize,
+    dims: &VisionDims,
+) -> (Vec<f32>, usize, usize, usize) {
+    let (p, m, tp, c_n) = (dims.patch, dims.merge, dims.temporal_patch, dims.in_channels);
+    assert_eq!(tp, 2, "this loop pairs frames two at a time; temporal_patch must be 2");
+    assert!(
+        frames.is_multiple_of(tp),
+        "{frames} frames does not split evenly into temporal patches of {tp}; \
+         qwen35_vision_image::prepare_clip pads to an even count and this \
+         should never see an odd one"
+    );
+    let frame_elems = c_n * height * width;
+    assert_eq!(planar.len(), frames * frame_elems);
+    let (gh, gw) = (height / p, width / p);
+    let grid_t = frames / tp;
+    let mut out = vec![0.0f32; grid_t * gh * gw * dims.patch_dim()];
+    for ti in 0..grid_t {
+        for idx in 0..gh * gw {
+            let (row, col) = patch_row_col(idx, gw, m);
+            let out_base = (ti * gh * gw + idx) * dims.patch_dim();
+            for c in 0..c_n {
+                for t in 0..tp {
+                    let frame = &planar[(ti * tp + t) * frame_elems..(ti * tp + t + 1) * frame_elems];
+                    for y in 0..p {
+                        for x in 0..p {
+                            let src = (c * height + row * p + y) * width + col * p + x;
+                            out[out_base + patch_slot(c, t, y, x, dims)] = frame[src];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (out, grid_t, gh, gw)
 }
 
 // ------------------------------------------------------------------- geometry

@@ -173,11 +173,26 @@ pub struct ContentPart {
     pub text: Option<String>,
     #[serde(default)]
     pub image_url: Option<ImageUrl>,
+    #[serde(default)]
+    pub video_url: Option<VideoUrl>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ImageUrl {
     pub url: String,
+}
+
+/// Not part of OpenAI's schema (video input is this server's own extension,
+/// same as `video_url` itself) -- `fps` mirrors vLLM's per-request
+/// `media_io_kwargs["video"]["fps"]` and Gemini's `videoMetadata.fps`: how
+/// densely to sample this one clip, overriding the server's own
+/// `--video-target-fps` default. `None` when the caller does not care and
+/// wants that default.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct VideoUrl {
+    pub url: String,
+    #[serde(default)]
+    pub fps: Option<f64>,
 }
 
 impl Message {
@@ -210,6 +225,16 @@ impl Message {
                 .filter_map(|p| p.image_url.as_ref())
                 .map(|u| u.url.as_str())
                 .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Every video part's `video_url`, in the order they appear -- the whole
+    /// object rather than just the url, since a caller may also have set
+    /// `fps`. Same reasoning as [`Self::image_urls`].
+    pub fn video_urls(&self) -> Vec<&VideoUrl> {
+        match &self.content {
+            Some(Content::Parts(parts)) => parts.iter().filter_map(|p| p.video_url.as_ref()).collect(),
             _ => Vec::new(),
         }
     }

@@ -31,6 +31,8 @@
 //! reach it before it is wired into `lib.rs`; see the report accompanying this
 //! work for the one line `lib.rs` needs.
 
+use rayon::prelude::*;
+
 /// `image_mean` / `image_std` from `preprocessor_config.json`.
 ///
 /// **0.5, not CLIP's.** `Qwen2VLImageProcessor`'s *class default* is
@@ -232,4 +234,67 @@ pub fn prepare_frame(
         grid_h: target_h / patch,
         grid_w: target_w / patch,
     }
+}
+
+/// A resized, normalized clip ready for
+/// [`crate::qwen35_vision::patchify_clip`].
+#[derive(Clone, Debug)]
+pub struct PreparedClip {
+    /// Planar `[frames, C, H, W]`, one frame's [`PreparedFrame::planar`]
+    /// after another.
+    pub planar: Vec<f32>,
+    /// Always even -- an odd input frame count gets its last frame
+    /// duplicated, the clip-level generalization of a still image's own two
+    /// identical temporal taps (see [`prepare_frame`]'s doc comment via
+    /// [`crate::qwen35_vision::patchify`]).
+    pub frames: usize,
+    pub height: usize,
+    pub width: usize,
+    pub grid_h: usize,
+    pub grid_w: usize,
+}
+
+/// Resize and normalize every frame of a clip to the same target, the way
+/// [`prepare_frame`] does for one image -- reused here per frame rather than
+/// duplicated, so the two share one tested resize/normalize path.
+///
+/// `raw_frames` must be non-empty. All frames share `src_h`/`src_w`: a real
+/// video's frames are already the same size, so a caller with frames of
+/// different sizes has a decode bug upstream, not a case this should paper
+/// over by resizing each independently to a common target and hoping the
+/// aspect ratios agreed.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_clip(
+    raw_frames: &[&[u8]],
+    src_h: usize,
+    src_w: usize,
+    channels: usize,
+    target_h: usize,
+    target_w: usize,
+    patch: usize,
+    merge: usize,
+) -> PreparedClip {
+    assert!(!raw_frames.is_empty(), "a clip with no frames");
+    // Every frame resizes independently of every other -- no shared state,
+    // same target size and grid for all of them -- so rayon's work-stealing
+    // pool runs them concurrently and this just concatenates the results in
+    // the original order afterwards, exactly what the old sequential loop
+    // built one `extend_from_slice` at a time.
+    let prepared: Vec<PreparedFrame> = raw_frames
+        .par_iter()
+        .map(|&f| prepare_frame(f, src_h, src_w, channels, target_h, target_w, patch, merge))
+        .collect();
+    let (grid_h, grid_w) = (prepared[0].grid_h, prepared[0].grid_w);
+    let frame_elems = prepared[0].planar.len();
+    let mut planar = Vec::with_capacity(frame_elems * raw_frames.len());
+    for pf in &prepared {
+        planar.extend_from_slice(&pf.planar);
+    }
+    let mut frames = raw_frames.len();
+    if !frames.is_multiple_of(2) {
+        let last = planar[planar.len() - frame_elems..].to_vec();
+        planar.extend(last);
+        frames += 1;
+    }
+    PreparedClip { planar, frames, height: target_h, width: target_w, grid_h, grid_w }
 }

@@ -170,6 +170,7 @@ fn main() -> Result<()> {
             rows: 0..1,
             positions: vec![pos],
             shifted: vec![second],
+            mrope: None,
         };
         let t = time(
             REPS,

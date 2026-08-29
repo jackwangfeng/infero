@@ -19,10 +19,11 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
+use infero_model::qwen35_vision::{Grid, llm_position_ids};
 use infero_model::{BatchItem, KvPool, Model, Sampler, SeqId, VisionFeatures};
 use infero_tokenizer::Tokenizer;
 
-use crate::engine::{Event, FinishReason, PendingImage, Request};
+use crate::engine::{Event, FinishReason, PendingImage, PendingVideo, Request};
 use crate::stop::split_at_stop;
 
 /// A sequence the scheduler is currently generating.
@@ -34,12 +35,35 @@ struct Running {
     /// The cached blocks this sequence borrows, and the references it holds on
     /// them. Released when it retires; see `retire`.
     prefix: crate::prefix::Prefix,
-    /// The tower's output for this sequence's one image, waiting for the
-    /// single unchunked prefill step that splices it in. `admit` fills this in
-    /// before the sequence starts running and `step` takes it the moment that
-    /// step's `BatchItem` is built — nothing after the prefill reads it again,
-    /// and holding the device buffer past that is a leak with no reader.
+    /// The tower's output for this sequence's one image or video, waiting for
+    /// however many prefill steps it takes to splice the whole thing in --
+    /// one, the common case, or several once a placeholder run outgrows a
+    /// single step's `batch_tokens` budget. `admit` fills this in before the
+    /// sequence starts running; `step` drops it once every pad token this
+    /// clip's rows replace has been consumed (see `vision_pad_tok`'s doc
+    /// comment below), the point past which nothing reads it again — holding
+    /// the device buffer longer than that is a leak with no reader.
     vision: Option<VisionFeatures>,
+    /// The placeholder id `vision`'s rows replace -- `img_tok` or `vid_tok`
+    /// (see `Model::vision_tokens`). Meaningless (and never read) once
+    /// `vision` is `None`. Set by `admit` alongside `vision`.
+    ///
+    /// What a prefill chunk `[from, from+len)` uses to compute
+    /// `BatchItem::vision_row_offset`: **not** `from` minus some remembered
+    /// start index. A video's placeholder tokens are not one contiguous run
+    /// the way an image's are -- `encode_pending_video` interleaves each
+    /// frame-group's pad run with `<T.T seconds>` text and its own
+    /// `vision_start`/`vision_end`, so "how far into the prompt this chunk
+    /// starts" and "how many pad tokens came before it" are different
+    /// numbers once more than one frame-group exists. The only correct way
+    /// to get the second number is to count actual occurrences of
+    /// `vision_pad_tok` in `prompt[..from]` -- see the two call sites in
+    /// `step`. A real, reproduced bug: an index-arithmetic shortcut here
+    /// passed every single-chunk (image, or a video whose whole run fit in
+    /// one step) test in this codebase and only broke on a video chunked
+    /// across steps with more than one frame-group, which is exactly the
+    /// case chunking exists for.
+    vision_pad_tok: u32,
     /// Whether this sequence ever carried an image, kept after `vision` above
     /// is taken.
     ///
@@ -52,6 +76,26 @@ struct Running {
     /// `retire` both check this to keep such a sequence out of the cache
     /// entirely, not just out of collisions with itself.
     had_vision: bool,
+    /// This sequence's absolute M-RoPE `[T, H, W]` positions, token-major
+    /// (`3 * prompt.len()` entries) over the whole *expanded* prompt.
+    /// `None` for a text-only sequence, or when the model has no
+    /// `cfg.mrope_section`.
+    ///
+    /// Outlives `vision` the same way `had_vision` does, and for the same
+    /// reason: a decode step's position still depends on this sequence ever
+    /// having carried an image, long after `vision`'s one prefill has come
+    /// and gone. `admit` fills it in from `qwen35_vision::llm_position_ids`
+    /// right after the placeholder expansion, while the grid is still in
+    /// hand. `step` slices it absolutely at `from..from+len` for a prefill
+    /// chunk, which is what makes it correct under a prefix-cache hit too
+    /// (`from` starts wherever the cached prefix left off, not at zero).
+    mrope: Option<Box<[i32]>>,
+    /// The constant M-RoPE adds to a plain running length once the prompt is
+    /// in: `0` without M-RoPE, negative for a sequence that passed through an
+    /// image (see `BatchItem::mrope_delta`'s doc comment for why negative is
+    /// correct, not a bug). Computed alongside `mrope` and constant for the
+    /// sequence's lifetime.
+    mrope_delta: i32,
     /// The token to feed next, once the prompt is in.
     next: Option<u32>,
     generated: Vec<u32>,
@@ -169,6 +213,285 @@ pub struct Scheduler {
     /// allocated once, at that size — is what `encode_image` writes into; a
     /// resize past it would overrun a buffer the loader already fixed.
     vision_max_patches: usize,
+    /// Mean absolute pixel difference (0-255 scale) below which a video
+    /// frame-group is dropped as a near-duplicate of the last *retained*
+    /// group, before it ever reaches the vision tower -- see
+    /// `drop_redundant_groups`'s own doc comment and `notes/video-encoding
+    /// -optimizations.md`'s item 5. `<= 0.0` (the default) disables this,
+    /// matching vLLM's own "pruning off unless a rate is explicitly set"
+    /// convention.
+    video_dedup_threshold: f64,
+}
+
+/// Absolute M-RoPE `[T, H, W]` positions for a prompt already spliced with one
+/// image's placeholder run, token-major, plus the running-position delta a
+/// decode step should carry forward afterwards.
+///
+/// `prompt` is the *expanded* prompt -- `encode_pending_image`'s output, `img_tok`
+/// repeated `feats.tokens` times where the single placeholder used to be, not
+/// the one-token version the template rendered. `qwen35_vision::llm_position_ids`
+/// wants `token_types` (0 text, 1 image) at that same width, and a `Grid` in
+/// pre-merge patch units, which is exactly what `VisionFeatures::grid_h/grid_w`
+/// already are -- see that struct's own doc comment.
+///
+/// `llm_position_ids` returns `[3, seq]` (axis-major, matching the capture this
+/// function is checked against in `crates/model/tests/qwen35_vision.rs`); the
+/// transpose to token-major here is so a prefill chunk's slice
+/// (`mrope[3*from..3*(from+len)]`) is one contiguous range rather than three.
+fn mrope_for_image(prompt: &[u32], img_tok: u32, feats: &VisionFeatures, merge: usize) -> (Box<[i32]>, i32) {
+    let grid = Grid { t: 1, h: feats.grid_h, w: feats.grid_w };
+    mrope_from_grid(prompt, img_tok, grid, merge)
+}
+
+/// Same idea as [`mrope_for_image`], but a video's placeholder run is
+/// `feats.grid_t` *separate* contiguous runs of `vid_tok` -- one a
+/// frame-group, timestamp text in between -- rather than one run covering the
+/// whole grid. `llm_position_ids` already expects exactly this shape (it
+/// pulls one `Grid` off `grids` per contiguous visual run it walks into), so
+/// the only change from the image path is passing `grid_t` copies of the same
+/// per-group `Grid` instead of one.
+fn mrope_for_video(prompt: &[u32], vid_tok: u32, feats: &VisionFeatures, merge: usize) -> (Box<[i32]>, i32) {
+    let grid = Grid { t: 1, h: feats.grid_h, w: feats.grid_w };
+    let grids = vec![grid; feats.grid_t];
+    mrope_from_grids(prompt, vid_tok, &grids, merge)
+}
+
+/// [`mrope_for_image`]'s arithmetic, independent of `VisionFeatures` so it can
+/// be unit-tested without a device.
+fn mrope_from_grid(prompt: &[u32], img_tok: u32, grid: Grid, merge: usize) -> (Box<[i32]>, i32) {
+    mrope_from_grids(prompt, img_tok, &[grid], merge)
+}
+
+/// [`mrope_from_grid`] generalized to `grids.len()` separate visual runs, all
+/// marked by the same `marker_tok` -- what [`mrope_for_video`] needs and
+/// [`mrope_from_grid`] is now a one-grid instance of.
+fn mrope_from_grids(prompt: &[u32], marker_tok: u32, grids: &[Grid], merge: usize) -> (Box<[i32]>, i32) {
+    let token_types: Vec<u8> = prompt.iter().map(|&t| u8::from(t == marker_tok)).collect();
+    let axis_major = llm_position_ids(&token_types, grids, merge);
+    let seq = prompt.len();
+    let mut token_major = vec![0i32; 3 * seq];
+    for t in 0..seq {
+        for axis in 0..3 {
+            token_major[3 * t + axis] = axis_major[axis * seq + t] as i32;
+        }
+    }
+    let max = axis_major.iter().copied().max().unwrap_or(0) as i32;
+    let delta = max + 1 - seq as i32;
+    (token_major.into_boxed_slice(), delta)
+}
+
+#[cfg(test)]
+mod mrope_tests {
+    use super::*;
+
+    /// Text(2) + a 4x4 pre-merge grid at merge 2 (post-merge 2x2, 4 image
+    /// tokens) + text(1). Hand-computed against `llm_position_ids`'s own
+    /// documented rule (advance by `max(lh, lw)`, not token count), not just
+    /// echoed back from the function under test:
+    ///
+    /// token  0    1    2      3      4      5      6
+    /// kind   text text img    img    img    img    text
+    /// (T,H,W)(0,0,0)(1,1,1)(2,2,2)(2,2,3)(2,3,2)(2,3,3)(4,4,4)
+    ///
+    /// The image run's four entries are `(hi,wi)` in `(0,0),(0,1),(1,0),(1,1)`
+    /// order, T constant at the text run's length (2), H/W offset by `hi`/`wi`.
+    /// The text run after it resumes at `2 + max(2,2) = 4`, not at `2 + 4 = 6`
+    /// -- the token-counting mistake `llm_position_ids`'s own doc comment
+    /// warns about. Max position is 4, over a 7-token prompt, so delta is
+    /// `4 + 1 - 7 = -2`: negative, which is the sign that the advance rule
+    /// was applied and not skipped.
+    const IMG: u32 = 999;
+    fn prompt() -> Vec<u32> {
+        vec![10, 11, IMG, IMG, IMG, IMG, 12]
+    }
+    fn grid() -> Grid {
+        Grid { t: 1, h: 4, w: 4 }
+    }
+    fn expected() -> Vec<[i32; 3]> {
+        vec![[0, 0, 0], [1, 1, 1], [2, 2, 2], [2, 2, 3], [2, 3, 2], [2, 3, 3], [4, 4, 4]]
+    }
+
+    #[test]
+    fn matches_the_hand_computed_positions_and_a_negative_delta() {
+        let (mrope, delta) = mrope_from_grid(&prompt(), IMG, grid(), 2);
+        let want = expected();
+        for (t, w) in want.iter().enumerate() {
+            assert_eq!(&mrope[3 * t..3 * t + 3], w, "token {t}");
+        }
+        assert_eq!(delta, -2, "max position 4 over 7 tokens");
+        assert!(delta < 0, "the advance-by-token-count bug gives delta >= 0");
+    }
+
+    /// The transpose is a real transpose of `llm_position_ids`'s own output,
+    /// not a coincidence of the hand-computed table above: recomputed
+    /// independently here via `llm_position_ids` directly plus a manual
+    /// transpose, and compared against `mrope_from_grid`'s result.
+    #[test]
+    fn the_transpose_matches_llm_position_ids_independently_reshaped() {
+        let p = prompt();
+        let token_types: Vec<u8> = p.iter().map(|&t| u8::from(t == IMG)).collect();
+        let axis_major = llm_position_ids(&token_types, &[grid()], 2);
+        let seq = p.len();
+        let (mrope, _) = mrope_from_grid(&p, IMG, grid(), 2);
+        for t in 0..seq {
+            for axis in 0..3 {
+                assert_eq!(
+                    mrope[3 * t + axis],
+                    axis_major[axis * seq + t] as i32,
+                    "token {t} axis {axis}"
+                );
+            }
+        }
+    }
+
+    /// A prefill chunk's slice, `mrope[3*from..3*(from+len)]` -- the shape
+    /// `step()` actually reads -- lands on the right tokens. This is the
+    /// property a prefix-cache hit depends on: `from` can be nonzero.
+    #[test]
+    fn a_chunk_slice_lands_on_the_right_tokens() {
+        let (mrope, _) = mrope_from_grid(&prompt(), IMG, grid(), 2);
+        let (from, len) = (3, 2);
+        let chunk = &mrope[3 * from..3 * (from + len)];
+        let want = expected();
+        assert_eq!(chunk, [want[3], want[4]].concat());
+    }
+
+    /// A prompt with no image token at all -- every position is `t` on all
+    /// three axes, and the delta is exactly zero: M-RoPE degenerates to the
+    /// plain scalar position when there is nothing visual to advance around.
+    #[test]
+    fn a_text_only_prompt_gives_zero_delta_and_equal_axes() {
+        let p: Vec<u32> = vec![1, 2, 3, 4, 5];
+        let (mrope, delta) = mrope_from_grid(&p, IMG, grid(), 2);
+        assert_eq!(delta, 0);
+        for t in 0..p.len() {
+            assert_eq!(&mrope[3 * t..3 * t + 3], &[t as i32, t as i32, t as i32]);
+        }
+    }
+}
+
+/// Drop video frame-groups that are near-duplicates of the last *retained*
+/// group -- a coarser, much safer relative of vLLM's per-token EVS pruning
+/// (`vllm/multimodal/video_prune/evs.py`, read directly from vLLM's real
+/// source; see `notes/video-encoding-optimizations.md`'s item 5 for the full
+/// writeup and why the token-level version was not attempted). Whole groups
+/// are kept or dropped, never split, so every downstream stage of this
+/// pipeline -- `vision_resize_video`, `prepare_clip`, `encode_clip`, the
+/// M-RoPE position math -- sees an ordinary (if shorter) clip and needs no
+/// changes: `grid_t` already varies request to request today.
+///
+/// Runs on raw decoded pixels, before the tower ever sees a frame -- unlike
+/// EVS (which prunes the tower's *output*), this also saves the compute a
+/// dropped group would have cost, not just the tokens it would have spent.
+///
+/// `frames` is `PendingVideo`/`DecodedClip`'s own layout: interleaved RGB8,
+/// two entries a temporal-patch group (a group's second frame duplicates the
+/// first if the clip's raw frame count was odd, same convention `prepare_clip`
+/// documents). `timestamps` has one entry a group. `threshold` is mean
+/// absolute per-channel pixel difference (0-255 scale); group 0 is always
+/// kept. Group `gi`'s frames are compared against the last *retained* group's,
+/// not simply the previous group -- a slow fade across several near-identical
+/// groups should not each compare "close enough" to its immediate
+/// predecessor and all survive; they should all compare against the one
+/// frame actually being kept.
+fn drop_redundant_groups(frames: &[Vec<u8>], timestamps: &[f64], threshold: f64) -> (Vec<Vec<u8>>, Vec<f64>) {
+    if timestamps.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut kept_frames = Vec::with_capacity(frames.len());
+    let mut kept_timestamps = Vec::with_capacity(timestamps.len());
+    let mut last_kept_gi: Option<usize> = None;
+    for gi in 0..timestamps.len() {
+        let a = &frames[2 * gi];
+        let b = frames.get(2 * gi + 1).unwrap_or(a);
+        let keep = match last_kept_gi {
+            None => true,
+            Some(lgi) => {
+                let la = &frames[2 * lgi];
+                let lb = frames.get(2 * lgi + 1).unwrap_or(la);
+                mean_abs_diff(a, la) > threshold || mean_abs_diff(b, lb) > threshold
+            }
+        };
+        if keep {
+            kept_frames.push(a.clone());
+            kept_frames.push(b.clone());
+            kept_timestamps.push(timestamps[gi]);
+            last_kept_gi = Some(gi);
+        }
+    }
+    (kept_frames, kept_timestamps)
+}
+
+/// Mean absolute byte difference between two equal-shaped interleaved RGB8
+/// buffers. A shape mismatch (should not happen -- every sampled frame
+/// shares one source resolution) returns `f64::INFINITY` so the caller keeps
+/// the group rather than silently comparing against nothing.
+fn mean_abs_diff(a: &[u8], b: &[u8]) -> f64 {
+    if a.len() != b.len() || a.is_empty() {
+        return f64::INFINITY;
+    }
+    let sum: u64 = a.iter().zip(b).map(|(&x, &y)| (x as i32 - y as i32).unsigned_abs() as u64).sum();
+    sum as f64 / a.len() as f64
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+
+    fn solid(v: u8) -> Vec<u8> {
+        vec![v; 12] // a tiny "frame": 4 pixels x 3 channels
+    }
+
+    #[test]
+    fn identical_groups_collapse_to_the_first() {
+        let frames = vec![solid(10), solid(10), solid(10), solid(10), solid(10), solid(10)];
+        let timestamps = vec![0.0, 1.0, 2.0];
+        let (kf, kt) = drop_redundant_groups(&frames, &timestamps, 1.0);
+        assert_eq!(kt, vec![0.0], "three identical groups should collapse to one");
+        assert_eq!(kf, vec![solid(10), solid(10)]);
+    }
+
+    #[test]
+    fn a_real_change_survives() {
+        let frames = vec![solid(10), solid(10), solid(200), solid(200)];
+        let timestamps = vec![0.0, 1.0];
+        let (kf, kt) = drop_redundant_groups(&frames, &timestamps, 1.0);
+        assert_eq!(kt, vec![0.0, 1.0], "a genuinely different group must survive");
+        assert_eq!(kf, frames);
+    }
+
+    #[test]
+    fn a_threshold_of_zero_still_drops_exact_duplicates() {
+        // The "disabled by default" behaviour lives in the *caller*
+        // (`encode_pending_video` only calls this at all when
+        // `video_dedup_threshold > 0.0`) -- this function has no separate
+        // disable guard of its own. At a threshold of exactly zero, two
+        // byte-identical groups still diff at 0, which is not `> 0.0`, so
+        // the second one is still dropped as redundant.
+        let frames = vec![solid(10), solid(10), solid(10), solid(10)];
+        let timestamps = vec![0.0, 1.0];
+        let (_, kt) = drop_redundant_groups(&frames, &timestamps, 0.0);
+        assert_eq!(kt, vec![0.0]);
+    }
+
+    #[test]
+    fn compares_against_the_last_retained_group_not_the_immediate_predecessor() {
+        // A slow fade: 10 -> 12 -> 14 -> ... each step under the threshold
+        // versus its immediate neighbour, but a real cumulative change
+        // versus whichever group is actually still retained.
+        let vals = [10u8, 12, 14, 16, 18, 20];
+        let frames: Vec<Vec<u8>> = vals.iter().flat_map(|&v| [solid(v), solid(v)]).collect();
+        let timestamps: Vec<f64> = (0..vals.len()).map(|i| i as f64).collect();
+        let (_, kt) = drop_redundant_groups(&frames, &timestamps, 3.0);
+        // Kept: 0 (10), then the first one that differs from 10 by > 3,
+        // which is 16 (index 3, diff 6) -- 12 and 14 diff from the *kept*
+        // group (10) by only 2 and 4... 4 > 3, so 14 (index 2) should
+        // actually be the second kept group. Recompute by hand: vs kept=10,
+        // group1(12) diff=2 <=3 drop; group2(14) diff=4 >3 keep (now kept=14);
+        // group3(16) vs 14 diff=2 <=3 drop; group4(18) vs 14 diff=4 >3 keep
+        // (kept=18); group5(20) vs 18 diff=2 <=3 drop.
+        assert_eq!(kt, vec![0.0, 2.0, 4.0]);
+    }
 }
 
 impl Scheduler {
@@ -177,6 +500,7 @@ impl Scheduler {
         Self {
             prefix,
             vision_max_patches: 0,
+            video_dedup_threshold: 0.0,
             model,
             pool,
             tokenizer,
@@ -223,6 +547,10 @@ impl Scheduler {
     /// resizes images to what the tower's scratch can actually hold.
     pub fn set_vision_max_patches(&mut self, max_patches: usize) {
         self.vision_max_patches = max_patches;
+    }
+
+    pub fn set_video_dedup_threshold(&mut self, threshold: f64) {
+        self.video_dedup_threshold = threshold;
     }
 
     pub fn enable_speculation(&mut self, dir: &str, k: usize) -> Result<bool> {
@@ -435,6 +763,7 @@ impl Scheduler {
                 &draft,
                 &mut r.sampler,
                 &history,
+                r.mrope_delta,
             )?
         };
 
@@ -570,6 +899,27 @@ impl Scheduler {
                         tokens: &r.prompt[*from..*from + *len],
                         wants_logits: *last,
                         vision: r.vision.as_ref(),
+                        // How many of `vision`'s rows earlier chunks of this
+                        // sequence already consumed -- a *count of actual pad
+                        // tokens* in `prompt[..from]`, not an index
+                        // subtraction (`Running::vision_pad_tok`'s doc
+                        // comment explains why the shortcut is wrong for a
+                        // multi-frame-group video). `0` for a text-only
+                        // sequence, where no token ever equals
+                        // `r.vision_pad_tok` and this is never read anyway.
+                        vision_row_offset: if r.vision.is_some() {
+                            r.prompt[..*from].iter().filter(|&&t| t == r.vision_pad_tok).count()
+                        } else {
+                            0
+                        },
+                        // Sliced absolutely, so a prefix-cache hit (`from >
+                        // 0`) still lands on the right rows of `r.mrope` --
+                        // see `Running::mrope`'s doc comment. `r.mrope` is
+                        // `None` for a text-only sequence or a model without
+                        // M-RoPE, in which case `mrope_delta: 0` reproduces
+                        // `pool.len(seq) + k` on all three axes.
+                        mrope: r.mrope.as_deref().map(|m| &m[3 * from..3 * (from + len)]),
+                        mrope_delta: r.mrope_delta,
                     },
                     Work::Decode => BatchItem {
                         seq: r.seq,
@@ -578,6 +928,13 @@ impl Scheduler {
                         tokens: std::slice::from_ref(r.next.as_ref().unwrap()),
                         wants_logits: true,
                         vision: None,
+                        vision_row_offset: 0,
+                        // A single generated token is never mid-image, so its
+                        // three axes are always `pool.len(seq) + mrope_delta`
+                        // -- no per-token array needed here even when `r.mrope`
+                        // is `Some` (it was only ever the prompt's array).
+                        mrope: None,
+                        mrope_delta: r.mrope_delta,
                     },
                 }
             })
@@ -589,15 +946,27 @@ impl Scheduler {
         self.model.forward_batch_device(&items, &mut self.pool)?;
         let t1 = timed.then(std::time::Instant::now);
 
-        // The tower's output is read exactly once, by the pass just above —
-        // `plan` guarantees a vision sequence's whole prompt lands in this
-        // same step, so there is no later prefill chunk left to read it.
-        // Dropping it here rather than leaving it on `Running` until the
-        // sequence retires is the difference between one splice's scratch and
-        // a device allocation held for the rest of a long conversation.
+        // Drop a sequence's vision features once every pad token they
+        // replace has been consumed by some chunk -- again a *count* of
+        // `vision_pad_tok` occurrences in `prompt[..from+len]`, not
+        // `from + len` compared against a remembered start index, for the
+        // same reason `vision_row_offset` above cannot be either. A
+        // placeholder run split across several chunks keeps its features
+        // alive until the last of them; the common case (the whole run in one
+        // chunk) drops it immediately, same as before. Dropping it here
+        // rather than leaving it on `Running` until the sequence retires is
+        // the difference between one splice's scratch and a device
+        // allocation held for the rest of a long conversation.
         for (idx, work) in &plan {
-            if matches!(work, Work::Prefill { .. }) {
-                self.running[*idx].vision = None;
+            if let Work::Prefill { from, len, .. } = work {
+                let r = &mut self.running[*idx];
+                if let Some(f) = &r.vision {
+                    let consumed =
+                        r.prompt[..from + len].iter().filter(|&&t| t == r.vision_pad_tok).count();
+                    if consumed >= f.tokens {
+                        r.vision = None;
+                    }
+                }
             }
         }
 
@@ -715,10 +1084,21 @@ impl Scheduler {
                         pending
                     });
                 }
+                // Only a prefill's rows can be mid-image; a decode row's
+                // `from` indexes past `r.prompt.len()` into `r.generated`,
+                // which `r.mrope` (sized to the prompt alone) does not cover
+                // and does not need to -- see `MtpHead::run`'s doc comment.
+                let mrope = match work {
+                    Work::Prefill { .. } => {
+                        r.mrope.as_deref().map(|m| m[3 * from..3 * (from + len)].to_vec())
+                    }
+                    Work::Decode => None,
+                };
                 self.running[*idx].spec_feed = Some(infero_model::spec::DraftFeed {
                     rows: 0..len,
                     positions: (from..from + len).collect(),
                     shifted,
+                    mrope,
                 });
             }
         }
@@ -801,17 +1181,12 @@ impl Scheduler {
     /// Face's own processor does between tokenizing and calling the model.
     /// Runs on this thread because both steps need `&mut self.model`: sizing
     /// the resize target and running the tower itself.
-    fn encode_pending_image(&mut self, prompt: &mut Vec<u32>, img: PendingImage) -> Result<VisionFeatures> {
+    fn encode_pending_image(&mut self, prompt: &mut Vec<u32>, img: PendingImage) -> Result<(VisionFeatures, u32)> {
         anyhow::ensure!(
             self.model.has_vision(),
             "this request has an image but the loaded model has no vision tower"
         );
-        let (img_tok, vid_tok) = self.model.vision_tokens().expect("has_vision checked above");
-        anyhow::ensure!(
-            !prompt.contains(&vid_tok),
-            "this checkpoint's template placed a video placeholder; video \
-             input is not supported yet"
-        );
+        let (img_tok, _) = self.model.vision_tokens().expect("has_vision checked above");
         let mut hits = prompt.iter().enumerate().filter(|&(_, &t)| t == img_tok);
         let Some((at, _)) = hits.next() else {
             anyhow::bail!(
@@ -845,34 +1220,157 @@ impl Scheduler {
              loader/config mismatch, not a request problem",
             feats.tokens
         );
-        // The splice that writes the tower's output runs once, over one
-        // `BatchItem`, so the whole placeholder run has to fit in a single
-        // step — `forward_batch_device` refuses more than `self.model
-        // .batch_tokens()` in one pass, and that ceiling sizes fixed scratch
-        // buffers, not a preference `plan` could work around by splitting
-        // across steps the way it already does for plain text. This is now a
-        // per-model value, not the old fixed `MAX_BATCH_TOKENS` — a wide-head
-        // model's own attention-score buffer can pull it below that ceiling,
-        // and checking against the compile-time constant here would accept a
-        // request `forward_batch_device` then had to refuse anyway, taking
-        // every *other* running request down with it once the batch it landed
-        // in overran the real limit. `vision_max_patches` bounds the resize
-        // target; this is the check that turns a resize past what one step
-        // can carry into a clear refusal instead of that internal error.
-        let batch_tokens = self.model.batch_tokens();
+        // The splice can now span several prefill steps -- `plan` chunks a
+        // vision-carrying sequence's placeholder run exactly the way it
+        // already chunks plain text, splitting on `batch_tokens` step
+        // boundaries rather than requiring the whole thing in one step (see
+        // `BatchItem::vision_row_offset`). What still has to fit is the
+        // *sequence's* context, same as any other prompt -- `admit`'s own
+        // `need > self.pool.max_seq()` check already covers that generically,
+        // so this is a pre-check to avoid running the tower at all on a
+        // request that check would refuse anyway, not the real gate.
+        let max_seq = self.pool.max_seq();
         let expanded_len = prompt.len() - 1 + tokens;
         anyhow::ensure!(
-            expanded_len <= batch_tokens,
+            expanded_len <= max_seq,
             "this image resizes to {tokens} language-model tokens ({th}x{tw} \
              at patch {}), and the rest of the prompt is {} more — {expanded_len} \
-             total, over the {batch_tokens} this model's prefill step can carry. \
-             Send a smaller image; splitting one image's placeholder run \
-             across steps is not supported yet",
+             total, over the {max_seq} tokens this model's context can hold",
             shape.patch,
             prompt.len() - 1,
         );
         prompt.splice(at..at + 1, std::iter::repeat_n(img_tok, tokens));
-        Ok(feats)
+        Ok((feats, img_tok))
+    }
+
+    /// [`Self::encode_pending_image`] for a decoded clip.
+    ///
+    /// The one real structural difference: the template renders a single
+    /// `<|vision_start|><|video_pad|><|vision_end|>` triple (same shape as an
+    /// image), but the *reference processor* only ever substitutes the inner
+    /// `video_token` -- see `processing_qwen3_vl.py`'s `replace_video_token`,
+    /// confirmed by reading the installed transformers on bw -- leaving the
+    /// template's outer `vision_start`/`vision_end` in place and expanding the
+    /// single pad token into `grid_t` *separate* `<T.T seconds><|vision_start|>
+    /// pad×n<|vision_end|>` groups, one a temporal-patch pair. So this only
+    /// splices `at..at+1` (the lone pad token), not `at-1..at+2`: the outer
+    /// wrap is the template's, not this function's, to touch.
+    fn encode_pending_video(&mut self, prompt: &mut Vec<u32>, mut vid: PendingVideo) -> Result<(VisionFeatures, u32)> {
+        anyhow::ensure!(
+            self.model.has_vision(),
+            "this request has a video but the loaded model has no vision tower"
+        );
+        let (_, vid_tok) = self.model.vision_tokens().expect("has_vision checked above");
+        let vision_start = self
+            .tokenizer
+            .token_to_id("<|vision_start|>")
+            .context("this checkpoint's tokenizer has no <|vision_start|> token")?;
+        let vision_end = self
+            .tokenizer
+            .token_to_id("<|vision_end|>")
+            .context("this checkpoint's tokenizer has no <|vision_end|> token")?;
+
+        let mut hits = prompt.iter().enumerate().filter(|&(_, &t)| t == vid_tok);
+        let Some((at, _)) = hits.next() else {
+            anyhow::bail!(
+                "this request carries a video but the rendered prompt has no \
+                 video placeholder; the chat template may not support video \
+                 the way this server expects"
+            );
+        };
+        anyhow::ensure!(
+            hits.next().is_none(),
+            "the rendered prompt has more than one video placeholder for a \
+             single video; this should not happen and points at a template \
+             mismatch"
+        );
+        anyhow::ensure!(
+            at > 0 && at + 1 < prompt.len() && prompt[at - 1] == vision_start && prompt[at + 1] == vision_end,
+            "the video placeholder is not wrapped in <|vision_start|>/<|vision_end|> \
+             the way this checkpoint's template is expected to render it"
+        );
+
+        if self.video_dedup_threshold > 0.0 {
+            let (frames, timestamps) =
+                drop_redundant_groups(&vid.frames, &vid.timestamps, self.video_dedup_threshold);
+            tracing::debug!(
+                kept = timestamps.len(),
+                total = vid.timestamps.len(),
+                "video dedup dropped near-duplicate frame-groups"
+            );
+            vid.frames = frames;
+            vid.timestamps = timestamps;
+        }
+
+        let shape = *self.model.vision_shape().expect("has_vision checked above");
+        let max_seq = self.pool.max_seq();
+        let rest = prompt.len() - 1;
+
+        // The splice can now span several prefill steps, so what has to fit
+        // is the *sequence's* context (`admit`'s generic `need > max_seq`
+        // check), not one step's `batch_tokens` -- see `encode_pending_image`'s
+        // matching comment. The shrink-retry loop is still worth keeping: it
+        // bounds how much of that context one video request can claim before
+        // its own resolution gives, rather than spending the whole budget on
+        // one clip at maximum resolution by default. `grid_t` (fixed by the
+        // frame count, not the patch budget -- see
+        // `qwen35_vision::video_resize_budget`) stays the same across every
+        // attempt, so the timestamp-count check only has to run once.
+        let mut patch_budget = self.vision_max_patches;
+        let mut attempt = None;
+        for _ in 0..4 {
+            let (th, tw, grid_t, tokens) = self
+                .model
+                .vision_resize_video(vid.frames.len(), vid.height, vid.width, patch_budget)
+                .context("sizing the video for the vision tower")?;
+            anyhow::ensure!(
+                grid_t == vid.timestamps.len(),
+                "the decoder sampled {} frame-groups but produced {} timestamps; a \
+                 decode/resize mismatch, not a request problem",
+                grid_t,
+                vid.timestamps.len()
+            );
+            let frame_seqlen = tokens / grid_t;
+            let mut replacement = Vec::with_capacity(grid_t * (frame_seqlen + 3));
+            for i in 0..grid_t {
+                let ts = format!("<{:.1} seconds>", vid.timestamps[i]);
+                replacement.extend(self.tokenizer.encode(&ts, Some(false), true));
+                replacement.push(vision_start);
+                replacement.extend(std::iter::repeat_n(vid_tok, frame_seqlen));
+                replacement.push(vision_end);
+            }
+            let expanded_len = rest + replacement.len();
+            let fits = expanded_len <= max_seq;
+            attempt = Some((th, tw, grid_t, tokens, replacement, expanded_len));
+            if fits {
+                break;
+            }
+            patch_budget /= 2;
+        }
+        let (th, tw, grid_t, tokens, replacement, expanded_len) = attempt.expect("looped at least once");
+        anyhow::ensure!(
+            expanded_len <= max_seq,
+            "this video resizes to {tokens} vision tokens across {grid_t} \
+             frame-groups ({th}x{tw} at patch {}) even after repeatedly \
+             shrinking the resolution, plus timestamp text, and the rest of \
+             the prompt is {rest} more -- {expanded_len} total, over the \
+             {max_seq} tokens this model's context can hold. Send fewer frames",
+            shape.patch,
+        );
+
+        let raw_frames: Vec<&[u8]> = vid.frames.iter().map(Vec::as_slice).collect();
+        let clip = infero_model::qwen35_vision_image::prepare_clip(
+            &raw_frames, vid.height, vid.width, 3, th, tw, shape.patch, shape.merge,
+        );
+        let feats = self.model.encode_clip(&clip).context("running the vision tower")?;
+        anyhow::ensure!(
+            feats.tokens == tokens,
+            "the tower produced {} tokens where the resize said {tokens}; a \
+             loader/config mismatch, not a request problem",
+            feats.tokens
+        );
+        prompt.splice(at..at + 1, replacement);
+        Ok((feats, vid_tok))
     }
 
     fn admit(&mut self) {
@@ -887,17 +1385,50 @@ impl Scheduler {
             // same place it held before; see the `push_front` calls below.
             let mut req = self.waiting.pop_front().unwrap();
 
-            let vision = match req.pending_image.take() {
-                Some(img) => match self.encode_pending_image(&mut req.prompt, img) {
-                    Ok(feats) => Some(feats),
+            // `routes.rs` already refuses a request carrying both an image
+            // and a video before it ever reaches the queue; the `(Some,
+            // Some)` arm here is a defensive refusal, not a real path.
+            let (vision, vision_pad_tok, is_video) = match (req.pending_image.take(), req.pending_video.take()) {
+                (Some(img), None) => match self.encode_pending_image(&mut req.prompt, img) {
+                    Ok((feats, tok)) => (Some(feats), tok, false),
                     Err(e) => {
                         let _ = req.events.send(Event::Failed(format!("{e:#}")));
                         continue;
                     }
                 },
-                None => None,
+                (None, Some(vid)) => match self.encode_pending_video(&mut req.prompt, vid) {
+                    Ok((feats, tok)) => (Some(feats), tok, true),
+                    Err(e) => {
+                        let _ = req.events.send(Event::Failed(format!("{e:#}")));
+                        continue;
+                    }
+                },
+                (None, None) => (None, 0, false),
+                (Some(_), Some(_)) => {
+                    let _ = req.events.send(Event::Failed(
+                        "this request has both an image and a video pending; refused".into(),
+                    ));
+                    continue;
+                }
             };
             let had_vision = vision.is_some();
+            // Computed from the *expanded* prompt (the splice above already
+            // ran), while the grid is still attached to `vision` -- `Running`
+            // does not hold onto `VisionFeatures` past its one prefill, so
+            // this is the only point this data is available together.
+            let (mrope, mrope_delta) = match (&vision, self.model.config().mrope_section) {
+                (Some(feats), Some(_)) => {
+                    let merge = self.model.vision_shape().expect("has_vision").merge;
+                    let (img_tok, vid_tok) = self.model.vision_tokens().expect("has_vision");
+                    let (m, d) = if is_video {
+                        mrope_for_video(&req.prompt, vid_tok, feats, merge)
+                    } else {
+                        mrope_for_image(&req.prompt, img_tok, feats, merge)
+                    };
+                    (Some(m), d)
+                }
+                _ => (None, 0),
+            };
 
             // Admit only with room for the whole prompt plus something to
             // generate; a sequence admitted into a pool it cannot finish in
@@ -984,7 +1515,10 @@ impl Scheduler {
                 prefilled: hit.len(),
                 prefix: hit,
                 vision,
+                vision_pad_tok,
                 had_vision,
+                mrope,
+                mrope_delta,
                 next: None,
                 sampled: 0,
                 spec_feed: None,
@@ -1023,27 +1557,6 @@ impl Scheduler {
         let mut plan = Vec::with_capacity(self.running.len());
         let mut budget = self.model.batch_tokens();
 
-        // A fresh vision sequence's placeholder splice runs once, over one
-        // `BatchItem`, so its whole prompt has to land in a single step rather
-        // than being split the way an ordinary prefill can be — see the
-        // comment on the second loop. Reserving its length here, before
-        // decodes draw from the same budget, is what guarantees it that room:
-        // `admit`'s token-count check already bounds it to fit inside
-        // `self.model.batch_tokens()` on its own, so this cannot starve every
-        // decode in the batch, only reduce how many of them fit into this one
-        // step.
-        // `encode_pending_image` also guarantees there is at most one such
-        // sequence at a time — a second one, if it were somehow admitted,
-        // would simply wait for a later step, the same as any prefill does
-        // when the budget runs out.
-        let vision_reserved = self
-            .running
-            .iter()
-            .position(|r| r.vision.is_some() && r.prefilled == 0);
-        if let Some(i) = vision_reserved {
-            budget = budget.saturating_sub(self.running[i].prompt.len());
-        }
-
         // Decodes first: one token each, and a running sequence starved by a
         // prefill is a stall the client feels.
         for (i, r) in self.running.iter().enumerate() {
@@ -1056,18 +1569,16 @@ impl Scheduler {
             }
         }
 
-        if let Some(i) = vision_reserved {
-            let len = self.running[i].prompt.len();
-            plan.push((i, Work::Prefill { from: 0, len, last: true }));
-        }
-
         // Whatever is left goes to the other prompts, split across steps if
-        // need be.
+        // need be -- a vision-carrying sequence included: its placeholder run
+        // is no longer required to land in one step (`BatchItem
+        // ::vision_row_offset` is what a chunk boundary landing inside it
+        // needs), so it is just an ordinary prompt here, same as plain text.
         for (i, r) in self.running.iter().enumerate() {
             if budget == 0 {
                 break;
             }
-            if Some(i) == vision_reserved || r.prompt_complete() {
+            if r.prompt_complete() {
                 continue;
             }
             let remaining = r.prompt.len() - r.prefilled;
@@ -1336,13 +1847,18 @@ pub fn make_pool(model: &Model, max_seqs: usize, slots: Option<usize>) -> Result
         .context("allocating the kv pool")
 }
 
-/// The MTP sidecar beside a GGUF model, if there is one.
+/// Where the MTP head's GGUF tensors live, if anywhere findable without
+/// being told.
 ///
 /// `INFERO_MTP` names it outright. Otherwise this looks in the model's own
 /// directory for a single `mtp*.gguf`, which is what llama.cpp's conversion
 /// produces and what the ggml-org repacks ship. Two of them is ambiguous rather
 /// than a reason to guess, so it takes neither and speculation stays off — a
-/// user with two heads should say which.
+/// user with two heads should say which. Failing that, the main file itself
+/// is checked for `nextn_predict_layers`: some exports pack the head into the
+/// last blocks of the same file instead of shipping a sidecar, and returning
+/// the model's own path here is what lets [`Scheduler::enable_speculation`]
+/// hand it straight to [`Model::load_mtp_head_gguf`] unchanged.
 fn mtp_sidecar(model: &str) -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("INFERO_MTP") {
         let p = std::path::PathBuf::from(p);
@@ -1371,7 +1887,18 @@ fn mtp_sidecar(model: &str) -> Option<std::path::PathBuf> {
     hits.sort();
     match hits.len() {
         1 => hits.pop(),
-        0 => None,
+        // No separate file: some GGUFs (llama.cpp/unsloth's Qwen3.8 exports
+        // among them) pack the head into the main file instead, as the last
+        // `nextn_predict_layers` blocks. `load_mtp_head_gguf` already knows
+        // how to read that shape out of a `Gguf` handle -- it just has never
+        // been pointed at the main file itself before. Reading the model's
+        // own metadata here, rather than assuming, is what tells a plain
+        // single-head checkpoint from one that never carried a head at all.
+        0 => {
+            let f = infero_gguf::Gguf::open(path).ok()?;
+            f.usize(&f.akey("nextn_predict_layers").ok()?).ok()?;
+            Some(path.to_path_buf())
+        }
         n => {
             tracing::warn!(
                 count = n,

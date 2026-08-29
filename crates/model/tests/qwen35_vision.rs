@@ -26,7 +26,12 @@
 //!
 //! Without the environment variable these tests report as skipped rather than
 //! passing, because a silent skip is how a suite comes to be green without
-//! checking anything.
+//! checking anything -- which is exactly what happened to the two mRoPE tests
+//! for one full session's worth of work on the text-side position plumbing:
+//! the fixture had gone stale, the suite stayed green, and nothing that
+//! actually reads `llm_position_ids`/`interleaved_mrope_axis` had run. Set
+//! `INFERO_REQUIRE_CAPTURE=1` alongside the capture path to turn a missing or
+//! unreadable fixture into a hard failure instead of a quiet skip.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -143,6 +148,13 @@ impl Capture {
 fn with_capture(what: &str, body: impl FnOnce(&Capture)) {
     match Capture::open() {
         Some(c) => body(&c),
+        None if std::env::var("INFERO_REQUIRE_CAPTURE").as_deref() == Ok("1") => {
+            panic!(
+                "{what}: INFERO_QWEN35_VISION_CAPTURE is unset or unreadable, and \
+                 INFERO_REQUIRE_CAPTURE=1 forbids silently skipping. Point it at a \
+                 directory written by tools/capture_qwen35_vision.py."
+            )
+        }
         None => eprintln!(
             "SKIPPED {what}: set INFERO_QWEN35_VISION_CAPTURE to a directory \
              written by tools/capture_qwen35_vision.py"
@@ -1315,6 +1327,88 @@ fn the_spliced_position_ids_advance_by_the_larger_spatial_extent() {
     });
 }
 
+/// A video's position ids: `get_rope_index` docs it as "Qwen3.5 use
+/// timestamps to separate videos" -- `<t1><vision_start>frame1<vision_end>
+/// <t2><vision_start>frame2<vision_end>...` -- and splits `video_grid_thw`'s
+/// one `[grid_t, h, w]` row into `grid_t` separate `[1, h, w]` frame-groups
+/// itself, via `repeat_interleave`, before ever reaching the per-run
+/// position math `the_spliced_position_ids_advance_by_the_larger_spatial_extent`
+/// already covers. What this test is actually checking is that split: does
+/// the caller (this crate's, eventually the scheduler's) correctly hand
+/// `llm_position_ids` one `Grid { t: 1, .. }` per frame-group rather than one
+/// `Grid { t: grid_t, .. }` for the whole clip -- the natural mistake, since
+/// `video_splice.grid_thw` as captured is the *un*-split row, exactly what a
+/// caller that forgot the split would reach for.
+#[test]
+fn the_video_splice_grid_is_split_one_frame_group_at_a_time() {
+    with_capture("llm position ids for video", |c| {
+        let d = c.dims();
+        let types: Vec<u8> =
+            c.get("video_splice.mm_token_type_ids").iter().map(|v| *v as u8).collect();
+        let seq = types.len();
+        let unsplit = c.grids("video_splice.grid_thw");
+        assert_eq!(unsplit.len(), 1, "one video in this capture");
+        let grid_t = unsplit[0].t;
+        assert!(grid_t > 1, "a clip of one frame-group cannot discriminate a split from none");
+
+        // The correct reading: `grid_t` separate `t=1` entries, one per
+        // video-type run in the prompt.
+        let split: Vec<Grid> = std::iter::repeat_n(
+            Grid { t: 1, h: unsplit[0].h, w: unsplit[0].w },
+            grid_t,
+        )
+        .collect();
+        let got = llm_position_ids(&types, &split, d.merge);
+        let want: Vec<u32> =
+            c.get("video_splice.position_ids").iter().map(|v| *v as u32).collect();
+        assert_eq!(got, want, "3-D position ids for the spliced video");
+
+        let max = *got.iter().max().unwrap() as i64;
+        let delta = max + 1 - seq as i64;
+        assert_eq!(delta, c.get("video_splice.rope_delta")[0] as i64, "rope delta");
+        assert!(delta < 0, "each frame-group's advance-by-max(h,w)/merge rule applies to video too");
+
+        // Exactly `grid_t` visual runs are expected; confirms the prompt this
+        // capture built really does carry `grid_t` separate type=2 runs and
+        // not one merged run (which `llm_position_ids` would refuse: too few
+        // grids for the run count, or too many left over).
+        let mut runs = 0;
+        let mut i = 0;
+        while i < seq {
+            let kind = types[i];
+            let mut j = i;
+            while j < seq && types[j] == kind {
+                j += 1;
+            }
+            if kind != 0 {
+                runs += 1;
+            }
+            i = j;
+        }
+        assert_eq!(runs, grid_t, "expected one video-type run per frame-group");
+
+        // The wrong reading: the single un-split `Grid { t: grid_t, .. }`
+        // row, exactly what a caller that skipped the `repeat_interleave`
+        // split would pass -- against the *same* `grid_t`-separate-run
+        // prompt. `llm_position_ids` groups by contiguous token-type runs
+        // and pulls one grid a run, so a prompt with `grid_t` video runs
+        // against only one grid entry runs the iterator dry on the second
+        // run. That is not merely "a different number": `llm_position_ids`
+        // refuses outright (`grid_iter.next().expect(..)`) rather than
+        // silently reading past the end -- a stronger guarantee than
+        // "produces a wrong but plausible position array" would be, so this
+        // asserts the panic rather than comparing numbers.
+        let wrong = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            llm_position_ids(&types, &unsplit, d.merge)
+        }));
+        assert!(
+            wrong.is_err(),
+            "an un-split video grid against a {grid_t}-run prompt should have run \
+             the grid iterator dry, not produced an answer"
+        );
+    });
+}
+
 /// Interleaved mRoPE assigns axis `i % 3`, not three contiguous sections.
 #[test]
 fn the_text_mrope_interleaves_its_axes_rather_than_chunking_them() {
@@ -1506,4 +1600,82 @@ fn the_hard_coded_dimensions_match_the_checkpoint() {
         assert_eq!(got.grid_per_side(), c.u("num_grid_per_side"));
         assert_eq!(got.resize_factor(), c.u("smart_resize_factor"));
     });
+}
+
+/// `video_resize_budget` divides a whole-clip patch budget by `grid_t`
+/// before anything is resized — a table of hand-computed cases, not
+/// re-derived from the function itself.
+#[test]
+fn video_resize_budget_divides_by_grid_t() {
+    // (frames, temporal_patch, merge_unit, max_patches) -> Some((grid_t, per_group))
+    let cases: &[((usize, usize, usize, usize), Option<(usize, usize)>)] = &[
+        // 8 frames, temporal_patch 2 -> 4 groups, 4096 / 4 = 1024 a group.
+        ((8, 2, 4, 4096), Some((4, 1024))),
+        // An odd frame count still folds into whole groups, rounding up:
+        // 7 frames -> ceil(7/2) = 4 groups, same as 8.
+        ((7, 2, 4, 4096), Some((4, 1024))),
+        // A single frame is one group -- the still-image case, budget
+        // untouched.
+        ((1, 2, 4, 4096), Some((1, 4096))),
+        // A budget that leaves less than one merge block a group is refused
+        // rather than handed to `smart_resize` as zero.
+        ((100, 2, 4, 150), None), // 50 groups, 3 patches a group < merge_unit 4
+        // No frames at all.
+        ((0, 2, 4, 4096), None),
+    ];
+    for (input, want) in cases {
+        let (frames, temporal_patch, merge_unit, max_patches) = *input;
+        let got = video_resize_budget(frames, temporal_patch, merge_unit, max_patches);
+        assert_eq!(got, *want, "frames={frames} temporal_patch={temporal_patch} \
+                    merge_unit={merge_unit} max_patches={max_patches}");
+    }
+}
+
+/// The reason `vision_resize_video` divides the budget by `grid_t` before
+/// calling `smart_resize`, rather than resizing one frame at the full
+/// budget and repeating it `grid_t` times: the latter overruns the clip's
+/// actual patch budget by very close to `grid_t`x, and `vision_forward`'s own
+/// `n <= scratch.max_patches` check is what would have to catch it -- a
+/// refusal deep in the tower instead of a plan that fits from the start.
+#[test]
+fn resizing_one_frame_group_at_the_full_budget_would_overrun_the_clip_budget() {
+    let d = VisionDims::QWEN35_27B;
+    let max_patches = 4096usize;
+    let frames = 8usize;
+    let (src_h, src_w) = (1080usize, 1920usize);
+
+    let (grid_t, per_group) =
+        video_resize_budget(frames, d.temporal_patch, d.merge_unit(), max_patches).unwrap();
+    assert_eq!(grid_t, 4);
+
+    let (h, w) = smart_resize(
+        src_h, src_w, d.resize_factor(),
+        d.patch * d.patch * d.merge_unit(), per_group * d.patch * d.patch,
+    ).unwrap();
+    let patches_per_group = (h / d.patch) * (w / d.patch);
+    let total_correct = grid_t * patches_per_group;
+    assert!(
+        total_correct <= max_patches,
+        "dividing the budget by grid_t first must keep the clip within it: \
+         {total_correct} > {max_patches}"
+    );
+
+    // The wrong reading: resize as if this were one image at the *whole*
+    // budget, then imagine repeating that same grid across all `grid_t`
+    // groups (what a caller that forgot to divide would do).
+    let (h_wrong, w_wrong) = smart_resize(
+        src_h, src_w, d.resize_factor(),
+        d.patch * d.patch * d.merge_unit(), max_patches * d.patch * d.patch,
+    ).unwrap();
+    let patches_per_group_wrong = (h_wrong / d.patch) * (w_wrong / d.patch);
+    let total_wrong = grid_t * patches_per_group_wrong;
+    assert!(
+        total_wrong > max_patches,
+        "this case should demonstrate an overrun, got {total_wrong} <= {max_patches} \
+         -- pick a src size where the two readings actually diverge"
+    );
+    eprintln!(
+        "divided-budget total {total_correct} vs whole-budget-repeated total \
+         {total_wrong}, against a {max_patches}-patch budget"
+    );
 }

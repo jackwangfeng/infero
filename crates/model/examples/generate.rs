@@ -73,7 +73,8 @@ fn main() -> Result<()> {
     let gguf = Gguf::open(&path)?;
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
     let dev = Device::new(0)?;
-    let mut model = Model::load_with(dev, &gguf, 4096, kv_quant, gpu_layers)?;
+    let ctx = std::env::var("GEN_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(4096);
+    let mut model = Model::load_with(dev, &gguf, ctx, kv_quant, gpu_layers)?;
 
     let text = if raw {
         prompt.clone()
@@ -119,6 +120,9 @@ fn main() -> Result<()> {
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_new);
     let mut next = sampler.sample(logits, &generated);
+    if model.device().profile().enabled() {
+        eprintln!("{}", model.device().profile().report());
+    }
     let mut detok = tokenizer.detokenizer();
 
     let t1 = Instant::now();

@@ -123,6 +123,7 @@ fn partial_rope_matches_the_host_reference() -> Result<()> {
     let pos = positions();
     let dpos = stream.clone_htod(&pos)?;
     let ones = stream.clone_htod(&vec![1.0f32; D_HEAD / 2])?;
+    let axis0 = scalar_axis(&stream, D_HEAD / 2)?;
 
     let q = pseudo_random(N_TOKENS * N_HEADS * D_HEAD, 0x51);
     let kk = pseudo_random(N_TOKENS * N_KV_HEADS * D_HEAD, 0x52);
@@ -133,6 +134,8 @@ fn partial_rope_matches_the_host_reference() -> Result<()> {
         &mut dk.as_view_mut(),
         &dpos.as_view(),
         &ones.as_view(),
+        &axis0.as_view(),
+        1,
         N_TOKENS,
         N_HEADS,
         N_KV_HEADS,
@@ -189,6 +192,7 @@ fn the_wrong_frequency_width_and_the_wrong_pairing_are_far_outside_the_tolerance
     let pos = positions();
     let dpos = stream.clone_htod(&pos)?;
     let ones = stream.clone_htod(&vec![1.0f32; D_HEAD / 2])?;
+    let axis0 = scalar_axis(&stream, D_HEAD / 2)?;
 
     let q = pseudo_random(N_TOKENS * N_HEADS * D_HEAD, 0x61);
     let kk = pseudo_random(N_TOKENS * N_KV_HEADS * D_HEAD, 0x62);
@@ -198,6 +202,8 @@ fn the_wrong_frequency_width_and_the_wrong_pairing_are_far_outside_the_tolerance
         &mut dk.as_view_mut(),
         &dpos.as_view(),
         &ones.as_view(),
+        &axis0.as_view(),
+        1,
         N_TOKENS,
         N_HEADS,
         N_KV_HEADS,
@@ -259,6 +265,7 @@ fn the_full_width_case_is_bit_identical_to_the_untouched_kernel() -> Result<()> 
         .map(|x| x.abs() + 0.5)
         .collect::<Vec<_>>();
     let dff = stream.clone_htod(&ff)?;
+    let axis0 = scalar_axis(&stream, d_head / 2)?;
 
     for interleaved in [false, true] {
         let (mut sq, mut sk) = (stream.clone_htod(&q)?, stream.clone_htod(&kk)?);
@@ -296,6 +303,8 @@ fn the_full_width_case_is_bit_identical_to_the_untouched_kernel() -> Result<()> 
                     &mut fk.as_view_mut(),
                     &dpos.as_view(),
                     &dff.as_view(),
+                    &axis0.as_view(),
+                    1,
                     n_tokens,
                     n_heads,
                     n_kv_heads,
@@ -310,6 +319,8 @@ fn the_full_width_case_is_bit_identical_to_the_untouched_kernel() -> Result<()> 
                     &mut fk.as_view_mut(),
                     &dpos.as_view(),
                     &dff.as_view(),
+                    &axis0.as_view(),
+                    1,
                     n_tokens,
                     n_heads,
                     n_kv_heads,
@@ -351,6 +362,7 @@ fn the_packed_full_width_case_is_bit_identical_to_the_untouched_kernel() -> Resu
     let pos: Vec<i32> = (0..n_tokens as i32).map(|i| i * 7 + 1).collect();
     let dpos = stream.clone_htod(&pos)?;
     let ones = stream.clone_htod(&vec![1.0f32; d_head / 2])?;
+    let axis0 = scalar_axis(&stream, d_head / 2)?;
 
     for interleaved in [false, true] {
         // Reference: unpack, then rope each tensor with the untouched kernel.
@@ -398,6 +410,8 @@ fn the_packed_full_width_case_is_bit_identical_to_the_untouched_kernel() -> Resu
             da,
             &dpos.as_view(),
             &ones.as_view(),
+            &axis0.as_view(),
+            1,
             n_tokens,
             n_heads,
             n_kv_heads,
@@ -446,6 +460,7 @@ fn the_packed_path_copies_qs_unrotated_tail() -> Result<()> {
     let pos = positions();
     let dpos = stream.clone_htod(&pos)?;
     let ones = stream.clone_htod(&vec![1.0f32; D_HEAD / 2])?;
+    let axis0 = scalar_axis(&stream, D_HEAD / 2)?;
 
     let da = N_HEADS * D_HEAD;
     let kv = N_KV_HEADS * D_HEAD;
@@ -463,6 +478,8 @@ fn the_packed_path_copies_qs_unrotated_tail() -> Result<()> {
         da,
         &dpos.as_view(),
         &ones.as_view(),
+        &axis0.as_view(),
+        1,
         N_TOKENS,
         N_HEADS,
         N_KV_HEADS,
@@ -551,6 +568,7 @@ fn shifting_all_positions_leaves_the_score_matrix_unchanged() -> Result<()> {
     let k = kernels()?;
     let stream = k.device().stream().clone();
     let ones = stream.clone_htod(&vec![1.0f32; D_HEAD / 2])?;
+    let axis0 = scalar_axis(&stream, D_HEAD / 2)?;
     let q = pseudo_random(N_TOKENS * N_HEADS * D_HEAD, 0xA1);
     let kk = pseudo_random(N_TOKENS * N_KV_HEADS * D_HEAD, 0xA2);
 
@@ -574,6 +592,8 @@ fn shifting_all_positions_leaves_the_score_matrix_unchanged() -> Result<()> {
                 &mut scratch.as_view_mut(),
                 &dpos.as_view(),
                 &ones.as_view(),
+                &axis0.as_view(),
+                1,
                 N_TOKENS,
                 heads,
                 0,
@@ -664,6 +684,7 @@ fn an_impossible_rotary_width_is_refused() -> Result<()> {
     let stream = k.device().stream().clone();
     let dpos = stream.clone_htod(&vec![0i32; 1])?;
     let ones = stream.clone_htod(&vec![1.0f32; D_HEAD / 2])?;
+    let axis0 = scalar_axis(&stream, D_HEAD / 2)?;
     let mut dq = stream.alloc_zeros::<f32>(D_HEAD)?;
     let mut dk = stream.alloc_zeros::<f32>(D_HEAD)?;
 
@@ -673,6 +694,8 @@ fn an_impossible_rotary_width_is_refused() -> Result<()> {
             &mut dk.as_view_mut(),
             &dpos.as_view(),
             &ones.as_view(),
+            &axis0.as_view(),
+            1,
             1,
             1,
             1,
@@ -694,6 +717,8 @@ fn an_impossible_rotary_width_is_refused() -> Result<()> {
             &mut dk.as_view_mut(),
             &dpos.as_view(),
             &short.as_view(),
+            &axis0.as_view(),
+            1,
             1,
             1,
             1,
@@ -705,6 +730,52 @@ fn an_impossible_rotary_width_is_refused() -> Result<()> {
         )
         .is_err(),
         "a freq_factors buffer shorter than rotary_dim/2 should be refused"
+    );
+
+    // A `pos_stride` other than 1 or 3 must be refused.
+    assert!(
+        k.rope_qk_partial(
+            &mut dq.as_view_mut(),
+            &mut dk.as_view_mut(),
+            &dpos.as_view(),
+            &ones.as_view(),
+            &axis0.as_view(),
+            2,
+            1,
+            1,
+            1,
+            D_HEAD,
+            ROTARY_DIM,
+            THETA,
+            1.0,
+            false,
+        )
+        .is_err(),
+        "pos_stride 2 should be refused: only 1 (scalar) and 3 (mRoPE T/H/W) are valid"
+    );
+
+    // An `mrope_axis` buffer shorter than the frequencies that rotate must be
+    // refused, the same reasoning as the `freq_factors` case above.
+    let short_axis = scalar_axis(&stream, ROTARY_DIM / 2 - 1)?;
+    assert!(
+        k.rope_qk_partial(
+            &mut dq.as_view_mut(),
+            &mut dk.as_view_mut(),
+            &dpos.as_view(),
+            &ones.as_view(),
+            &short_axis.as_view(),
+            1,
+            1,
+            1,
+            1,
+            D_HEAD,
+            ROTARY_DIM,
+            THETA,
+            1.0,
+            false,
+        )
+        .is_err(),
+        "an mrope_axis buffer shorter than rotary_dim/2 should be refused"
     );
     Ok(())
 }

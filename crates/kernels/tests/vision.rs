@@ -1127,6 +1127,7 @@ fn the_patchify_kernel_emits_block_order_and_channel_temporal_row_column() -> Re
             h_px,
             w_px,
             &shape,
+            1,
         )?;
         let got = stream.clone_dtoh(&dout)?;
         let got_h = stream.clone_dtoh(&dout_h)?;
@@ -2068,6 +2069,7 @@ fn the_whole_tower_matches_the_host_reference() -> Result<()> {
             h_px,
             w_px,
             &shape,
+            1,
         )?;
     }
     assert_eq!(

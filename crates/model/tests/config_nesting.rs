@@ -250,6 +250,75 @@ fn the_27b_rotates_64_of_its_256_dimensions() {
     assert_eq!(cfg.rope_freq_factors(&j).len(), 32, "rotary_dim / 2");
 }
 
+/// `mrope_section` is read out of the same `rope_parameters` object, and has
+/// to survive a config that carries `mrope_interleaved`/`mrope_section` as
+/// realistic noise alongside fields this parser did already read — the two
+/// are easy to leave unparsed and have every other assertion still pass,
+/// which is exactly what happened here for one session.
+#[test]
+fn mrope_section_is_read_from_rope_parameters() {
+    let j = qwen35_shaped(real_rope_parameters());
+    let cfg = Config::from_hf(&j, "qwen35").unwrap();
+    assert_eq!(cfg.mrope_section, Some([11, 11, 10]));
+}
+
+/// No `mrope_section` at all — every non-vision checkpoint, and every vision
+/// checkpoint before this field existed — must not synthesize one.
+#[test]
+fn mrope_section_absent_is_none() {
+    let j = qwen35_shaped(serde_json::json!({
+        "rope_type": "default",
+        "rope_theta": 10000000.0,
+        "partial_rotary_factor": 0.25,
+    }));
+    let cfg = Config::from_hf(&j, "m").unwrap();
+    assert_eq!(cfg.mrope_section, None);
+
+    // And the fully flat, no-`rope_parameters`-at-all shape every model
+    // before Qwen3.5 has.
+    let flat = serde_json::json!({
+        "model_type": "qwen3", "hidden_size": 4096, "num_attention_heads": 32,
+        "num_key_value_heads": 8, "head_dim": 128, "num_hidden_layers": 36,
+        "intermediate_size": 12288, "vocab_size": 151936, "rope_theta": 1000000.0,
+    });
+    assert_eq!(Config::from_hf(&flat, "qwen3-8b").unwrap().mrope_section, None);
+}
+
+/// A section that does not cover every rotary frequency is refused rather
+/// than silently leaving some frequencies with no axis assignment — the
+/// kernel has nothing sane to do with a frequency `mrope_section` doesn't
+/// name, so this has to fail at load, not at a garbled attention output.
+#[test]
+fn a_mrope_section_that_does_not_sum_to_the_rotary_width_is_refused() {
+    let mut rope = real_rope_parameters();
+    rope["mrope_section"] = serde_json::json!([11, 11, 9]); // sums to 31, not 32
+    let j = qwen35_shaped(rope);
+    let err = Config::from_hf(&j, "m").unwrap_err().to_string();
+    assert!(
+        err.contains("31") && err.contains("32"),
+        "the error should name both the given sum and the required one: {err}"
+    );
+}
+
+/// `mrope_interleaved: false` is the Qwen2-VL/2.5-VL chunked axis layout —
+/// `[0..11)` time, `[11..22)` height, `[22..32)` width — which reads the same
+/// JSON shape as Qwen3.5's interleaved one and diverges only once an image is
+/// in context. Refuse it outright rather than silently running the wrong
+/// axis map.
+#[test]
+fn mrope_interleaved_false_is_refused() {
+    let mut rope = real_rope_parameters();
+    rope["mrope_interleaved"] = serde_json::json!(false);
+    let j = qwen35_shaped(rope);
+    assert!(Config::from_hf(&j, "m").is_err());
+
+    // Absent is the same as false, not the same as true.
+    let mut rope = real_rope_parameters();
+    rope.as_object_mut().unwrap().remove("mrope_interleaved");
+    let j = qwen35_shaped(rope);
+    assert!(Config::from_hf(&j, "m").is_err());
+}
+
 /// `partial_rotary_factor` is duplicated on the real checkpoint, so both
 /// locations have to be read — and each has to be read *on its own*, which is
 /// what these two halves establish separately.

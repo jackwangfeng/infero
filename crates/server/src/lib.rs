@@ -10,6 +10,7 @@ pub mod prefix;
 pub mod scheduler;
 pub mod tool_call;
 pub mod vision;
+pub mod video;
 pub mod stop;
 
 pub use engine::{Engine, ModelInfo};

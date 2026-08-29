@@ -396,3 +396,132 @@ fn the_preprocessing_path_produces_a_whole_patch_grid() {
         }
     }
 }
+
+/// `prepare_clip` on an odd frame count pads to even by duplicating the
+/// *last* frame's already-processed pixels, not by zero-filling -- the clip
+/// generalization of a still image's own two identical temporal taps
+/// (`qwen35_vision::patchify`'s doc comment).
+///
+/// Target size equals source size so `pil_resize_u8` is an exact identity
+/// (bicubic at `scale == 1` puts all its weight on the one matching source
+/// pixel — see `coeffs`), which makes each frame's normalized planar segment
+/// hand-traceable straight from its raw bytes.
+#[test]
+fn prepare_clip_duplicates_the_last_frame_for_an_odd_count() {
+    let d = VisionDims::QWEN35_27B;
+    let (h, w) = (32usize, 32usize); // a multiple of patch * merge = 32
+    let frame = |v: u8| -> Vec<u8> { vec![v; h * w * 3] };
+    let raws = [frame(10), frame(80), frame(200)]; // odd: 3 frames
+    let refs: Vec<&[u8]> = raws.iter().map(|v| v.as_slice()).collect();
+
+    let clip = image::prepare_clip(&refs, h, w, 3, h, w, d.patch, d.merge);
+    assert_eq!(clip.frames, 4, "3 frames should pad to 4, not stay odd");
+    let frame_elems = 3 * h * w;
+    assert_eq!(clip.planar.len(), 4 * frame_elems);
+
+    for (i, raw) in raws.iter().enumerate() {
+        let want = image::normalize_planar(raw, h, w, 3, &image::IMAGE_MEAN, &image::IMAGE_STD);
+        assert_eq!(&clip.planar[i * frame_elems..(i + 1) * frame_elems], want.as_slice(), "frame {i}");
+    }
+    let want_last = image::normalize_planar(&raws[2], h, w, 3, &image::IMAGE_MEAN, &image::IMAGE_STD);
+    let got_pad = &clip.planar[3 * frame_elems..4 * frame_elems];
+    assert_eq!(got_pad, want_last.as_slice(), "the padding frame must equal the 3rd, not be a fresh resize of it");
+    assert!(
+        got_pad.iter().any(|&v| v != 0.0),
+        "the padding frame is zero -- this is exactly the zero-fill \
+         `qwen35_vision::patchify`'s doc comment says the reference does not do"
+    );
+}
+
+/// `patchify_clip` reads temporal group `ti`'s two taps from frames `2*ti`
+/// and `2*ti + 1` -- not the other way around, and not by frame-minor
+/// (`t`-major) order, both of which run to completion and fill every slot.
+#[test]
+fn patchify_clip_reads_the_right_frame_per_temporal_tap() {
+    // A minimal custom shape: one channel, patch 2, merge 1 (so
+    // `patch_row_col` is plain raster order), temporal_patch 2 (the only
+    // value `patchify_clip` accepts). 4x4 frames -> a 2x2 patch grid.
+    let d = VisionDims {
+        depth: 0,
+        hidden: 0,
+        heads: 1,
+        intermediate: 0,
+        out_hidden: 0,
+        in_channels: 1,
+        patch: 2,
+        temporal_patch: 2,
+        merge: 1,
+        num_position_embeddings: 4,
+        eps: 1e-6,
+        rope_theta: 1.0,
+    };
+    let (h, w) = (4usize, 4usize);
+    let frame_elems = h * w;
+    let n_frames = 4usize; // 2 temporal groups
+
+    // Frame f's pixel (y, x) = f*1000 + y*10 + x: every value names its own
+    // frame, row, and column, so a misrouted read is caught by value alone.
+    let mut planar = vec![0.0f32; n_frames * frame_elems];
+    for f in 0..n_frames {
+        for y in 0..h {
+            for x in 0..w {
+                planar[f * frame_elems + y * w + x] = (f * 1000 + y * 10 + x) as f32;
+            }
+        }
+    }
+
+    let (patches, grid_t, gh, gw) = vref::patchify_clip(&planar, n_frames, h, w, &d);
+    assert_eq!((grid_t, gh, gw), (2, 2, 2));
+    assert_eq!(patches.len(), grid_t * gh * gw * d.patch_dim());
+
+    let expect_at = |src_frame: usize, row: usize, col: usize, py: usize, px: usize| -> f32 {
+        (src_frame * 1000 + (row * d.patch + py) * 10 + (col * d.patch + px)) as f32
+    };
+
+    for ti in 0..grid_t {
+        for idx in 0..gh * gw {
+            let (row, col) = vref::patch_row_col(idx, gw, d.merge);
+            for t in 0..d.temporal_patch {
+                for py in 0..d.patch {
+                    for px in 0..d.patch {
+                        let slot = vref::patch_slot(0, t, py, px, &d);
+                        let got = patches[(ti * gh * gw + idx) * d.patch_dim() + slot];
+                        assert_eq!(
+                            got,
+                            expect_at(2 * ti + t, row, col, py, px),
+                            "ti={ti} idx={idx} t={t} py={py} px={px}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Two wrong readings, built explicitly rather than assumed wrong: each
+    // fills every slot, so only a value-level comparison catches them.
+    let build_wrong = |wrong_src: &dyn Fn(usize, usize) -> usize| -> Vec<f32> {
+        let mut out = vec![0.0f32; patches.len()];
+        for ti in 0..grid_t {
+            for idx in 0..gh * gw {
+                let (row, col) = vref::patch_row_col(idx, gw, d.merge);
+                for t in 0..d.temporal_patch {
+                    for py in 0..d.patch {
+                        for px in 0..d.patch {
+                            let slot = vref::patch_slot(0, t, py, px, &d);
+                            out[(ti * gh * gw + idx) * d.patch_dim() + slot] =
+                                expect_at(wrong_src(ti, t), row, col, py, px);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    };
+    // Frame-minor: `t` outermost instead of `ti` -- coincides with the right
+    // answer only where `ti == t`.
+    let frame_minor = build_wrong(&|ti, t| 2 * t + ti);
+    assert_ne!(patches, frame_minor, "frame-minor (ti, t swapped) ordering coincides with the real output");
+    // Swapped taps within a group.
+    let swapped_taps = build_wrong(&|ti, t| 2 * ti + (1 - t));
+    assert_ne!(patches, swapped_taps, "swapped temporal taps coincide with the real output");
+}

@@ -48,7 +48,7 @@ use half::f16;
 use infero_gpu::Device;
 use infero_kernels::{AttnDims, BatchLayout, Kernels, WeightType};
 
-use crate::weights::{Matrix, MtpWeights};
+use crate::weights::{Matrix, MtpWeights, mrope_axis_table};
 
 /// Everything about the head's one block that is a number rather than a tensor.
 ///
@@ -67,6 +67,8 @@ pub struct HeadDims {
     pub rope_theta: f32,
     /// The vocabulary, which sizes the logits buffer.
     pub vocab: usize,
+    /// See `Config::mrope_section`. `None` for every model without M-RoPE.
+    pub mrope_section: Option<[usize; 3]>,
 }
 
 impl HeadDims {
@@ -89,6 +91,7 @@ impl HeadDims {
             eps: cfg.rms_eps,
             rope_theta: cfg.rope_theta,
             vocab: cfg.vocab_size,
+            mrope_section: cfg.mrope_section,
         }
     }
 }
@@ -133,10 +136,22 @@ pub struct MtpHead {
 
     ids: Buf<i32>,
     positions: Buf<i32>,
+    /// `[max_tokens, 3]`, token-major `[T, H, W]` -- fed to the rope kernel
+    /// instead of `positions` whenever `run` is given a real `mrope` slice
+    /// (only `prime`/`step` ever are; `step_from_own_output`/`step_tree` are
+    /// always decode-phase and stay on the scalar `positions` path, which is
+    /// exactly right there -- see `MtpHead::run`'s doc comment).
+    mrope_positions: Buf<i32>,
     slots: Buf<i32>,
     seq_of: Buf<i32>,
     /// All ones: the head rotates every pair at the base frequency.
     freqs: Buf<f32>,
+    /// Which axis of `mrope_positions` each rope frequency reads, from
+    /// `HeadDims::mrope_section` -- all zeros for a model without one, which
+    /// makes `pos_stride: 1` (`positions`, not `mrope_positions`) the only
+    /// path that buffer's contents can affect. See
+    /// `Kernels::rope_qk_partial`'s doc comment.
+    mrope_axis: Buf<i32>,
 
     /// The drafter's own single-sequence KV cache, `[kv_heads, max_seq, d_head]`.
     kc: Buf<f16>,
@@ -218,14 +233,18 @@ impl MtpHead {
             slots: stream.alloc_zeros::<i32>(t)?,
             seq_of: stream.alloc_zeros::<i32>(t)?,
             freqs: stream.clone_htod(&vec![1.0f32; dims.rotary_dim / 2])?,
+            mrope_axis: stream.clone_htod(&mrope_axis_table(dims.rotary_dim, dims.mrope_section))?,
+            mrope_positions: stream.alloc_zeros::<i32>(t * 3)?,
             kc: stream.alloc_zeros::<f16>(dims.kv_heads * max_seq * dims.d_head)?,
             vc: stream.alloc_zeros::<f16>(dims.kv_heads * max_seq * dims.d_head)?,
             slot_table: stream.alloc_zeros::<i32>(branches * max_seq)?,
             branches,
             fork_at: 0,
-            // The vocabulary projection's activation, quantized. Sized for the
-            // widest row the head has, which is `d_model`.
-            q8_1: stream.alloc_zeros::<u8>(Kernels::q8_1_bytes(d))?,
+            // The activation of whichever projection is being quantized,
+            // sized for the widest single row `matmul` ever passes it: not
+            // `d_model` but `d_ff`, which `w_down` and the FC's `2 * d_model`
+            // cat both exceed it by. See `matmul`'s own `has_mmvq` branch.
+            q8_1: stream.alloc_zeros::<u8>(Kernels::q8_1_bytes((2 * d).max(da).max(dims.d_ff)))?,
             len: 0,
             rows: 0,
             w,
@@ -288,6 +307,8 @@ impl MtpHead {
     /// * `positions[i]` is the position of the *hidden state's* token.
     /// * `hidden` is `[rows, d_model]`, the text model's output **after**
     ///   `model.language_model.norm`.
+    /// * `mrope`: see [`Self::run`]'s doc comment.
+    #[allow(clippy::too_many_arguments)]
     pub fn step(
         &mut self,
         kern: &Kernels,
@@ -295,6 +316,7 @@ impl MtpHead {
         shifted_ids: &[u32],
         positions: &[usize],
         hidden: &View<'_, f32>,
+        mrope: Option<&[i32]>,
     ) -> Result<()> {
         let n = shifted_ids.len();
         anyhow::ensure!(
@@ -318,7 +340,7 @@ impl MtpHead {
             .stream()
             .memcpy_dtod(hidden, &mut self.hidden_in.slice_mut(..n * self.dims.d_model))?;
         // One branch: `step` is the linear draft's own entry point.
-        self.run(kern, embed, shifted_ids, positions, &vec![0; shifted_ids.len()], 0)
+        self.run(kern, embed, shifted_ids, positions, &vec![0; shifted_ids.len()], 0, mrope)
     }
 
     /// [`MtpHead::step`] over a feed of any width, in chunks.
@@ -337,6 +359,12 @@ impl MtpHead {
     /// the final token, since `rows` only ever describes the most recent chunk.
     /// A caller that keeps using `feed.rows.len() - 1` reads a row the last chunk
     /// never wrote.
+    /// `mrope`: `Some`, token-major `[T,H,W]` (`3 * shifted_ids.len()`
+    /// entries) over the *whole* feed, when priming after a prefill that may
+    /// have spliced in an image -- sliced per chunk below the same way
+    /// `positions`/`shifted_ids` are. See [`Self::run`]'s doc comment for why
+    /// this is the one place besides `step` that takes a real one.
+    #[allow(clippy::too_many_arguments)]
     pub fn prime(
         &mut self,
         kern: &Kernels,
@@ -344,6 +372,7 @@ impl MtpHead {
         shifted_ids: &[u32],
         positions: &[usize],
         hidden: &View<'_, f32>,
+        mrope: Option<&[i32]>,
     ) -> Result<usize> {
         let n = shifted_ids.len();
         anyhow::ensure!(n > 0, "priming the drafter with no rows");
@@ -352,6 +381,14 @@ impl MtpHead {
             "{n} shifted ids against {} positions",
             positions.len()
         );
+        if let Some(m) = mrope {
+            anyhow::ensure!(
+                m.len() == 3 * n,
+                "{} mrope entries for {n} rows, expected {}",
+                m.len(),
+                3 * n
+            );
+        }
         let d = self.dims.d_model;
         anyhow::ensure!(
             hidden.len() >= n * d,
@@ -370,6 +407,7 @@ impl MtpHead {
                 &shifted_ids[start..end],
                 &positions[start..end],
                 &chunk,
+                mrope.map(|m| &m[3 * start..3 * end]),
             )?;
             last_row = end - start - 1;
             start = end;
@@ -404,7 +442,7 @@ impl MtpHead {
         // so reading it as an input would alias.
         let mut dst = self.hidden_in.slice_mut(..d);
         self.dev.stream().memcpy_dtod(&src, &mut dst)?;
-        self.run(kern, embed, &[drafted], &[position], &[0], 0)
+        self.run(kern, embed, &[drafted], &[position], &[0], 0, None)
     }
 
     /// One draft step's kernels: four small uploads, then eighteen launches.
@@ -473,7 +511,7 @@ impl MtpHead {
             let mut dst = self.hidden_in.slice_mut(i * d..(i + 1) * d);
             self.dev.stream().memcpy_dtod(&src, &mut dst)?;
         }
-        self.run(kern, embed, tokens, positions, branch_of, tail)
+        self.run(kern, embed, tokens, positions, branch_of, tail, None)
     }
 
     /// Point every branch at the same prefix and its own slots past it.
@@ -536,6 +574,18 @@ impl MtpHead {
     /// `branch_of` names the tree branch each row belongs to, and `tail` how far
     /// past the fork point a branch may reach. All zeros and any `tail` is the
     /// linear draft, where a slot equals its position.
+    ///
+    /// `mrope`: `Some`, token-major `[T,H,W]` (`3 * shifted_ids.len()`
+    /// entries), only when this row set can be mid-image -- which in
+    /// practice means only `step`/`prime`, priming the drafter right after a
+    /// prefill that may have spliced one in. `step_from_own_output` and
+    /// `step_tree` are always decode-phase continuations of an already-primed
+    /// cache, never mid-image, so they pass `None` and get the scalar
+    /// `positions` path -- correct because a decode-phase position's three
+    /// axes are always equal, which `crates/kernels/tests/mrope.rs`'s
+    /// `equal_axes_reduce_to_the_scalar_case` proves is bit-identical to
+    /// giving the kernel real equal-valued axes anyway.
+    #[allow(clippy::too_many_arguments)]
     fn run(
         &mut self,
         kern: &Kernels,
@@ -544,6 +594,7 @@ impl MtpHead {
         positions: &[usize],
         branch_of: &[usize],
         tail: usize,
+        mrope: Option<&[i32]>,
     ) -> Result<()> {
         let n = shifted_ids.len();
         let dims = self.dims;
@@ -604,6 +655,35 @@ impl MtpHead {
         stream.memcpy_htod(&pos, &mut self.positions.slice_mut(..n))?;
         stream.memcpy_htod(&slots, &mut self.slots.slice_mut(..n))?;
         stream.memcpy_htod(&seqs, &mut self.seq_of.slice_mut(..n))?;
+        // `pos_stride` is a property of this *head*, not of this call:
+        // `self.mrope_axis` holds the head's real, possibly non-zero axis
+        // map whenever `dims.mrope_section` is set, regardless of whether
+        // this particular row set carries an `mrope` array. Making
+        // `pos_stride` follow `mrope.is_some()` instead of `mrope_axis`'s own
+        // shape was a real bug caught by `tests/mtp_mrope.rs`: a decode-phase
+        // call (`mrope: None`) on a model with M-RoPE would fall back to
+        // `pos_stride: 1` while `mrope_axis` still named axis 1 or 2 for some
+        // frequencies, reading `self.positions[token + 1]` /
+        // `[token + 2]` -- a different token's position entirely, since
+        // `self.positions` is only `n` long, one value a token. Broadcasting
+        // `[p, p, p]` here for the `None` case is what `Acts::mrope_positions`
+        // does on the target model's decode path, for the identical reason.
+        let pos_stride = if self.dims.mrope_section.is_some() { 3 } else { 1 };
+        if pos_stride == 3 {
+            let triples: Vec<i32> = match mrope {
+                Some(m) => {
+                    anyhow::ensure!(
+                        m.len() == 3 * n,
+                        "{} mrope entries for {n} rows, expected {}",
+                        m.len(),
+                        3 * n
+                    );
+                    m.to_vec()
+                }
+                None => positions.iter().flat_map(|&p| [p as i32; 3]).collect(),
+            };
+            stream.memcpy_htod(&triples, &mut self.mrope_positions.slice_mut(..n * 3))?;
+        }
         kern.write_slot_table(
             &mut self.slot_table.as_view_mut(),
             &self.seq_of.slice(..n),
@@ -650,6 +730,7 @@ impl MtpHead {
             kern,
             &mut self.x.slice_mut(..n * d),
             &self.w.fc,
+            &mut self.q8_1,
             &mut self.x16,
             &self.cat.slice(..n * 2 * d),
             n,
@@ -679,6 +760,7 @@ impl MtpHead {
             kern,
             &mut self.gate.slice_mut(..n * 2 * da),
             &l.wq,
+            &mut self.q8_1,
             &mut self.x16,
             &self.xb.slice(..n * d),
             n,
@@ -698,6 +780,7 @@ impl MtpHead {
             kern,
             &mut self.k.slice_mut(..n * dkv),
             &l.wk,
+            &mut self.q8_1,
             &mut self.x16,
             &self.xb.slice(..n * d),
             n,
@@ -706,6 +789,7 @@ impl MtpHead {
             kern,
             &mut self.v.slice_mut(..n * dkv),
             &l.wv,
+            &mut self.q8_1,
             &mut self.x16,
             &self.xb.slice(..n * d),
             n,
@@ -744,12 +828,19 @@ impl MtpHead {
         )?;
 
         {
+            let rope_positions = if pos_stride == 3 {
+                self.mrope_positions.slice(..n * 3)
+            } else {
+                self.positions.slice(..n)
+            };
             let (q, k) = (&mut self.q, &mut self.k);
             kern.rope_qk_partial(
                 &mut q.slice_mut(..n * da),
                 &mut k.slice_mut(..n * dkv),
-                &self.positions.slice(..n),
+                &rope_positions,
                 &self.freqs.as_view(),
+                &self.mrope_axis.as_view(),
+                pos_stride,
                 n,
                 dims.heads,
                 dims.kv_heads,
@@ -840,6 +931,7 @@ impl MtpHead {
             kern,
             &mut self.proj.slice_mut(..n * d),
             &l.wo,
+            &mut self.q8_1,
             &mut self.x16,
             &self.attn.slice(..n * da),
             n,
@@ -862,6 +954,7 @@ impl MtpHead {
             kern,
             &mut self.gate.slice_mut(..n * dims.d_ff),
             &self.w.layer.dense().w_gate,
+            &mut self.q8_1,
             &mut self.x16,
             &self.xb.slice(..n * d),
             n,
@@ -870,6 +963,7 @@ impl MtpHead {
             kern,
             &mut self.up.slice_mut(..n * dims.d_ff),
             &self.w.layer.dense().w_up,
+            &mut self.q8_1,
             &mut self.x16,
             &self.xb.slice(..n * d),
             n,
@@ -884,6 +978,7 @@ impl MtpHead {
             kern,
             &mut self.proj.slice_mut(..n * d),
             &self.w.layer.dense().w_down,
+            &mut self.q8_1,
             &mut self.x16,
             &self.ffn.slice(..n * dims.d_ff),
             n,
@@ -988,7 +1083,7 @@ impl MtpHead {
                     n,
                 )?;
             } else {
-                matmul(kern, &mut out, head, &mut self.x16, &src, 1)?;
+                matmul(kern, &mut out, head, &mut self.q8_1, &mut self.x16, &src, 1)?;
             }
         }
         Ok(n)
@@ -1466,7 +1561,7 @@ impl crate::Model {
                 .slice(hidden_rows.start * d..hidden_rows.end * d);
             head.truncate(positions[0]);
             let root_row =
-                head.prime(&self.kern, &self.w.token_embd, shifted_ids, positions, &hidden)?;
+                head.prime(&self.kern, &self.w.token_embd, shifted_ids, positions, &hidden, feed.mrope.as_deref())?;
             let lm = self.w.output.as_ref().unwrap_or(&self.w.token_embd);
             let base = positions[rows - 1] + 1;
             // Every lane shares the prefix and owns `depth` slots past it, which
@@ -1613,7 +1708,7 @@ impl crate::Model {
             // and the head is built for one draft step's width. The row it
             // returns is the final token's index within the last chunk.
             let mut row =
-                head.prime(&self.kern, &self.w.token_embd, shifted_ids, positions, &hidden)?;
+                head.prime(&self.kern, &self.w.token_embd, shifted_ids, positions, &hidden, feed.mrope.as_deref())?;
             let lm = self.w.output.as_ref().unwrap_or(&self.w.token_embd);
             let mut drafted = Vec::with_capacity(k);
             // The window the repetition penalty reads, extended per draft.
@@ -1671,7 +1766,7 @@ impl crate::Model {
             // the target's — see `MtpHead::truncate`.
             head.truncate(positions[0]);
             let mut row =
-                head.prime(&self.kern, &self.w.token_embd, shifted_ids, positions, &hidden)?;
+                head.prime(&self.kern, &self.w.token_embd, shifted_ids, positions, &hidden, feed.mrope.as_deref())?;
             let lm = self.w.output.as_ref().unwrap_or(&self.w.token_embd);
             let mut drafted = Vec::with_capacity(k);
             let mut position = positions[rows - 1];
@@ -1697,12 +1792,12 @@ impl crate::Model {
 /// weight type — the mat-vec for a handful of rows, cuBLAS above that — rather
 /// than a call into it, because the head's activations are its own and threading
 /// `Model`'s scratch through here would tie the drafter to the text model's
-/// buffers for no gain. Everything the head owns is f16, so there is no integer
-/// path to choose between.
+/// buffers for no gain.
 fn matmul(
     kern: &Kernels,
     out: &mut ViewMut<'_, f32>,
     w: &Matrix,
+    q8_1: &mut Buf<u8>,
     x16: &mut Buf<f16>,
     x: &View<'_, f32>,
     n_tokens: usize,
@@ -1716,6 +1811,20 @@ fn matmul(
         x.len()
     );
     let weights = w.view(None)?;
+    // One draft step is one token, and a Q8_0 head is bandwidth-bound there
+    // exactly like the vocabulary mat-vec below is -- same kernel, same
+    // reason. Going through `gemv` here left a k=4 verify round's draft phase
+    // at 9.36 ms; `mmvq` is what the vocabulary step already takes for the
+    // identical reason ("Going through `gemv` here left the draft at 4.65 ms
+    // against a 1.68 ms byte bound"), just never extended to the head's own
+    // seven projections. `q8_1` is sized for the widest single row across all
+    // of them, not just `d_model`, so this covers `w_down`'s `d_ff` and the
+    // FC's `2 * d_model` too.
+    if n_tokens == 1 && Kernels::has_mmvq(w.ty) && w.k.is_multiple_of(32) {
+        let bytes = Kernels::q8_1_bytes(w.k);
+        kern.quantize_q8_1(&mut q8_1.slice_mut(..bytes), x, w.k)?;
+        return kern.mmvq(out, &weights, w.ty, &q8_1.slice(..bytes), w.k, w.n);
+    }
     // Block-scaled FP8, which is what the head's seven projections are in this
     // checkpoint. Same two paths `Model::matmul_pre` takes and for the same
     // reasons: at one token a mat-vec is the right kernel shape, and at a few

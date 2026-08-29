@@ -807,13 +807,22 @@ def mrope_axis_map(model_dir):
     return axis, rot.mrope_section, half, cfg
 
 
-def llm_position_ids(model_dir, cfg, input_ids, mm_token_type_ids, image_grid_thw):
+def llm_position_ids(model_dir, cfg, input_ids, mm_token_type_ids,
+                      image_grid_thw=None, video_grid_thw=None):
     """3-D text-side positions for a spliced sequence, via the reference's own
     `Qwen3_5Model.get_rope_index`.
 
     The full model is 27B and will not be instantiated here, but `get_rope_index`
     only reaches `self.config` and `self.get_vision_position_ids`, so binding the
     unbound methods to a stub runs the library's code without the weights.
+
+    `video_grid_thw` is the *un*-split `[num_videos, 3]` shape -- one row per
+    video, `t` counting sampled frame-pairs -- exactly what a real caller has
+    before this function runs. `get_rope_index` does the
+    `repeat_interleave(video_grid_thw, video_grid_thw[:, 0])` split into one
+    `[1, h, w]` per frame-group itself; this wrapper does not pre-split it,
+    so a Rust caller that skips that step is exactly what the "wrong" reading
+    in the test built from this capture has to reproduce.
     """
     from transformers.models.qwen3_5 import modeling_qwen3_5 as m
 
@@ -825,7 +834,7 @@ def llm_position_ids(model_dir, cfg, input_ids, mm_token_type_ids, image_grid_th
     stub.get_vision_position_ids = m.Qwen3_5Model.get_vision_position_ids.__get__(stub)
     pos, delta = m.Qwen3_5Model.get_rope_index.__get__(stub)(
         input_ids=input_ids, mm_token_type_ids=mm_token_type_ids,
-        image_grid_thw=image_grid_thw,
+        image_grid_thw=image_grid_thw, video_grid_thw=video_grid_thw,
     )
     return pos, delta
 
@@ -1003,6 +1012,41 @@ def main():
     print(f"== splice: {len(ids)} tokens, {n_tok_a} image tokens, "
           f"rope delta {delta.reshape(-1).tolist()}")
 
+    # A spliced *video*: per `get_rope_index`'s own docstring, Qwen3.5 uses
+    # timestamps to separate videos -- `<t1><vision_start>frame1<vision_end>
+    # <t2><vision_start>frame2<vision_end>...` -- so `video_grid_thw` names
+    # one video's full `[grid_t, h, w]` and `get_rope_index` itself splits it
+    # into `grid_t` separate `[1, h, w]` frame-groups via
+    # `repeat_interleave`. The *prompt* has to already carry `grid_t`
+    # separate video-type (`type=2`) runs to match, each preceded by its own
+    # timestamp placeholder -- one contiguous `type=2` run for the whole clip
+    # would desync against the split grid at the very first frame after the
+    # first. Placeholder ids and timestamp token *counts* are arbitrary
+    # (`get_rope_index` never reads `input_ids`' values, only
+    # `mm_token_type_ids` and the grid), but the *count* of separate `type=2`
+    # runs is not.
+    grid_t = 3
+    n_tok_v = n_tok_a  # reuse image A's per-frame-group token count
+    video_grid_thw = torch.tensor([[grid_t, int(grid_a[0, 1]), int(grid_a[0, 2])]])
+    vids, vtypes = [9010, 9011], [0, 0]
+    for g in range(grid_t):
+        # A different placeholder-token count per timestamp, the way a real
+        # "<0.5 seconds>" vs "<12.3 seconds>" would tokenize differently --
+        # so a Rust reader that assumed a fixed timestamp width would also be
+        # caught here, not just the run-count mistake.
+        ts_ids = [9100 + g] * (g + 1)
+        vids += ts_ids
+        vtypes += [0] * len(ts_ids)
+        vids += [cfg.vision_start_token_id] + [cfg.video_token_id] * n_tok_v + [cfg.vision_end_token_id]
+        vtypes += [0] + [2] * n_tok_v + [0]
+    vids += [9020, 9021]
+    vtypes += [0, 0]
+    pos3v, deltav = llm_position_ids(
+        args.model_dir, cfg, torch.tensor([vids]), torch.tensor([vtypes]),
+        image_grid_thw=None, video_grid_thw=video_grid_thw)
+    print(f"== video splice: {len(vids)} tokens, {grid_t} frame-groups of "
+          f"{n_tok_v} tokens each, rope delta {deltav.reshape(-1).tolist()}")
+
     manifest = {
         "config": {
             "depth": vcfg.depth,
@@ -1136,6 +1180,11 @@ def main():
     dump("splice.grid_thw", grid_a.float())
     dump("splice.position_ids", pos3[:, 0].float())
     dump("splice.rope_delta", delta.reshape(-1).float())
+    dump("video_splice.input_ids", torch.tensor(vids, dtype=torch.float32))
+    dump("video_splice.mm_token_type_ids", torch.tensor(vtypes, dtype=torch.float32))
+    dump("video_splice.grid_thw", video_grid_thw.float())
+    dump("video_splice.position_ids", pos3v[:, 0].float())
+    dump("video_splice.rope_delta", deltav.reshape(-1).float())
 
     print("== smart_resize table (from the reference function)")
     from transformers.models.qwen2_vl.image_processing_qwen2_vl import (

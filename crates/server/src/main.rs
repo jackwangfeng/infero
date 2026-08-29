@@ -58,6 +58,32 @@ struct Args {
     /// tokens than one prefill step can carry, regardless of this number.
     #[arg(long, default_value_t = 4096)]
     vision_max_patches: usize,
+
+    /// How many frames a video request may be sampled down to. The real
+    /// ceiling is `Model::batch_tokens()` (a runtime value that shrinks with
+    /// `--ctx`), which a single request is separately refused against
+    /// regardless of this number — this is the earlier, cheaper refusal, and
+    /// the knob an operator has for "how much of a step's budget one video
+    /// may claim" independent of a specific request's resolution.
+    #[arg(long, default_value_t = 16)]
+    video_max_frames: usize,
+
+    /// How many frames a second a video request is sampled at, when the
+    /// request itself does not set `video_url.fps`. A moving subject wants
+    /// more than the default 2fps (see `notes/video-encoding-optimizations
+    /// .md`, item 6, for the reasoning); a mostly-static scene can get away
+    /// with less, saving `--video-max-frames`' budget for a longer clip.
+    #[arg(long, default_value_t = infero_server::video::DEFAULT_TARGET_FPS)]
+    video_target_fps: f64,
+
+    /// Drop a video frame-group as a near-duplicate of the last retained one
+    /// when their mean per-channel pixel difference (0-255 scale) is at or
+    /// below this. `0.0` (the default) disables the check entirely -- a
+    /// slow-panning or mostly-static clip otherwise spends its whole token
+    /// budget on frames that would tell the model nothing new; see
+    /// `notes/video-encoding-optimizations.md`, item 5.
+    #[arg(long, default_value_t = 0.0)]
+    video_dedup_threshold: f64,
 }
 
 #[tokio::main]
@@ -82,6 +108,9 @@ async fn main() -> Result<()> {
         args.max_seqs,
         args.kv_slots,
         args.vision_max_patches,
+        args.video_max_frames,
+        args.video_target_fps,
+        args.video_dedup_threshold,
     )
     .context("starting the inference engine")?;
 
