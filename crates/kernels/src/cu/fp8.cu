@@ -530,6 +530,59 @@ extern "C" __global__ void quantize_act_e4m3_f32(unsigned char* __restrict__ xq,
     }
 }
 
+// Same quantization as `quantize_act_e4m3_f32`, but writes the scale
+// directly into `transpose_pad_scale_a_f32`'s output layout (`sfa_t`,
+// `[groups, m_pad]`) instead of the natural `[n_tokens, groups]` one --
+// folding that separate transpose-and-pad kernel into this one's existing
+// per-group reduction, for callers (the CUTLASS unified-layout path) that
+// have no other use for the natural layout. `xq` is unaffected: the GEMM's
+// row-padding for *that* happens separately, via `mma_e4m3_cutlass`'s own
+// zero-fill and `memcpy_dtod`, not here.
+//
+// Grid is `(m_pad, groups)`, not `(n_tokens, groups)`: the padded rows past
+// `n_tokens` still need a block to write `sfa_t`'s harmless `1.0f` filler
+// (see `transpose_pad_scale_a_f32`'s doc comment for why 1.0, not 0), but
+// they skip `x` entirely rather than reading it.
+extern "C" __global__ void quantize_act_e4m3_cutlass_f32(unsigned char* __restrict__ xq,
+                                                          float* __restrict__ sfa_t,
+                                                          const float* __restrict__ x,
+                                                          int k, int n_tokens, int m_pad) {
+    const int tok = blockIdx.x;
+    const int group = blockIdx.y;
+    const int tid = threadIdx.x;
+    if (tok >= n_tokens) {
+        if (tid == 0) sfa_t[(size_t)group * m_pad + tok] = 1.0f;
+        return;
+    }
+    const int idx = group * QUANT_GROUP + tid;
+    const float v = x[(size_t)tok * k + idx];
+
+    __shared__ float red[QUANT_GROUP / WARP_SIZE];
+    float amax = fabsf(v);
+#pragma unroll
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
+    }
+    const int warp = tid / WARP_SIZE;
+    if (tid % WARP_SIZE == 0) red[warp] = amax;
+    __syncthreads();
+    if (warp == 0) {
+        float m = (tid < QUANT_GROUP / WARP_SIZE) ? red[tid] : 0.0f;
+#pragma unroll
+        for (int off = (QUANT_GROUP / WARP_SIZE) / 2; off > 0; off >>= 1) {
+            m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFFu, m, off));
+        }
+        if (tid == 0) red[0] = fmaxf(m, 1e-30f);
+    }
+    __syncthreads();
+    const float scale = red[0] / 448.0f;
+
+    xq[(size_t)tok * k + idx] = f32_to_e4m3(v / scale);
+    if (tid == 0) {
+        sfa_t[(size_t)group * m_pad + tok] = scale;
+    }
+}
+
 // ---- tensor cores ------------------------------------------------------------
 //
 // The batched mat-vec's marginal row is 81% per-token multiply-accumulate

@@ -651,6 +651,53 @@ impl Kernels {
         Ok(())
     }
 
+    /// Same quantization as [`Self::quantize_act_e4m3`], but for callers with
+    /// no other use for the natural `[n_tokens, groups]` scale layout: writes
+    /// directly into `sfa_t`, the transposed-and-padded `[groups, m_pad]`
+    /// layout `mma_e4m3_cutlass`'s CUTLASS kernel wants, folding what used to
+    /// be a separate `transpose_pad_scale_a_f32` pass into this kernel's
+    /// existing per-group reduction. `xq` is still `[n_tokens, k]` —
+    /// unaffected, that padding happens elsewhere. See
+    /// [`crate::cutlass_fp8::Kernels::mma_e4m3_cutlass_sfa`], which consumes
+    /// `sfa_t` directly rather than computing it from `xs`.
+    pub fn quantize_act_e4m3_cutlass(
+        &self,
+        xq: &mut ViewMut<'_, u8>,
+        sfa_t: &mut ViewMut<'_, f32>,
+        x: &View<'_, f32>,
+        k: usize,
+        n_tokens: usize,
+        m_pad: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            k.is_multiple_of(ACT_QUANT_GROUP),
+            "the activation quantizer's groups are {ACT_QUANT_GROUP} wide; k is {k}"
+        );
+        anyhow::ensure!(m_pad >= n_tokens, "m_pad {m_pad} is narrower than n_tokens {n_tokens}");
+        debug_assert!(x.len() >= n_tokens * k);
+        debug_assert!(xq.len() >= n_tokens * k);
+        debug_assert!(sfa_t.len() >= (k / ACT_QUANT_GROUP) * m_pad);
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_fp8", fp8_src(), "quantize_act_e4m3_cutlass_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (m_pad as u32, (k / ACT_QUANT_GROUP) as u32, 1),
+            block_dim: (ACT_QUANT_GROUP as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (ki, nt, mp) = (k as i32, n_tokens as i32, m_pad as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(xq).arg(sfa_t).arg(x).arg(&ki).arg(&nt).arg(&mp);
+        self.dev
+            .profile()
+            .time("quantize_act_e4m3_cutlass", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("quantize_act_e4m3_cutlass")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     /// `out = W x`, with `W` in FP8 and its block scales, at one token.
     ///
     /// `w` is the whole buffer: quants then grid. `accum` adds into `out`

@@ -222,6 +222,94 @@ fn the_unified_plain_layout_agrees_with_mma_e4m3_block() -> Result<()> {
     Ok(())
 }
 
+/// `quantize_act_e4m3_cutlass` + `mma_e4m3_cutlass_sfa` (the fused path,
+/// writing the transposed scale directly) against `quantize_act_e4m3` +
+/// `mma_e4m3_cutlass` (the original two-step path) on the same weight and
+/// activation. Both compute the identical quantization; only *where* the
+/// scale transpose happens differs, so this expects exact equality, not a
+/// tolerance -- any difference means the fused kernel's `sfa_t` indexing or
+/// padding-fill disagrees with `transpose_pad_scale_a_f32`'s.
+#[test]
+fn the_fused_quantizer_matches_the_separate_transpose() -> Result<()> {
+    let k = kernels()?;
+    if !k.device().caps().fp8 {
+        eprintln!("skipping: sm_{} has no native e4m3 mma", k.device().arch());
+        return Ok(());
+    }
+    let stream = k.device().stream().clone();
+
+    let quants = quant_bytes(N * K, 0xFEED);
+    let scale_grid_n = N / FP8_BLOCK;
+    let scale_grid_k = K / FP8_BLOCK;
+    let scales: Vec<f32> = (0..scale_grid_n * scale_grid_k).map(|i| 0.25 + 0.35 * (i % 6) as f32).collect();
+    let w_buf = packed(&quants, &scales, K, N);
+    let d_w = stream.clone_htod(&w_buf)?;
+    let cutlass_w = k.prepare_cutlass_weight(&d_w.as_view(), K, N, false)?;
+
+    // Token counts that land on both sides of a 128-row pad boundary.
+    for n_tokens in [1usize, 2, 8, 17, 127, 128, 129] {
+        let x: Vec<f32> =
+            (0..n_tokens).flat_map(|t| pseudo_random_f32(K, 0x5CA1E + t as u64, 2.0 + t as f32)).collect();
+        let d_x = stream.clone_htod(&x)?;
+        let m_pad = n_tokens.next_multiple_of(128);
+        let scale_cols = K / ACT_QUANT_GROUP;
+
+        // Original: separate quantize + internal transpose.
+        let mut d_xq_a = stream.alloc_zeros::<u8>(n_tokens * K)?;
+        let mut d_xs_a = stream.alloc_zeros::<f32>(n_tokens * scale_cols)?;
+        k.quantize_act_e4m3(&mut d_xq_a.as_view_mut(), &mut d_xs_a.as_view_mut(), &d_x.as_view(), K, n_tokens)?;
+        let mut d_want = stream.alloc_zeros::<f32>(n_tokens * N)?;
+        let ran = k.mma_e4m3_cutlass(
+            &mut d_want.as_view_mut(),
+            &d_w.as_view(),
+            &cutlass_w,
+            &d_xq_a.as_view(),
+            &d_xs_a.as_view(),
+            K,
+            N,
+            n_tokens,
+            false,
+        )?;
+        assert!(ran, "mma_e4m3_cutlass declined {n_tokens} tokens at K={K}");
+
+        // Fused: quantizer writes sfa_t directly.
+        let mut d_xq_b = stream.alloc_zeros::<u8>(n_tokens * K)?;
+        let mut d_sfa_t = stream.alloc_zeros::<f32>(scale_cols * m_pad)?;
+        k.quantize_act_e4m3_cutlass(
+            &mut d_xq_b.as_view_mut(),
+            &mut d_sfa_t.as_view_mut(),
+            &d_x.as_view(),
+            K,
+            n_tokens,
+            m_pad,
+        )?;
+        let mut d_got = stream.alloc_zeros::<f32>(n_tokens * N)?;
+        let ran = k.mma_e4m3_cutlass_sfa(
+            &mut d_got.as_view_mut(),
+            &d_w.as_view(),
+            &cutlass_w,
+            &d_xq_b.as_view(),
+            &d_sfa_t.as_view(),
+            K,
+            N,
+            n_tokens,
+            false,
+        )?;
+        assert!(ran, "mma_e4m3_cutlass_sfa declined {n_tokens} tokens at K={K}");
+
+        k.device().synchronize()?;
+        let want = stream.clone_dtoh(&d_want)?;
+        let got = stream.clone_dtoh(&d_got)?;
+        let xq_a = stream.clone_dtoh(&d_xq_a)?;
+        let xq_b = stream.clone_dtoh(&d_xq_b)?;
+        k.device().synchronize()?;
+
+        assert_eq!(xq_a, xq_b, "{n_tokens} tokens: quantized activation bytes differ");
+        assert_eq!(got, want, "{n_tokens} tokens: GEMM output differs between the two paths");
+    }
+    Ok(())
+}
+
 fn max_rel_diff(got: &[f32], want: &[f32], rel: f32) -> (f32, usize) {
     let peak = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     let floor = 3e-2 * peak.max(f32::MIN_POSITIVE);

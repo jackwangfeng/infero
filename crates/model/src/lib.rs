@@ -4114,30 +4114,41 @@ impl Model {
                     kern.mmv_f8_plain(out, &weights, x, w.k, w.n, false)?;
                     return Ok(());
                 }
+                // `quantize_act_e4m3_cutlass` writes the activation scale
+                // straight into the transposed-and-padded `[scale_cols,
+                // m_pad]` layout `mma_e4m3_cutlass_sfa`'s CUTLASS kernel
+                // wants, folding what used to be a separate
+                // `transpose_pad_scale_a_f32` pass (`cutlass_transpose_sfa`
+                // in a profile) into this quantizer's existing per-group
+                // reduction -- free here because, unlike the AWQ/non-unified
+                // path below, nothing else in this branch reads `xs` in its
+                // natural `[n_tokens, scale_cols]` layout.
                 let scale_cols = w.k.div_ceil(infero_kernels::fp8::ACT_QUANT_GROUP);
+                let m_pad = n_tokens.next_multiple_of(128);
                 let xq_len = n_tokens * w.k;
-                let xs_len = n_tokens * scale_cols;
+                let sfa_len = scale_cols * m_pad;
                 anyhow::ensure!(
-                    scratch.xq_e4m3.len() >= xq_len && scratch.xs_e4m3.len() >= xs_len,
+                    scratch.xq_e4m3.len() >= xq_len && scratch.xs_e4m3.len() >= sfa_len,
                     "activation quant scratch too small for {n_tokens} tokens at k={}",
                     w.k
                 );
-                kern.quantize_act_e4m3(
+                kern.quantize_act_e4m3_cutlass(
                     &mut scratch.xq_e4m3.slice_mut(..xq_len),
-                    &mut scratch.xs_e4m3.slice_mut(..xs_len),
+                    &mut scratch.xs_e4m3.slice_mut(..sfa_len),
                     x,
                     w.k,
                     n_tokens,
+                    m_pad,
                 )?;
                 let cw = w
                     .cutlass_weight(kern)
                     .with_context(|| format!("preparing CUTLASS weight for a {}x{} matrix", w.n, w.k))?;
-                let ran = kern.mma_e4m3_cutlass(
+                let ran = kern.mma_e4m3_cutlass_sfa(
                     out,
                     &weights,
                     cw,
                     &scratch.xq_e4m3.slice(..xq_len),
-                    &scratch.xs_e4m3.slice(..xs_len),
+                    &scratch.xs_e4m3.slice(..sfa_len),
                     w.k,
                     w.n,
                     n_tokens,

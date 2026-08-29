@@ -247,7 +247,10 @@ impl Kernels {
         let groups = k / FP8_BLOCK;
         let m_pad = n_tokens.next_multiple_of(128);
 
-        // 1. Transpose + pad the activation scale: [n_tokens,groups] -> [groups,m_pad].
+        // Transpose + pad the activation scale: [n_tokens,groups] -> [groups,m_pad].
+        // `mma_e4m3_cutlass_sfa` skips this for callers (the unified-layout
+        // path) whose quantizer wrote the transposed layout directly —
+        // see `Kernels::quantize_act_e4m3_cutlass`.
         let mut sfa_t = stream.alloc_zeros::<f32>(groups * m_pad)?;
         {
             let f = self
@@ -270,8 +273,41 @@ impl Kernels {
                     Ok(())
                 })?;
         }
+        self.mma_e4m3_cutlass_sfa(out, w, cw, xq, &sfa_t.as_view(), k, n, n_tokens, accum)
+    }
 
-        // 4. Pad activations: [n_tokens,k] -> [m_pad,k], zero rows past
+    /// Same as [`Self::mma_e4m3_cutlass`], but `sfa_t` is already in the
+    /// transposed-and-padded `[groups, m_pad]` layout (`m_pad =
+    /// n_tokens.next_multiple_of(128)`) — the caller's own quantizer wrote
+    /// it directly (see [`Kernels::quantize_act_e4m3_cutlass`]), so there is
+    /// no separate `[n_tokens, groups]` scale to transpose here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mma_e4m3_cutlass_sfa(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
+        cw: &CutlassWeight,
+        xq: &View<'_, u8>,
+        sfa_t: &View<'_, f32>,
+        k: usize,
+        n: usize,
+        n_tokens: usize,
+        accum: bool,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            cw.k == k && cw.n == n,
+            "CutlassWeight is [{}, {}], called with k={k} n={n}",
+            cw.n,
+            cw.k
+        );
+        if !k.is_multiple_of(FP8_BLOCK) || !n.is_multiple_of(FP8_BLOCK) || n_tokens == 0 {
+            return Ok(false);
+        }
+        let stream = self.dev.stream();
+        let m_pad = n_tokens.next_multiple_of(128);
+        debug_assert!(sfa_t.len() >= (k / FP8_BLOCK) * m_pad);
+
+        // Pad activations: [n_tokens,k] -> [m_pad,k], zero rows past
         // n_tokens. `CUTLASS_A_PAD` is reused across calls (see its doc
         // comment), so the tail past `n_tokens` -- which a *fresh*
         // `alloc_zeros` would already be zero, but reused scratch might
