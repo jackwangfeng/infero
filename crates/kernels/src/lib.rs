@@ -3153,8 +3153,25 @@ impl Kernels {
         // `sv0`/`sv1` are four `WK`-wide, `krow`-wide buffers -- identical
         // shared-memory footprint to `attn_prefill_pipev`'s, since the
         // producer warp adds threads (`NWARPS + 1` total) but no new shared
-        // state.
-        let shared = (NWARPS * 16 * (dims.d_head + KPAD) * 2 + 4 * WK * (dims.d_head + KPAD) * 2) as u32;
+        // state during the K/V loop.
+        let kv_shared = NWARPS * 16 * (dims.d_head + KPAD) * 2 + 4 * WK * (dims.d_head + KPAD) * 2;
+        // The kernel *can* reuse this same region afterward (dead by then)
+        // to stage the `single`-path output for a coalesced write instead
+        // of the MMA C-fragment's own scattered one -- see its doc comment
+        // in `ops.cu`. `tpw * group` is at most 16, and at that width (a
+        // wide `group`, few kv heads -- `(16, 2)` at this model's `d_head`
+        // is the real example `attn_prefill_matches_the_three_kernels`
+        // exercises) the staging buffer alone is past this GPU's ~100 KiB
+        // dynamic-shared ceiling, past what even `set_max_dynamic_shared`
+        // can grant -- confirmed by trying, not assumed (`CUDA_ERROR_INVALID_VALUE`,
+        // "kernel refused a 114688-byte dynamic shared request"). Staging
+        // is opt-in per launch (`use_out_stage`) for exactly this reason:
+        // when it would not fit, the kernel falls back to the scattered
+        // write rather than the launch failing outright.
+        const MAX_DYNAMIC_SHARED: usize = 100 * 1024;
+        let out_stage_shared = NWARPS * tpw * group * dims.d_head * 4;
+        let use_out_stage = out_stage_shared <= MAX_DYNAMIC_SHARED;
+        let shared = if use_out_stage { kv_shared.max(out_stage_shared) } else { kv_shared } as u32;
         if shared > 48 * 1024 {
             infero_gpu::set_max_dynamic_shared(&f, shared)?;
         }
@@ -3164,7 +3181,7 @@ impl Kernels {
             block_dim: ((NWARPS + 1) as u32 * 32, 1, 1),
             shared_mem_bytes: shared,
         };
-        let (stride, h, kh, dh, ns, ck, kl, gi, tp, rb, rt) = (
+        let (stride, h, kh, dh, ns, ck, kl, gi, tp, rb, rt, uos) = (
             batch.table_stride as i32,
             dims.n_heads as i32,
             dims.n_kv_heads as i32,
@@ -3176,6 +3193,7 @@ impl Kernels {
             tpw as i32,
             run_base as i32,
             run_tokens as i32,
+            i32::from(use_out_stage),
         );
         let mut b = self.dev.stream().launch_builder(&f);
         b.arg(&mut *partial)
@@ -3199,7 +3217,8 @@ impl Kernels {
             .arg(&gi)
             .arg(&tp)
             .arg(&rb)
-            .arg(&rt);
+            .arg(&rt)
+            .arg(&uos);
         self.dev
             .profile()
             .time("attn_prefill_ws", self.dev.stream(), || {

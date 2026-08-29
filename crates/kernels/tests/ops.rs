@@ -870,7 +870,11 @@ fn attn_prefill_matches_the_three_kernels() -> Result<()> {
 
     // 256 with d_head 256 is Qwen3.8-27B-FP8's own shape; 4 and 7 are groups
     // that do not divide sixteen evenly, matching the decode test's choices.
-    for (n_heads, n_kv_heads, d_head) in [(24usize, 4usize, 256usize), (8, 2, 128), (14, 2, 64)] {
+    // group=8 (16, 2) is `prefill_attention`'s own upper bound and the one
+    // shape where `tpw*group` (16) is exactly the MMA fragment's row count
+    // instead of less than it -- the boundary `attn_prefill_ws`'s output
+    // staging buffer sizing has to get right, not just the common case.
+    for (n_heads, n_kv_heads, d_head) in [(24usize, 4usize, 256usize), (8, 2, 128), (14, 2, 64), (16, 2, 256)] {
         let dims_probe = AttnDims { n_heads, n_kv_heads, d_head, n_slots: 1, n_tokens: 1 };
         if !k.prefill_attention(&dims_probe) {
             continue;

@@ -3583,7 +3583,7 @@ extern "C" __global__ void attn_prefill_mma_ws_f32(
     const int* __restrict__ positions, const int* __restrict__ slot_table,
     int table_stride, int n_heads, int n_kv_heads, int d_head, int n_slots,
     float scale, int chunk, int kv_len, int group, int tpw, int run_base,
-    int run_tokens) {
+    int run_tokens, int use_out_stage) {
     const int kv_head = blockIdx.x;
     const int tile = blockIdx.y;
     const int c = blockIdx.z;
@@ -3798,6 +3798,69 @@ extern "C" __global__ void attn_prefill_mma_ws_f32(
         asm volatile("bar.arrive %0, %1;" ::"r"(fbar), "r"(total_threads));
     }
 
+    if (single && use_out_stage) {
+        // The MMA C-fragment splits a warp's 32 lanes across up to 8
+        // different (token, head) rows (`cr = lane/4`), each getting a
+        // narrow, scattered slice -- ncu flags this as ~31% excessive
+        // global sectors. Stage the already-normalized row into shared
+        // memory first (reusing the now-dead `sq`/`sk*`/`sv*` space --
+        // `nwarps * (tpw*group) * d_head` floats, which the launcher sizes
+        // the launch's dynamic shared memory for when it fits, since a
+        // narrow `group` can need more of it than the K/V buffers did; see
+        // `Kernels::attn_prefill_ws`'s doc comment) and then have the warp
+        // read it back with consecutive lanes covering consecutive `dim`s
+        // of the *same* row, which is coalesced. Only for `single`: the
+        // multi-chunk `partial` path also needs `m`/`den` staged per-row for
+        // `attn_flash_reduce_f32`'s later read, and is the rare case in
+        // practice (`n_chunks` is usually 1 at real prefill lengths) -- not
+        // worth the extra bookkeeping here.
+        //
+        // Safe to repurpose `sq`/`sk*`/`sv*`'s shared memory: every warp's
+        // last read of it happened before this iteration's FREE bar.arrive,
+        // and `bar.arrive` doesn't block -- a fast warp could otherwise
+        // start writing here before a slower one finishes reading -- so
+        // this block-wide `__syncthreads()` (barrier 0, distinct from the
+        // named ones above) closes that gap. The producer warp never
+        // reaches this: it returned already, which is fine -- CUDA's
+        // `__syncthreads()` only waits for threads that are still live to
+        // reach it.
+        __syncthreads();
+
+        float* stage = (float*)attn_ws_smem;
+        const int pair_count = tpw * group;
+        float* mystage = stage + (size_t)cwarp * pair_count * d_head;
+#pragma unroll
+        for (int rg = 0; rg < 2; ++rg) {
+            if (!row_live[rg]) continue;
+            const int abs_row = cr + rg * 8;
+            const float den = l_run[rg];
+#pragma unroll
+            for (int i = 0; i < ATTN_MMA_MAX_NTILES; ++i) {
+                if (i >= ntiles) break;
+                const int d0 = i * 8 + cc;
+                const float v0 = o[i].x[rg * 2];
+                const float v1 = o[i].x[rg * 2 + 1];
+                mystage[(size_t)abs_row * d_head + d0] = den > 0.0f ? v0 / den : 0.0f;
+                mystage[(size_t)abs_row * d_head + d0 + 1] = den > 0.0f ? v1 / den : 0.0f;
+            }
+        }
+        __syncthreads();
+
+        for (int idx = lane; idx < pair_count * d_head; idx += WARP_SIZE) {
+            const int abs_row = idx / d_head;
+            const int d = idx % d_head;
+            const int row_j2 = abs_row / group;
+            if (local0 + row_j2 >= tokens_here) continue;
+            const int token = run_base + tile * tile_tokens + local0 + row_j2;
+            const int head = kv_head * group + abs_row % group;
+            out[((size_t)token * n_heads + head) * d_head + d] = mystage[idx];
+        }
+        return;
+    }
+
+    // Fallback (either the rare multi-chunk `partial` path, or `single`
+    // when the output-staging buffer above would not fit): the original
+    // scattered write straight from the MMA C-fragment, one lane at a time.
 #pragma unroll
     for (int rg = 0; rg < 2; ++rg) {
         if (!row_live[rg]) continue;
