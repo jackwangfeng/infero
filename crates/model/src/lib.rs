@@ -3240,11 +3240,21 @@ impl Model {
                 // three.
                 // `prefill_run` is `Some(n)` only when this whole pass is one
                 // item — one sequence, `n` tokens, contiguous, causal — which
-                // `attn_prefill_ws` requires and the caller
+                // `attn_prefill_ws4` requires and the caller
                 // (`forward_batch_rows`) has already checked; see its own doc
                 // comment for why a narrower run is not attempted here.
+                //
+                // `_ws4`, not `_ws`: a real 13.4% win on the isolated 16-layer
+                // x 30552-token benchmark (2277ms -> 2008ms) from dropping Q's
+                // shared-memory staging entirely (loaded straight into `qa[]`'s
+                // registers from global memory instead) and spending the
+                // freed budget on a 48-key K/V tile instead of 16, at the same
+                // NWARPS=7 this kernel family's occupancy sweet spot already
+                // established — see `attn_prefill_mma_ws4_f32`'s doc comment
+                // in `ops.cu` for the full byte-exact shared-memory accounting
+                // and why two prior widening attempts (`_ws2`, `_ws3`) failed.
                 if let Some(run_tokens) = prefill_run.filter(|_| self.kern.prefill_attention(&dims)) {
-                    self.kern.attn_prefill_ws(
+                    self.kern.attn_prefill_ws4(
                         &mut attn_out.slice_mut(..n * da),
                         &self.act.q.slice(..n * da),
                         &pool.dense(layer).0.as_view(),

@@ -1171,6 +1171,50 @@ fn attn_prefill_matches_the_three_kernels() -> Result<()> {
                 "attn_prefill_ws {n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
                  wrote past the run"
             );
+
+            // Same reference, the no-`sq` / 48-key-wide-tile architectural
+            // variant.
+            let mut got_ws4_d = stream.clone_htod(&want)?;
+            let mut part_ws4 = stream.alloc_zeros::<f32>(Kernels::attn_partial_floats(
+                dims.n_heads,
+                dims.d_head,
+                run_tokens,
+            ))?;
+            k.attn_prefill_ws4(
+                &mut got_ws4_d.as_view_mut(),
+                &dq.as_view(),
+                &dk.as_view(),
+                &dv.as_view(),
+                batch,
+                dims,
+                pad,
+                run_tokens,
+                kv_len,
+                scale,
+                &mut part_ws4.as_view_mut(),
+            )?;
+            let got_ws4 = stream.clone_dtoh(&got_ws4_d)?;
+            k.device().synchronize()?;
+            let (abs_ws4, at_ws4) = max_abs_diff(&got_ws4[run_lo..run_hi], &want[run_lo..run_hi]);
+            assert!(
+                abs_ws4 < 2e-3,
+                "attn_prefill_ws4 {n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
+                 max abs diff {abs_ws4} at {at_ws4} (got {}, want {})",
+                got_ws4[run_lo + at_ws4],
+                want[run_lo + at_ws4]
+            );
+            assert_eq!(
+                &got_ws4[..run_lo],
+                &want[..run_lo],
+                "attn_prefill_ws4 {n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
+                 wrote before the run"
+            );
+            assert_eq!(
+                &got_ws4[run_hi..],
+                &want[run_hi..],
+                "attn_prefill_ws4 {n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
+                 wrote past the run"
+            );
         }
     }
     Ok(())
@@ -1184,11 +1228,10 @@ fn attn_ws_pair_probe_matches_closed_form() -> Result<()> {
     let k = kernels()?;
     let stream = k.device().stream().clone();
     let iters = 5000i32;
-    let mut d_out = stream.alloc_zeros::<f32>(24)?;
+    let mut d_out = stream.alloc_zeros::<f32>(4)?;
     k.attn_ws_pair_probe(&mut d_out.as_view_mut(), iters)?;
     k.device().synchronize()?;
     let got = stream.clone_dtoh(&d_out)?;
-    eprintln!("first 20 values pair 0 read: {:?}", &got[4..24]);
     let n = (iters - 1) as f64;
     let want0 = (n * (n + 1.0) / 2.0) as f32;
     let want1 = want0 * 2.0;
@@ -1196,5 +1239,23 @@ fn attn_ws_pair_probe_matches_closed_form() -> Result<()> {
         assert_eq!(got[pair * 2], want0, "pair {pair} acc0");
         assert_eq!(got[pair * 2 + 1], want1, "pair {pair} acc1");
     }
+    Ok(())
+}
+
+// TEMP, not for the deployed tree: does ptxas actually reuse registers
+// across two sequential, non-overlapping live ranges (see
+// reg_phase_probe_overlap_f32/reg_phase_probe_phased_f32's own comment)?
+// This is the load-bearing question for whether splitting
+// attn_prefill_mma_ws_f32 into a QK^T/softmax phase and a P@V phase, handed
+// off through a small scratch buffer, could actually lower its peak
+// register count -- checked before spending real effort building that
+// kernel, the same "validate the mechanism in isolation first" discipline
+// as attn_ws_pair_probe.
+#[test]
+fn reg_phase_probe_shows_whether_ptxas_reuses_registers_across_phases() -> Result<()> {
+    let k = kernels()?;
+    let (overlap_regs, _) = k.kernel_registers("infero_ops", "reg_phase_probe_overlap_f32")?;
+    let (phased_regs, _) = k.kernel_registers("infero_ops", "reg_phase_probe_phased_f32")?;
+    eprintln!("reg_phase_probe: overlap={overlap_regs} regs, phased={phased_regs} regs");
     Ok(())
 }
