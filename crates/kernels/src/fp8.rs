@@ -733,6 +733,39 @@ impl Kernels {
         Ok(())
     }
 
+    /// One warp a `(token, kv_head)` key vector: quantizes `k` to e4m3 under
+    /// a single whole-`d_head` scale (validated at this checkpoint's
+    /// d_head=256 by the accuracy probe, no split-group correction needed
+    /// downstream). `k` and `kq` are `[n_tokens, n_kv_heads, d_head]`;
+    /// `kscale` is `[n_tokens, n_kv_heads]`. See `quantize_k_e4m3_f32` in
+    /// `fp8.cu`.
+    pub fn quantize_k_e4m3(
+        &self,
+        kq: &mut ViewMut<'_, u8>,
+        kscale: &mut ViewMut<'_, f32>,
+        k: &View<'_, f32>,
+        n_tokens: usize,
+        n_kv_heads: usize,
+        d_head: usize,
+    ) -> Result<()> {
+        debug_assert!(kq.len() >= n_tokens * n_kv_heads * d_head);
+        debug_assert!(kscale.len() >= n_tokens * n_kv_heads);
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_fp8", fp8_src(), "quantize_k_e4m3_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_tokens as u32, n_kv_heads as u32, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (nt, nh, dh) = (n_tokens as i32, n_kv_heads as i32, d_head as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(kq).arg(kscale).arg(k).arg(&nt).arg(&nh).arg(&dh);
+        unsafe { b.launch(cfg) }.context("quantize_k_e4m3")?;
+        Ok(())
+    }
+
     /// One warp, `ws4`'s WK=48/d_head=256 K tile, converted from resident
     /// `__half` to e4m3 with a per-key scale, `outer_iters` times. See
     /// `attn_ktile_e4m3_quantize_probe` in `fp8.cu` — the cost `ws4`'s

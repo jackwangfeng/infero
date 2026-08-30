@@ -1235,6 +1235,54 @@ extern "C" __global__ void attn_ktile_e4m3_quantize_probe(float* __restrict__ ou
     if (lane == 0) out[blockIdx.x] = acc;
 }
 
+// One warp a (token, kv_head) key vector: quantizes the whole d_head=256
+// vector to e4m3 under a single scale (max-abs/448), not the GEMM path's
+// 128-wide `QUANT_GROUP`. The accuracy probe found a single 256-wide group
+// costs no more real accuracy than two 128-wide ones for this checkpoint's
+// realistic Q/K magnitudes (0.0294 vs 0.0290 score-std of noise) -- worth
+// taking to avoid a two-group-accumulator split in the attention kernel
+// that reads this. Proper grid parallelism (`n_tokens * n_kv_heads`
+// independent warps), unlike the two throughput probes above, which
+// deliberately serialized many keys in one warp/block to measure a
+// worst-case cost in isolation -- this is the real, amortized-by-design
+// shape a one-shot quantize pass should have.
+extern "C" __global__ void quantize_k_e4m3_f32(unsigned char* __restrict__ kq,
+                                                float* __restrict__ kscale,
+                                                const float* __restrict__ k,
+                                                int n_tokens, int n_kv_heads,
+                                                int d_head) {
+    const int token = blockIdx.x;
+    const int kv_head = blockIdx.y;
+    const int lane = threadIdx.x;
+    const int per_lane = d_head / WARP_SIZE;
+    const float* row = k + ((size_t)token * n_kv_heads + kv_head) * d_head;
+    unsigned char* orow = kq + ((size_t)token * n_kv_heads + kv_head) * d_head;
+
+    float v[8];
+    float amax = 0.0f;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        if (e < per_lane) {
+            v[e] = row[lane * per_lane + e];
+            amax = fmaxf(amax, fabsf(v[e]));
+        }
+    }
+#pragma unroll
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
+    }
+    const float scale = fmaxf(amax, 1e-30f) / 448.0f;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        if (e < per_lane) {
+            orow[lane * per_lane + e] = f32_to_e4m3(v[e] / scale);
+        }
+    }
+    if (lane == 0) {
+        kscale[(size_t)token * n_kv_heads + kv_head] = scale;
+    }
+}
+
 // Same job as `attn_ktile_e4m3_quantize_probe`, avoiding the five
 // `__shfl_xor_sync` steps a key entirely: one thread a key (48 of 64
 // threads active, block-wide instead of one warp), each doing a plain

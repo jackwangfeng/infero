@@ -497,6 +497,176 @@ fn attention_matches_reference() -> Result<()> {
     Ok(())
 }
 
+/// Bit-level decode of the e4m3 format `attn_e4m3_encode`/`f32_to_e4m3`
+/// write -- unambiguous (unlike encode, decode needs no rounding decision),
+/// ported from `e4m3_to_f32` in `fp8.cu` so the reference below can use the
+/// GPU's own quantized bytes directly instead of re-deriving them.
+fn e4m3_to_f32_host(b: u8) -> f32 {
+    let sign = (b & 0x80) != 0;
+    let exp = ((b >> 3) & 0x0F) as i32;
+    let man = (b & 0x07) as i32;
+    let v = if exp == 0 {
+        man as f32 / 512.0
+    } else if exp == 0x0F && man == 0x07 {
+        return f32::NAN;
+    } else {
+        f32::from_bits(((exp + 120) as u32) << 23 | ((man as u32) << 20))
+    };
+    if sign { -v } else { v }
+}
+
+/// `attn_prefill_e4m3k_f32` against a reference that isolates this kernel's
+/// own correctness (MMA fragment layout, causal masking, online-softmax
+/// bookkeeping, PV) from e4m3 quantization accuracy, which is validated
+/// separately (`examples/e4m3_qk_accuracy_probe.rs`, ~3% of a score-std).
+/// Both Q and K are quantized to e4m3 on the GPU first (`quantize_k_e4m3`,
+/// reused for Q by treating its `n_heads` as the "kv_head" dimension --
+/// same `[position, head, d_head]` shape), decoded back to f32 on the host,
+/// and the reference computes exact causal attention on *those* dequantized
+/// values against full-precision V -- the same values, bit for bit, this
+/// kernel's own e4m3 arithmetic is built from. A real bug in this kernel's
+/// own logic should show up here even though the quantization noise itself
+/// is expected and already characterized elsewhere.
+#[test]
+fn attn_prefill_e4m3k_matches_a_quantized_reference() -> Result<()> {
+    // (n_heads, n_kv_heads, n_tokens): d_head is fixed at 256, the only
+    // width this validation kernel's register arrays support. Covers this
+    // checkpoint's real GQA ratio (24/4) alongside a smaller one, and
+    // token counts landing exactly on `ATTN_E4M3_WK`'s 48-key boundary,
+    // just past it, and well past it with a remainder.
+    for &(n_heads, n_kv_heads, n_tokens) in &[
+        (8usize, 2usize, 48usize),
+        (8, 2, 49),
+        (8, 2, 130),
+        (24, 4, 97),
+    ] {
+        attn_prefill_e4m3k_case(n_heads, n_kv_heads, n_tokens)?;
+    }
+    Ok(())
+}
+
+fn attn_prefill_e4m3k_case(n_heads: usize, n_kv_heads: usize, n_tokens: usize) -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+
+    let d_head = 256;
+    // A fresh single-shot prefill: kv_len == n_tokens.
+    let kv_len = n_tokens;
+    let scale = 1.0 / (d_head as f32).sqrt();
+
+    let q = pseudo_random(n_tokens * n_heads * d_head, 0x71);
+    let k_host = pseudo_random(kv_len * n_kv_heads * d_head, 0x82);
+    let v_host: Vec<f16> = pseudo_random(kv_len * n_kv_heads * d_head, 0x93)
+        .into_iter()
+        .map(f16::from_f32)
+        .collect();
+
+    let dq = stream.clone_htod(&q)?;
+    let dk = stream.clone_htod(&k_host)?;
+    let dv = stream.clone_htod(&v_host)?;
+
+    let mut dkq = stream.alloc_zeros::<u8>(kv_len * n_kv_heads * d_head)?;
+    let mut dkscale = stream.alloc_zeros::<f32>(kv_len * n_kv_heads)?;
+    k.quantize_k_e4m3(
+        &mut dkq.as_view_mut(),
+        &mut dkscale.as_view_mut(),
+        &dk.as_view(),
+        kv_len,
+        n_kv_heads,
+        d_head,
+    )?;
+
+    let mut dqq = stream.alloc_zeros::<u8>(n_tokens * n_heads * d_head)?;
+    let mut dqscale = stream.alloc_zeros::<f32>(n_tokens * n_heads)?;
+    k.quantize_k_e4m3(
+        &mut dqq.as_view_mut(),
+        &mut dqscale.as_view_mut(),
+        &dq.as_view(),
+        n_tokens,
+        n_heads,
+        d_head,
+    )?;
+
+    let kq_bytes = stream.clone_dtoh(&dkq)?;
+    let kscale_host = stream.clone_dtoh(&dkscale)?;
+    let qq_bytes = stream.clone_dtoh(&dqq)?;
+    let qscale_host = stream.clone_dtoh(&dqscale)?;
+    k.device().synchronize()?;
+
+    let dequant = |bytes: &[u8], scales: &[f32], n_rows: usize, n_h: usize| -> Vec<f32> {
+        let mut out = vec![0f32; n_rows * n_h * d_head];
+        for r in 0..n_rows {
+            for h in 0..n_h {
+                let s = scales[r * n_h + h];
+                for i in 0..d_head {
+                    let b = bytes[(r * n_h + h) * d_head + i];
+                    out[(r * n_h + h) * d_head + i] = s * e4m3_to_f32_host(b);
+                }
+            }
+        }
+        out
+    };
+    let q_deq = dequant(&qq_bytes, &qscale_host, n_tokens, n_heads);
+    let k_deq = dequant(&kq_bytes, &kscale_host, kv_len, n_kv_heads);
+
+    let group = n_heads / n_kv_heads;
+    let mut want = vec![0f32; n_tokens * n_heads * d_head];
+    for t in 0..n_tokens {
+        for h in 0..n_heads {
+            let kv_head = h / group;
+            let last = t.min(kv_len - 1);
+            let mut scores = vec![0f32; last + 1];
+            let mut m = f32::NEG_INFINITY;
+            for (kpos, slot) in scores.iter_mut().enumerate() {
+                let mut s = 0f32;
+                for d in 0..d_head {
+                    s += q_deq[(t * n_heads + h) * d_head + d]
+                        * k_deq[(kpos * n_kv_heads + kv_head) * d_head + d];
+                }
+                s *= scale;
+                *slot = s;
+                m = m.max(s);
+            }
+            let probs = softmax_ref(&scores);
+            for d in 0..d_head {
+                let mut acc = 0f32;
+                for (kpos, p) in probs.iter().enumerate() {
+                    acc += p * v_host[(kpos * n_kv_heads + kv_head) * d_head + d].to_f32();
+                }
+                want[(t * n_heads + h) * d_head + d] = acc;
+            }
+        }
+    }
+
+    let dims = AttnDims { n_heads, n_kv_heads, d_head, n_slots: 0, n_tokens };
+    let mut dout = stream.alloc_zeros::<f32>(n_tokens * n_heads * d_head)?;
+    k.attn_prefill_e4m3k(
+        &mut dout.as_view_mut(),
+        &dq.as_view(),
+        &dkq.as_view(),
+        &dkscale.as_view(),
+        &dv.as_view(),
+        dims,
+        kv_len,
+        scale,
+    )?;
+    let got = stream.clone_dtoh(&dout)?;
+    k.device().synchronize()?;
+
+    // Real measured max abs diff on this shape is ~1.9e-4 (fp16-rounding-
+    // level noise from the unchanged PV/output path, not from this kernel's
+    // own e4m3 QK^T logic) -- the relative bound is looser only because
+    // relative error blows up near-zero values, the same artifact the
+    // accuracy probe's own "|score| > 1e-3" filter exists to avoid.
+    let (abs, at) = max_abs_diff(&got, &want);
+    let rel = max_rel_diff(&got, &want);
+    assert!(
+        abs < 2e-3,
+        "n_heads={n_heads} n_kv_heads={n_kv_heads} n_tokens={n_tokens}: max abs diff {abs} at {at}, max rel diff {rel}"
+    );
+    Ok(())
+}
+
 #[test]
 fn masked_positions_get_no_weight() -> Result<()> {
     let k = kernels()?;

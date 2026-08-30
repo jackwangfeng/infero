@@ -3416,6 +3416,63 @@ impl Kernels {
         Ok(())
     }
 
+    /// Validation-only: `ws4` with e4m3 QK^T against a plain contiguous,
+    /// single-sequence, single-chunk K (already quantized by
+    /// [`Self::quantize_k_e4m3`]) and V, no paged pool, no `BatchLayout`.
+    /// See `attn_prefill_e4m3k_f32`'s doc comment in `ops.cu` for why this
+    /// exists and why it is not the real `ws4` replacement: that needs a
+    /// persistent e4m3 shadow cache spanning prefill chunks, deliberately
+    /// not built yet. `kq`/`kscale`/`v` are `[position, kv_head, d_head]`
+    /// (`kscale` `[position, kv_head]`), matching what
+    /// `Self::quantize_k_e4m3` produces directly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prefill_e4m3k(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        q: &View<'_, f32>,
+        kq: &View<'_, u8>,
+        kscale: &View<'_, f32>,
+        v: &View<'_, f16>,
+        dims: AttnDims,
+        kv_len: usize,
+        scale: f32,
+    ) -> Result<()> {
+        anyhow::ensure!(dims.d_head == 256, "attn_prefill_e4m3k: only this checkpoint's d_head=256 is supported");
+        let run_tokens = dims.n_tokens;
+        anyhow::ensure!(run_tokens >= 1, "attn_prefill_e4m3k: empty run");
+        let group = dims.n_heads / dims.n_kv_heads;
+        let tpw = (16 / group).max(1);
+        const NWARPS: usize = 7;
+        const KPAD: usize = 8;
+        const WK: usize = 48;
+        let tile_tokens = NWARPS * tpw;
+        let n_tiles = run_tokens.div_ceil(tile_tokens);
+
+        let f = self.dev.kernels().get("infero_ops", ops_src(), "attn_prefill_e4m3k_f32")?;
+        let krow = dims.d_head + KPAD;
+        let shared = (2 * WK * dims.d_head + 2 * WK * krow * 2 + 2 * WK * 4) as u32;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared)?;
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (dims.n_kv_heads as u32, n_tiles as u32, 1),
+            block_dim: ((NWARPS + 1) as u32 * 32, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let (h, kh, dh) = (dims.n_heads as i32, dims.n_kv_heads as i32, dims.d_head as i32);
+        let (kl, gi, tp, rt) = (kv_len as i32, group as i32, tpw as i32, run_tokens as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(&mut *out).arg(q).arg(kq).arg(kscale).arg(v)
+            .arg(&h).arg(&kh).arg(&dh).arg(&scale).arg(&kl).arg(&gi).arg(&tp).arg(&rt);
+        self.dev
+            .profile()
+            .time("attn_prefill_e4m3k", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("attn_prefill_e4m3k")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     /// Option 3's two-kernel split (see `attn_prefill_stats_f32`'s doc
     /// comment in `ops.cu` for the full design and reasoning). Runs the
     /// stats pass (`attn_prefill_stats_f32`: QK^T + exact online-softmax

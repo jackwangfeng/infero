@@ -5280,3 +5280,337 @@ extern "C" __global__ void attn_full_tile_e4m3_probe(float* __restrict__ out, in
         out[blockIdx.x] = sum + m_run[0] + l_run[0];
     }
 }
+
+// ---- validation-only e4m3-QK^T attention kernel ---------------------------
+//
+// Standalone, single-sequence, single-chunk, e4m3-K adaptation of
+// `attn_prefill_mma_ws4_f32`, built to answer one question with a real,
+// complete kernel rather than another isolated probe: does this session's
+// three favorable probes (bare MMA 1.958x, full-tile-with-dependency-chain
+// 2.513x, QK^T accuracy ~3% of a score-std) survive contact with a real,
+// correctness-tested kernel and produce a real wall-clock win? NOT wired
+// into `Model` or the real paged `KvPool` -- that integration needs a
+// persistent e4m3 shadow cache spanning prefill chunks (see this file's own
+// `project-infero-perf-gap` memory entry for why that is deliberately its
+// own, larger, not-rushed task). `k`/`kscale`/`v` here are plain contiguous
+// `[position, kv_head, d_head]` buffers a test harness owns directly, not
+// the real pool's paged, slot-table-indexed storage.
+//
+// Softmax/PV logic below is `ws4`'s own, unchanged line for line except for
+// operating on the same-shape `sv_score`/`p` arrays this kernel builds --
+// the only real change is QK^T: K is e4m3 (one scale a whole d_head=256
+// key, per `quantize_k_e4m3_f32`'s doc comment on why a single 256-wide
+// group costs no measurable extra accuracy over the GEMM path's own 128-wide
+// one for this checkpoint), Q is quantized to e4m3 once a warp-tile (not
+// once a K-block -- the same amortization-for-free every other per-tile Q
+// cost in `ws4` already gets), and PV stays `mma_f16` exactly as `ws4`'s
+// does, isolating the change to QK^T the same way every probe here did.
+//
+// Q's own scale: each of the (up to) four lanes sharing an `ar` value reads
+// all 256 elements of its row independently rather than cooperating via a
+// partial-warp shuffle reduction -- 4x redundant scalar work, paid once a
+// warp-tile, in exchange for not needing a shuffle mask scoped to a lane
+// subset smaller than a full warp, which is real complexity this kernel's
+// stakes (a second real attention kernel, not a disposable probe) don't
+// need to carry.
+__device__ __forceinline__ unsigned char attn_e4m3_encode(float f) {
+#if __CUDA_ARCH__ >= 890
+    unsigned short packed;
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(packed) : "f"(f), "f"(f));
+    return (unsigned char)(packed & 0xFFu);
+#else
+    (void)f;
+    return 0;
+#endif
+}
+
+#define ATTN_E4M3_WK 48
+
+extern "C" __global__ void attn_prefill_e4m3k_f32(
+    float* __restrict__ out, const float* __restrict__ q,
+    const unsigned char* __restrict__ kq, const float* __restrict__ kscale,
+    const __half* __restrict__ v, int n_heads, int n_kv_heads, int d_head,
+    float scale, int kv_len, int group, int tpw, int run_tokens) {
+    const int WK = ATTN_E4M3_WK;
+    const int kv_head = blockIdx.x;
+    const int tile = blockIdx.y;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const bool is_producer = (warp == 0);
+    const int cwarp = warp - 1;
+    const int nwarps = blockDim.x / WARP_SIZE - 1;
+    const int tile_tokens = nwarps * tpw;
+    const int total_threads = blockDim.x;
+
+    const int krow = d_head + ATTN_MMA_KPAD;
+    const int e4m3_ksteps = d_head / 32;
+    const int ntiles = d_head / 8;
+    const int kchunks = d_head / 16;   // 16-byte (16-element) cp_async chunks
+    const int quads = d_head / 8;      // 16-byte (8-half) cp_async chunks for V
+
+    extern __shared__ char attn_e4m3_smem[];
+    unsigned char* sk0 = (unsigned char*)attn_e4m3_smem;
+    unsigned char* sk1 = sk0 + (size_t)WK * d_head;
+    __half* sv0 = (__half*)(sk1 + (size_t)WK * d_head);
+    __half* sv1 = sv0 + (size_t)WK * krow;
+    float* sks0 = (float*)(sv1 + (size_t)WK * krow);
+    float* sks1 = sks0 + WK;
+
+    const int tile_base = tile * tile_tokens;
+    const int tokens_here = min(tile_tokens, run_tokens - tile_base);
+    const int last_max = tile_base + tokens_here - 1;
+    const int end = min(kv_len, last_max + 1);
+    const int n_blk = end > 0 ? (end + WK - 1) / WK : 0;
+
+    if (is_producer) {
+        for (int b = 0; b < n_blk; ++b) {
+            const int stage = b & 1;
+            if (b >= 2) {
+                const int bar = (stage == 0) ? ATTN_WS_BAR_FREE0 : ATTN_WS_BAR_FREE1;
+                asm volatile("bar.sync %0, %1;" ::"r"(bar), "r"(total_threads) : "memory");
+            }
+            unsigned char* skb = (stage == 0) ? sk0 : sk1;
+            __half* svb = (stage == 0) ? sv0 : sv1;
+            float* sksb = (stage == 0) ? sks0 : sks1;
+            const int base = b * WK;
+            const int n = min(WK, end - base);
+            for (int e = lane; e < WK * kchunks; e += WARP_SIZE) {
+                const int r = e / kchunks, w16 = e % kchunks;
+                const bool hit = r < n;
+                const int pos = base + (hit ? r : 0);
+                const size_t koff = ((size_t)pos * n_kv_heads + kv_head) * d_head + w16 * 16;
+                cp_async16(skb + (size_t)r * d_head + w16 * 16, kq + koff, hit);
+            }
+            for (int e = lane; e < WK * quads; e += WARP_SIZE) {
+                const int r = e / quads, w8 = e % quads;
+                const bool hit = r < n;
+                const int pos = base + (hit ? r : 0);
+                const size_t voff = ((size_t)pos * n_kv_heads + kv_head) * d_head + w8 * 8;
+                cp_async16(svb + (size_t)r * krow + w8 * 8, v + voff, hit);
+            }
+            CP_ASYNC_FENCE();
+            for (int r = lane; r < WK; r += WARP_SIZE) {
+                const bool hit = r < n;
+                const int pos = base + (hit ? r : 0);
+                sksb[r] = hit ? kscale[(size_t)pos * n_kv_heads + kv_head] : 1.0f;
+            }
+            CP_ASYNC_WAIT(0);
+            const int bar = (stage == 0) ? ATTN_WS_BAR_READY0 : ATTN_WS_BAR_READY1;
+            asm volatile("bar.arrive %0, %1;" ::"r"(bar), "r"(total_threads) : "memory");
+        }
+        return;
+    }
+
+    // Consumer.
+    const int local0 = cwarp * tpw;
+    const int ar = mma_a_row(lane);
+    const int bc = mma_b_col(lane);
+    const int k0s = mma_k0(lane);       // e4m3/s8 fragment k-offset, 4-wide
+    const int cr = mma_c_row(lane);
+    const int cc = mma_c_col(lane);
+
+    int j_lo = ar / group;
+    const bool live_lo = ar < tpw * group && local0 + j_lo < run_tokens;
+    const int token_lo = tile_base + local0 + j_lo;
+    const int head_lo = kv_head * group + ar % group;
+    const float* q_lo = live_lo ? q + ((size_t)token_lo * n_heads + head_lo) * d_head : nullptr;
+
+    const int ar_hi = ar + 8;
+    int j_hi = ar_hi / group;
+    const bool live_hi = ar_hi < tpw * group && local0 + j_hi < run_tokens;
+    const int token_hi = tile_base + local0 + j_hi;
+    const int head_hi = kv_head * group + ar_hi % group;
+    const float* q_hi = live_hi ? q + ((size_t)token_hi * n_heads + head_hi) * d_head : nullptr;
+
+    float qs_lo = 1.0f, qs_hi = 1.0f;
+    if (live_lo) {
+        float m = 0.0f;
+        for (int i = 0; i < d_head; ++i) m = fmaxf(m, fabsf(q_lo[i]));
+        qs_lo = fmaxf(m, 1e-30f) / 448.0f;
+    }
+    if (live_hi) {
+        float m = 0.0f;
+        for (int i = 0; i < d_head; ++i) m = fmaxf(m, fabsf(q_hi[i]));
+        qs_hi = fmaxf(m, 1e-30f) / 448.0f;
+    }
+
+    mma_a_s8 qa[ATTN_MMA_MAX_KSTEPS / 2];
+#pragma unroll
+    for (int t = 0; t < ATTN_MMA_MAX_KSTEPS / 2; ++t) {
+        if (t >= e4m3_ksteps) break;
+        const int d0 = t * 32 + k0s;
+        unsigned char b4lo[4], b4hi[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            b4lo[i] = live_lo ? attn_e4m3_encode(q_lo[d0 + i] / qs_lo) : 0;
+            b4hi[i] = live_hi ? attn_e4m3_encode(q_hi[d0 + i] / qs_hi) : 0;
+        }
+        unsigned char b4lo2[4], b4hi2[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            b4lo2[i] = live_lo ? attn_e4m3_encode(q_lo[d0 + 16 + i] / qs_lo) : 0;
+            b4hi2[i] = live_hi ? attn_e4m3_encode(q_hi[d0 + 16 + i] / qs_hi) : 0;
+        }
+        qa[t].x[0] = *(const int*)(const void*)b4lo;
+        qa[t].x[1] = *(const int*)(const void*)b4hi;
+        qa[t].x[2] = *(const int*)(const void*)b4lo2;
+        qa[t].x[3] = *(const int*)(const void*)b4hi2;
+    }
+
+    mma_c_f32 o[ATTN_MMA_MAX_NTILES];
+#pragma unroll
+    for (int i = 0; i < ATTN_MMA_MAX_NTILES; ++i) {
+        o[i].x[0] = 0.0f;
+        o[i].x[1] = 0.0f;
+        o[i].x[2] = 0.0f;
+        o[i].x[3] = 0.0f;
+    }
+    float m_run[2] = {-INFINITY, -INFINITY};
+    float l_run[2] = {0.0f, 0.0f};
+    int row_j[2], row_last[2];
+    bool row_live[2];
+#pragma unroll
+    for (int rg = 0; rg < 2; ++rg) {
+        const int abs_row = cr + rg * 8;
+        row_j[rg] = abs_row / group;
+        row_last[rg] = tile_base + local0 + row_j[rg];
+        row_live[rg] = abs_row < tpw * group && local0 + row_j[rg] < tokens_here;
+    }
+
+    for (int b = 0; b < n_blk; ++b) {
+        const int stage = b & 1;
+        const int rbar = (stage == 0) ? ATTN_WS_BAR_READY0 : ATTN_WS_BAR_READY1;
+        asm volatile("bar.sync %0, %1;" ::"r"(rbar), "r"(total_threads) : "memory");
+
+        unsigned char* skb = (stage == 0) ? sk0 : sk1;
+        __half* svb = (stage == 0) ? sv0 : sv1;
+        float* sksb = (stage == 0) ? sks0 : sks1;
+        const int base = b * WK;
+        const int n = min(WK, end - base);
+
+        // Six 8-key QK^T sub-tiles, same as `ws4` -- the raw e4m3 MMA
+        // accumulator still needs `qs * ks` applied per key (each key's own
+        // scale, read once a sub-tile's worth of keys since `sksb` is tiny
+        // and already resident).
+        mma_c_f32 s2[6];
+#pragma unroll
+        for (int nt = 0; nt < 6; ++nt) {
+            s2[nt].x[0] = 0.0f;
+            s2[nt].x[1] = 0.0f;
+            s2[nt].x[2] = 0.0f;
+            s2[nt].x[3] = 0.0f;
+            const int key0 = nt * 8;
+#pragma unroll
+            for (int t = 0; t < ATTN_MMA_MAX_KSTEPS / 2; ++t) {
+                if (t >= e4m3_ksteps) break;
+                mma_b_s8 b_;
+                const unsigned char* bp = skb + (size_t)(key0 + bc) * d_head + t * 32 + k0s;
+                b_.x[0] = *(const int*)(const void*)bp;
+                b_.x[1] = *(const int*)(const void*)(bp + 16);
+                mma_e4m3(s2[nt], qa[t], b_);
+            }
+        }
+
+        float sv_score[24];
+#pragma unroll
+        for (int rg = 0; rg < 2; ++rg) {
+            const float qs = (rg == 0) ? qs_lo : qs_hi;
+#pragma unroll
+            for (int nt = 0; nt < 6; ++nt) {
+#pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    const int key = nt * 8 + cc + e;
+                    const int abs_key = base + key;
+                    const float ks = (key < n) ? sksb[key] : 1.0f;
+                    sv_score[rg * 12 + nt * 2 + e] =
+                        (row_live[rg] && key < n && abs_key <= row_last[rg])
+                            ? s2[nt].x[rg * 2 + e] * qs * ks * scale
+                            : -INFINITY;
+                }
+            }
+        }
+
+        // Online-softmax update -- byte-for-byte `ws4`'s own.
+        float p[24];
+#pragma unroll
+        for (int rg = 0; rg < 2; ++rg) {
+            float* svr = sv_score + rg * 12;
+            float m_own = svr[0];
+#pragma unroll
+            for (int i = 1; i < 12; ++i) m_own = fmaxf(m_own, svr[i]);
+            m_own = fmaxf(m_own, __shfl_xor_sync(0xffffffff, m_own, 1, WARP_SIZE));
+            m_own = fmaxf(m_own, __shfl_xor_sync(0xffffffff, m_own, 2, WARP_SIZE));
+            const float m_new = fmaxf(m_run[rg], m_own);
+            float psum = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 12; ++i) {
+                p[rg * 12 + i] = (svr[i] == -INFINITY) ? 0.0f : __expf(svr[i] - m_new);
+                psum += p[rg * 12 + i];
+            }
+            psum += __shfl_xor_sync(0xffffffff, psum, 1, WARP_SIZE);
+            psum += __shfl_xor_sync(0xffffffff, psum, 2, WARP_SIZE);
+
+            const float corr =
+                (m_run[rg] == -INFINITY) ? 0.0f : __expf(m_run[rg] - m_new);
+            l_run[rg] = l_run[rg] * corr + psum;
+            m_run[rg] = m_new;
+#pragma unroll
+            for (int i = 0; i < ATTN_MMA_MAX_NTILES; ++i) {
+                if (i >= ntiles) break;
+                o[i].x[rg * 2] *= corr;
+                o[i].x[rg * 2 + 1] *= corr;
+            }
+        }
+
+        // PV-MMA -- `mma_f16`, unchanged from `ws4`.
+#pragma unroll
+        for (int kg = 0; kg < 3; ++kg) {
+            const int nt_lo = kg * 2, nt_hi = kg * 2 + 1;
+            mma_a_f16 pa;
+            const __half2 p_rg0_lo = __floats2half2_rn(p[nt_lo * 2], p[nt_lo * 2 + 1]);
+            const __half2 p_rg1_lo = __floats2half2_rn(p[12 + nt_lo * 2], p[12 + nt_lo * 2 + 1]);
+            const __half2 p_rg0_hi = __floats2half2_rn(p[nt_hi * 2], p[nt_hi * 2 + 1]);
+            const __half2 p_rg1_hi = __floats2half2_rn(p[12 + nt_hi * 2], p[12 + nt_hi * 2 + 1]);
+            pa.x[0] = *(const unsigned*)(const void*)&p_rg0_lo;
+            pa.x[1] = *(const unsigned*)(const void*)&p_rg1_lo;
+            pa.x[2] = *(const unsigned*)(const void*)&p_rg0_hi;
+            pa.x[3] = *(const unsigned*)(const void*)&p_rg1_hi;
+            const int row0 = kg * 16;
+#pragma unroll
+            for (int i = 0; i < ATTN_MMA_MAX_NTILES; ++i) {
+                if (i >= ntiles) break;
+                const int dim = i * 8 + bc;
+                mma_b_f16 b_;
+                const int mmak0 = mma_k0_f16(lane);
+                b_.x[0] = attn_pack_half2(svb + (size_t)(row0 + mmak0) * krow + dim,
+                                          svb + (size_t)(row0 + mmak0 + 1) * krow + dim);
+                b_.x[1] = attn_pack_half2(svb + (size_t)(row0 + mmak0 + 8) * krow + dim,
+                                          svb + (size_t)(row0 + mmak0 + 9) * krow + dim);
+                mma_f16(o[i], pa, b_);
+            }
+        }
+
+        const int fbar = (stage == 0) ? ATTN_WS_BAR_FREE0 : ATTN_WS_BAR_FREE1;
+        asm volatile("bar.arrive %0, %1;" ::"r"(fbar), "r"(total_threads) : "memory");
+    }
+
+    // Direct output (no partial-buffer / out-stage path -- this validation
+    // kernel is single-chunk only).
+    for (int rg = 0; rg < 2; ++rg) {
+        if (!row_live[rg]) continue;
+        const int abs_row = cr + rg * 8;
+        const int row_j2 = abs_row / group;
+        const int token = tile_base + local0 + row_j2;
+        const int head = kv_head * group + abs_row % group;
+        const float den = l_run[rg];
+#pragma unroll
+        for (int i = 0; i < ATTN_MMA_MAX_NTILES; ++i) {
+            if (i >= ntiles) break;
+            const int d0 = i * 8 + cc;
+            const float v0 = o[i].x[rg * 2];
+            const float v1 = o[i].x[rg * 2 + 1];
+            out[((size_t)token * n_heads + head) * d_head + d0] = den > 0.0f ? v0 / den : 0.0f;
+            out[((size_t)token * n_heads + head) * d_head + d0 + 1] = den > 0.0f ? v1 / den : 0.0f;
+        }
+    }
+}
