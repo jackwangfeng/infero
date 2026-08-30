@@ -764,6 +764,35 @@ impl Kernels {
         Ok(())
     }
 
+    /// The shuffle-free counterpart of [`Self::attn_ktile_e4m3_quantize_probe`]:
+    /// one thread a key (48 of 64), a plain sequential max-then-quantize loop
+    /// over the key's 256 elements, no cross-lane communication at all. See
+    /// `attn_ktile_e4m3_quantize_v2_probe` in `fp8.cu`.
+    pub fn attn_ktile_e4m3_quantize_v2_probe(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        blocks: usize,
+        outer_iters: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_fp8", fp8_src(), "attn_ktile_e4m3_quantize_v2_probe")?;
+        const WK: usize = 48;
+        const KROW: usize = 256 + 8;
+        let shared = (WK * KROW * 2 + WK * KROW) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks as u32, 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let iters = outer_iters as i32;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(&iters);
+        unsafe { b.launch(cfg) }.context("attn_ktile_e4m3_quantize_v2_probe")?;
+        Ok(())
+    }
+
     /// `out = W x`, with `W` in FP8 and its block scales, at one token.
     ///
     /// `w` is the whole buffer: quants then grid. `accum` adds into `out`

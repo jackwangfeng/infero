@@ -1234,3 +1234,46 @@ extern "C" __global__ void attn_ktile_e4m3_quantize_probe(float* __restrict__ ou
     }
     if (lane == 0) out[blockIdx.x] = acc;
 }
+
+// Same job as `attn_ktile_e4m3_quantize_probe`, avoiding the five
+// `__shfl_xor_sync` steps a key entirely: one thread a key (48 of 64
+// threads active, block-wide instead of one warp), each doing a plain
+// sequential max-then-quantize loop over its own key's 256 elements. No
+// cross-lane communication at all -- trades shuffle latency for more
+// serial per-thread work, which the previous probe's real 44.52 ns/tile
+// (dominated by five real-latency shuffles times 48 keys) suggests may
+// be the cheaper trade on this card.
+extern "C" __global__ void attn_ktile_e4m3_quantize_v2_probe(float* __restrict__ out,
+                                                              int outer_iters) {
+    const int WK = 48;
+    const int krow = 256 + 8;
+    const int tid = threadIdx.x;
+
+    extern __shared__ char smem[];
+    __half* sk = (__half*)smem;
+    unsigned char* sk8 = (unsigned char*)(sk + (size_t)WK * krow);
+    for (int i = tid; i < WK * krow; i += blockDim.x) {
+        const unsigned h = (unsigned)((i * 2654435761u + blockIdx.x) & 0xFFu);
+        sk[i] = __float2half((float)h / 255.0f - 0.5f);
+    }
+    __syncthreads();
+
+    float acc = 0.0f;
+    for (int iter = 0; iter < outer_iters; ++iter) {
+        const float bias = (float)(iter & 0xFF) * 1e-20f;
+        if (tid < WK) {
+            __half* row = sk + tid * krow;
+            float amax = 1e-30f;
+            for (int e = 0; e < 256; ++e) {
+                amax = fmaxf(amax, fabsf(__half2float(row[e]) + bias));
+            }
+            const float scale = amax / 448.0f;
+            unsigned char* orow = sk8 + tid * krow;
+            for (int e = 0; e < 256; ++e) {
+                orow[e] = f32_to_e4m3((__half2float(row[e]) + bias) / scale);
+            }
+            acc += scale;
+        }
+    }
+    if (tid == 0) out[blockIdx.x] = acc;
+}
