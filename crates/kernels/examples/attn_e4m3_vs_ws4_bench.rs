@@ -163,5 +163,13 @@ fn main() -> Result<()> {
 
     println!("attn_prefill_ws4        best: {best_ws4:.2} ms total ({N_LAYERS} layers x {TOTAL_TOKENS} tokens)");
     println!("attn_prefill_e4m3k+quant best: {best_e4m3:.2} ms total, {:.3}x", best_ws4 / best_e4m3);
+
+    if k.device().profile().enabled() {
+        // One more (unrepeated, serialized) pass under INFERO_PROFILE for a
+        // real per-kernel breakdown of where the e4m3 path's time actually
+        // goes -- quantize, attention, or the flash-reduce call.
+        run_e4m3(&mut out2, &mut part2, &mut kq, &mut kscale)?;
+        println!("\n{}", k.device().profile().report());
+    }
     Ok(())
 }
