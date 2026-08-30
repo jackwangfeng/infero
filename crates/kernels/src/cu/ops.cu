@@ -6042,3 +6042,272 @@ extern "C" __global__ void attn_prefill_e4m3k_f32(
         }
     }
 }
+
+// Isolated toy probe for the next real candidate after the output-split
+// dead end: functional/role warp specialization, not the intra-warp
+// instruction reordering `attn_full_tile_pipelined_probe` already found
+// dead (that one failed because `mma.sync` blocks its OWN issuing warp
+// until retirement, so reordering one warp's own source doesn't change
+// what that warp can overlap with itself). This is a different claim:
+// two DIFFERENT physical warps, one doing tensor-core work continuously,
+// the other doing the softmax dependent-scalar chain continuously, handing
+// off through shared memory one tile behind -- real hardware concurrency
+// between two independent instruction streams, not a single warp's
+// self-overlap. `ws4`'s own consumer warps are already independent of each
+// other in principle, but all 7 hit the SAME per-tile barrier and run the
+// SAME QK^T-then-softmax-then-PV sequence at the same rate, so they reach
+// the softmax dependent chain in near lockstep with nothing else resident
+// to fill the gap -- that phase alignment, not merely "too few warps," is
+// hypothesized as the real reason `ncu` sees `No Eligible: 73%` alongside
+// only 40% compute throughput (real spare capacity, not an SFU-saturated
+// kernel). Splitting into a QK^T/PV role and a softmax role, pipelined by
+// one tile so the softmax role processes tile i while the MMA role is
+// already issuing tile i+1's tensor-core work, would put those two
+// different execution-unit demands in different physical warps running at
+// the same time instead of the same warp running them one after another --
+// something a single lockstepped warp fundamentally cannot do regardless
+// of instruction order.
+//
+// Validated here with plain FMA/expf busywork (not real Q/K/V), matching
+// the shape and instruction count of `ws4`'s own QK^T (96 mma_f16: 6
+// subtiles x 16 ksteps), PV (96 mma_f16: 3 kg x 32 ntiles), and per-tile
+// softmax (2 row-groups x a ~12-step dependent __expf chain) work --
+// checking two things before ever touching the real kernel: (1) does the
+// double-buffered cross-warp handoff protocol produce bit-identical final
+// state to a single-warp sequential reference doing the exact same
+// arithmetic in the exact same order (any synchronization bug -- a stale
+// read, a lost update, an off-by-one in the READY/FREE alternation --
+// should show up as a wrong final checksum, since every value here is a
+// deterministic function of iteration index); (2) does real wall-clock
+// time move toward max(mma_time, softmax_time) instead of their sum.
+//
+// Measured (`attn_ws_functional_pingpong_probe_bench`): checksums match the
+// sequential reference exactly (bits-identical, confirming the handoff
+// protocol is correct) -- but timing shows only 1.014x, essentially
+// nothing. The correct implementation exists; the overlap it was built to
+// find isn't there in any useful amount at this granularity. Most likely
+// explanation: the 8 named-barrier operations this adds per tile (4 each
+// direction) cost about as much as the compute they were meant to overlap,
+// at `ws4`'s natural 48-key tile size. Real cross-warp concurrency between
+// a tensor-core role and an SFU role is possible on this hardware (the
+// protocol itself proves that), but paying for it via a second layer of
+// per-tile named-barrier synchronization, on top of the one `ws4` already
+// has for K/V staging, doesn't pay for itself at this tile granularity.
+#define ATTN_PP_ITERS 512
+#define ATTN_PP_SCORE_READY0 1
+#define ATTN_PP_SCORE_READY1 2
+#define ATTN_PP_CORR_READY0 3
+#define ATTN_PP_CORR_READY1 4
+#define ATTN_PP_SCORE_FREE0 5
+#define ATTN_PP_SCORE_FREE1 6
+#define ATTN_PP_CORR_FREE0 7
+#define ATTN_PP_CORR_FREE1 8
+
+__device__ __forceinline__ float attn_pp_softmax_step(
+    float score, float& m_run, float& l_run) {
+    float total = 0.0f;
+#pragma unroll
+    for (int rg = 0; rg < 2; ++rg) {
+        const float row_score = score + rg * 0.0625f;
+        const float m_new = fmaxf(m_run, row_score);
+        float psum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 12; ++i) {
+            psum = fmaf(psum, 0.0f, __expf(row_score - m_new + i * 1.0e-4f));
+        }
+        const float corr = (m_run == -INFINITY) ? 0.0f : __expf(m_run - m_new);
+        l_run = l_run * corr + psum;
+        m_run = m_new;
+        total += corr;
+    }
+    return total;
+}
+
+extern "C" __global__ void attn_ws_functional_pingpong_probe(float* __restrict__ out_checksum) {
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+
+    __shared__ float score_buf[2];
+    __shared__ float corr_buf[2];
+
+    mma_a_f16 qa;
+    mma_b_f16 bf;
+    {
+        const __half2 one = __floats2half2_rn(0.02f, 0.02f);
+        const unsigned bits = *(const unsigned*)(const void*)&one;
+        qa.x[0] = qa.x[1] = qa.x[2] = qa.x[3] = bits;
+        bf.x[0] = bf.x[1] = bits;
+    }
+
+    if (warp == 0) {
+        // MMA role: QK^T (tensor core) continuously, PV (tensor core) one
+        // tile behind, using the softmax role's corr as soon as it's ready.
+        mma_c_f32 acc[6];
+        mma_c_f32 o[32];
+#pragma unroll
+        for (int i = 0; i < 6; ++i) acc[i] = {{0.0f, 0.0f, 0.0f, 0.0f}};
+#pragma unroll
+        for (int i = 0; i < 32; ++i) o[i] = {{0.0f, 0.0f, 0.0f, 0.0f}};
+
+        for (int i = 0; i < ATTN_PP_ITERS; ++i) {
+            const int stage = i & 1;
+            if (i >= 2) {
+                const int bar = (stage == 0) ? ATTN_PP_SCORE_FREE0 : ATTN_PP_SCORE_FREE1;
+                asm volatile("bar.sync %0, %1;" ::"r"(bar), "r"(64) : "memory");
+            }
+#pragma unroll
+            for (int nt = 0; nt < 6; ++nt) {
+#pragma unroll
+                for (int t = 0; t < 16; ++t) mma_f16(acc[nt], qa, bf);
+            }
+            float score = acc[0].x[0] + acc[0].x[1] + acc[0].x[2] + acc[0].x[3];
+#pragma unroll
+            for (int off = 1; off < 32; off *= 2) {
+                score += __shfl_xor_sync(0xffffffff, score, off, WARP_SIZE);
+            }
+            if (lane == 0) score_buf[stage] = score * 1.0e-6f;
+            {
+                const int bar = (stage == 0) ? ATTN_PP_SCORE_READY0 : ATTN_PP_SCORE_READY1;
+                asm volatile("bar.arrive %0, %1;" ::"r"(bar), "r"(64) : "memory");
+            }
+
+            if (i >= 1) {
+                const int pstage = (i - 1) & 1;
+                {
+                    const int bar = (pstage == 0) ? ATTN_PP_CORR_READY0 : ATTN_PP_CORR_READY1;
+                    asm volatile("bar.sync %0, %1;" ::"r"(bar), "r"(64) : "memory");
+                }
+                const float corr = corr_buf[pstage];
+                {
+                    const int bar = (pstage == 0) ? ATTN_PP_CORR_FREE0 : ATTN_PP_CORR_FREE1;
+                    asm volatile("bar.arrive %0, %1;" ::"r"(bar), "r"(64) : "memory");
+                }
+#pragma unroll
+                for (int j = 0; j < 32; ++j) {
+                    o[j].x[0] *= corr;
+                    o[j].x[1] *= corr;
+                    o[j].x[2] *= corr;
+                    o[j].x[3] *= corr;
+                }
+#pragma unroll
+                for (int kg = 0; kg < 3; ++kg) {
+#pragma unroll
+                    for (int j = 0; j < 32; ++j) mma_f16(o[j], qa, bf);
+                }
+            }
+        }
+        {
+            const int pstage = (ATTN_PP_ITERS - 1) & 1;
+            const int bar = (pstage == 0) ? ATTN_PP_CORR_READY0 : ATTN_PP_CORR_READY1;
+            asm volatile("bar.sync %0, %1;" ::"r"(bar), "r"(64) : "memory");
+            const float corr = corr_buf[pstage];
+#pragma unroll
+            for (int j = 0; j < 32; ++j) {
+                o[j].x[0] *= corr;
+                o[j].x[1] *= corr;
+                o[j].x[2] *= corr;
+                o[j].x[3] *= corr;
+            }
+#pragma unroll
+            for (int kg = 0; kg < 3; ++kg) {
+#pragma unroll
+                for (int j = 0; j < 32; ++j) mma_f16(o[j], qa, bf);
+            }
+        }
+        float sum = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) sum += o[j].x[0] + o[j].x[1] + o[j].x[2] + o[j].x[3];
+        sum += acc[0].x[0];
+        if (lane == 0) out_checksum[0] = sum;
+    } else {
+        // Softmax role: the dependent scalar chain, one tile behind the
+        // MMA role's QK^T, freeing each score slot as soon as it's read.
+        float m_run = -INFINITY;
+        float l_run = 0.0f;
+        for (int i = 0; i < ATTN_PP_ITERS; ++i) {
+            const int stage = i & 1;
+            {
+                const int bar = (stage == 0) ? ATTN_PP_SCORE_READY0 : ATTN_PP_SCORE_READY1;
+                asm volatile("bar.sync %0, %1;" ::"r"(bar), "r"(64) : "memory");
+            }
+            const float score = score_buf[stage];
+            {
+                const int bar = (stage == 0) ? ATTN_PP_SCORE_FREE0 : ATTN_PP_SCORE_FREE1;
+                asm volatile("bar.arrive %0, %1;" ::"r"(bar), "r"(64) : "memory");
+            }
+            const float corr = attn_pp_softmax_step(score, m_run, l_run);
+            if (i >= 2) {
+                const int bar = (stage == 0) ? ATTN_PP_CORR_FREE0 : ATTN_PP_CORR_FREE1;
+                asm volatile("bar.sync %0, %1;" ::"r"(bar), "r"(64) : "memory");
+            }
+            if (lane == 0) corr_buf[stage] = corr;
+            {
+                const int bar = (stage == 0) ? ATTN_PP_CORR_READY0 : ATTN_PP_CORR_READY1;
+                asm volatile("bar.arrive %0, %1;" ::"r"(bar), "r"(64) : "memory");
+            }
+        }
+        if (lane == 0) out_checksum[1] = l_run + m_run;
+    }
+}
+
+// Sequential single-warp reference for the probe above -- the exact same
+// arithmetic, same iteration order, no cross-warp handoff at all. Its
+// final checksum must match `attn_ws_functional_pingpong_probe`'s exactly:
+// every quantity either kernel computes is a deterministic function of the
+// iteration index alone (QK^T's operands never depend on softmax's
+// output), so any mismatch means the handoff protocol above lost or
+// reordered an update, not a benign floating-point reassociation.
+extern "C" __global__ void attn_ws_functional_pingpong_sequential_ref(float* __restrict__ out_checksum) {
+    const int lane = threadIdx.x % WARP_SIZE;
+    mma_a_f16 qa;
+    mma_b_f16 bf;
+    {
+        const __half2 one = __floats2half2_rn(0.02f, 0.02f);
+        const unsigned bits = *(const unsigned*)(const void*)&one;
+        qa.x[0] = qa.x[1] = qa.x[2] = qa.x[3] = bits;
+        bf.x[0] = bf.x[1] = bits;
+    }
+    mma_c_f32 acc[6];
+    mma_c_f32 o[32];
+#pragma unroll
+    for (int i = 0; i < 6; ++i) acc[i] = {{0.0f, 0.0f, 0.0f, 0.0f}};
+#pragma unroll
+    for (int i = 0; i < 32; ++i) o[i] = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    float m_run = -INFINITY;
+    float l_run = 0.0f;
+
+    for (int i = 0; i < ATTN_PP_ITERS; ++i) {
+#pragma unroll
+        for (int nt = 0; nt < 6; ++nt) {
+#pragma unroll
+            for (int t = 0; t < 16; ++t) mma_f16(acc[nt], qa, bf);
+        }
+        float score = acc[0].x[0] + acc[0].x[1] + acc[0].x[2] + acc[0].x[3];
+#pragma unroll
+        for (int off = 1; off < 32; off *= 2) {
+            score += __shfl_xor_sync(0xffffffff, score, off, WARP_SIZE);
+        }
+        score *= 1.0e-6f;
+        const float corr = attn_pp_softmax_step(score, m_run, l_run);
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            o[j].x[0] *= corr;
+            o[j].x[1] *= corr;
+            o[j].x[2] *= corr;
+            o[j].x[3] *= corr;
+        }
+#pragma unroll
+        for (int kg = 0; kg < 3; ++kg) {
+#pragma unroll
+            for (int j = 0; j < 32; ++j) mma_f16(o[j], qa, bf);
+        }
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) sum += o[j].x[0] + o[j].x[1] + o[j].x[2] + o[j].x[3];
+    sum += acc[0].x[0];
+    if (lane == 0) {
+        out_checksum[0] = sum;
+        out_checksum[1] = l_run + m_run;
+    }
+}

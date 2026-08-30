@@ -6974,6 +6974,40 @@ impl Kernels {
         Ok(())
     }
 
+    /// Two physical warps, one doing QK^T/PV-shaped tensor-core busywork
+    /// continuously, the other doing a softmax-shaped dependent scalar
+    /// chain one tile behind, handed off through shared memory -- real
+    /// cross-warp concurrency, unlike [`Self::attn_full_tile_pipelined_probe`]'s
+    /// single-warp reordering (found dead: `mma.sync` blocks its own
+    /// issuing warp regardless of source order). See
+    /// `attn_ws_functional_pingpong_probe` in `ops.cu`.
+    pub fn attn_ws_functional_pingpong_probe(&self, out: &mut ViewMut<'_, f32>) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_ops", ops_src(), "attn_ws_functional_pingpong_probe")?;
+        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (64, 1, 1), shared_mem_bytes: 0 };
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out);
+        unsafe { b.launch(cfg) }.context("attn_ws_functional_pingpong_probe")?;
+        Ok(())
+    }
+
+    /// Sequential single-warp reference for
+    /// [`Self::attn_ws_functional_pingpong_probe`] -- identical arithmetic,
+    /// no cross-warp handoff. Its checksum must match exactly.
+    pub fn attn_ws_functional_pingpong_sequential_ref(&self, out: &mut ViewMut<'_, f32>) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_ops", ops_src(), "attn_ws_functional_pingpong_sequential_ref")?;
+        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out);
+        unsafe { b.launch(cfg) }.context("attn_ws_functional_pingpong_sequential_ref")?;
+        Ok(())
+    }
+
     /// The e4m3-QK^T counterpart of [`Self::attn_full_tile_f16_probe`]; PV
     /// stays `mma_f16` in both, isolating the comparison to QK^T only.
     pub fn attn_full_tile_e4m3_probe(
