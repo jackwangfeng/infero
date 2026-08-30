@@ -6751,6 +6751,60 @@ impl Kernels {
         })?;
         Ok(())
     }
+
+    /// A tight, register-resident, memory-traffic-free loop of `reps` back to
+    /// back `mma.sync.m16n8k16.f16` instructions, one warp a block. See the
+    /// doc comment on `mma_f16_throughput_probe`/`mma_e4m3_throughput_probe`
+    /// in `ops.cu` for why this exists: measuring the real per-instruction
+    /// issue rate on this card before considering an e4m3 QK^T/PV attention
+    /// kernel, rather than trusting `mma_e4m3`'s "roughly double" hardware-
+    /// spec comment. `out` gets one f32 a block (the folded accumulator, kept
+    /// only so the compiler can't treat the whole loop as dead code).
+    pub fn mma_f16_throughput_probe(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        blocks: usize,
+        reps: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_ops", ops_src(), "mma_f16_throughput_probe")?;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let r = reps as i32;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(&r);
+        unsafe { b.launch(cfg) }.context("mma_f16_throughput_probe")?;
+        Ok(())
+    }
+
+    /// The `mma.sync.m16n8k32.e4m3` counterpart of
+    /// [`Self::mma_f16_throughput_probe`], same shape, same purpose.
+    pub fn mma_e4m3_throughput_probe(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        blocks: usize,
+        reps: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_ops", ops_src(), "mma_e4m3_throughput_probe")?;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let r = reps as i32;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(&r);
+        unsafe { b.launch(cfg) }.context("mma_e4m3_throughput_probe")?;
+        Ok(())
+    }
 }
 
 /// The shape parameters every attention kernel needs.

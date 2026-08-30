@@ -4985,3 +4985,66 @@ extern "C" __global__ void reg_phase_probe_phased_f32(
     }
     out[threadIdx.x] = sum;
 }
+
+// ---- fp8 vs f16 tensor-core MMA throughput probe -------------------------
+//
+// Before considering an e4m3 QK^T/PV attention kernel (the GEMM path already
+// gets `mma.m16n8k32.e4m3` -- see `mma_e4m3` in `mma.cuh` -- but attention is
+// still `mma.m16n8k16.f16` throughout), this answers one narrow question: on
+// this card, for a tight, register-resident, memory-traffic-free loop of
+// each instruction, how much faster is `mma_e4m3` than `mma_f16` really? The
+// "roughly double" in `mma_e4m3`'s own doc comment is a hardware-spec claim,
+// not a measurement on this exact SM -- and `attn_prefill_mma_ws4_f32`'s own
+// `ncu` numbers this session found its dominant stalls to be a *dependent
+// scalar chain* (softmax bookkeeping between MMA batches), not tensor-core
+// issue rate, so a real MMA-throughput win here would not be conclusive on
+// its own that a full e4m3 rewrite (which would also need a new e4m3 KV-cache
+// format end to end, a production-quality-risk change well beyond this
+// probe) is worth its cost -- only that the one premise it would rest on
+// holds or doesn't. `reps` should be set to the real instruction count
+// `ws4`'s QK^T loop issues for a comparable K-tile so the two calls are
+// apples to apples: six 8-key sub-tiles times `d_head/16` `mma_f16` calls
+// against the same six times `d_head/32` `mma_e4m3` calls.
+extern "C" __global__ void mma_f16_throughput_probe(float* __restrict__ out, int reps) {
+    const int lane = threadIdx.x % WARP_SIZE;
+    unsigned base = (unsigned)(lane * 2654435761u + blockIdx.x);
+    mma_a_f16 a;
+    mma_b_f16 b;
+    a.x[0] = base;
+    a.x[1] = base ^ 1u;
+    a.x[2] = base ^ 2u;
+    a.x[3] = base ^ 3u;
+    b.x[0] = base ^ 4u;
+    b.x[1] = base ^ 5u;
+    mma_c_f32 d = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    for (int i = 0; i < reps; ++i) {
+        mma_f16(d, a, b);
+        // Feeds the accumulator back into an operand so the compiler can't
+        // hoist the loop or fold it into a closed form.
+        a.x[0] ^= __float_as_uint(d.x[0]);
+    }
+    if (lane == 0) {
+        out[blockIdx.x] = d.x[0] + d.x[1] + d.x[2] + d.x[3];
+    }
+}
+
+extern "C" __global__ void mma_e4m3_throughput_probe(float* __restrict__ out, int reps) {
+    const int lane = threadIdx.x % WARP_SIZE;
+    unsigned base = (unsigned)(lane * 2654435761u + blockIdx.x);
+    mma_a_s8 a;
+    mma_b_s8 b;
+    a.x[0] = (int)base;
+    a.x[1] = (int)(base ^ 1u);
+    a.x[2] = (int)(base ^ 2u);
+    a.x[3] = (int)(base ^ 3u);
+    b.x[0] = (int)(base ^ 4u);
+    b.x[1] = (int)(base ^ 5u);
+    mma_c_f32 d = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    for (int i = 0; i < reps; ++i) {
+        mma_e4m3(d, a, b);
+        a.x[0] ^= (int)__float_as_uint(d.x[0]);
+    }
+    if (lane == 0) {
+        out[blockIdx.x] = d.x[0] + d.x[1] + d.x[2] + d.x[3];
+    }
+}
