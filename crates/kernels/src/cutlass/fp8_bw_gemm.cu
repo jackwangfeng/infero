@@ -161,3 +161,85 @@ extern "C" int32_t infero_cutlass_fp8_bw_gemm(const void* a, const void* b, cons
   status = gemm.run(arguments, workspace, stream);
   return static_cast<int32_t>(status);
 }
+
+// f32-direct variant: writes straight into the model's own `out` buffer (no
+// bf16 scratch, no separate upconvert/discard kernel afterward) -- only
+// possible now that `mma_e4m3_cutlass_sfa` no longer pads `M`, so there are no
+// padded rows for a separate kernel to discard; the only remaining job of
+// that kernel was the bf16->f32 upconvert, which this removes by having
+// CUTLASS's own epilogue write f32 (and, when `beta=1`, accumulate into the
+// caller's existing `out` directly, matching `bf16_store_or_accum_f32`'s own
+// `accum` flag) in one pass instead of two. A prior attempt at f32 output
+// (see project memory) kept the second kernel and only changed its element
+// width, which is why it regressed (pure once-more-bytes with nothing saved);
+// this one is not that experiment.
+namespace f32out {
+using ElementC = float;
+using LayoutC = cutlass::layout::RowMajor;
+constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+using ElementD = ElementC;
+using AlignmentD = std::integral_constant<int, AlignmentC>;
+
+using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+    cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, CooperativeMmaTileShape_MNK, ClusterShape_MNK,
+    cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementCompute, ElementC, LayoutC,
+    AlignmentC, ElementD, LayoutC, AlignmentD::value,
+    cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+
+using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+    cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, ElementA, cute::tuple<LayoutA, LayoutSFA>, AlignmentA,
+    ElementB, cute::tuple<LayoutB, LayoutSFB>, AlignmentB, ElementAccumulator, CooperativeMmaTileShape_MNK,
+    ClusterShape_MNK,
+    cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+    cutlass::gemm::KernelScheduleSm120Blockwise>::CollectiveOp;
+
+using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop,
+                                                         CollectiveEpilogue, void>;
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+using StrideD = typename Gemm::GemmKernel::StrideD;
+}  // namespace f32out
+
+extern "C" size_t infero_cutlass_fp8_bw_gemm_f32out_workspace(int m, int n, int k) {
+  auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
+  auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
+  auto stride_D = cutlass::make_cute_packed_stride(f32out::StrideD{}, cute::make_shape(m, n, 1));
+  auto layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(m, n, k, 1));
+  auto layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, 1));
+  typename f32out::Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {m, n, k, 1},
+      {nullptr, stride_A, nullptr, stride_B, nullptr, layout_SFA, nullptr, layout_SFB},
+      {{}, nullptr, stride_D, nullptr, stride_D}};
+  return f32out::Gemm::get_workspace_size(arguments);
+}
+
+// `d` is the model's own `out` buffer (f32), read as C too when `accum`
+// (beta=1) -- no separate scratch, no separate store/upconvert kernel after
+// this returns.
+extern "C" int32_t infero_cutlass_fp8_bw_gemm_f32out(const void* a, const void* b, const float* sfa,
+                                                      const float* sfb, float* d, void* workspace, int m, int n,
+                                                      int k, int accum, cudaStream_t stream) {
+  auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
+  auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
+  auto stride_D = cutlass::make_cute_packed_stride(f32out::StrideD{}, cute::make_shape(m, n, 1));
+  auto layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(m, n, k, 1));
+  auto layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, 1));
+
+  typename f32out::Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {m, n, k, 1},
+      {static_cast<const ElementA*>(a), stride_A, static_cast<const ElementB*>(b), stride_B, sfa, layout_SFA, sfb,
+       layout_SFB},
+      {{}, d, stride_D, d, stride_D}};
+  arguments.epilogue.thread.alpha = 1.0f;
+  arguments.epilogue.thread.beta = accum ? 1.0f : 0.0f;
+
+  f32out::Gemm gemm;
+  auto status = gemm.can_implement(arguments);
+  if (status != cutlass::Status::kSuccess) return static_cast<int32_t>(status);
+  status = gemm.initialize(arguments, workspace, stream);
+  if (status != cutlass::Status::kSuccess) return static_cast<int32_t>(status);
+  status = gemm.run(arguments, workspace, stream);
+  return static_cast<int32_t>(status);
+}

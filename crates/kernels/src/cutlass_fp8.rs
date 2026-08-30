@@ -200,6 +200,21 @@ mod ffi {
             k: i32,
             stream: cudarc::driver::sys::CUstream,
         ) -> i32;
+        pub fn infero_cutlass_fp8_bw_gemm_f32out_workspace(m: i32, n: i32, k: i32) -> usize;
+        #[allow(clippy::too_many_arguments)]
+        pub fn infero_cutlass_fp8_bw_gemm_f32out(
+            a: *const c_void,
+            b: *const c_void,
+            sfa: *const f32,
+            sfb: *const f32,
+            d: *mut f32,
+            workspace: *mut c_void,
+            m: i32,
+            n: i32,
+            k: i32,
+            accum: i32,
+            stream: cudarc::driver::sys::CUstream,
+        ) -> i32;
     }
 }
 
@@ -209,9 +224,9 @@ impl Kernels {
     /// TFLOPS on the shapes this model uses (see the project memory this
     /// came out of). `cw` must already be prepared (build once at load time
     /// with [`Kernels::prepare_cutlass_weight`]); what remains per call is
-    /// transposing/padding the *activation* scale and padding `n_tokens` up
-    /// to CUTLASS's 128-row minimum, both `O(n_tokens*k/128)` or smaller
-    /// against an `O(n*k*n_tokens)` GEMM.
+    /// transposing the *activation* scale, `O(n_tokens*k/128)` against an
+    /// `O(n*k*n_tokens)` GEMM. No `n_tokens` padding: CUTLASS accepts any
+    /// `M` here, not just multiples of 128.
     ///
     /// `w` is the matrix's own device buffer, same one every other FP8
     /// kernel here reads -- used directly as the quants operand when `cw`
@@ -245,7 +260,10 @@ impl Kernels {
         }
         let stream = self.dev.stream();
         let groups = k / FP8_BLOCK;
-        let m_pad = n_tokens.next_multiple_of(128);
+        // No padding: CUTLASS's `can_implement`/correctness hold for any M,
+        // not just multiples of 128 (verified across n_tokens 1..129, see
+        // [[project-infero-perf-gap]]).
+        let m_pad = n_tokens;
 
         // Transpose + pad the activation scale: [n_tokens,groups] -> [groups,m_pad].
         // `mma_e4m3_cutlass_sfa` skips this for callers (the unified-layout
@@ -273,14 +291,18 @@ impl Kernels {
                     Ok(())
                 })?;
         }
-        self.mma_e4m3_cutlass_sfa(out, w, cw, xq, &sfa_t.as_view(), k, n, n_tokens, accum)
+        self.mma_e4m3_cutlass_sfa(out, w, cw, xq, &sfa_t.as_view(), k, n, n_tokens, m_pad, accum)
     }
 
     /// Same as [`Self::mma_e4m3_cutlass`], but `sfa_t` is already in the
-    /// transposed-and-padded `[groups, m_pad]` layout (`m_pad =
-    /// n_tokens.next_multiple_of(128)`) — the caller's own quantizer wrote
+    /// transposed `[groups, m_pad]` layout — the caller's own quantizer wrote
     /// it directly (see [`Kernels::quantize_act_e4m3_cutlass`]), so there is
-    /// no separate `[n_tokens, groups]` scale to transpose here.
+    /// no separate `[n_tokens, groups]` scale to transpose here. `m_pad` is
+    /// whatever width the caller actually built `sfa_t` at — pass `n_tokens`
+    /// itself for no padding at all; CUTLASS's `can_implement`/correctness
+    /// were verified to accept any `M`, not just multiples of 128 (see
+    /// [[project-infero-perf-gap]]'s CUTLASS-M-alignment entry), so callers
+    /// no longer need to round up.
     #[allow(clippy::too_many_arguments)]
     pub fn mma_e4m3_cutlass_sfa(
         &self,
@@ -292,6 +314,7 @@ impl Kernels {
         k: usize,
         n: usize,
         n_tokens: usize,
+        m_pad: usize,
         accum: bool,
     ) -> Result<bool> {
         anyhow::ensure!(
@@ -303,33 +326,21 @@ impl Kernels {
         if !k.is_multiple_of(FP8_BLOCK) || !n.is_multiple_of(FP8_BLOCK) || n_tokens == 0 {
             return Ok(false);
         }
+        anyhow::ensure!(m_pad >= n_tokens, "m_pad {m_pad} is narrower than n_tokens {n_tokens}");
         let stream = self.dev.stream();
-        let m_pad = n_tokens.next_multiple_of(128);
         debug_assert!(sfa_t.len() >= (k / FP8_BLOCK) * m_pad);
 
-        // Pad activations: [n_tokens,k] -> [m_pad,k], zero rows past
-        // n_tokens. `CUTLASS_A_PAD` is reused across calls (see its doc
-        // comment), so the tail past `n_tokens` -- which a *fresh*
-        // `alloc_zeros` would already be zero, but reused scratch might
-        // still hold a previous call's rows -- needs an explicit clear
-        // whenever this call is narrower than the last one that grew it.
-        let a_pad_bytes = m_pad * k;
+        // `m_pad == n_tokens` (the common case now that CUTLASS is known to
+        // accept any M) needs no activation padding at all -- `xq` goes
+        // straight in as `a`, skipping `CUTLASS_A_PAD`'s memset+memcpy
+        // entirely. A caller that still wants real padding (`m_pad >
+        // n_tokens`) gets the old copy-into-scratch path.
         let d_pad_bytes = m_pad * n * 2; // bf16, held as raw bits
         let ws_bytes = unsafe { ffi::infero_cutlass_fp8_bw_gemm_workspace(m_pad as i32, n as i32, k as i32) };
 
-        CUTLASS_A_PAD.with(stream, a_pad_bytes, |a_pad_bytes_view| {
-            if m_pad > n_tokens {
-                stream
-                    .memset_zeros(&mut a_pad_bytes_view.slice_mut(n_tokens * k..m_pad * k))
-                    .context("clearing the CUTLASS activation pad tail")?;
-            }
-            stream
-                .memcpy_dtod(&xq.slice(0..n_tokens * k), &mut a_pad_bytes_view.slice_mut(0..n_tokens * k))
-                .context("padding activations for the CUTLASS GEMM")?;
-
+        let run_gemm = |a_ptr, stream: &_| -> Result<()> {
             CUTLASS_D_PAD.with(stream, d_pad_bytes, |d_pad_view| {
                 CUTLASS_WORKSPACE.with(stream, ws_bytes.max(1), |ws_view| {
-                    let (a_ptr, _ra) = a_pad_bytes_view.device_ptr(stream);
                     let (b_ptr, _rb) = match &cw.quants {
                         Some(q) => q.device_ptr(stream),
                         None => w.device_ptr(stream),
@@ -362,10 +373,10 @@ impl Kernels {
                     // mutably; drop them now that the launch is submitted,
                     // or the `as_view()` read-back below can't borrow
                     // `d_pad_view` again.
-                    drop((_ra, _rb, _rsfa, _rsfb, _rd, _rws));
+                    drop((_rb, _rsfa, _rsfb, _rd, _rws));
                     anyhow::ensure!(status == 0, "CUTLASS GEMM returned status {status}");
 
-                    // 6. Upconvert bf16 -> f32 into `out`, discarding the padded rows.
+                    // Upconvert bf16 -> f32 into `out`, discarding any padded rows.
                     let f = self
                         .dev
                         .kernels()
@@ -392,8 +403,104 @@ impl Kernels {
                         })
                 })
             })
-        })?;
+        };
 
+        if m_pad == n_tokens {
+            let (a_ptr, _ra) = xq.device_ptr(stream);
+            let result = run_gemm(a_ptr, stream);
+            drop(_ra);
+            result?;
+        } else {
+            let a_pad_bytes = m_pad * k;
+            CUTLASS_A_PAD.with(stream, a_pad_bytes, |a_pad_bytes_view| {
+                stream
+                    .memset_zeros(&mut a_pad_bytes_view.slice_mut(n_tokens * k..m_pad * k))
+                    .context("clearing the CUTLASS activation pad tail")?;
+                stream
+                    .memcpy_dtod(&xq.slice(0..n_tokens * k), &mut a_pad_bytes_view.slice_mut(0..n_tokens * k))
+                    .context("padding activations for the CUTLASS GEMM")?;
+                let (a_ptr, _ra) = a_pad_bytes_view.device_ptr(stream);
+                let result = run_gemm(a_ptr, stream);
+                drop(_ra);
+                result
+            })?;
+        }
+
+        Ok(true)
+    }
+
+    /// [`Self::mma_e4m3_cutlass_sfa`], but CUTLASS's own epilogue writes `out`
+    /// (f32) directly -- no bf16 scratch, no separate
+    /// `bf16_store_or_accum_f32` kernel afterward. Only for `n_tokens` (no
+    /// padding); a caller that still needs `m_pad > n_tokens` should use
+    /// [`Self::mma_e4m3_cutlass_sfa`] instead. `accum` maps straight to
+    /// CUTLASS's own `beta` (1.0 to add into `out`'s existing contents, 0.0
+    /// to overwrite), the same semantics `bf16_store_or_accum_f32`'s own
+    /// `accum` flag had.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mma_e4m3_cutlass_sfa_f32out(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
+        cw: &CutlassWeight,
+        xq: &View<'_, u8>,
+        sfa_t: &View<'_, f32>,
+        k: usize,
+        n: usize,
+        n_tokens: usize,
+        accum: bool,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            cw.k == k && cw.n == n,
+            "CutlassWeight is [{}, {}], called with k={k} n={n}",
+            cw.n,
+            cw.k
+        );
+        if !k.is_multiple_of(FP8_BLOCK) || !n.is_multiple_of(FP8_BLOCK) || n_tokens == 0 {
+            return Ok(false);
+        }
+        debug_assert!(sfa_t.len() >= (k / FP8_BLOCK) * n_tokens);
+        debug_assert!(out.len() >= n_tokens * n);
+        let stream = self.dev.stream();
+        let ws_bytes =
+            unsafe { ffi::infero_cutlass_fp8_bw_gemm_f32out_workspace(n_tokens as i32, n as i32, k as i32) };
+
+        CUTLASS_WORKSPACE.with(stream, ws_bytes.max(1), |ws_view| {
+            let (a_ptr, _ra) = xq.device_ptr(stream);
+            let (b_ptr, _rb) = match &cw.quants {
+                Some(q) => q.device_ptr(stream),
+                None => w.device_ptr(stream),
+            };
+            let (sfa_ptr, _rsfa) = sfa_t.device_ptr(stream);
+            let (sfb_ptr, _rsfb) = cw.scale_t.device_ptr(stream);
+            let (d_ptr, _rd) = out.device_ptr_mut(stream);
+            let (ws_ptr, _rws) = ws_view.device_ptr_mut(stream);
+            let acc = i32::from(accum);
+            let status = self
+                .dev
+                .profile()
+                .time("cutlass_fp8_gemm_f32out", stream, || {
+                    let st = unsafe {
+                        ffi::infero_cutlass_fp8_bw_gemm_f32out(
+                            a_ptr as *const std::ffi::c_void,
+                            b_ptr as *const std::ffi::c_void,
+                            sfa_ptr as *const f32,
+                            sfb_ptr as *const f32,
+                            d_ptr as *mut f32,
+                            ws_ptr as *mut std::ffi::c_void,
+                            n_tokens as i32,
+                            n as i32,
+                            k as i32,
+                            acc,
+                            stream.cu_stream(),
+                        )
+                    };
+                    Ok(st)
+                })?;
+            drop((_ra, _rb, _rsfa, _rsfb, _rd, _rws));
+            anyhow::ensure!(status == 0, "CUTLASS f32-output GEMM returned status {status}");
+            Ok(())
+        })?;
         Ok(true)
     }
 }
