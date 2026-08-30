@@ -159,7 +159,15 @@ pub fn batch_tokens_for(
         return n.min(ceiling);
     }
     let chunk = if !needs_score_buffer {
-        ceiling
+        // `ceiling` is a floor here (`batch_ceiling` only ever raises it, see
+        // its own doc comment), meant to keep many concurrent short prompts
+        // from starving against a small tuned constant. When the caller also
+        // hands over a model-specific `fp8_ceiling` -- itself measured
+        // against real VRAM and kernel-occupancy limits, not a generic
+        // one-size floor -- prefer it outright rather than letting the floor
+        // silently cap it back down for a model that was never the reason
+        // the floor exists (this model needs no score buffer at all).
+        fp8_ceiling.unwrap_or(ceiling)
     } else {
         let per_token = n_heads.max(1) * max_seq.max(1) * std::mem::size_of::<f32>();
         (SCORE_BUDGET / per_token.max(1)).clamp(64, ceiling)
@@ -1001,12 +1009,20 @@ impl Model {
         // so applying that ceiling there only throttles the chunk for a
         // constraint that doesn't exist on the kernel actually running.
         // `CUTLASS_BATCH_TOKENS` is its own, separately measured ceiling on
-        // the real 30552-token prefill: uncapped (only `batch_ceiling`'s
-        // ~2048 at this server's `--max-seqs`) was 9.0s; capped at 256 (the
-        // legacy ceiling, before this fix existed) was 11.1s; 1024 was the
-        // measured optimum at 8.7s, with 512 and 2048 both slightly worse --
-        // a real optimum, not "bigger is strictly better."
-        const CUTLASS_BATCH_TOKENS: usize = 1024;
+        // the real 30552-token prefill. Re-measured 2026-08-30 after the
+        // CUTLASS f32-direct-epilogue and `gdn_conv` chunking fixes changed
+        // what these kernels' own per-call costs look like: 1024 (the prior
+        // optimum) measured 7.40s; 2048 measured 7.30s; 4096 measured 7.22s;
+        // 8192 measured 7.08s -- and 8192 is not an arbitrarily-chosen bigger
+        // number: it's vLLM's own resolved `max_num_batched_tokens` for its
+        // OpenAI-compatible server on this exact GPU class (>=70 GiB, not an
+        // A100 -- see `vllm/engine/arg_utils.py`'s
+        // `_set_default_max_num_seqs_and_batched_tokens_args`, which gives
+        // `UsageContext.OPENAI_API_SERVER` 8192 and `UsageContext.LLM_CLASS`
+        // 16384 on hardware like this). 16384 measured faster still (6.95s)
+        // but OOMs a real `--ctx 65536` server on `attn_prefill`'s partial-
+        // reduction scratch, which scales with the chunk; 8192 does not.
+        const CUTLASS_BATCH_TOKENS: usize = 8192;
         let fp8_ceiling = if w.dominant_type() != infero_kernels::WeightType::F8E4M3 {
             None
         } else if weights::fp8_unified_layout() {
@@ -1471,6 +1487,22 @@ impl Model {
         // `attn_prefill`'s tiling across item boundaries mid-kernel is a
         // sharper version of the same hazard and is not implemented.
         let single_seq_run = (items.len() == 1).then(|| items[0].tokens.len());
+        // The pool slot this call's one sequence actually occupies, when
+        // there is exactly one AND the run is at least `gdn_conv_prefill`'s
+        // own `MIN_CHUNK` (32) tokens wide. The kernel is named, and scoped
+        // by its wrapper, for the prefill case specifically; gating this on
+        // nothing but `items.len() == 1` also took every plain one-sequence
+        // *decode* step (one token, sometimes two under speculation) down
+        // the same path, and produced visibly degenerate output within a
+        // dozen or so decode steps -- caught by testing the real server end
+        // to end, not by the kernel-level unit test alone, which only
+        // exercised prefill-sized runs. `SeqId` is that slot's index into
+        // the pool's per-slot GDN arrays directly (see `KvPool::alloc`), and
+        // slot 0 is only the *common* case, not a guarantee, once slots have
+        // cycled.
+        const MIN_GDN_CONV_PREFILL_RUN: usize = 32;
+        let single_seq_slot = (single_seq_run.unwrap_or(0) >= MIN_GDN_CONV_PREFILL_RUN)
+            .then(|| items[0].seq.0);
 
         phase.mark(2);
         let stream = self.dev.stream().clone();
@@ -1670,7 +1702,7 @@ impl Model {
                             probe(&self.kern, layer, "embedding", &self.act.x.slice(..d));
                         }
                         if self.layer_kinds[layer] {
-                            self.linear_attention(layer, n_tokens, pool, s)?;
+                            self.linear_attention(layer, n_tokens, pool, s, single_seq_slot)?;
                         } else {
                             self.attention(layer, n_tokens, kv, dims, pool, s, prefill_run)?;
                         }
@@ -2292,6 +2324,7 @@ impl Model {
         n: usize,
         pool: &mut KvPool,
         slot: Option<usize>,
+        single_seq_slot: Option<usize>,
     ) -> Result<()> {
         let la = self
             .cfg
@@ -2420,15 +2453,58 @@ impl Model {
 
         // The convolution needs a separate output: it reads three tokens back,
         // so writing in place would consume values it had already overwritten.
-        self.kern.gdn_conv(
-            &mut acts.qkv_conv.slice_mut(..n * width),
-            &acts.qkv.slice(..n * width),
-            &mut conv,
-            &gw.conv1d.as_view(),
-            &seqs,
-            width,
-            la.conv_kernel,
-        )?;
+        // `gdn_conv_prefill` also splits the token dimension across blocks --
+        // real headroom for the one-sequence case (measured 8.28% achieved
+        // occupancy without it, at this checkpoint's channel count), and
+        // correct but no better for a many-short-sequence decode batch, which
+        // is why it's scoped to one sequence *this call* (`single_seq_slot`)
+        // rather than replacing `gdn_conv` outright.
+        //
+        // That is deliberately not `n_seqs == 1` (the pool's configured
+        // capacity, `--max-seqs`): a server almost always runs with room for
+        // more than one concurrent request, so that check was true only for
+        // the single-sequence *benchmark harness* and never in production --
+        // this fast path sat unreachable behind it. `gdn_conv_prefill` itself
+        // still asserts `n_seqs == 1`, because the one sequence's row in the
+        // pool's arrays is not necessarily row 0 once slots have cycled, so
+        // it gets a fresh one-element `SeqLayout` sliced at that sequence's
+        // own slot rather than the pool-wide arrays sliced from the front.
+        if let Some(active_slot) = single_seq_slot {
+            let one_first = first.slice(active_slot..active_slot + 1);
+            let one_ntok = ntok.slice(active_slot..active_slot + 1);
+            let one = infero_kernels::gdn::SeqLayout {
+                first_token: &one_first,
+                n_tokens: &one_ntok,
+                n_seqs: 1,
+                total_tokens: n,
+            };
+            // `conv`, like `first`/`n_tok` above, is laid out one window a
+            // slot (`GdnState::conv_span`) -- unlike them it is a `ViewMut`
+            // `gdn_conv_prefill` also writes through, so it needs its own
+            // slice rather than sharing `conv` unsliced, which would read and
+            // write slot 0's window regardless of which slot is active.
+            let conv_n = width * (la.conv_kernel - 1);
+            let mut one_conv = conv.slice_mut(active_slot * conv_n..(active_slot + 1) * conv_n);
+            self.kern.gdn_conv_prefill(
+                &mut acts.qkv_conv.slice_mut(..n * width),
+                &acts.qkv.slice(..n * width),
+                &mut one_conv,
+                &gw.conv1d.as_view(),
+                &one,
+                width,
+                la.conv_kernel,
+            )?;
+        } else {
+            self.kern.gdn_conv(
+                &mut acts.qkv_conv.slice_mut(..n * width),
+                &acts.qkv.slice(..n * width),
+                &mut conv,
+                &gw.conv1d.as_view(),
+                &seqs,
+                width,
+                la.conv_kernel,
+            )?;
+        }
 
         // Stacked, `a` is columns `[0, heads)` of each `2 * heads`-wide row and
         // `b` is the rest, so the same buffer goes in twice with `b` offset and
@@ -2496,13 +2572,46 @@ impl Model {
             None
         };
         let state = staged.as_mut().unwrap_or(&mut recurrent);
+        // Same reasoning and same slot, sliced the same way, as the
+        // `gdn_conv`/`gdn_conv_prefill` choice above: `Kernels::
+        // gdn_delta_rule` picks its own column-split fast path by
+        // `seqs.n_seqs == 1`, and `pool.max_seqs()` would make that always
+        // false in any real server (`--max-seqs` > 1), never true outside
+        // the single-sequence benchmark harness that first measured the
+        // split path's win — exactly the bug `single_seq_slot`'s own note
+        // above describes, reproduced here on a different kernel before it
+        // ever shipped, because `n_seqs` in `seqs` below is that same
+        // `pool.max_seqs()` value. `state`, like `conv`, is one block a
+        // slot (`heads * dk * dv` floats), so it needs the same per-slot
+        // slice the fast path assumes, not the pool-wide buffer unsliced.
+        let one_seq_layout;
+        let mut one_state;
+        let delta_first;
+        let delta_ntok;
+        let (seqs_for_delta, state_for_delta): (&infero_kernels::gdn::SeqLayout<'_>, &mut ViewMut<'_, f32>) =
+            match single_seq_slot {
+                Some(active_slot) => {
+                    let state_n = heads * la.key_head_dim * la.value_head_dim;
+                    one_state = state.slice_mut(active_slot * state_n..(active_slot + 1) * state_n);
+                    delta_first = first.slice(active_slot..active_slot + 1);
+                    delta_ntok = ntok.slice(active_slot..active_slot + 1);
+                    one_seq_layout = infero_kernels::gdn::SeqLayout {
+                        first_token: &delta_first,
+                        n_tokens: &delta_ntok,
+                        n_seqs: 1,
+                        total_tokens: n,
+                    };
+                    (&one_seq_layout, &mut one_state)
+                }
+                None => (&seqs, state),
+            };
         self.kern.gdn_delta_rule(
             &mut acts.core.slice_mut(..n * val_dim),
-            state,
+            state_for_delta,
             &acts.qkv_conv.slice(..n * width),
             &acts.g.slice(..n * heads),
             &acts.beta.slice(..n * heads),
-            &seqs,
+            seqs_for_delta,
             heads,
             la.key_heads,
             la.key_head_dim,
@@ -4115,18 +4224,24 @@ impl Model {
                     return Ok(());
                 }
                 // `quantize_act_e4m3_cutlass` writes the activation scale
-                // straight into the transposed-and-padded `[scale_cols,
-                // m_pad]` layout `mma_e4m3_cutlass_sfa`'s CUTLASS kernel
+                // straight into the transposed `[scale_cols, n_tokens]`
+                // layout `mma_e4m3_cutlass_sfa_f32out`'s CUTLASS kernel
                 // wants, folding what used to be a separate
                 // `transpose_pad_scale_a_f32` pass (`cutlass_transpose_sfa`
                 // in a profile) into this quantizer's existing per-group
                 // reduction -- free here because, unlike the AWQ/non-unified
                 // path below, nothing else in this branch reads `xs` in its
-                // natural `[n_tokens, scale_cols]` layout.
+                // natural `[n_tokens, scale_cols]` layout. No row padding
+                // (`m_pad = n_tokens`): CUTLASS's `can_implement`/correctness
+                // were verified to accept any M, not just multiples of 128
+                // (see project-infero-perf-gap memory's CUTLASS-M-alignment
+                // entry). `_f32out` writes `out` directly from CUTLASS's own
+                // epilogue -- no bf16 scratch, no separate upconvert kernel
+                // after it returns -- measured 1.1-1.3x faster than the
+                // bf16-scratch path at this shape/batch (same memory entry).
                 let scale_cols = w.k.div_ceil(infero_kernels::fp8::ACT_QUANT_GROUP);
-                let m_pad = n_tokens.next_multiple_of(128);
                 let xq_len = n_tokens * w.k;
-                let sfa_len = scale_cols * m_pad;
+                let sfa_len = scale_cols * n_tokens;
                 anyhow::ensure!(
                     scratch.xq_e4m3.len() >= xq_len && scratch.xs_e4m3.len() >= sfa_len,
                     "activation quant scratch too small for {n_tokens} tokens at k={}",
@@ -4138,12 +4253,12 @@ impl Model {
                     x,
                     w.k,
                     n_tokens,
-                    m_pad,
+                    n_tokens,
                 )?;
                 let cw = w
                     .cutlass_weight(kern)
                     .with_context(|| format!("preparing CUTLASS weight for a {}x{} matrix", w.n, w.k))?;
-                let ran = kern.mma_e4m3_cutlass_sfa(
+                let ran = kern.mma_e4m3_cutlass_sfa_f32out(
                     out,
                     &weights,
                     cw,

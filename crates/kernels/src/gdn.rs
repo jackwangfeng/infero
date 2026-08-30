@@ -199,6 +199,74 @@ impl Kernels {
         Ok(())
     }
 
+    /// [`Self::gdn_conv`], but for the one-sequence prefill case: also splits
+    /// the token dimension across blocks (`gdn_conv_chunked_f32`) instead of
+    /// leaving every channel's whole token loop to a single thread. `channels
+    /// / 128` blocks (80 at this checkpoint) against this GPU's 188 SMs
+    /// measured 8.28% achieved occupancy for the unsplit kernel -- most SMs
+    /// idle for the entire call. A chunk past the first bootstraps its
+    /// window by re-reading the `k - 1` raw inputs immediately before it
+    /// (already resident in `x`, no cross-block dependency), so this is
+    /// splitting a per-channel loop that was never really sequential across
+    /// chunks, not a new synchronization primitive.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_conv_prefill(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        x: &View<'_, f32>,
+        state: &mut ViewMut<'_, f32>,
+        w: &View<'_, f32>,
+        seqs: &SeqLayout<'_>,
+        channels: usize,
+        k: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            (2..=8).contains(&k),
+            "conv kernel width {k} is outside the range the kernel's register \
+             window covers (2..=8)"
+        );
+        anyhow::ensure!(seqs.n_seqs == 1, "gdn_conv_prefill is scoped to one sequence a call, got {}", seqs.n_seqs);
+        debug_assert!(out.len() >= seqs.total_tokens * channels);
+        debug_assert!(x.len() >= seqs.total_tokens * channels);
+        debug_assert!(state.len() >= channels * (k - 1));
+        debug_assert!(w.len() >= channels * k);
+
+        const BLOCK: u32 = 128;
+        let channel_blocks = (channels as u32).div_ceil(BLOCK);
+        // Oversubscribe generously (this GPU has 188 SMs; others have fewer)
+        // rather than tune to one card, and keep chunks no smaller than 32
+        // tokens so the `k - 1`-tap re-read at each chunk's start stays a
+        // rounding error against the chunk's own work.
+        const TARGET_BLOCKS: u32 = 512;
+        const MIN_CHUNK: usize = 32;
+        let n_chunks = (TARGET_BLOCKS.div_ceil(channel_blocks.max(1)).max(1) as usize).min(seqs.total_tokens.max(1));
+        let chunk_len = seqs.total_tokens.div_ceil(n_chunks.max(1)).max(MIN_CHUNK);
+        let n_chunks = seqs.total_tokens.div_ceil(chunk_len).max(1);
+
+        let f = self.dev.kernels().get("infero_gdn", gdn_src(), "gdn_conv_chunked_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (channel_blocks, n_chunks as u32, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (c, kk, cl) = (channels as i32, k as i32, chunk_len as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out)
+            .arg(x)
+            .arg(state)
+            .arg(w)
+            .arg(seqs.first_token)
+            .arg(seqs.n_tokens)
+            .arg(&c)
+            .arg(&kk)
+            .arg(&cl);
+        self.dev.profile().time("gdn_conv", self.dev.stream(), || {
+            unsafe { b.launch(cfg) }.context("gdn_conv_chunked")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     /// `beta = sigmoid(b)` and `g = -exp(A_log) * softplus(a + dt_bias)`.
     ///
     /// `a` and `b` are `[n_tokens, heads]`; `a_log` and `dt_bias` are `[heads]`.
@@ -419,10 +487,28 @@ impl Kernels {
         // of two; the shared version puts the whole state after them.
         let f32_size = std::mem::size_of::<f32>();
         let (name, threads, shared) = match chosen {
-            // `R = 2` threads a column: 2 * dv threads, 4 * dk floats of
-            // shared. Both are the kernel's, not the caller's, choice — see
-            // the note above `gdn_delta_rule_reg_body`.
-            DeltaVariant::Reg => ("gdn_delta_rule_reg128_f32", 2 * dv, 4 * dk * f32_size),
+            // `R = 2` threads a column: 2 * dv threads, `4 * dk + 32` floats
+            // of shared -- the `+ 32` is bank-conflict padding (`4 * R *
+            // PAD`, R = 2 and PAD = 4 in the kernel). All of this is the
+            // kernel's, not the caller's, choice — see the note above
+            // `gdn_delta_rule_reg_body`.
+            //
+            // `n_seqs == 1` (a solo prefill, the reason this variant exists
+            // at all) launches exactly `heads` blocks -- 48 on this
+            // checkpoint, 25.5% of a 188-SM part, independent of anything
+            // per-block occupancy fixes. The `split4` kernel quarters `dv`
+            // across four times as many blocks instead, at the cost of a
+            // redundant per-block q/k reload (see its own comment); worth it
+            // exactly when the launch would otherwise leave most SMs with
+            // nothing to do, which is only true at `n_seqs == 1` -- at
+            // `n_seqs > 1` the plain kernel already launches `heads *
+            // n_seqs` blocks, quartering further would just multiply
+            // redundant reloads for no occupancy gain the device still had
+            // room to give for free.
+            DeltaVariant::Reg if seqs.n_seqs == 1 => {
+                ("gdn_delta_rule_reg128_split4_f32", dv / 2, (4 * dk + 32) * f32_size)
+            }
+            DeltaVariant::Reg => ("gdn_delta_rule_reg128_f32", 2 * dv, (4 * dk + 32) * f32_size),
             DeltaVariant::Shared => (
                 "gdn_delta_rule_smem_f32",
                 dv.max(32),
@@ -468,8 +554,9 @@ impl Kernels {
                 )
             })?;
         }
+        let col_groups = if name == "gdn_delta_rule_reg128_split4_f32" { 4 } else { 1 };
         let cfg = LaunchConfig {
-            grid_dim: (heads as u32, seqs.n_seqs as u32, 1),
+            grid_dim: (heads as u32, seqs.n_seqs as u32, col_groups),
             block_dim: (threads as u32, 1, 1),
             shared_mem_bytes: shared as u32,
         };

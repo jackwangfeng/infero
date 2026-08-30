@@ -82,6 +82,68 @@ extern "C" __global__ void gdn_conv_f32(float* __restrict__ out,
     for (int j = 0; j < hist; ++j) st[j] = win[j];
 }
 
+// `gdn_conv_f32` grids `(channels/BLOCK, n_seqs)` -- for decode (n_seqs many,
+// nt=1 each) that's already plenty of blocks, but a real prefill has n_seqs=1
+// and channels alone (10240 at this checkpoint / 128 = 80 blocks) against
+// this GPU's 188 SMs, leaving most of it idle for the whole, sequential-over-
+// nt (up to 1024) token loop -- confirmed by `ncu`: 8.28% achieved occupancy
+// against 100% theoretical, "Est. Local Speedup: 91.72%". The token loop
+// looks sequential but isn't really: every read is from `x` (the raw input,
+// fully resident before this kernel starts) and the carried window is only
+// `k - 1` values, not a full recurrent state -- unlike GDN's chunk-parallel
+// delta rule, there is no hidden state threading chunk to chunk except the
+// `state` buffer at the very start of a call. So a chunk past the first can
+// bootstrap its own window by re-reading the `hist` raw inputs immediately
+// before it, with no cross-block dependency at all; only the chunk covering
+// the sequence's last token needs to write the carried-forward `state`.
+extern "C" __global__ void gdn_conv_chunked_f32(float* __restrict__ out,
+                                                const float* __restrict__ x,
+                                                float* __restrict__ state,
+                                                const float* __restrict__ w,
+                                                const int* __restrict__ first_token,
+                                                const int* __restrict__ n_tok,
+                                                int channels, int k, int chunk_len) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    const int seq = blockIdx.z;
+    const int nt = n_tok[seq];
+    if (nt <= 0) return;
+    const int t0 = first_token[seq];
+    const int hist = k - 1;
+
+    const int start = blockIdx.y * chunk_len;
+    if (start >= nt) return;
+    const int len = min(chunk_len, nt - start);
+
+    float win[8];
+    if (start == 0) {
+        const float* st = state + ((size_t)seq * channels + c) * hist;
+        for (int j = 0; j < hist; ++j) win[j] = st[j];
+    } else {
+        for (int j = 0; j < hist; ++j) {
+            const int pos = start - hist + j;
+            win[j] = (pos >= 0) ? x[(size_t)(t0 + pos) * channels + c] : 0.0f;
+        }
+    }
+
+    const float* wc_g = w + (size_t)c * k;
+    float wc[8];
+    for (int j = 0; j <= hist; ++j) wc[j] = wc_g[j];
+
+    for (int n = 0; n < len; ++n) {
+        const float cur = x[(size_t)(t0 + start + n) * channels + c];
+        float acc = wc[hist] * cur;
+        for (int j = 0; j < hist; ++j) acc += wc[j] * win[j];
+        out[(size_t)(t0 + start + n) * channels + c] = acc / (1.0f + __expf(-acc));
+        for (int j = 0; j + 1 < hist; ++j) win[j] = win[j + 1];
+        if (hist > 0) win[hist - 1] = cur;
+    }
+    if (start + len == nt) {
+        float* st = state + ((size_t)seq * channels + c) * hist;
+        for (int j = 0; j < hist; ++j) st[j] = win[j];
+    }
+}
+
 // beta = sigmoid(b);  g = -exp(A_log) * softplus(a + dt_bias)
 //
 // `g` is non-positive by construction, so `exp(g)` in the recurrence is a
@@ -340,7 +402,23 @@ extern "C" __global__ void gdn_delta_rule_f32(float* __restrict__ out,
 // `__launch_bounds__` is the other half of it: without it ptxas assumes a
 // 1024-thread block and caps the body at 64 registers, which spills whatever
 // the unrolling achieved.
-template <int DK_C, int DV_C, int R, int ACC>
+// `G` splits `DV_C` columns across `G` blocks a head, so a launch can use
+// more of the device than `heads * n_seqs` blocks when that alone leaves
+// most SMs idle (48 heads on a 188-SM part is 25.5% launch-wide, independent
+// of anything per-block occupancy can fix -- see the note above
+// `gdn_delta_rule_reg128_f32`). `G == 1` reproduces the original kernel
+// exactly, column for column; this is a strict generalization, not a second
+// algorithm, and a compile-time one (`GCOLS`, `GTHREADS`, `Q_LOADS` below
+// are all `constexpr`) for the same register-spill reason every other loop
+// bound in this kernel is a template parameter, not a runtime one -- see the
+// note above this function's non-templated call sites. Splitting costs a
+// redundant per-group reload of this token's q/k (v, g and beta already
+// varied by column and were never shared), traded for `GCOLS` threads a
+// block instead of `DV_C` -- fewer registers a block at the same registers a
+// thread, so more blocks fit a launch, both by using idle SMs and by
+// letting more than one block's worth of this head's own columns share one
+// SM and hide each other's stalls.
+template <int DK_C, int DV_C, int R, int ACC, int G>
 __device__ __forceinline__ void gdn_delta_rule_reg_body(
         float* __restrict__ out, float* __restrict__ state,
         const float* __restrict__ qkv, const float* __restrict__ g,
@@ -353,9 +431,31 @@ __device__ __forceinline__ void gdn_delta_rule_reg_body(
     // The partner lanes of a column must sit in one warp for the shuffle.
     static_assert(R >= 1 && R <= 32 && (R & (R - 1)) == 0, "R must be 1..32, a power of two");
     constexpr int RB = DK_C / R;   // rows of S a thread owns
+    // `RB`'s region in the q/k shared buffer starts at bank `(part*RB) % 32`.
+    // When RB is itself a multiple of 32 (128/2 here), every part restarts at
+    // bank 0, so two parts reading the same unrolled `r` this iteration hit
+    // one bank from two different addresses -- a real, measured conflict
+    // (ncu: ~27% est. speedup on this kernel's shared loads, 4-way, half the
+    // wavefronts). A gap between each part's region, sized so the region
+    // stride is no longer a multiple of 32, breaks the alignment.
+    constexpr int PAD = (RB % 32 == 0) ? 4 : 0;
+    constexpr int ROW = RB + PAD;     // one part's region, with its gap
+    constexpr int BUF = R * ROW;      // one cur-buffer of q or k, padded
+
+    // This block's share of `DV_C` columns, and how many threads that takes:
+    // `G == 1` gives `GCOLS == DV_C`, `GTHREADS == 2 * DV_C` -- the original
+    // kernel's shape exactly. `Q_LOADS` covers the q/k prologue and lookahead
+    // below needing more than one pass to cover `DK_C` once `GTHREADS < DK_C`
+    // (true from `G == 4` on here); it is 1, unrolled to nothing extra, right
+    // up to there.
+    static_assert(DV_C % G == 0, "G must divide the column count evenly");
+    constexpr int GCOLS = DV_C / G;
+    constexpr int GTHREADS = R * GCOLS;
+    constexpr int Q_LOADS = (DK_C + GTHREADS - 1) / GTHREADS;
 
     const int head = blockIdx.x;
     const int seq = blockIdx.y;
+    const int col_group = blockIdx.z;
     const int nt = n_tok[seq];
     // Before any access to `state`. Falling through would still leave an idle
     // slot bit-identical — the store below writes back exactly what the load
@@ -365,36 +465,45 @@ __device__ __forceinline__ void gdn_delta_rule_reg_body(
     if (nt <= 0) return;
     const int t0 = first_token[seq];
     const int lane = threadIdx.x;
-    const int j = lane / R;        // the column this thread contributes to
+    const int j = lane / R;        // the column this thread contributes to, within its group
+    const int jg = col_group * GCOLS + j;  // ... and across the whole head
     const int part = lane % R;     // which slice of it, in adjacent lanes
     const int i0 = part * RB;
+    const int i0s = part * ROW;    // same rows, in the padded shared layout
     // repeat_interleave, not modular — see the note on the version above.
     const int khead = v_tiled ? (head % key_heads)
                               : (head / (heads / key_heads));
 
     // Double-buffered: buffer `n & 1` is the token being consumed.
-    float* qs = smem;                  // 2 * DK_C
-    float* ks = smem + 2 * DK_C;       // 2 * DK_C
+    float* qs = smem;                  // 2 * BUF
+    float* ks = smem + 2 * BUF;        // 2 * BUF
     float* S = state + ((size_t)seq * heads + head) * (size_t)DK_C * DV_C;
 
-    // Rows [i0, i0 + RB) of column j. Across a warp these reads are 32 / R
+    // Rows [i0, i0 + RB) of column jg. Across a warp these reads are 32 / R
     // consecutive floats per row, so a row costs whole sectors and wastes no
     // bytes; it happens once for the chunk either way.
     float sc[RB];
 #pragma unroll
-    for (int r = 0; r < RB; ++r) sc[r] = S[(size_t)(i0 + r) * DV_C + j];
+    for (int r = 0; r < RB; ++r) sc[r] = S[(size_t)(i0 + r) * DV_C + jg];
 
     // The first token, into buffer 0. `vn`, `gn`, `bn` are this thread's
-    // per-token scalars, carried in registers one token ahead of their use.
+    // per-token scalars, carried in registers one token ahead of their use;
+    // `qn`/`kn` are `Q_LOADS`-wide because a thread covers more than one
+    // `dk` index once `GTHREADS < DK_C` (see `Q_LOADS`'s note above).
     const float* row0 = qkv + (size_t)t0 * stride;
-    float qn = 0.0f, kn = 0.0f;
-    if (lane < DK_C) {
-        qn = row0[q_off + (size_t)khead * DK_C + lane];
-        kn = row0[k_off + (size_t)khead * DK_C + lane];
-        qs[lane] = qn;
-        ks[lane] = kn;
+    float qn[Q_LOADS], kn[Q_LOADS];
+#pragma unroll
+    for (int it = 0; it < Q_LOADS; ++it) {
+        const int d = lane + it * GTHREADS;
+        if (d < DK_C) {
+            qn[it] = row0[q_off + (size_t)khead * DK_C + d];
+            kn[it] = row0[k_off + (size_t)khead * DK_C + d];
+            const int off = d + PAD * (d / RB);
+            qs[off] = qn[it];
+            ks[off] = kn[it];
+        }
     }
-    float vn = row0[v_off + (size_t)head * DV_C + j];
+    float vn = row0[v_off + (size_t)head * DV_C + jg];
     float gn = g[(size_t)t0 * heads + head];
     float bn = beta[(size_t)t0 * heads + head];
 
@@ -409,11 +518,15 @@ __device__ __forceinline__ void gdn_delta_rule_reg_body(
         // overlaps this token's arithmetic rather than preceding it.
         if (n + 1 < nt) {
             const float* rn = qkv + (size_t)(t + 1) * stride;
-            if (lane < DK_C) {
-                qn = rn[q_off + (size_t)khead * DK_C + lane];
-                kn = rn[k_off + (size_t)khead * DK_C + lane];
+#pragma unroll
+            for (int it = 0; it < Q_LOADS; ++it) {
+                const int d = lane + it * GTHREADS;
+                if (d < DK_C) {
+                    qn[it] = rn[q_off + (size_t)khead * DK_C + d];
+                    kn[it] = rn[k_off + (size_t)khead * DK_C + d];
+                }
             }
-            vn = rn[v_off + (size_t)head * DV_C + j];
+            vn = rn[v_off + (size_t)head * DV_C + jg];
             gn = g[(size_t)(t + 1) * heads + head];
             bn = beta[(size_t)(t + 1) * heads + head];
         }
@@ -421,8 +534,8 @@ __device__ __forceinline__ void gdn_delta_rule_reg_body(
         // tail of the previous iteration after that.
         __syncthreads();
 
-        const float* qc = qs + cur * DK_C;
-        const float* kc = ks + cur * DK_C;
+        const float* qc = qs + cur * BUF;
+        const float* kc = ks + cur * BUF;
 
         // S *= exp(g);  kv_mem = kᵀ S, this thread's rows then the partner's.
         float kv[ACC];
@@ -431,7 +544,7 @@ __device__ __forceinline__ void gdn_delta_rule_reg_body(
 #pragma unroll
         for (int r = 0; r < RB; ++r) {
             sc[r] *= decay;
-            kv[r % ACC] += sc[r] * kc[i0 + r];
+            kv[r % ACC] += sc[r] * kc[i0s + r];
         }
 #pragma unroll
         for (int a = 1; a < ACC; ++a) kv[0] += kv[a];
@@ -448,33 +561,42 @@ __device__ __forceinline__ void gdn_delta_rule_reg_body(
         for (int a = 0; a < ACC; ++a) o[a] = 0.0f;
 #pragma unroll
         for (int r = 0; r < RB; ++r) {
-            sc[r] += kc[i0 + r] * delta;
-            o[r % ACC] += sc[r] * qc[i0 + r];
+            sc[r] += kc[i0s + r] * delta;
+            o[r % ACC] += sc[r] * qc[i0s + r];
         }
 #pragma unroll
         for (int a = 1; a < ACC; ++a) o[0] += o[a];
         float ot = o[0];
 #pragma unroll
         for (int m = 1; m < R; m <<= 1) ot += __shfl_xor_sync(0xffffffffu, ot, m);
-        if (part == 0) out[((size_t)t * heads + head) * DV_C + j] = ot;
+        if (part == 0) out[((size_t)t * heads + head) * DV_C + jg] = ot;
 
         // Into the buffer nobody read this iteration, so no barrier separates
         // the reads above from this write; the one at the top of the next
         // iteration is what publishes it.
-        if (n + 1 < nt && lane < DK_C) {
-            qs[(cur ^ 1) * DK_C + lane] = qn;
-            ks[(cur ^ 1) * DK_C + lane] = kn;
+        if (n + 1 < nt) {
+#pragma unroll
+            for (int it = 0; it < Q_LOADS; ++it) {
+                const int d = lane + it * GTHREADS;
+                if (d < DK_C) {
+                    const int off = (cur ^ 1) * BUF + d + PAD * (d / RB);
+                    qs[off] = qn[it];
+                    ks[off] = kn[it];
+                }
+            }
         }
     }
 
 #pragma unroll
-    for (int r = 0; r < RB; ++r) S[(size_t)(i0 + r) * DV_C + j] = sc[r];
+    for (int r = 0; r < RB; ++r) S[(size_t)(i0 + r) * DV_C + jg] = sc[r];
 }
 
 // dk = dv = 128, which is this checkpoint's `linear_key_head_dim` and
-// `linear_value_head_dim`. Launched with `2 * dv` threads and `4 * dk` floats
-// of dynamic shared; `Kernels::gdn_delta_rule` sizes both and sends every
-// other shape to the global version.
+// `linear_value_head_dim`. Launched with `2 * dv` threads and `4 * dk + 32`
+// floats of dynamic shared -- the `+ 32` is the bank-conflict padding above
+// (`4 * R * PAD` = `4 * 2 * 4`, R and PAD fixed for this dk); `Kernels::
+// gdn_delta_rule` sizes both and sends every other shape to the global
+// version.
 extern "C" __global__ __launch_bounds__(256) void gdn_delta_rule_reg128_f32(
         float* __restrict__ out, float* __restrict__ state,
         const float* __restrict__ qkv, const float* __restrict__ g,
@@ -486,7 +608,31 @@ extern "C" __global__ __launch_bounds__(256) void gdn_delta_rule_reg128_f32(
     (void)dk;
     (void)dv;
     extern __shared__ float smem[];
-    gdn_delta_rule_reg_body<128, 128, 2, 4>(out, state, qkv, g, beta,
+    gdn_delta_rule_reg_body<128, 128, 2, 4, 1>(out, state, qkv, g, beta,
+                                            first_token, n_tok, heads, key_heads,
+                                            stride, q_off, k_off, v_off, v_tiled, smem);
+}
+
+// Same recurrence, same per-thread register shape (`RB`, `PAD`, `ROW`, `BUF`
+// are all unchanged -- see the note above `gdn_delta_rule_reg_body`), but
+// each of `heads * n_seqs * 4` blocks owns a quarter of `dv`'s 128 columns
+// instead of one block owning all of them. `heads = 48` on this checkpoint,
+// so a solo long prefill (the common case this exists for: `n_seqs == 1`)
+// launches 48 blocks on a 188-SM part either way -- 25.5% of the device,
+// occupancy notwithstanding, before this. `Kernels::gdn_delta_rule` picks
+// between the two by measured shape, not by feel; see its own call site.
+// Launched with `64` threads (`2 * dv / 4`) and the same dynamic shared as
+// the undivided kernel, since `BUF` does not depend on `G`.
+extern "C" __global__ __launch_bounds__(256) void gdn_delta_rule_reg128_split4_f32(
+        float* __restrict__ out, float* __restrict__ state,
+        const float* __restrict__ qkv, const float* __restrict__ g,
+        const float* __restrict__ beta, const int* __restrict__ first_token,
+        const int* __restrict__ n_tok, int heads, int key_heads, int dk, int dv,
+        int stride, int q_off, int k_off, int v_off, int v_tiled) {
+    (void)dk;
+    (void)dv;
+    extern __shared__ float smem[];
+    gdn_delta_rule_reg_body<128, 128, 2, 4, 4>(out, state, qkv, g, beta,
                                             first_token, n_tok, heads, key_heads,
                                             stride, q_off, k_off, v_off, v_tiled, smem);
 }
@@ -962,14 +1108,33 @@ extern "C" __global__ __launch_bounds__(256) void gdn_chunk_delta_rule_f32(
         // block-wide barriers a chunk here alone was a meaningful share of
         // why this kernel measured slower than `gdn_delta_rule_reg128_f32`
         // rather than faster (see the top-of-kernel comment).
+        //
+        // A race hidden here from `gdn_two_phase_state_f32`'s single-chunk
+        // isolation down: `sA[i][m]` for `m` in `[kk, i)` reads OTHER lanes'
+        // own targets in this same iteration (`m` can equal another active
+        // lane's `kk`), so every lane's read of row `i` must finish before
+        // any lane's write to row `i` starts. The one `__syncwarp()` at the
+        // end of each `i` only orders writer against the *next* iteration's
+        // readers, not against this iteration's own -- racecheck confirms
+        // it (192-11232 hazards depending on shape) though the answer comes
+        // out right anyway on this hardware, which is exactly the class of
+        // bug `--tool racecheck` exists to catch that a numerical diff
+        // can't. Splitting read and write into their own phases with a
+        // `__syncwarp()` between them costs one more of the same
+        // near-zero-cost barrier, not a `__syncthreads()`.
         for (int i = 0; i < C; ++i) {
-            if (lane < C && lane <= i) {
+            const bool active = (lane < C && lane <= i);
+            float acc = 0.0f;
+            if (active) {
                 const int kk = lane;
-                float acc = (i == kk) ? 1.0f : 0.0f;
+                acc = (i == kk) ? 1.0f : 0.0f;
                 for (int m = kk; m < i; ++m) {
                     acc -= sA[i * GDN_A_STRIDE + m] * sA[m * GDN_A_STRIDE + kk];
                 }
-                sA[i * GDN_A_STRIDE + kk] = acc;
+            }
+            __syncwarp();
+            if (active) {
+                sA[i * GDN_A_STRIDE + lane] = acc;
             }
             __syncwarp();
         }

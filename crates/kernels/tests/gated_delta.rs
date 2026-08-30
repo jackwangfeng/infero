@@ -147,6 +147,261 @@ fn the_conv_matches_the_reference_and_carries_its_window() -> Result<()> {
     Ok(())
 }
 
+/// `gdn_conv_prefill` (token dimension split across blocks) against
+/// `gdn_conv` (the reference, one thread walks every token of a channel) --
+/// same math, different grid, so this expects the tolerance a reassociated
+/// float sum gets elsewhere in this file, not bit-for-bit. Shapes chosen to
+/// land on both sides of a chunk boundary (`gdn_conv_prefill`'s own internal
+/// chunking, not the model's `batch_tokens`): smaller than one chunk, exactly
+/// the minimum chunk width, several chunks, and a ragged tail past a whole
+/// number of chunks.
+#[test]
+fn the_chunked_conv_matches_the_unchunked_one() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    let channels = 2 * KEY_HEADS * DK + VAL_HEADS * DV;
+
+    for t_len in [1usize, 9, 32, 33, 63, 200, 257, 1024, 1025] {
+        let x = pseudo_random(t_len * channels, 0x9a51 + t_len as u64);
+        let w = pseudo_random(channels * CONV_K, 0x9a52);
+
+        let d_x = stream.clone_htod(&x)?;
+        let d_w = stream.clone_htod(&w)?;
+        let d_first = stream.clone_htod(&[0i32])?;
+        let d_ntok = stream.clone_htod(&[t_len as i32])?;
+        let seqs = infero_kernels::gdn::SeqLayout {
+            first_token: &d_first.as_view(),
+            n_tokens: &d_ntok.as_view(),
+            n_seqs: 1,
+            total_tokens: t_len,
+        };
+
+        let mut d_want = stream.alloc_zeros::<f32>(t_len * channels)?;
+        let mut d_state_want = stream.alloc_zeros::<f32>(channels * (CONV_K - 1))?;
+        k.gdn_conv(
+            &mut d_want.as_view_mut(),
+            &d_x.as_view(),
+            &mut d_state_want.as_view_mut(),
+            &d_w.as_view(),
+            &seqs,
+            channels,
+            CONV_K,
+        )?;
+
+        let mut d_got = stream.alloc_zeros::<f32>(t_len * channels)?;
+        let mut d_state_got = stream.alloc_zeros::<f32>(channels * (CONV_K - 1))?;
+        k.gdn_conv_prefill(
+            &mut d_got.as_view_mut(),
+            &d_x.as_view(),
+            &mut d_state_got.as_view_mut(),
+            &d_w.as_view(),
+            &seqs,
+            channels,
+            CONV_K,
+        )?;
+        k.device().synchronize()?;
+
+        let want = stream.clone_dtoh(&d_want)?;
+        let got = stream.clone_dtoh(&d_got)?;
+        let (worst, at) = max_abs_diff(&got, &want);
+        assert!(worst < 2e-5, "{t_len} tokens: chunked conv disagreed by {worst:.2e} at {at}");
+
+        let state_want = stream.clone_dtoh(&d_state_want)?;
+        let state_got = stream.clone_dtoh(&d_state_got)?;
+        let (sworst, sat) = max_abs_diff(&state_got, &state_want);
+        assert!(sworst < 2e-5, "{t_len} tokens: chunked conv's carried window disagreed by {sworst:.2e} at {sat}");
+    }
+    Ok(())
+}
+
+/// `Model::linear_attention` picks `gdn_conv_prefill` for a single-sequence
+/// call by slicing that one sequence's own row out of the pool-wide
+/// `first`/`n_tokens` arrays -- `SeqLayout { n_seqs: 1, .. }` pointed at
+/// `first[slot..slot+1]`, not the front of the array. This is the case that
+/// slicing gets wrong if it slices from the front instead: the active
+/// sequence sits in a slot that is not 0 (the common case once a pool's
+/// slots have cycled), with a stale, nonzero `first` value left behind in
+/// slot 0 by whichever sequence used to be there. If the fast path ever goes
+/// back to reading slot 0 outright, this catches it: the two kernels would
+/// read different tokens entirely, not just compute them differently, so a
+/// disagreement here is not a rounding question.
+#[test]
+fn a_sliced_slot_feeds_gdn_conv_prefill_the_right_row_not_slot_zero() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    let channels = 2 * KEY_HEADS * DK + VAL_HEADS * DV;
+    const MAX_SEQS: usize = 4;
+    const ACTIVE_SLOT: usize = 2;
+    let t_len = 200usize;
+
+    // Slot 0 looks like a stale previous occupant: a nonzero `first` with
+    // `n_tok = 0` -- exactly what a freed-then-reused pool leaves behind,
+    // since only `n_tok` is what marks a slot idle.
+    let x = pseudo_random(t_len * channels, 0x5c01);
+    let w = pseudo_random(channels * CONV_K, 0x5c02);
+    let d_x = stream.clone_htod(&x)?;
+    let d_w = stream.clone_htod(&w)?;
+
+    let mut first = vec![0i32; MAX_SEQS];
+    let mut ntok = vec![0i32; MAX_SEQS];
+    first[0] = 777; // stale, must never be read
+    first[ACTIVE_SLOT] = 0;
+    ntok[ACTIVE_SLOT] = t_len as i32;
+    let d_first = stream.clone_htod(&first)?;
+    let d_ntok = stream.clone_htod(&ntok)?;
+
+    // Reference: the unchunked kernel, given the whole pool-wide layout --
+    // already trusted to route to the right slot, since it walks every slot
+    // and skips the idle ones by `n_tok`, not by position.
+    let full = infero_kernels::gdn::SeqLayout {
+        first_token: &d_first.as_view(),
+        n_tokens: &d_ntok.as_view(),
+        n_seqs: MAX_SEQS,
+        total_tokens: t_len, // only the active slot's tokens are real
+    };
+    // `gdn_conv`'s state, unlike `gdn_conv_prefill`'s, is pool-wide -- one
+    // window a slot (`debug_assert!(state.len() >= seqs.n_seqs * channels *
+    // (k - 1))` in `Kernels::gdn_conv`) -- so the reference call needs room
+    // for all `MAX_SEQS` windows even though only one slot is live.
+    let conv_n = channels * (CONV_K - 1);
+    let mut d_want = stream.alloc_zeros::<f32>(t_len * channels)?;
+    let mut d_state_want = stream.alloc_zeros::<f32>(MAX_SEQS * conv_n)?;
+    k.gdn_conv(
+        &mut d_want.as_view_mut(),
+        &d_x.as_view(),
+        &mut d_state_want.as_view_mut(),
+        &d_w.as_view(),
+        &full,
+        channels,
+        CONV_K,
+    )?;
+
+    // Subject: exactly what `Model::linear_attention` now does -- slice the
+    // active slot's own one-element row out of the same device arrays and
+    // hand that to `gdn_conv_prefill`.
+    let active_first = d_first.as_view().slice(ACTIVE_SLOT..ACTIVE_SLOT + 1);
+    let active_ntok = d_ntok.as_view().slice(ACTIVE_SLOT..ACTIVE_SLOT + 1);
+    let one = infero_kernels::gdn::SeqLayout {
+        first_token: &active_first,
+        n_tokens: &active_ntok,
+        n_seqs: 1,
+        total_tokens: t_len,
+    };
+    let mut d_got = stream.alloc_zeros::<f32>(t_len * channels)?;
+    let mut d_state_got = stream.alloc_zeros::<f32>(channels * (CONV_K - 1))?;
+    k.gdn_conv_prefill(
+        &mut d_got.as_view_mut(),
+        &d_x.as_view(),
+        &mut d_state_got.as_view_mut(),
+        &d_w.as_view(),
+        &one,
+        channels,
+        CONV_K,
+    )?;
+    k.device().synchronize()?;
+
+    let want = stream.clone_dtoh(&d_want)?;
+    let got = stream.clone_dtoh(&d_got)?;
+    let (worst, at) = max_abs_diff(&got, &want);
+    assert!(worst < 2e-5, "sliced active slot {ACTIVE_SLOT} disagreed with the full layout by {worst:.2e} at {at}");
+
+    let state_want = stream.clone_dtoh(&d_state_want)?;
+    let state_got = stream.clone_dtoh(&d_state_got)?;
+    let active_want = &state_want[ACTIVE_SLOT * conv_n..(ACTIVE_SLOT + 1) * conv_n];
+    let (sworst, sat) = max_abs_diff(&state_got, active_want);
+    assert!(sworst < 2e-5, "sliced active slot {ACTIVE_SLOT}'s carried window disagreed by {sworst:.2e} at {sat}");
+    Ok(())
+}
+
+/// `Model::linear_attention` picks `gdn_delta_rule`'s column-split fast path
+/// (`gdn_delta_rule_reg128_split4_f32`) the same way it picks
+/// `gdn_conv_prefill`'s -- by whether this call has exactly one active
+/// sequence, not by `pool.max_seqs()` (a bug caught, and fixed, in the conv
+/// path first; reproduced here and fixed the same way before this one ever
+/// shipped) -- and slices `state` at that sequence's own slot, not the
+/// front of the pool-wide buffer. Same shape of test as
+/// `a_sliced_slot_feeds_gdn_conv_prefill_the_right_row_not_slot_zero`, this
+/// time against the host reference rather than a second GPU kernel, since
+/// there is no separate full-layout path here to also have to trust.
+#[test]
+fn a_sliced_slot_feeds_the_split_delta_rule_the_right_row_not_slot_zero() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    let t_len = 11;
+    const MAX_SEQS: usize = 4;
+    const ACTIVE_SLOT: usize = 2;
+
+    let q_small = pseudo_random(t_len * KEY_HEADS * DK, 0x7a01);
+    let k_small = pseudo_random(t_len * KEY_HEADS * DK, 0x7a02);
+    let v = pseudo_random(t_len * VAL_HEADS * DV, 0x7a03);
+    let g = decaying(t_len * VAL_HEADS, 0x7a04, 0.7);
+    let beta = betas(t_len * VAL_HEADS, 0x7a05);
+
+    let (row, off) = packed(&q_small, &k_small, &v, t_len);
+    let (want, want_state) = reference(&q_small, &k_small, &v, &g, &beta, t_len);
+
+    let d_row = stream.clone_htod(&row)?;
+    let d_g = stream.clone_htod(&g)?;
+    let d_beta = stream.clone_htod(&beta)?;
+
+    // Slot 0 looks like a stale previous occupant, same poisoning as the
+    // conv test above.
+    let mut first = vec![0i32; MAX_SEQS];
+    let mut ntok = vec![0i32; MAX_SEQS];
+    first[0] = 777;
+    first[ACTIVE_SLOT] = 0;
+    ntok[ACTIVE_SLOT] = t_len as i32;
+    let d_first = stream.clone_htod(&first)?;
+    let d_ntok = stream.clone_htod(&ntok)?;
+    let active_first = d_first.as_view().slice(ACTIVE_SLOT..ACTIVE_SLOT + 1);
+    let active_ntok = d_ntok.as_view().slice(ACTIVE_SLOT..ACTIVE_SLOT + 1);
+    let seqs = infero_kernels::gdn::SeqLayout {
+        first_token: &active_first,
+        n_tokens: &active_ntok,
+        n_seqs: 1, // triggers the split4 fast path, exactly as production now does
+        total_tokens: t_len,
+    };
+
+    let mut d_out = stream.alloc_zeros::<f32>(t_len * VAL_HEADS * DV)?;
+    // Pool-wide state, one block a slot -- sliced the same way
+    // `Model::linear_attention` slices `recurrent`/the rollback scratch.
+    let mut d_state = stream.alloc_zeros::<f32>(MAX_SEQS * VAL_HEADS * DK * DV)?;
+    let state_n = VAL_HEADS * DK * DV;
+    let mut d_state_view = d_state.as_view_mut();
+    let mut active_state = d_state_view.slice_mut(ACTIVE_SLOT * state_n..(ACTIVE_SLOT + 1) * state_n);
+
+    k.gdn_delta_rule(
+        &mut d_out.as_view_mut(),
+        &mut active_state,
+        &d_row.as_view(),
+        &d_g.as_view(),
+        &d_beta.as_view(),
+        &seqs,
+        VAL_HEADS,
+        KEY_HEADS,
+        DK,
+        DV,
+        off,
+        false,
+    )?;
+    k.device().synchronize()?;
+
+    let got = stream.clone_dtoh(&d_out)?;
+    let got_state = stream.clone_dtoh(&d_state)?;
+    let active_state_got = &got_state[ACTIVE_SLOT * state_n..(ACTIVE_SLOT + 1) * state_n];
+
+    let rel = max_rel_diff(&got, &want);
+    assert!(rel < 2e-3, "sliced active slot {ACTIVE_SLOT}'s output diverged by {rel:.2e}");
+    let peak = want_state.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let (worst, at) = max_abs_diff(active_state_got, &want_state);
+    assert!(
+        worst < 1e-4 * peak,
+        "sliced active slot {ACTIVE_SLOT}'s final state diverged by {worst:.2e} at {at} \
+         against a peak of {peak:.3e}"
+    );
+    Ok(())
+}
+
 #[test]
 fn the_gate_and_decay_match_the_reference() -> Result<()> {
     let k = kernels()?;
@@ -1138,6 +1393,44 @@ fn the_register_state_does_not_spill() -> Result<()> {
         "the register-blocked delta rule fits no block an SM at all: {regs} \
          registers over 2 * {DV} threads is past this device's budget, and the \
          launch will fail rather than run slowly"
+    );
+    Ok(())
+}
+
+/// Same check, for `gdn_delta_rule_reg128_split4_f32` -- the column-split
+/// variant `Kernels::gdn_delta_rule` picks instead of the kernel above for a
+/// solo sequence (`n_seqs == 1`), where the plain kernel's `heads`-blocks-
+/// only launch leaves most of the device idle. Its per-thread state (`sc`,
+/// `RB` rows) is the identical size and shape to the undivided kernel's --
+/// splitting columns across more blocks does not touch how many rows a
+/// thread owns -- so it is exactly as vulnerable to the same silent local-
+/// memory fallback, and the `qn`/`kn` lookahead arrays this variant adds
+/// (`Q_LOADS` wide, to cover `DK_C` in more than one pass once a quarter of
+/// `dv`'s threads is fewer than `dk`) are a second, new place the same
+/// mistake could happen.
+#[test]
+fn the_split_column_delta_rule_does_not_spill() -> Result<()> {
+    let k = kernels()?;
+    // A quarter of `2 * DV` threads a block; shared is unchanged by the
+    // split (see the kernel's own comment on `BUF` not depending on `G`).
+    let (regs, stat, spill) = k.gdn_kernel_registers("gdn_delta_rule_reg128_split4_f32")?;
+    let blocks = k.gdn_occupancy_blocks("gdn_delta_rule_reg128_split4_f32", (2 * DV / 4) as u32, 4 * DK * 4)?;
+    eprintln!(
+        "  gdn_delta_rule_reg128_split4_f32: {regs} regs, {stat} B static shared, \
+         {spill} B spill, {blocks} blocks/SM"
+    );
+    assert_eq!(
+        spill, 0,
+        "the column-split delta rule spills {spill} bytes a thread; see \
+         `the_register_state_does_not_spill`'s doc comment for why that is a \
+         silent, correctness-preserving performance regression rather than a \
+         test failure anywhere else"
+    );
+    assert!(
+        blocks >= 1,
+        "the column-split delta rule fits no block an SM at all: {regs} \
+         registers over {} threads is past this device's budget",
+        2 * DV / 4
     );
     Ok(())
 }
