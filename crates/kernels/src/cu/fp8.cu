@@ -543,6 +543,17 @@ extern "C" __global__ void quantize_act_e4m3_f32(unsigned char* __restrict__ xq,
 // `n_tokens` still need a block to write `sfa_t`'s harmless `1.0f` filler
 // (see `transpose_pad_scale_a_f32`'s doc comment for why 1.0, not 0), but
 // they skip `x` entirely rather than reading it.
+// One warp per (token, 128-wide k-group), each lane owning `QUANT_GROUP /
+// WARP_SIZE` strided elements instead of one block-wide thread per element.
+// The block-of-128 version below this comment used to split the group across
+// four warps and reduce across them with shared memory and two
+// `__syncthreads()` -- for a kernel this small (one load, one shuffle
+// reduction, one store), those barriers were most of the cost: `ncu` had it
+// at 60.77% achieved occupancy against 100% theoretical and 64.45% "No
+// Eligible", the signature of warps parked on a barrier rather than doing
+// real work. A single warp needs no cross-warp reduction at all -- the
+// `__shfl_xor_sync` tree already leaves every lane holding the final max --
+// so there is nothing left to synchronize on.
 extern "C" __global__ void quantize_act_e4m3_cutlass_f32(unsigned char* __restrict__ xq,
                                                           float* __restrict__ sfa_t,
                                                           const float* __restrict__ x,
@@ -554,30 +565,25 @@ extern "C" __global__ void quantize_act_e4m3_cutlass_f32(unsigned char* __restri
         if (tid == 0) sfa_t[(size_t)group * m_pad + tok] = 1.0f;
         return;
     }
-    const int idx = group * QUANT_GROUP + tid;
-    const float v = x[(size_t)tok * k + idx];
-
-    __shared__ float red[QUANT_GROUP / WARP_SIZE];
-    float amax = fabsf(v);
+    constexpr int PER_LANE = QUANT_GROUP / WARP_SIZE;
+    const int base = group * QUANT_GROUP + tid;
+    float v[PER_LANE];
+    float amax = 0.0f;
+#pragma unroll
+    for (int e = 0; e < PER_LANE; ++e) {
+        v[e] = x[(size_t)tok * k + base + e * WARP_SIZE];
+        amax = fmaxf(amax, fabsf(v[e]));
+    }
 #pragma unroll
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
     }
-    const int warp = tid / WARP_SIZE;
-    if (tid % WARP_SIZE == 0) red[warp] = amax;
-    __syncthreads();
-    if (warp == 0) {
-        float m = (tid < QUANT_GROUP / WARP_SIZE) ? red[tid] : 0.0f;
-#pragma unroll
-        for (int off = (QUANT_GROUP / WARP_SIZE) / 2; off > 0; off >>= 1) {
-            m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFFu, m, off));
-        }
-        if (tid == 0) red[0] = fmaxf(m, 1e-30f);
-    }
-    __syncthreads();
-    const float scale = red[0] / 448.0f;
+    const float scale = fmaxf(amax, 1e-30f) / 448.0f;
 
-    xq[(size_t)tok * k + idx] = f32_to_e4m3(v / scale);
+#pragma unroll
+    for (int e = 0; e < PER_LANE; ++e) {
+        xq[(size_t)tok * k + base + e * WARP_SIZE] = f32_to_e4m3(v[e] / scale);
+    }
     if (tid == 0) {
         sfa_t[(size_t)group * m_pad + tok] = scale;
     }

@@ -683,7 +683,10 @@ impl Kernels {
             .get("infero_fp8", fp8_src(), "quantize_act_e4m3_cutlass_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (m_pad as u32, (k / ACT_QUANT_GROUP) as u32, 1),
-            block_dim: (ACT_QUANT_GROUP as u32, 1, 1),
+            // One warp a block: see `quantize_act_e4m3_cutlass_f32`'s doc
+            // comment for why this replaced the old one-thread-a-lane,
+            // four-warp, shared-memory-reduced layout.
+            block_dim: (32, 1, 1),
             shared_mem_bytes: 0,
         };
         let (ki, nt, mp) = (k as i32, n_tokens as i32, m_pad as i32);
