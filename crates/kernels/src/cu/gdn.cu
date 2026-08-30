@@ -1406,3 +1406,81 @@ extern "C" __global__ void gdn_pp_pipelined_probe(float* __restrict__ out_checks
         if (lane == 0) out_checksum[1] = s;
     }
 }
+
+// Same pipeline, coarser handoff: `GDN_PP_BATCH` (4) timesteps' worth of
+// state per barrier round instead of 1. The per-timestep real work
+// (~128 FMA-ish ops, 2 shuffles) is far smaller than one named-barrier
+// round-trip's own fixed cost -- the exact result above (0.269x, a real
+// 3.7x regression, despite a correct handoff) -- so this checks whether
+// amortizing that fixed cost over more real work per round recovers any
+// of it, before concluding the whole direction is dead rather than just
+// mis-sized.
+#define GDN_PP_BATCH 4
+extern "C" __global__ void gdn_pp_pipelined_batched_probe(float* __restrict__ out_checksum) {
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    extern __shared__ float gdn_pp_smem[];
+    // [2 stages][32 lanes][GDN_PP_BATCH timesteps][64 rows]
+    const int stage_floats = 32 * GDN_PP_BATCH * 64;
+    float* sbuf0 = gdn_pp_smem;
+    float* sbuf1 = gdn_pp_smem + stage_floats;
+
+    const int n_batches = GDN_PP_ITERS / GDN_PP_BATCH;
+
+    if (warp == 0) {
+        float sc[64], kc[64];
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            sc[r] = 0.0f;
+            kc[r] = 0.01f * ((lane * 64 + r) % 7 - 3);
+        }
+        for (int batch = 0; batch < n_batches; ++batch) {
+            const int stage = batch & 1;
+            if (batch >= 2) {
+                const int bar = (stage == 0) ? GDN_PP_STATE_FREE0 : GDN_PP_STATE_FREE1;
+                asm volatile("bar.sync %0, %1;" ::"r"(bar), "r"(64) : "memory");
+            }
+            float* dst = (stage == 0) ? sbuf0 : sbuf1;
+#pragma unroll
+            for (int i = 0; i < GDN_PP_BATCH; ++i) {
+                const int n = batch * GDN_PP_BATCH + i;
+                const float decay = 0.999f;
+                const float v = 0.1f + 0.001f * (n % 13);
+                const float b = 0.5f;
+                gdn_pp_state_advance(sc, kc, kc, decay, v, b, lane);
+#pragma unroll
+                for (int r = 0; r < 64; ++r) dst[(lane * GDN_PP_BATCH + i) * 64 + r] = sc[r];
+            }
+            const int bar = (stage == 0) ? GDN_PP_STATE_READY0 : GDN_PP_STATE_READY1;
+            asm volatile("bar.arrive %0, %1;" ::"r"(bar), "r"(64) : "memory");
+        }
+    } else {
+        float qc[64];
+#pragma unroll
+        for (int r = 0; r < 64; ++r) qc[r] = 0.01f * ((lane * 64 + r) % 5 - 2);
+        float out_sum = 0.0f;
+        float last_sc[64];
+        for (int batch = 0; batch < n_batches; ++batch) {
+            const int stage = batch & 1;
+            const int bar = (stage == 0) ? GDN_PP_STATE_READY0 : GDN_PP_STATE_READY1;
+            asm volatile("bar.sync %0, %1;" ::"r"(bar), "r"(64) : "memory");
+            const float* src = (stage == 0) ? sbuf0 : sbuf1;
+#pragma unroll
+            for (int i = 0; i < GDN_PP_BATCH; ++i) {
+#pragma unroll
+                for (int r = 0; r < 64; ++r) last_sc[r] = src[(lane * GDN_PP_BATCH + i) * 64 + r];
+                const float ot = gdn_pp_output(last_sc, qc);
+                out_sum += ot;
+            }
+            {
+                const int fbar = (stage == 0) ? GDN_PP_STATE_FREE0 : GDN_PP_STATE_FREE1;
+                asm volatile("bar.arrive %0, %1;" ::"r"(fbar), "r"(64) : "memory");
+            }
+        }
+        if (lane == 0) out_checksum[0] = out_sum;
+        float s = 0.0f;
+#pragma unroll
+        for (int r = 0; r < 64; ++r) s += last_sc[r];
+        if (lane == 0) out_checksum[1] = s;
+    }
+}

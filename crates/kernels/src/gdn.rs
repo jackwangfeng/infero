@@ -817,4 +817,20 @@ impl Kernels {
         unsafe { b.launch(cfg) }.context("gdn_pp_pipelined_probe")?;
         Ok(())
     }
+
+    /// Same as [`Self::gdn_pp_pipelined_probe`], batching `GDN_PP_BATCH`
+    /// (4) timesteps per handoff round instead of 1 -- see
+    /// `gdn_pp_pipelined_batched_probe`'s doc comment in `cu/gdn.cu`.
+    pub fn gdn_pp_pipelined_batched_probe(&self, out: &mut ViewMut<'_, f32>) -> Result<()> {
+        let f = self.dev.kernels().get("infero_gdn", gdn_src(), "gdn_pp_pipelined_batched_probe")?;
+        let shared = 2 * 32 * 4 * 64 * 4;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared as u32)?;
+        }
+        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (64, 1, 1), shared_mem_bytes: shared as u32 };
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out);
+        unsafe { b.launch(cfg) }.context("gdn_pp_pipelined_batched_probe")?;
+        Ok(())
+    }
 }
