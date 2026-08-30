@@ -7008,6 +7008,26 @@ impl Kernels {
         Ok(())
     }
 
+    /// Isolates each role's own cost -- see `attn_pp_mma_only_ref` /
+    /// `attn_pp_softmax_only_ref` in `ops.cu` for why.
+    pub fn attn_pp_mma_only_ref(&self, out: &mut ViewMut<'_, f32>) -> Result<()> {
+        let f = self.dev.kernels().get("infero_ops", ops_src(), "attn_pp_mma_only_ref")?;
+        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out);
+        unsafe { b.launch(cfg) }.context("attn_pp_mma_only_ref")?;
+        Ok(())
+    }
+
+    pub fn attn_pp_softmax_only_ref(&self, out: &mut ViewMut<'_, f32>) -> Result<()> {
+        let f = self.dev.kernels().get("infero_ops", ops_src(), "attn_pp_softmax_only_ref")?;
+        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out);
+        unsafe { b.launch(cfg) }.context("attn_pp_softmax_only_ref")?;
+        Ok(())
+    }
+
     /// The e4m3-QK^T counterpart of [`Self::attn_full_tile_f16_probe`]; PV
     /// stays `mma_f16` in both, isolating the comparison to QK^T only.
     pub fn attn_full_tile_e4m3_probe(

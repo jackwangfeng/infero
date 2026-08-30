@@ -6311,3 +6311,57 @@ extern "C" __global__ void attn_ws_functional_pingpong_sequential_ref(float* __r
         out_checksum[1] = l_run + m_run;
     }
 }
+
+// Ablations of the sequential reference above, isolating each role's own
+// cost -- answers whether the 1.014x ceiling in the ping-pong probe was
+// "barrier overhead ate a real overlap opportunity" (roughly equal costs,
+// so max() vs sum() should have been a big win) or "one role dominates so
+// there was never much to overlap in the first place" (max() close to
+// sum() already, so no synchronization scheme could have done much better).
+extern "C" __global__ void attn_pp_mma_only_ref(float* __restrict__ out_checksum) {
+    const int lane = threadIdx.x % WARP_SIZE;
+    mma_a_f16 qa;
+    mma_b_f16 bf;
+    {
+        const __half2 one = __floats2half2_rn(0.02f, 0.02f);
+        const unsigned bits = *(const unsigned*)(const void*)&one;
+        qa.x[0] = qa.x[1] = qa.x[2] = qa.x[3] = bits;
+        bf.x[0] = bf.x[1] = bits;
+    }
+    mma_c_f32 acc[6];
+    mma_c_f32 o[32];
+#pragma unroll
+    for (int i = 0; i < 6; ++i) acc[i] = {{0.0f, 0.0f, 0.0f, 0.0f}};
+#pragma unroll
+    for (int i = 0; i < 32; ++i) o[i] = {{0.0f, 0.0f, 0.0f, 0.0f}};
+
+    for (int i = 0; i < ATTN_PP_ITERS; ++i) {
+#pragma unroll
+        for (int nt = 0; nt < 6; ++nt) {
+#pragma unroll
+            for (int t = 0; t < 16; ++t) mma_f16(acc[nt], qa, bf);
+        }
+#pragma unroll
+        for (int kg = 0; kg < 3; ++kg) {
+#pragma unroll
+            for (int j = 0; j < 32; ++j) mma_f16(o[j], qa, bf);
+        }
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) sum += o[j].x[0] + o[j].x[1] + o[j].x[2] + o[j].x[3];
+    sum += acc[0].x[0];
+    if (lane == 0) out_checksum[0] = sum;
+}
+
+extern "C" __global__ void attn_pp_softmax_only_ref(float* __restrict__ out_checksum) {
+    const int lane = threadIdx.x % WARP_SIZE;
+    float m_run = -INFINITY;
+    float l_run = 0.0f;
+    float score = 0.0f;
+    for (int i = 0; i < ATTN_PP_ITERS; ++i) {
+        score += 0.02f;
+        attn_pp_softmax_step(score * 1.0e-6f, m_run, l_run);
+    }
+    if (lane == 0) out_checksum[1] = l_run + m_run;
+}

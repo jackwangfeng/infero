@@ -71,5 +71,32 @@ fn main() -> Result<()> {
     println!("sequential (1 warp, QK^T -> softmax -> PV in order): {:.3} us", seq_best * 1e6);
     println!("pingpong   (2 warps, MMA role || softmax role, 1 tile offset): {:.3} us", pp_best * 1e6);
     println!("\ncross-warp overlap speedup: {:.3}x", seq_best / pp_best);
+
+    // Isolate each role's own cost: was there ever much to overlap, or does
+    // one role dominate so badly that no synchronization scheme could have
+    // done much better than sequential?
+    let mut mma_best = f64::INFINITY;
+    for _ in 0..REPEATS {
+        let t = std::time::Instant::now();
+        k.attn_pp_mma_only_ref(&mut out_seq.as_view_mut())?;
+        k.device().synchronize()?;
+        mma_best = mma_best.min(t.elapsed().as_secs_f64());
+    }
+    let mut softmax_best = f64::INFINITY;
+    for _ in 0..REPEATS {
+        let t = std::time::Instant::now();
+        k.attn_pp_softmax_only_ref(&mut out_seq.as_view_mut())?;
+        k.device().synchronize()?;
+        softmax_best = softmax_best.min(t.elapsed().as_secs_f64());
+    }
+    let ceiling = mma_best.max(softmax_best);
+    println!("\nmma-only role     (QK^T+PV, no softmax): {:.3} us", mma_best * 1e6);
+    println!("softmax-only role (dependent chain, no MMA): {:.3} us", softmax_best * 1e6);
+    println!(
+        "theoretical ceiling if perfectly overlapped, max(mma,softmax)={:.3} us vs sequential sum={:.3} us -> best possible speedup {:.3}x",
+        ceiling * 1e6,
+        seq_best * 1e6,
+        seq_best / ceiling
+    );
     Ok(())
 }
