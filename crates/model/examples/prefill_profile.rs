@@ -33,6 +33,14 @@ fn main() -> Result<()> {
         let item = BatchItem::new(seq, chunk);
         model.forward_batch_device(std::slice::from_ref(&item), &mut pool)?;
     }
+    // `forward_batch_device` does not block on the GPU (the real server's own
+    // sampling call is what waits, deliberately -- see the note in
+    // `Scheduler::step`), so the loop above returns once every kernel is
+    // *launched*, not once the last one has *run*. Without this, the reported
+    // time silently drops however much of the GPU's queue is still draining
+    // when the CPU reaches here -- measured on a 30552-token prefill as
+    // missing the better part of a second.
+    model.device().synchronize()?;
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
     println!("prefill {n_tokens} tokens: {ms:.1} ms ({:.1} tok/s)", n_tokens as f64 / (ms / 1000.0));
 
