@@ -3454,7 +3454,11 @@ impl Kernels {
         let tpw = (16 / group).max(1);
         const NWARPS: usize = 7;
         const KPAD: usize = 8;
-        const WK: usize = 48;
+        // e4m3 K is one byte an element, half `ws4`'s `__half` -- this
+        // kernel's shared-memory footprint at the same tile width is
+        // smaller, so 64 fits the same 99 KiB budget with room to spare
+        // (must match `ATTN_E4M3_WK` in `ops.cu`).
+        const WK: usize = 64;
         let tile_tokens = NWARPS * tpw;
         let n_tiles = run_tokens.div_ceil(tile_tokens);
         let (n_chunks, chunk) = self.prefill_chunks(dims.n_kv_heads, n_tiles, kv_len);

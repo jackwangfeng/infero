@@ -5324,7 +5324,11 @@ __device__ __forceinline__ unsigned char attn_e4m3_encode(float f) {
 #endif
 }
 
-#define ATTN_E4M3_WK 48
+// e4m3 K is one byte an element (half `ws4`'s `__half`), so this kernel's
+// shared-memory footprint at the same WK is smaller -- 64 fits the same 99
+// KiB budget with room to spare (2*64*256 + 2*64*264*2 + 2*64*4 == 100864,
+// under 101376), unlike `ws4` itself which is already exact at WK=48.
+#define ATTN_E4M3_WK 64
 
 extern "C" __global__ void attn_prefill_e4m3k_f32(
     float* __restrict__ partial, int ms_off, float* __restrict__ out, int single,
@@ -5504,13 +5508,13 @@ extern "C" __global__ void attn_prefill_e4m3k_f32(
         const int base = begin + b * WK;
         const int n = min(WK, end - base);
 
-        // Six 8-key QK^T sub-tiles, same as `ws4` -- the raw e4m3 MMA
-        // accumulator still needs `qs * ks` applied per key (each key's own
-        // scale, read once a sub-tile's worth of keys since `sksb` is tiny
-        // and already resident).
-        mma_c_f32 s2[6];
+        // `WK/8` 8-key QK^T sub-tiles, same shape as `ws4` -- the raw e4m3
+        // MMA accumulator still needs `qs * ks` applied per key (each key's
+        // own scale, read once a sub-tile's worth of keys since `sksb` is
+        // tiny and already resident).
+        mma_c_f32 s2[ATTN_E4M3_WK / 8];
 #pragma unroll
-        for (int nt = 0; nt < 6; ++nt) {
+        for (int nt = 0; nt < ATTN_E4M3_WK / 8; ++nt) {
             s2[nt].x[0] = 0.0f;
             s2[nt].x[1] = 0.0f;
             s2[nt].x[2] = 0.0f;
@@ -5527,18 +5531,21 @@ extern "C" __global__ void attn_prefill_e4m3k_f32(
             }
         }
 
-        float sv_score[24];
+        // `ROWN = (WK/8)*2`: local values a row-group a thread carries
+        // before the 4-lane shuffle reduction below combines them.
+        const int ROWN = (ATTN_E4M3_WK / 8) * 2;
+        float sv_score[(ATTN_E4M3_WK / 8) * 2 * 2];
 #pragma unroll
         for (int rg = 0; rg < 2; ++rg) {
             const float qs = (rg == 0) ? qs_lo : qs_hi;
 #pragma unroll
-            for (int nt = 0; nt < 6; ++nt) {
+            for (int nt = 0; nt < ATTN_E4M3_WK / 8; ++nt) {
 #pragma unroll
                 for (int e = 0; e < 2; ++e) {
                     const int key = nt * 8 + cc + e;
                     const int abs_key = base + key;
                     const float ks = (key < n) ? sksb[key] : 1.0f;
-                    sv_score[rg * 12 + nt * 2 + e] =
+                    sv_score[rg * ROWN + nt * 2 + e] =
                         (row_live[rg] && key < n && abs_key <= row_last[rg])
                             ? s2[nt].x[rg * 2 + e] * qs * ks * scale
                             : -INFINITY;
@@ -5546,22 +5553,23 @@ extern "C" __global__ void attn_prefill_e4m3k_f32(
             }
         }
 
-        // Online-softmax update -- byte-for-byte `ws4`'s own.
-        float p[24];
+        // Online-softmax update -- `ws4`'s own shape, `ROWN` local values a
+        // row-group instead of its fixed 12 (`WK=48` only).
+        float p[(ATTN_E4M3_WK / 8) * 2 * 2];
 #pragma unroll
         for (int rg = 0; rg < 2; ++rg) {
-            float* svr = sv_score + rg * 12;
+            float* svr = sv_score + rg * ROWN;
             float m_own = svr[0];
 #pragma unroll
-            for (int i = 1; i < 12; ++i) m_own = fmaxf(m_own, svr[i]);
+            for (int i = 1; i < ROWN; ++i) m_own = fmaxf(m_own, svr[i]);
             m_own = fmaxf(m_own, __shfl_xor_sync(0xffffffff, m_own, 1, WARP_SIZE));
             m_own = fmaxf(m_own, __shfl_xor_sync(0xffffffff, m_own, 2, WARP_SIZE));
             const float m_new = fmaxf(m_run[rg], m_own);
             float psum = 0.0f;
 #pragma unroll
-            for (int i = 0; i < 12; ++i) {
-                p[rg * 12 + i] = (svr[i] == -INFINITY) ? 0.0f : __expf(svr[i] - m_new);
-                psum += p[rg * 12 + i];
+            for (int i = 0; i < ROWN; ++i) {
+                p[rg * ROWN + i] = (svr[i] == -INFINITY) ? 0.0f : __expf(svr[i] - m_new);
+                psum += p[rg * ROWN + i];
             }
             psum += __shfl_xor_sync(0xffffffff, psum, 1, WARP_SIZE);
             psum += __shfl_xor_sync(0xffffffff, psum, 2, WARP_SIZE);
@@ -5578,15 +5586,15 @@ extern "C" __global__ void attn_prefill_e4m3k_f32(
             }
         }
 
-        // PV-MMA -- `mma_f16`, unchanged from `ws4`.
+        // PV-MMA -- `mma_f16`, unchanged from `ws4`, `WK/16` 16-key passes.
 #pragma unroll
-        for (int kg = 0; kg < 3; ++kg) {
+        for (int kg = 0; kg < ATTN_E4M3_WK / 16; ++kg) {
             const int nt_lo = kg * 2, nt_hi = kg * 2 + 1;
             mma_a_f16 pa;
             const __half2 p_rg0_lo = __floats2half2_rn(p[nt_lo * 2], p[nt_lo * 2 + 1]);
-            const __half2 p_rg1_lo = __floats2half2_rn(p[12 + nt_lo * 2], p[12 + nt_lo * 2 + 1]);
+            const __half2 p_rg1_lo = __floats2half2_rn(p[ROWN + nt_lo * 2], p[ROWN + nt_lo * 2 + 1]);
             const __half2 p_rg0_hi = __floats2half2_rn(p[nt_hi * 2], p[nt_hi * 2 + 1]);
-            const __half2 p_rg1_hi = __floats2half2_rn(p[12 + nt_hi * 2], p[12 + nt_hi * 2 + 1]);
+            const __half2 p_rg1_hi = __floats2half2_rn(p[ROWN + nt_hi * 2], p[ROWN + nt_hi * 2 + 1]);
             pa.x[0] = *(const unsigned*)(const void*)&p_rg0_lo;
             pa.x[1] = *(const unsigned*)(const void*)&p_rg1_lo;
             pa.x[2] = *(const unsigned*)(const void*)&p_rg0_hi;
