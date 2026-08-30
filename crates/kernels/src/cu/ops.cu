@@ -3626,7 +3626,16 @@ extern "C" __global__ void attn_prefill_mma_ws_f32(
             const int stage = b & 1;
             if (b >= 2) {
                 const int bar = (stage == 0) ? ATTN_WS_BAR_FREE0 : ATTN_WS_BAR_FREE1;
-                asm volatile("bar.sync %0, %1;" ::"r"(bar), "r"(total_threads));
+                // "memory": without it the compiler has no reason to keep
+                // the cp.async issues below on this instruction's far side --
+                // it sees an opaque instruction with no memory effect, not a
+                // synchronization point. Found the hard way, in an isolated
+                // toy probe of this same primitive rather than here: a
+                // missing clobber there produced a deterministic (not
+                // timing-dependent) wrong answer that a stray debug store
+                // masked by accident. See `attn_ws_pair_probe_f32`'s own
+                // comment for the full account.
+                asm volatile("bar.sync %0, %1;" ::"r"(bar), "r"(total_threads) : "memory");
             }
             __half* skb = (stage == 0) ? sk0 : sk1;
             __half* svb = (stage == 0) ? sv0 : sv1;
@@ -3642,7 +3651,7 @@ extern "C" __global__ void attn_prefill_mma_ws_f32(
             CP_ASYNC_FENCE();
             CP_ASYNC_WAIT(0);
             const int bar = (stage == 0) ? ATTN_WS_BAR_READY0 : ATTN_WS_BAR_READY1;
-            asm volatile("bar.arrive %0, %1;" ::"r"(bar), "r"(total_threads));
+            asm volatile("bar.arrive %0, %1;" ::"r"(bar), "r"(total_threads) : "memory");
         }
         return;
     }
@@ -3703,7 +3712,8 @@ extern "C" __global__ void attn_prefill_mma_ws_f32(
     for (int b = 0; b < n_blk; ++b) {
         const int stage = b & 1;
         const int rbar = (stage == 0) ? ATTN_WS_BAR_READY0 : ATTN_WS_BAR_READY1;
-        asm volatile("bar.sync %0, %1;" ::"r"(rbar), "r"(total_threads));
+        // "memory" clobber -- see the producer's own copy of this note above.
+        asm volatile("bar.sync %0, %1;" ::"r"(rbar), "r"(total_threads) : "memory");
 
         __half* skb = (stage == 0) ? sk0 : sk1;
         __half* svb = (stage == 0) ? sv0 : sv1;
@@ -3795,7 +3805,8 @@ extern "C" __global__ void attn_prefill_mma_ws_f32(
         }
 
         const int fbar = (stage == 0) ? ATTN_WS_BAR_FREE0 : ATTN_WS_BAR_FREE1;
-        asm volatile("bar.arrive %0, %1;" ::"r"(fbar), "r"(total_threads));
+        // "memory" clobber -- see the producer's own copy of this note above.
+        asm volatile("bar.arrive %0, %1;" ::"r"(fbar), "r"(total_threads) : "memory");
     }
 
     if (single && use_out_stage) {
@@ -3828,7 +3839,16 @@ extern "C" __global__ void attn_prefill_mma_ws_f32(
 
         float* stage = (float*)attn_ws_smem;
         const int pair_count = tpw * group;
-        float* mystage = stage + (size_t)cwarp * pair_count * d_head;
+        // `abs_row * d_head` repeats the same bank for every `abs_row` once
+        // `d_head` is itself a multiple of 32 (256, this checkpoint's full-
+        // attention `d_head`) -- ncu measured this as a 3.5-way shared-store
+        // conflict across 71% of this section's wavefronts. `stage_row` is
+        // the same fix as `gdn_delta_rule_reg_body`'s `PAD`/`ROW`: widen the
+        // per-row stride so it stops lining up with the bank count. The
+        // launcher sizes `out_stage_shared` off this same expression, not
+        // `d_head`, so the extra columns have real backing space.
+        const int stage_row = (d_head % 32 == 0) ? d_head + 4 : d_head;
+        float* mystage = stage + (size_t)cwarp * pair_count * stage_row;
 #pragma unroll
         for (int rg = 0; rg < 2; ++rg) {
             if (!row_live[rg]) continue;
@@ -3840,8 +3860,8 @@ extern "C" __global__ void attn_prefill_mma_ws_f32(
                 const int d0 = i * 8 + cc;
                 const float v0 = o[i].x[rg * 2];
                 const float v1 = o[i].x[rg * 2 + 1];
-                mystage[(size_t)abs_row * d_head + d0] = den > 0.0f ? v0 / den : 0.0f;
-                mystage[(size_t)abs_row * d_head + d0 + 1] = den > 0.0f ? v1 / den : 0.0f;
+                mystage[(size_t)abs_row * stage_row + d0] = den > 0.0f ? v0 / den : 0.0f;
+                mystage[(size_t)abs_row * stage_row + d0 + 1] = den > 0.0f ? v1 / den : 0.0f;
             }
         }
         __syncthreads();
@@ -3853,7 +3873,7 @@ extern "C" __global__ void attn_prefill_mma_ws_f32(
             if (local0 + row_j2 >= tokens_here) continue;
             const int token = run_base + tile * tile_tokens + local0 + row_j2;
             const int head = kv_head * group + abs_row % group;
-            out[((size_t)token * n_heads + head) * d_head + d] = mystage[idx];
+            out[((size_t)token * n_heads + head) * d_head + d] = mystage[(size_t)abs_row * stage_row + d];
         }
         return;
     }
@@ -3893,6 +3913,86 @@ extern "C" __global__ void attn_prefill_mma_ws_f32(
                     ms[1] = den;
                 }
             }
+        }
+    }
+}
+
+// Isolated validation of a *second* producer/consumer handoff, this time
+// between two consumer warps sharing one query-row group rather than
+// between the K/V-staging warp and the consumers -- built while considering
+// that design for `attn_prefill_mma_ws_f32`'s own occupancy problem (see the
+// note above it), exactly like `ATTN_WS_BAR_READY0..FREE1`'s own toy probe
+// preceded that kernel. Kept, not thrown away once it passed: its first
+// version passed by accident (see the note on the "memory" clobber below)
+// and would have carried that mistake straight into `attn_prefill_mma_ws_f32`
+// if it had been deleted the moment the numbers looked right, so it now
+// doubles as this file's regression test for the exact pitfall it found --
+// see `attn_ws_pair_probe_matches_closed_form` in `tests/ops.rs`.
+//
+// Two independent pairs a block (warps 0+1, warps 2+3), each pair using its
+// own barrier IDs so the pairs make progress independently -- the property
+// a real design needs (one row-group's pair must not wait on another's).
+// "lo" writes an iteration-numbered value to its pair's own 2-float slot and
+// signals ready; "hi" waits, reads it, accumulates, signals free. 5000
+// iterations, like the original probe.
+#define ATTN_PAIR_BAR_READY_0 5
+#define ATTN_PAIR_BAR_FREE_0 6
+#define ATTN_PAIR_BAR_READY_1 7
+#define ATTN_PAIR_BAR_FREE_1 8
+
+extern "C" __global__ void attn_ws_pair_probe_f32(float* __restrict__ out, int iters) {
+    extern __shared__ float pair_smem[]; // 2 pairs * 2 floats
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int pair = warp / 2;         // 0 or 1
+    const bool is_lo = (warp % 2) == 0;
+    const int ready_bar = pair == 0 ? ATTN_PAIR_BAR_READY_0 : ATTN_PAIR_BAR_READY_1;
+    const int free_bar = pair == 0 ? ATTN_PAIR_BAR_FREE_0 : ATTN_PAIR_BAR_FREE_1;
+    const int participants = 64; // one pair: 2 warps
+    float* slot = pair_smem + pair * 2;
+
+    if (is_lo) {
+        for (int it = 0; it < iters; ++it) {
+            if (it >= 1) {
+                asm volatile("bar.sync %0, %1;" ::"r"(free_bar), "r"(participants) : "memory");
+            }
+            if (lane == 0) {
+                slot[0] = (float)it;
+                slot[1] = (float)(it * 2);
+            }
+            // Every barrier call below carries an explicit "memory" clobber.
+            // Without it, plain (non-`cp.async`) shared-memory reads/writes
+            // around these opaque `asm volatile` blocks are not something
+            // the compiler knows to keep on their own side of the barrier --
+            // `bar.sync`/`bar.arrive` are, to the compiler, just an
+            // instruction with no memory side effect it can see, so a plain
+            // load or store next to one is free to be reordered across it.
+            // Confirmed the hard way: this failed a fixed, wrong sum
+            // (11721244 against a closed-form 12497500) with `"memory"`
+            // left off every call but this one, deterministically -- not a
+            // timing-dependent race, since the actual defect is a
+            // compile-time reordering decision, not a runtime one. Adding a
+            // debug store right after the read below made it pass by
+            // accident (the extra store gave the compiler a reason not to
+            // reorder that one load), which is what put the clobber back on
+            // this session's own list of near-misses this would otherwise
+            // have been: [[feedback-verify-surprising-benchmarks]]'s
+            // discipline applies to a passing toy probe as much as to a
+            // suspicious benchmark number -- a debug print changing the
+            // answer is itself the finding.
+            asm volatile("bar.arrive %0, %1;" ::"r"(ready_bar), "r"(participants) : "memory");
+        }
+    } else {
+        float acc0 = 0.0f, acc1 = 0.0f;
+        for (int it = 0; it < iters; ++it) {
+            asm volatile("bar.sync %0, %1;" ::"r"(ready_bar), "r"(participants) : "memory");
+            acc0 += slot[0];
+            acc1 += slot[1];
+            asm volatile("bar.arrive %0, %1;" ::"r"(free_bar), "r"(participants) : "memory");
+        }
+        if (lane == 0) {
+            out[pair * 2] = acc0;
+            out[pair * 2 + 1] = acc1;
         }
     }
 }

@@ -1176,3 +1176,25 @@ fn attn_prefill_matches_the_three_kernels() -> Result<()> {
     Ok(())
 }
 
+
+// TEMP, not for the deployed tree: see `Kernels::attn_ws_pair_probe`'s own
+// note.
+#[test]
+fn attn_ws_pair_probe_matches_closed_form() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    let iters = 5000i32;
+    let mut d_out = stream.alloc_zeros::<f32>(24)?;
+    k.attn_ws_pair_probe(&mut d_out.as_view_mut(), iters)?;
+    k.device().synchronize()?;
+    let got = stream.clone_dtoh(&d_out)?;
+    eprintln!("first 20 values pair 0 read: {:?}", &got[4..24]);
+    let n = (iters - 1) as f64;
+    let want0 = (n * (n + 1.0) / 2.0) as f32;
+    let want1 = want0 * 2.0;
+    for pair in 0..2 {
+        assert_eq!(got[pair * 2], want0, "pair {pair} acc0");
+        assert_eq!(got[pair * 2 + 1], want1, "pair {pair} acc1");
+    }
+    Ok(())
+}

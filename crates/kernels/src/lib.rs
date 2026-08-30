@@ -777,7 +777,7 @@ impl Kernels {
         let (d_i, t_i) = (d_ff as i32, total as i32);
         let mut b = self.dev.stream().launch_builder(&f);
         b.arg(out).arg(xy).arg(&d_i).arg(&t_i);
-        self.dev.profile().time("silu_mul", self.dev.stream(), || {
+        self.dev.profile().time("silu_mul_split", self.dev.stream(), || {
             unsafe { b.launch(elementwise(total as u32)) }.context("silu_mul_split")?;
             Ok(())
         })?;
@@ -809,7 +809,7 @@ impl Kernels {
         let (d_i, t_i) = (d_ff as i32, total as i32);
         let mut b = self.dev.stream().launch_builder(&f);
         b.arg(out).arg(hout).arg(xy).arg(&d_i).arg(&t_i);
-        self.dev.profile().time("silu_mul", self.dev.stream(), || {
+        self.dev.profile().time("silu_mul_split_f16", self.dev.stream(), || {
             unsafe { b.launch(elementwise(total as u32)) }.context("silu_mul_split_f16")?;
             Ok(())
         })?;
@@ -3136,7 +3136,22 @@ impl Kernels {
         anyhow::ensure!(run_tokens >= 1, "attn_prefill_ws: empty run");
         let group = dims.n_heads / dims.n_kv_heads;
         let tpw = (16 / group).max(1);
-        const NWARPS: usize = 7; // consumer/compute warp count -- matches attn_prefill's own
+        // consumer/compute warp count -- matches attn_prefill's own.
+        //
+        // Measured, not assumed: a smaller value shrinks `sq` and the block
+        // (fewer threads a block, in principle room for a second resident
+        // block an SM against the 245-register/92 KiB-shared occupancy
+        // ceiling this kernel otherwise hits -- see the note on
+        // `attn_prefill_mma_ws_f32` in `ops.cu`). Swept 7/5/4/3/2 on the
+        // real 30552-token benchmark instead of trusting that theory:
+        // 2190/2935/3639/4709/6731 ms -- monotonically *worse*, not better.
+        // The producer's K/V staging is a per-tile fixed cost that does not
+        // shrink with `NWARPS`, and a smaller `NWARPS` means fewer query
+        // rows share it (`tile_tokens = NWARPS * tpw`); that cost dominates
+        // long before occupancy's theoretical benefit could show up. Do not
+        // retry this lever without also shrinking the K/V staging cost per
+        // tile, not just the tile.
+        const NWARPS: usize = 7;
         const KPAD: usize = 8;
         const WK: usize = 16;
         let tile_tokens = NWARPS * tpw;
@@ -3169,7 +3184,12 @@ impl Kernels {
         // when it would not fit, the kernel falls back to the scattered
         // write rather than the launch failing outright.
         const MAX_DYNAMIC_SHARED: usize = 100 * 1024;
-        let out_stage_shared = NWARPS * tpw * group * dims.d_head * 4;
+        // Matches the kernel's own `stage_row`: widened by 4 columns once
+        // `d_head` is a multiple of 32, so the per-row stride stops lining
+        // up with the bank count (see the kernel's comment on the 3.5-way
+        // shared-store conflict this fixes).
+        let stage_row = if dims.d_head % 32 == 0 { dims.d_head + 4 } else { dims.d_head };
+        let out_stage_shared = NWARPS * tpw * group * stage_row * 4;
         let use_out_stage = out_stage_shared <= MAX_DYNAMIC_SHARED;
         let shared = if use_out_stage { kv_shared.max(out_stage_shared) } else { kv_shared } as u32;
         if shared > 48 * 1024 {
@@ -3253,6 +3273,31 @@ impl Kernels {
                 unsafe { rb2.launch(elementwise(total)) }.context("attn_prefill_reduce")?;
                 Ok(())
             })?;
+        Ok(())
+    }
+
+    /// Launches `attn_ws_pair_probe_f32`, a standalone isolated validation
+    /// of a second (consumer-warp-pair) producer/consumer handoff being
+    /// considered for `attn_prefill_mma_ws_f32`'s own occupancy problem.
+    /// Its first version passed only because a since-removed debug store
+    /// happened to change codegen enough to hide a real missing-`"memory"`-
+    /// clobber bug (see the kernel's own comment) -- kept as a permanent
+    /// regression test for exactly that pitfall
+    /// (`attn_ws_pair_probe_matches_closed_form` in `tests/ops.rs`) rather
+    /// than deleted now that it passes cleanly.
+    pub fn attn_ws_pair_probe(&self, out: &mut ViewMut<'_, f32>, iters: i32) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_ops", ops_src(), "attn_ws_pair_probe_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 16,
+        };
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(&mut *out).arg(&iters);
+        unsafe { b.launch(cfg) }.context("attn_ws_pair_probe")?;
         Ok(())
     }
 
