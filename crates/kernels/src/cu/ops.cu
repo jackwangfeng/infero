@@ -4271,6 +4271,581 @@ extern "C" __global__ void attn_prefill_mma_ws4_f32(
     }
 }
 
+// Option 3: a genuinely different architecture, not another parameter on
+// `attn_prefill_mma_ws_f32`'s family. Splits online-softmax attention into
+// two real kernel launches instead of one fused kernel -- NOT by
+// materializing the full causal score/probability matrix (that is the old,
+// much slower `attn_scores`/`attn_softmax`/`attn_output` three-kernel
+// reference path this file already keeps only for testing; a causal
+// `run_tokens x kv_len` matrix is quadratic and was exactly what online
+// softmax exists to avoid). Instead, the split is along the *softmax
+// bookkeeping itself*: one pass to learn each row's true final `(m, l)`
+// (max and sum), one pass to consume it. That is small, O(run_tokens),
+// state -- not the full matrix -- carried through a small scratch buffer,
+// not registers.
+//
+// The two identified real bottlenecks (`ws4`'s own `ncu` numbers: Compute
+// Throughput 32.35% against vLLM's FA2 77.43%; Warp Stall Sampling showing
+// `wait`+`short_scoreboard` -- a dependent scalar chain, not memory
+// latency -- as 59% of samples) live in *different* parts of the fused
+// kernel's per-tile work, and this split targets each separately:
+//
+// `attn_prefill_stats_f32` (below) computes only QK^T and the running
+// `(m, l)` online-softmax state -- no `o[]` accumulator, no PV-MMA, and
+// critically no `V` staged at all (`sv0`/`sv1` do not exist here). Removing
+// `o[]`'s 128 registers is the point: far lower register pressure should
+// allow real occupancy this kernel family has never had. Removing `V`
+// staging is a second, independent effect of the same split: the freed
+// shared-memory half goes entirely to `K`, so this kernel's tile can be
+// twice `attn_prefill_ws4`'s 48 (`2*96*264*2 == 101376`, exact) *without*
+// giving up double buffering the way `attn_prefill_mma_ws5_f32` (reverted)
+// had to.
+//
+// `attn_prefill_pv_f32` (further below) re-reads Q, re-stages K *and* V,
+// and recomputes QK^T (redundant -- but this GPU's Compute Throughput and
+// DRAM Throughput both still have real headroom, established across every
+// step of this investigation, so redundant work has somewhere to land)
+// against the *already-known* `m_final`/`l_final` from the stats pass.
+// Because those are already exact, this kernel needs no running max, no
+// running sum, no per-tile correction, and no `o[]` rescale -- the entire
+// `wait`/`short_scoreboard`-heavy chain the stats pass (and every prior
+// kernel in this family) still has to carry. Its per-tile critical path
+// collapses to QK^T -> elementwise `exp(s*scale - m_final)` (no cross-lane
+// reduction at all, since `m_final` is a precomputed constant for the row,
+// not something this tile's warp has to help compute) -> PV-MMA. Real
+// register pressure is unchanged (`qa[]`+`o[]`, same as `ws4`), so this
+// kernel is not expected to gain occupancy -- the bet is that a
+// structurally shorter dependency chain raises Compute Throughput on its
+// own, the same shape of result FA2's own kernel already shows (worse
+// occupancy than this kernel family, far higher Compute Throughput).
+//
+// Real, deliberately accepted costs, none free: QK^T computed twice across
+// the two kernels; K re-fetched from L2/HBM a second time; a small
+// `(m, l)` scratch buffer (`run_tokens * n_heads * 2` floats, not the full
+// matrix) allocated, written, and read; two kernel launches per attention
+// layer instead of one (once per layer, not once per K-tile -- negligible
+// against real compute time). Whether the two kernels' combined real time
+// beats the fused fused kernel's is what this exists to measure.
+extern "C" __global__ void attn_prefill_stats_f32(
+    float* __restrict__ ms_out,  // [run_tokens, n_heads, 2] -- (m, l) per row, absolute token index
+    const float* __restrict__ q, const __half* __restrict__ k_cache,
+    const int* __restrict__ seq_of,
+    const int* __restrict__ positions, const int* __restrict__ slot_table,
+    int table_stride, int n_heads, int n_kv_heads, int d_head, int n_slots,
+    float scale, int chunk, int kv_len, int group, int tpw, int run_base,
+    int run_tokens) {
+    const int WKS = 96;
+    const int kv_head = blockIdx.x;
+    const int tile = blockIdx.y;
+    const int c = blockIdx.z;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const bool is_producer = (warp == 0);
+    const int cwarp = warp - 1;  // valid only for consumers
+    const int nwarps = blockDim.x / WARP_SIZE - 1;  // consumer count
+    const int tile_tokens = nwarps * tpw;
+    const int total_threads = blockDim.x;
+
+    const int krow = d_head + ATTN_MMA_KPAD;
+    const int ksteps = d_head / 16;
+    const int quads = d_head / 8;
+
+    // K only -- no `sq`, no V staging.
+    extern __shared__ char attn_stats_smem[];
+    __half* sk0 = (__half*)attn_stats_smem;
+    __half* sk1 = sk0 + (size_t)WKS * krow;
+
+    const int tile_base = run_base + tile * tile_tokens;
+    const int base_last = positions[tile_base];
+    const int* table = slot_table + (size_t)seq_of[tile_base] * table_stride;
+    const __half* kbase = k_cache + (size_t)kv_head * n_slots * d_head;
+    const int tokens_here = min(tile_tokens, run_tokens - tile * tile_tokens);
+    const int last_max = base_last + tokens_here - 1;
+    const int begin = c * chunk;
+    int end = begin + chunk;
+    if (end > kv_len) end = kv_len;
+    if (end > last_max + 1) end = last_max + 1;
+    const int n_blk = end > begin ? (end - begin + WKS - 1) / WKS : 0;
+
+    if (is_producer) {
+        for (int b = 0; b < n_blk; ++b) {
+            const int stage = b & 1;
+            if (b >= 2) {
+                const int bar = (stage == 0) ? ATTN_WS_BAR_FREE0 : ATTN_WS_BAR_FREE1;
+                asm volatile("bar.sync %0, %1;" ::"r"(bar), "r"(total_threads) : "memory");
+            }
+            __half* skb = (stage == 0) ? sk0 : sk1;
+            const int base = begin + b * WKS;
+            const int n = min(WKS, end - base);
+            for (int e = lane; e < WKS * quads; e += WARP_SIZE) {
+                const int r = e / quads, w8 = e % quads;
+                const bool hit = r < n;
+                const size_t off = (size_t)table[base + (hit ? r : 0)] * d_head + w8 * 8;
+                cp_async16(skb + r * krow + w8 * 8, kbase + off, hit);
+            }
+            CP_ASYNC_FENCE();
+            CP_ASYNC_WAIT(0);
+            const int bar = (stage == 0) ? ATTN_WS_BAR_READY0 : ATTN_WS_BAR_READY1;
+            asm volatile("bar.arrive %0, %1;" ::"r"(bar), "r"(total_threads) : "memory");
+        }
+        return;
+    }
+
+    // Consumer: register-direct Q load, same as `attn_prefill_mma_ws4_f32`'s.
+    const int local0 = cwarp * tpw;
+    const int ar = mma_a_row(lane);
+    const int bc = mma_b_col(lane);
+    const int k0 = mma_k0_f16(lane);
+    const int cr = mma_c_row(lane);
+    const int cc = mma_c_col(lane);
+
+    int j_lo = ar / group;
+    const bool live_lo = ar < tpw * group && local0 + j_lo < run_tokens;
+    const int token_lo = run_base + tile * tile_tokens + local0 + j_lo;
+    const int head_lo = kv_head * group + ar % group;
+    const float* q_lo = live_lo ? q + ((size_t)token_lo * n_heads + head_lo) * d_head : nullptr;
+
+    const int ar_hi = ar + 8;
+    int j_hi = ar_hi / group;
+    const bool live_hi = ar_hi < tpw * group && local0 + j_hi < run_tokens;
+    const int token_hi = run_base + tile * tile_tokens + local0 + j_hi;
+    const int head_hi = kv_head * group + ar_hi % group;
+    const float* q_hi = live_hi ? q + ((size_t)token_hi * n_heads + head_hi) * d_head : nullptr;
+
+    mma_a_f16 qa[ATTN_MMA_MAX_KSTEPS];
+#pragma unroll
+    for (int t = 0; t < ATTN_MMA_MAX_KSTEPS; ++t) {
+        if (t >= ksteps) break;
+        const int d0 = t * 16 + k0;
+        const __half2 lo0 = __floats2half2_rn(live_lo ? q_lo[d0] : 0.0f, live_lo ? q_lo[d0 + 1] : 0.0f);
+        const __half2 hi0 = __floats2half2_rn(live_hi ? q_hi[d0] : 0.0f, live_hi ? q_hi[d0 + 1] : 0.0f);
+        const __half2 lo1 = __floats2half2_rn(live_lo ? q_lo[d0 + 8] : 0.0f, live_lo ? q_lo[d0 + 9] : 0.0f);
+        const __half2 hi1 = __floats2half2_rn(live_hi ? q_hi[d0 + 8] : 0.0f, live_hi ? q_hi[d0 + 9] : 0.0f);
+        qa[t].x[0] = *(const unsigned*)(const void*)&lo0;
+        qa[t].x[1] = *(const unsigned*)(const void*)&hi0;
+        qa[t].x[2] = *(const unsigned*)(const void*)&lo1;
+        qa[t].x[3] = *(const unsigned*)(const void*)&hi1;
+    }
+
+    float m_run[2] = {-INFINITY, -INFINITY};
+    float l_run[2] = {0.0f, 0.0f};
+    int row_j[2], row_last[2];
+    bool row_live[2];
+#pragma unroll
+    for (int rg = 0; rg < 2; ++rg) {
+        const int abs_row = cr + rg * 8;
+        row_j[rg] = abs_row / group;
+        row_last[rg] = base_last + local0 + row_j[rg];
+        row_live[rg] = abs_row < tpw * group && local0 + row_j[rg] < tokens_here;
+    }
+    for (int b = 0; b < n_blk; ++b) {
+        const int stage = b & 1;
+        const int rbar = (stage == 0) ? ATTN_WS_BAR_READY0 : ATTN_WS_BAR_READY1;
+        asm volatile("bar.sync %0, %1;" ::"r"(rbar), "r"(total_threads) : "memory");
+
+        __half* skb = (stage == 0) ? sk0 : sk1;
+        const int base = begin + b * WKS;
+        const int n = min(WKS, end - base);
+
+        // Twelve 8-key QK^T sub-tiles (WKS/8).
+        mma_c_f32 s2[12];
+#pragma unroll
+        for (int nt = 0; nt < 12; ++nt) {
+            s2[nt].x[0] = 0.0f;
+            s2[nt].x[1] = 0.0f;
+            s2[nt].x[2] = 0.0f;
+            s2[nt].x[3] = 0.0f;
+            const int key0 = nt * 8;
+#pragma unroll
+            for (int t = 0; t < ATTN_MMA_MAX_KSTEPS; ++t) {
+                if (t >= ksteps) break;
+                mma_b_f16 b_;
+                const __half* bp = skb + (key0 + bc) * krow + t * 16 + k0;
+                b_.x[0] = *(const unsigned*)(const void*)bp;
+                b_.x[1] = *(const unsigned*)(const void*)(bp + 8);
+                mma_f16(s2[nt], qa[t], b_);
+            }
+        }
+
+        float sv_score[48];
+        bool sv_live[48];
+#pragma unroll
+        for (int rg = 0; rg < 2; ++rg) {
+#pragma unroll
+            for (int nt = 0; nt < 12; ++nt) {
+#pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    const int key = nt * 8 + cc + e;
+                    const int abs_key = base + key;
+                    const bool live = row_live[rg] && key < n && abs_key <= row_last[rg];
+                    sv_live[rg * 24 + nt * 2 + e] = live;
+                    sv_score[rg * 24 + nt * 2 + e] = live ? s2[nt].x[rg * 2 + e] * scale : -INFINITY;
+                }
+            }
+        }
+
+        // No `p[]`, no `o[]` -- only the running max/sum this pass exists
+        // to produce. Masking tracked as an explicit `bool`, not a
+        // `== -INFINITY` float comparison against a sentinel -- see
+        // [[feedback-verify-surprising-benchmarks]]'s sibling discipline:
+        // this kernel (no `o[]`, unusually low register count under this
+        // GPU's compiler) is different enough from its proven siblings that
+        // a pattern proven safe there was worth hardening here rather than
+        // assumed identical.
+#pragma unroll
+        for (int rg = 0; rg < 2; ++rg) {
+            float* svr = sv_score + rg * 24;
+            bool* live = sv_live + rg * 24;
+            float m_own = svr[0];
+#pragma unroll
+            for (int i = 1; i < 24; ++i) m_own = fmaxf(m_own, svr[i]);
+            m_own = fmaxf(m_own, __shfl_xor_sync(0xffffffff, m_own, 1, WARP_SIZE));
+            m_own = fmaxf(m_own, __shfl_xor_sync(0xffffffff, m_own, 2, WARP_SIZE));
+            const float m_new = fmaxf(m_run[rg], m_own);
+            float psum = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 24; ++i) {
+                psum += live[i] ? __expf(svr[i] - m_new) : 0.0f;
+            }
+            psum += __shfl_xor_sync(0xffffffff, psum, 1, WARP_SIZE);
+            psum += __shfl_xor_sync(0xffffffff, psum, 2, WARP_SIZE);
+
+            const float corr =
+                (m_run[rg] == -INFINITY) ? 0.0f : __expf(m_run[rg] - m_new);
+            l_run[rg] = l_run[rg] * corr + psum;
+            m_run[rg] = m_new;
+        }
+
+        const int fbar = (stage == 0) ? ATTN_WS_BAR_FREE0 : ATTN_WS_BAR_FREE1;
+        asm volatile("bar.arrive %0, %1;" ::"r"(fbar), "r"(total_threads) : "memory");
+    }
+
+    // One lane per row writes this chunk's partial (m, l) -- `cc == 0` picks
+    // exactly one of the four lanes sharing this row's already-identical
+    // reduced value (see the doc comment above for why all four agree).
+    // Indexed relative to `run_base` (not the absolute token) and by chunk
+    // `c`, so the caller needs a `n_chunks * run_tokens`-sized scratch
+    // buffer -- `attn_ms_reduce_f32` merges chunks afterward, the same
+    // online-softmax merge `attn_flash_reduce_f32` already does inline for
+    // the fused kernels' single-launch multi-chunk case.
+    if (cc == 0) {
+#pragma unroll
+        for (int rg = 0; rg < 2; ++rg) {
+            if (!row_live[rg]) continue;
+            const int abs_row = cr + rg * 8;
+            const int local_token = tile * tile_tokens + local0 + row_j[rg];
+            const int head = kv_head * group + abs_row % group;
+            float* dst = ms_out + (((size_t)c * run_tokens + local_token) * n_heads + head) * 2;
+            dst[0] = m_run[rg];
+            dst[1] = l_run[rg];
+        }
+    }
+}
+
+// Second half of the option-3 split (see `attn_prefill_stats_f32`'s doc
+// comment just above for the full design). Reads that kernel's exact
+// `(m_final, l_final)` per row instead of tracking softmax state itself, so
+// its per-tile critical path has no cross-lane reduction and no `o[]`
+// rescale at all: QK^T -> elementwise `exp(s*scale - m_final)` -> PV-MMA.
+extern "C" __global__ void attn_prefill_pv_f32(
+    float* __restrict__ out, float* __restrict__ partial_out, int single,
+    const float* __restrict__ ms_in,
+    const float* __restrict__ q, const __half* __restrict__ k_cache,
+    const __half* __restrict__ v_cache, const int* __restrict__ seq_of,
+    const int* __restrict__ positions, const int* __restrict__ slot_table,
+    int table_stride, int n_heads, int n_kv_heads, int d_head, int n_slots,
+    float scale, int chunk, int kv_len, int group, int tpw, int run_base,
+    int run_tokens) {
+    const int WKP = 48;
+    const int kv_head = blockIdx.x;
+    const int tile = blockIdx.y;
+    const int c = blockIdx.z;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const bool is_producer = (warp == 0);
+    const int cwarp = warp - 1;
+    const int nwarps = blockDim.x / WARP_SIZE - 1;
+    const int tile_tokens = nwarps * tpw;
+    const int total_threads = blockDim.x;
+
+    const int krow = d_head + ATTN_MMA_KPAD;
+    const int ksteps = d_head / 16;
+    const int ntiles = d_head / 8;
+    const int quads = d_head / 8;
+
+    extern __shared__ char attn_pv_smem[];
+    __half* sk0 = (__half*)attn_pv_smem;
+    __half* sk1 = sk0 + (size_t)WKP * krow;
+    __half* sv0 = sk1 + (size_t)WKP * krow;
+    __half* sv1 = sv0 + (size_t)WKP * krow;
+
+    const int tile_base = run_base + tile * tile_tokens;
+    const int base_last = positions[tile_base];
+    const int* table = slot_table + (size_t)seq_of[tile_base] * table_stride;
+    const __half* kbase = k_cache + (size_t)kv_head * n_slots * d_head;
+    const __half* vbase = v_cache + (size_t)kv_head * n_slots * d_head;
+    const int tokens_here = min(tile_tokens, run_tokens - tile * tile_tokens);
+    const int last_max = base_last + tokens_here - 1;
+    const int begin = c * chunk;
+    int end = begin + chunk;
+    if (end > kv_len) end = kv_len;
+    if (end > last_max + 1) end = last_max + 1;
+    const int n_blk = end > begin ? (end - begin + WKP - 1) / WKP : 0;
+
+    if (is_producer) {
+        for (int b = 0; b < n_blk; ++b) {
+            const int stage = b & 1;
+            if (b >= 2) {
+                const int bar = (stage == 0) ? ATTN_WS_BAR_FREE0 : ATTN_WS_BAR_FREE1;
+                asm volatile("bar.sync %0, %1;" ::"r"(bar), "r"(total_threads) : "memory");
+            }
+            __half* skb = (stage == 0) ? sk0 : sk1;
+            __half* svb = (stage == 0) ? sv0 : sv1;
+            const int base = begin + b * WKP;
+            const int n = min(WKP, end - base);
+            for (int e = lane; e < WKP * quads; e += WARP_SIZE) {
+                const int r = e / quads, w8 = e % quads;
+                const bool hit = r < n;
+                const size_t off = (size_t)table[base + (hit ? r : 0)] * d_head + w8 * 8;
+                cp_async16(skb + r * krow + w8 * 8, kbase + off, hit);
+                cp_async16(svb + r * krow + w8 * 8, vbase + off, hit);
+            }
+            CP_ASYNC_FENCE();
+            CP_ASYNC_WAIT(0);
+            const int bar = (stage == 0) ? ATTN_WS_BAR_READY0 : ATTN_WS_BAR_READY1;
+            asm volatile("bar.arrive %0, %1;" ::"r"(bar), "r"(total_threads) : "memory");
+        }
+        return;
+    }
+
+    const int local0 = cwarp * tpw;
+    const int ar = mma_a_row(lane);
+    const int bc = mma_b_col(lane);
+    const int k0 = mma_k0_f16(lane);
+    const int cr = mma_c_row(lane);
+    const int cc = mma_c_col(lane);
+
+    int j_lo = ar / group;
+    const bool live_lo = ar < tpw * group && local0 + j_lo < run_tokens;
+    const int token_lo = run_base + tile * tile_tokens + local0 + j_lo;
+    const int head_lo = kv_head * group + ar % group;
+    const float* q_lo = live_lo ? q + ((size_t)token_lo * n_heads + head_lo) * d_head : nullptr;
+
+    const int ar_hi = ar + 8;
+    int j_hi = ar_hi / group;
+    const bool live_hi = ar_hi < tpw * group && local0 + j_hi < run_tokens;
+    const int token_hi = run_base + tile * tile_tokens + local0 + j_hi;
+    const int head_hi = kv_head * group + ar_hi % group;
+    const float* q_hi = live_hi ? q + ((size_t)token_hi * n_heads + head_hi) * d_head : nullptr;
+
+    mma_a_f16 qa[ATTN_MMA_MAX_KSTEPS];
+#pragma unroll
+    for (int t = 0; t < ATTN_MMA_MAX_KSTEPS; ++t) {
+        if (t >= ksteps) break;
+        const int d0 = t * 16 + k0;
+        const __half2 lo0 = __floats2half2_rn(live_lo ? q_lo[d0] : 0.0f, live_lo ? q_lo[d0 + 1] : 0.0f);
+        const __half2 hi0 = __floats2half2_rn(live_hi ? q_hi[d0] : 0.0f, live_hi ? q_hi[d0 + 1] : 0.0f);
+        const __half2 lo1 = __floats2half2_rn(live_lo ? q_lo[d0 + 8] : 0.0f, live_lo ? q_lo[d0 + 9] : 0.0f);
+        const __half2 hi1 = __floats2half2_rn(live_hi ? q_hi[d0 + 8] : 0.0f, live_hi ? q_hi[d0 + 9] : 0.0f);
+        qa[t].x[0] = *(const unsigned*)(const void*)&lo0;
+        qa[t].x[1] = *(const unsigned*)(const void*)&hi0;
+        qa[t].x[2] = *(const unsigned*)(const void*)&lo1;
+        qa[t].x[3] = *(const unsigned*)(const void*)&hi1;
+    }
+
+    mma_c_f32 o[ATTN_MMA_MAX_NTILES];
+#pragma unroll
+    for (int i = 0; i < ATTN_MMA_MAX_NTILES; ++i) {
+        o[i].x[0] = 0.0f;
+        o[i].x[1] = 0.0f;
+        o[i].x[2] = 0.0f;
+        o[i].x[3] = 0.0f;
+    }
+    int row_j[2], row_last[2];
+    bool row_live[2];
+    // The stats pass's exact (m, l) for this warp's two rows -- read once,
+    // used as plain constants for every K-tile below. No running state.
+    float m_final[2], l_final[2];
+#pragma unroll
+    for (int rg = 0; rg < 2; ++rg) {
+        const int abs_row = cr + rg * 8;
+        row_j[rg] = abs_row / group;
+        row_last[rg] = base_last + local0 + row_j[rg];
+        row_live[rg] = abs_row < tpw * group && local0 + row_j[rg] < tokens_here;
+        m_final[rg] = 0.0f;
+        l_final[rg] = 0.0f;
+        if (row_live[rg]) {
+            // Relative to `run_base` -- matches `attn_prefill_stats_f32`'s
+            // own write indexing (see its doc comment).
+            const int local_token = tile * tile_tokens + local0 + row_j[rg];
+            const int head = kv_head * group + abs_row % group;
+            const float* src = ms_in + ((size_t)local_token * n_heads + head) * 2;
+            m_final[rg] = src[0];
+            l_final[rg] = src[1];
+        }
+    }
+
+    for (int b = 0; b < n_blk; ++b) {
+        const int stage = b & 1;
+        const int rbar = (stage == 0) ? ATTN_WS_BAR_READY0 : ATTN_WS_BAR_READY1;
+        asm volatile("bar.sync %0, %1;" ::"r"(rbar), "r"(total_threads) : "memory");
+
+        __half* skb = (stage == 0) ? sk0 : sk1;
+        __half* svb = (stage == 0) ? sv0 : sv1;
+        const int base = begin + b * WKP;
+        const int n = min(WKP, end - base);
+
+        mma_c_f32 s2[6];
+#pragma unroll
+        for (int nt = 0; nt < 6; ++nt) {
+            s2[nt].x[0] = 0.0f;
+            s2[nt].x[1] = 0.0f;
+            s2[nt].x[2] = 0.0f;
+            s2[nt].x[3] = 0.0f;
+            const int key0 = nt * 8;
+#pragma unroll
+            for (int t = 0; t < ATTN_MMA_MAX_KSTEPS; ++t) {
+                if (t >= ksteps) break;
+                mma_b_f16 b_;
+                const __half* bp = skb + (key0 + bc) * krow + t * 16 + k0;
+                b_.x[0] = *(const unsigned*)(const void*)bp;
+                b_.x[1] = *(const unsigned*)(const void*)(bp + 8);
+                mma_f16(s2[nt], qa[t], b_);
+            }
+        }
+
+        // No shuffle reduction anywhere in this loop: `m_final` is already
+        // the true row max, so `pflat` is exact on the first and only pass,
+        // and no running correction of `o[]` is ever needed.
+        float pflat[24];
+#pragma unroll
+        for (int rg = 0; rg < 2; ++rg) {
+#pragma unroll
+            for (int nt = 0; nt < 6; ++nt) {
+#pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    const int key = nt * 8 + cc + e;
+                    const int abs_key = base + key;
+                    const bool live = row_live[rg] && key < n && abs_key <= row_last[rg];
+                    const float s = live ? s2[nt].x[rg * 2 + e] * scale : -INFINITY;
+                    pflat[rg * 12 + nt * 2 + e] = (s == -INFINITY) ? 0.0f : __expf(s - m_final[rg]);
+                }
+            }
+        }
+
+#pragma unroll
+        for (int kg = 0; kg < 3; ++kg) {
+            const int nt_lo = kg * 2, nt_hi = kg * 2 + 1;
+            mma_a_f16 pa;
+            const __half2 p_rg0_lo = __floats2half2_rn(pflat[nt_lo * 2], pflat[nt_lo * 2 + 1]);
+            const __half2 p_rg1_lo = __floats2half2_rn(pflat[12 + nt_lo * 2], pflat[12 + nt_lo * 2 + 1]);
+            const __half2 p_rg0_hi = __floats2half2_rn(pflat[nt_hi * 2], pflat[nt_hi * 2 + 1]);
+            const __half2 p_rg1_hi = __floats2half2_rn(pflat[12 + nt_hi * 2], pflat[12 + nt_hi * 2 + 1]);
+            pa.x[0] = *(const unsigned*)(const void*)&p_rg0_lo;
+            pa.x[1] = *(const unsigned*)(const void*)&p_rg1_lo;
+            pa.x[2] = *(const unsigned*)(const void*)&p_rg0_hi;
+            pa.x[3] = *(const unsigned*)(const void*)&p_rg1_hi;
+            const int row0 = kg * 16;
+#pragma unroll
+            for (int i = 0; i < ATTN_MMA_MAX_NTILES; ++i) {
+                if (i >= ntiles) break;
+                const int dim = i * 8 + bc;
+                mma_b_f16 b_;
+                b_.x[0] = attn_pack_half2(svb + (row0 + k0) * krow + dim, svb + (row0 + k0 + 1) * krow + dim);
+                b_.x[1] = attn_pack_half2(svb + (row0 + k0 + 8) * krow + dim, svb + (row0 + k0 + 9) * krow + dim);
+                mma_f16(o[i], pa, b_);
+            }
+        }
+
+        const int fbar = (stage == 0) ? ATTN_WS_BAR_FREE0 : ATTN_WS_BAR_FREE1;
+        asm volatile("bar.arrive %0, %1;" ::"r"(fbar), "r"(total_threads) : "memory");
+    }
+
+    // Single chunk: straight scattered write, normalized by `l_final`. Multi
+    // chunk: each chunk's contribution is *already* an exact fraction of the
+    // true total (its scores were computed against the true global
+    // `m_final`/`l_final`, not a per-chunk running approximation the way the
+    // fused kernels' chunks are) -- so writing `v/den` per chunk here and
+    // summing across chunks in `attn_pv_sum_reduce_f32` is exactly the true
+    // output, no `exp(chunk_m - global_m)` reweighting step needed the way
+    // `attn_flash_reduce_f32` needs one for the fused path.
+#pragma unroll
+    for (int rg = 0; rg < 2; ++rg) {
+        if (!row_live[rg]) continue;
+        const int abs_row = cr + rg * 8;
+        const int local_token = tile * tile_tokens + local0 + row_j[rg];
+        const int token = run_base + local_token;
+        const int head = kv_head * group + abs_row % group;
+        const float den = l_final[rg];
+        float* dst = single
+            ? out + ((size_t)token * n_heads + head) * d_head
+            : partial_out + (((size_t)c * run_tokens + local_token) * n_heads + head) * d_head;
+#pragma unroll
+        for (int i = 0; i < ATTN_MMA_MAX_NTILES; ++i) {
+            if (i >= ntiles) break;
+            const int d0 = i * 8 + cc;
+            const float v0 = o[i].x[rg * 2];
+            const float v1 = o[i].x[rg * 2 + 1];
+            dst[d0] = den > 0.0f ? v0 / den : 0.0f;
+            dst[d0 + 1] = den > 0.0f ? v1 / den : 0.0f;
+        }
+    }
+}
+
+// Sums `attn_prefill_pv_f32`'s per-chunk partial output across chunks --
+// each chunk's partial is already an exact fraction of the true total (see
+// that kernel's own doc comment on its write-out), so this is a plain sum,
+// not a reweighted merge like `attn_flash_reduce_f32`'s.
+extern "C" __global__ void attn_pv_sum_reduce_f32(
+    float* __restrict__ out, const float* __restrict__ partial_out, int n_heads,
+    int d_head, int run_tokens, int n_chunks, int run_base) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = run_tokens * n_heads * d_head;
+    if (i >= total) return;
+    const int local_token = i / (d_head * n_heads);
+    const int rest = i % (d_head * n_heads);
+    float acc = 0.0f;
+    for (int c = 0; c < n_chunks; ++c) {
+        acc += partial_out[(size_t)c * total + i];
+    }
+    const int token = run_base + local_token;
+    const int head = rest / d_head;
+    const int d = rest % d_head;
+    out[((size_t)token * n_heads + head) * d_head + d] = acc;
+}
+
+// Merges `attn_prefill_stats_f32`'s per-chunk partial `(m, l)` into the
+// exact global `(m, l)` `attn_prefill_pv_f32` needs -- one thread per
+// `(token, head)`. Standard online-softmax merge (max first, then a
+// correction-weighted sum), the same shape `attn_flash_reduce_f32` already
+// does inline for the fused kernels, pulled out on its own here since the
+// stats and PV passes are two separate launches with nothing else between
+// them to do this merge as a side effect of.
+extern "C" __global__ void attn_ms_reduce_f32(
+    float* __restrict__ ms_final, const float* __restrict__ ms_partial,
+    int n_heads, int run_tokens, int n_chunks) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = run_tokens * n_heads;
+    if (i >= total) return;
+    float m = -INFINITY;
+    for (int c = 0; c < n_chunks; ++c) {
+        m = fmaxf(m, ms_partial[((size_t)c * total + i) * 2]);
+    }
+    if (m == -INFINITY) {
+        ms_final[i * 2] = -INFINITY;
+        ms_final[i * 2 + 1] = 0.0f;
+        return;
+    }
+    float l = 0.0f;
+    for (int c = 0; c < n_chunks; ++c) {
+        const float* ms = ms_partial + ((size_t)c * total + i) * 2;
+        if (ms[0] == -INFINITY) continue;
+        l += ms[1] * __expf(ms[0] - m);
+    }
+    ms_final[i * 2] = m;
+    ms_final[i * 2 + 1] = l;
+}
+
 // Isolated validation of a *second* producer/consumer handoff, this time
 // between two consumer warps sharing one query-row group rather than
 // between the K/V-staging warp and the consumers -- built while considering

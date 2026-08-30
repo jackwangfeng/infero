@@ -1968,6 +1968,16 @@ impl Kernels {
         32 * n_heads * n_tokens * (d_head + 2)
     }
 
+    /// Floats of scratch `attn_prefill_split` needs for `(m, l)`: up to 32
+    /// chunks' worth of per-chunk partials (same 32-chunk cap
+    /// `attn_partial_floats` and `Self::prefill_chunks` already use) plus one
+    /// slot for the merged result `attn_ms_reduce_f32` writes, run-relative
+    /// (not absolute-token) indexed, matching `attn_partial_floats`' own
+    /// convention.
+    pub fn attn_ms_floats(n_heads: usize, run_tokens: usize) -> usize {
+        33 * n_heads * run_tokens * 2
+    }
+
     /// How the fused attention kernel would split this shape, and `None` when
     /// it declines the work.
     ///
@@ -3403,6 +3413,203 @@ impl Kernels {
                 unsafe { rb2.launch(elementwise(total)) }.context("attn_prefill_reduce")?;
                 Ok(())
             })?;
+        Ok(())
+    }
+
+    /// Option 3's two-kernel split (see `attn_prefill_stats_f32`'s doc
+    /// comment in `ops.cu` for the full design and reasoning). Runs the
+    /// stats pass (`attn_prefill_stats_f32`: QK^T + exact online-softmax
+    /// `(m, l)`, no `V`, no `o[]`, a 96-key tile) into `ms_scratch`'s
+    /// per-chunk region, reduces chunks with `attn_ms_reduce_f32`, then runs
+    /// the PV pass (`attn_prefill_pv_f32`: recomputes QK^T against the
+    /// now-exact `(m, l)`, no running softmax state, a 48-key tile) into
+    /// `out` directly (single chunk) or `partial`'s per-chunk region
+    /// followed by `attn_pv_sum_reduce_f32` (multiple chunks).
+    ///
+    /// Real chunking now (`Self::prefill_chunks`, the same heuristic every
+    /// other prefill kernel here uses) instead of the single-mega-chunk
+    /// workaround this function used before the cross-chunk reduce kernels
+    /// existed -- that workaround gave up grid.z parallelism entirely,
+    /// confounding this path's own real cost with an avoidable one.
+    ///
+    /// Both kernels use the *same* `NWARPS` (hence the same `tile_tokens`
+    /// and grid shape) deliberately: `ms_scratch`/`partial` are indexed
+    /// relative to `run_base` by `tile * tile_tokens + local0 + row_j`, and
+    /// that only names the same token in both kernels if their tiling
+    /// agrees. Do not give them different `NWARPS` without also changing the
+    /// indexing to something tile-shape-independent.
+    pub fn attn_prefill_split(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        q: &View<'_, f32>,
+        k_cache: &View<'_, f16>,
+        v_cache: &View<'_, f16>,
+        batch: BatchLayout<'_>,
+        dims: AttnDims,
+        run_base: usize,
+        run_tokens: usize,
+        kv_len: usize,
+        scale: f32,
+        ms_scratch: &mut ViewMut<'_, f32>,
+        partial: &mut ViewMut<'_, f32>,
+    ) -> Result<()> {
+        anyhow::ensure!(self.prefill_attention(&dims), "attn_prefill_split: unsupported shape");
+        anyhow::ensure!(run_tokens >= 1, "attn_prefill_split: empty run");
+        let group = dims.n_heads / dims.n_kv_heads;
+        let tpw = (16 / group).max(1);
+        const NWARPS: usize = 7;
+        const KPAD: usize = 8;
+        let tile_tokens = NWARPS * tpw;
+        let n_tiles = run_tokens.div_ceil(tile_tokens);
+        let (n_chunks, chunk) = self.prefill_chunks(dims.n_kv_heads, n_tiles, kv_len);
+        anyhow::ensure!(
+            n_chunks <= 32,
+            "attn_prefill_split: {n_chunks} chunks past the scratch buffers' 32"
+        );
+
+        let (stride, h, kh, dh, ns, ck, kl, gi, tp, rb, rt) = (
+            batch.table_stride as i32,
+            dims.n_heads as i32,
+            dims.n_kv_heads as i32,
+            dims.d_head as i32,
+            dims.n_slots as i32,
+            chunk as i32,
+            kv_len as i32,
+            group as i32,
+            tpw as i32,
+            run_base as i32,
+            run_tokens as i32,
+        );
+        let grid_dim = (dims.n_kv_heads as u32, n_tiles as u32, n_chunks);
+        let block_dim = ((NWARPS + 1) as u32 * 32, 1, 1);
+        let ms_partial_len = (n_chunks as usize) * dims.n_heads * run_tokens * 2;
+        let ms_total_len = 33 * dims.n_heads * run_tokens * 2;
+
+        // Stats pass: K only, no `sq`, 96-key tile. Writes chunk-indexed
+        // partials into the front of `ms_scratch`.
+        {
+            const WKS: usize = 96;
+            let f = self.dev.kernels().get("infero_ops", ops_src(), "attn_prefill_stats_f32")?;
+            let shared = (2 * WKS * (dims.d_head + KPAD) * 2) as u32;
+            if shared > 48 * 1024 {
+                infero_gpu::set_max_dynamic_shared(&f, shared)?;
+            }
+            let mut ms_partial = ms_scratch.slice_mut(0..ms_partial_len);
+            let mut b = self.dev.stream().launch_builder(&f);
+            b.arg(&mut ms_partial)
+                .arg(q)
+                .arg(k_cache)
+                .arg(batch.seq_of)
+                .arg(batch.positions)
+                .arg(batch.slot_table)
+                .arg(&stride)
+                .arg(&h)
+                .arg(&kh)
+                .arg(&dh)
+                .arg(&ns)
+                .arg(&scale)
+                .arg(&ck)
+                .arg(&kl)
+                .arg(&gi)
+                .arg(&tp)
+                .arg(&rb)
+                .arg(&rt);
+            let cfg = LaunchConfig { grid_dim, block_dim, shared_mem_bytes: shared };
+            self.dev
+                .profile()
+                .time("attn_prefill_stats", self.dev.stream(), || {
+                    unsafe { b.launch(cfg) }.context("attn_prefill_stats")?;
+                    Ok(())
+                })?;
+        }
+
+        // Merge chunk partials into the exact global (m, l), stored right
+        // after the partial region so both live in one caller-owned buffer.
+        {
+            let total = (run_tokens * dims.n_heads) as u32;
+            let (rh, rt2, nc) = (h, run_tokens as i32, n_chunks as i32);
+            // `split_at_mut`, not two separate `slice`/`slice_mut` calls: the
+            // borrow checker can't otherwise see that the two ranges are
+            // disjoint within one `&mut ViewMut`. The caller's buffer is
+            // sized exactly `attn_ms_floats` (`ms_total_len`), so the second
+            // half is already exactly the final-slot region.
+            let (ms_partial, mut ms_final) = ms_scratch.split_at_mut(ms_partial_len);
+            let ms_partial = ms_partial.as_view();
+            let f = self.dev.kernels().get("infero_ops", ops_src(), "attn_ms_reduce_f32")?;
+            let mut b = self.dev.stream().launch_builder(&f);
+            b.arg(&mut ms_final).arg(&ms_partial).arg(&rh).arg(&rt2).arg(&nc);
+            self.dev
+                .profile()
+                .time("attn_ms_reduce", self.dev.stream(), || {
+                    unsafe { b.launch(elementwise(total)) }.context("attn_ms_reduce")?;
+                    Ok(())
+                })?;
+        }
+
+        // PV pass: K and V, 48-key tile, no running softmax state. Single
+        // chunk writes `out` directly; multiple chunks write `partial`'s
+        // per-chunk region for `attn_pv_sum_reduce_f32` below.
+        let single = i32::from(n_chunks == 1);
+        {
+            const WKP: usize = 48;
+            let f = self.dev.kernels().get("infero_ops", ops_src(), "attn_prefill_pv_f32")?;
+            let shared = (4 * WKP * (dims.d_head + KPAD) * 2) as u32;
+            if shared > 48 * 1024 {
+                infero_gpu::set_max_dynamic_shared(&f, shared)?;
+            }
+            let ms_final = ms_scratch.slice(ms_partial_len..ms_total_len);
+            let mut b = self.dev.stream().launch_builder(&f);
+            b.arg(&mut *out)
+                .arg(&mut *partial)
+                .arg(&single)
+                .arg(&ms_final)
+                .arg(q)
+                .arg(k_cache)
+                .arg(v_cache)
+                .arg(batch.seq_of)
+                .arg(batch.positions)
+                .arg(batch.slot_table)
+                .arg(&stride)
+                .arg(&h)
+                .arg(&kh)
+                .arg(&dh)
+                .arg(&ns)
+                .arg(&scale)
+                .arg(&ck)
+                .arg(&kl)
+                .arg(&gi)
+                .arg(&tp)
+                .arg(&rb)
+                .arg(&rt);
+            let cfg = LaunchConfig { grid_dim, block_dim, shared_mem_bytes: shared };
+            self.dev
+                .profile()
+                .time("attn_prefill_pv", self.dev.stream(), || {
+                    unsafe { b.launch(cfg) }.context("attn_prefill_pv")?;
+                    Ok(())
+                })?;
+        }
+        if single == 1 {
+            return Ok(());
+        }
+
+        {
+            let total = (run_tokens * dims.n_heads * dims.d_head) as u32;
+            let (nt, nc) = (run_tokens as i32, n_chunks as i32);
+            let out_off = run_base * dims.n_heads * dims.d_head;
+            let run_elems = run_tokens * dims.n_heads * dims.d_head;
+            let mut out_run = out.slice_mut(out_off..out_off + run_elems);
+            let part = partial.as_view();
+            let f = self.dev.kernels().get("infero_ops", ops_src(), "attn_pv_sum_reduce_f32")?;
+            let mut b = self.dev.stream().launch_builder(&f);
+            b.arg(&mut out_run).arg(&part).arg(&h).arg(&dh).arg(&nt).arg(&nc).arg(&0i32);
+            self.dev
+                .profile()
+                .time("attn_pv_sum_reduce", self.dev.stream(), || {
+                    unsafe { b.launch(elementwise(total)) }.context("attn_pv_sum_reduce")?;
+                    Ok(())
+                })?;
+        }
         Ok(())
     }
 

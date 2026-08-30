@@ -62,6 +62,7 @@ fn main() -> Result<()> {
 
     let mut out = stream.alloc_zeros::<f32>(n_tokens * N_HEADS * D_HEAD)?;
     let mut part = stream.alloc_zeros::<f32>(Kernels::attn_partial_floats(N_HEADS, D_HEAD, BATCH_TOKENS))?;
+    let mut ms = stream.alloc_zeros::<f32>(Kernels::attn_ms_floats(N_HEADS, BATCH_TOKENS))?;
 
     let run_one = |variant: u32, out: &mut infero_gpu::Buf<f32>, part: &mut infero_gpu::Buf<f32>| -> Result<f64> {
         k.device().synchronize()?;
@@ -104,16 +105,38 @@ fn main() -> Result<()> {
         Ok(t0.elapsed().as_secs_f64() * 1000.0)
     };
 
+    let run_split = |out: &mut infero_gpu::Buf<f32>, ms: &mut infero_gpu::Buf<f32>, part: &mut infero_gpu::Buf<f32>| -> Result<f64> {
+        k.device().synchronize()?;
+        let t0 = std::time::Instant::now();
+        for _layer in 0..N_LAYERS {
+            let mut base = 0usize;
+            while base < TOTAL_TOKENS {
+                let run_tokens = BATCH_TOKENS.min(TOTAL_TOKENS - base);
+                let kv_len = base + run_tokens;
+                k.attn_prefill_split(
+                    &mut out.as_view_mut(), &dq.as_view(), &dk.as_view(), &dv.as_view(),
+                    batch, dims, base, run_tokens, kv_len, scale, &mut ms.as_view_mut(), &mut part.as_view_mut(),
+                )?;
+                base += run_tokens;
+            }
+        }
+        k.device().synchronize()?;
+        Ok(t0.elapsed().as_secs_f64() * 1000.0)
+    };
+
     // Warmup all six, then take the best of a few timed reps each.
     for v in 0..6 {
         run_one(v, &mut out, &mut part)?;
     }
+    run_split(&mut out, &mut ms, &mut part)?;
 
     let mut best = [f64::MAX; 6];
+    let mut best_split = f64::MAX;
     for _ in 0..3 {
         for v in 0..6u32 {
             best[v as usize] = best[v as usize].min(run_one(v, &mut out, &mut part)?);
         }
+        best_split = best_split.min(run_split(&mut out, &mut ms, &mut part)?);
     }
     println!("attn_prefill (mma)  best: {:.2} ms total ({N_LAYERS} layers x {TOTAL_TOKENS} tokens)", best[0]);
     println!("attn_prefill_pipe   best: {:.2} ms total, {:.3}x", best[1], best[0] / best[1]);
@@ -121,5 +144,6 @@ fn main() -> Result<()> {
     println!("attn_prefill_pipev  best: {:.2} ms total, {:.3}x", best[3], best[0] / best[3]);
     println!("attn_prefill_ws     best: {:.2} ms total, {:.3}x", best[4], best[0] / best[4]);
     println!("attn_prefill_ws4    best: {:.2} ms total, {:.3}x", best[5], best[0] / best[5]);
+    println!("attn_prefill_split  best: {:.2} ms total, {:.3}x", best_split, best[0] / best_split);
     Ok(())
 }
