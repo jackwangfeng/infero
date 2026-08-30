@@ -1250,3 +1250,159 @@ extern "C" __global__ __launch_bounds__(256) void gdn_chunk_delta_rule_f32(
 #pragma unroll
     for (int r = 0; r < 64; ++r) S[(size_t)(i0 + r) * GDN_DV + j] = sc[r];
 }
+
+// Isolated toy probe -- NOT the real kernel, NOT launched by any real
+// caller. `gdn_delta_rule_reg128_f32`'s own doc history already
+// established this kernel "was never short of parallelism" (256 threads,
+// 8 warps, all resident) -- so unlike `ws4`'s attention family, adding
+// more warps for occupancy is not the lever here. The real lever, traced
+// through the actual per-timestep dependency graph in
+// `gdn_delta_rule_reg_body` above: state(t) has exactly two consumers --
+// timestep t+1's decay step (the true recurrence, must be sequential) and
+// timestep t's own output computation (`o = qᵀS`, a leaf that does NOT
+// feed back into the recurrence at all). Today both consumers run in the
+// SAME threads, back to back, inside the SAME `__syncthreads()`-bounded
+// iteration -- meaning the output computation (a real, non-trivial chunk
+// of per-timestep work, roughly the same size as the state update itself:
+// the same RB-element loop, the same one-shuffle reduction) sits on the
+// critical path for no structural reason. It could instead trail one
+// timestep behind on a SEPARATE physical warp while the state-advancing
+// warp races ahead uninterrupted -- real inter-warp concurrency (like the
+// attention ping-pong probe), but this time on a workload this session's
+// own prior investigation already confirmed is not occupancy-starved, and
+// with a REAL, traced, unconditional (not merely hoped-for) reason the
+// two stages don't depend on each other in the direction that would block
+// this.
+//
+// R=2, ACC=4, RB=64 -- this checkpoint's own `gdn_delta_rule_reg128_f32`
+// shape (`DK_C=DV_C=128`) -- with GCOLS scaled down to 16 (one warp's
+// worth via R=2 partnering) instead of the real kernel's 128, since this
+// probe exists to validate the cross-warp handoff mechanism and its
+// timing, not to reproduce the real kernel's exact memory layout.
+#define GDN_PP_ITERS 4096
+#define GDN_PP_STATE_READY0 1
+#define GDN_PP_STATE_READY1 2
+#define GDN_PP_STATE_FREE0 3
+#define GDN_PP_STATE_FREE1 4
+
+__device__ __forceinline__ float gdn_pp_state_advance(float* sc, const float* kc,
+                                                       const float* qc, float decay,
+                                                       float v, float b, int lane) {
+    float kv[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int r = 0; r < 64; ++r) {
+        sc[r] *= decay;
+        kv[r % 4] += sc[r] * kc[r];
+    }
+#pragma unroll
+    for (int a = 1; a < 4; ++a) kv[0] += kv[a];
+    float kvt = kv[0] + __shfl_xor_sync(0xffffffffu, kv[0], 1);
+    const float delta = (v - kvt) * b;
+#pragma unroll
+    for (int r = 0; r < 64; ++r) sc[r] += kc[r] * delta;
+    (void)lane;
+    return delta;
+}
+
+__device__ __forceinline__ float gdn_pp_output(const float* sc, const float* qc) {
+    float o[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int r = 0; r < 64; ++r) o[r % 4] += sc[r] * qc[r];
+#pragma unroll
+    for (int a = 1; a < 4; ++a) o[0] += o[a];
+    return o[0] + __shfl_xor_sync(0xffffffffu, o[0], 1);
+}
+
+// Sequential reference: one warp, both stages, every iteration -- exactly
+// today's real kernel's own per-timestep order, just without the real
+// memory layout.
+extern "C" __global__ void gdn_pp_sequential_ref(float* __restrict__ out_checksum) {
+    const int lane = threadIdx.x % WARP_SIZE;
+    float sc[64], kc[64], qc[64];
+#pragma unroll
+    for (int r = 0; r < 64; ++r) {
+        sc[r] = 0.0f;
+        kc[r] = 0.01f * ((lane * 64 + r) % 7 - 3);
+        qc[r] = 0.01f * ((lane * 64 + r) % 5 - 2);
+    }
+    float out_sum = 0.0f;
+    for (int n = 0; n < GDN_PP_ITERS; ++n) {
+        const float decay = 0.999f;
+        const float v = 0.1f + 0.001f * (n % 13);
+        const float b = 0.5f;
+        gdn_pp_state_advance(sc, kc, qc, decay, v, b, lane);
+        const float ot = gdn_pp_output(sc, qc);
+        out_sum += ot;
+    }
+    if (lane == 0) out_checksum[0] = out_sum;
+    float s = 0.0f;
+#pragma unroll
+    for (int r = 0; r < 64; ++r) s += sc[r];
+    if (lane == 0) out_checksum[1] = s;
+}
+
+// Pipelined: warp 0 advances state for every timestep, uninterrupted by
+// the other warp at all; warp 1 computes output for timestep n-1 while
+// warp 0 is already on timestep n. Handoff: warp 0 publishes its just-
+// updated `sc[64]` (this thread's own rows) to a double-buffered shared
+// slot; warp 1 reads it and computes output independently.
+extern "C" __global__ void gdn_pp_pipelined_probe(float* __restrict__ out_checksum) {
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    extern __shared__ float gdn_pp_smem[];
+    // [2 stages][32 lanes][64 rows]
+    float* sbuf0 = gdn_pp_smem;
+    float* sbuf1 = gdn_pp_smem + 32 * 64;
+
+    if (warp == 0) {
+        float sc[64], kc[64];
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            sc[r] = 0.0f;
+            kc[r] = 0.01f * ((lane * 64 + r) % 7 - 3);
+        }
+        for (int n = 0; n < GDN_PP_ITERS; ++n) {
+            const int stage = n & 1;
+            if (n >= 2) {
+                const int bar = (stage == 0) ? GDN_PP_STATE_FREE0 : GDN_PP_STATE_FREE1;
+                asm volatile("bar.sync %0, %1;" ::"r"(bar), "r"(64) : "memory");
+            }
+            const float decay = 0.999f;
+            const float v = 0.1f + 0.001f * (n % 13);
+            const float b = 0.5f;
+            // `qc` isn't needed for the state-advance stage at all (see
+            // `gdn_pp_state_advance`) -- only the output stage reads Q.
+            gdn_pp_state_advance(sc, kc, kc, decay, v, b, lane);
+            float* dst = (stage == 0) ? sbuf0 : sbuf1;
+#pragma unroll
+            for (int r = 0; r < 64; ++r) dst[lane * 64 + r] = sc[r];
+            const int bar = (stage == 0) ? GDN_PP_STATE_READY0 : GDN_PP_STATE_READY1;
+            asm volatile("bar.arrive %0, %1;" ::"r"(bar), "r"(64) : "memory");
+        }
+    } else {
+        float qc[64];
+#pragma unroll
+        for (int r = 0; r < 64; ++r) qc[r] = 0.01f * ((lane * 64 + r) % 5 - 2);
+        float out_sum = 0.0f;
+        float last_sc[64];
+        for (int n = 0; n < GDN_PP_ITERS; ++n) {
+            const int stage = n & 1;
+            const int bar = (stage == 0) ? GDN_PP_STATE_READY0 : GDN_PP_STATE_READY1;
+            asm volatile("bar.sync %0, %1;" ::"r"(bar), "r"(64) : "memory");
+            const float* src = (stage == 0) ? sbuf0 : sbuf1;
+#pragma unroll
+            for (int r = 0; r < 64; ++r) last_sc[r] = src[lane * 64 + r];
+            {
+                const int fbar = (stage == 0) ? GDN_PP_STATE_FREE0 : GDN_PP_STATE_FREE1;
+                asm volatile("bar.arrive %0, %1;" ::"r"(fbar), "r"(64) : "memory");
+            }
+            const float ot = gdn_pp_output(last_sc, qc);
+            out_sum += ot;
+        }
+        if (lane == 0) out_checksum[0] = out_sum;
+        float s = 0.0f;
+#pragma unroll
+        for (int r = 0; r < 64; ++r) s += last_sc[r];
+        if (lane == 0) out_checksum[1] = s;
+    }
+}

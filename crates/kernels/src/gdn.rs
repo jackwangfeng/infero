@@ -791,4 +791,30 @@ impl Kernels {
             })?;
         Ok(())
     }
+
+    /// Sequential reference for [`Self::gdn_pp_pipelined_probe`] -- see
+    /// `gdn_pp_sequential_ref`'s doc comment in `cu/gdn.cu`.
+    pub fn gdn_pp_sequential_ref(&self, out: &mut ViewMut<'_, f32>) -> Result<()> {
+        let f = self.dev.kernels().get("infero_gdn", gdn_src(), "gdn_pp_sequential_ref")?;
+        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out);
+        unsafe { b.launch(cfg) }.context("gdn_pp_sequential_ref")?;
+        Ok(())
+    }
+
+    /// Isolated toy probe: does pipelining GatedDeltaNet's own state-advance
+    /// and output-compute stages across two physical warps (state races
+    /// ahead uninterrupted, output trails one timestep behind) actually
+    /// overlap on real hardware? See `gdn_pp_pipelined_probe`'s doc comment
+    /// in `cu/gdn.cu` for the traced dependency-graph argument this tests.
+    pub fn gdn_pp_pipelined_probe(&self, out: &mut ViewMut<'_, f32>) -> Result<()> {
+        let f = self.dev.kernels().get("infero_gdn", gdn_src(), "gdn_pp_pipelined_probe")?;
+        let shared = 2 * 32 * 64 * 4;
+        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (64, 1, 1), shared_mem_bytes: shared as u32 };
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out);
+        unsafe { b.launch(cfg) }.context("gdn_pp_pipelined_probe")?;
+        Ok(())
+    }
 }
