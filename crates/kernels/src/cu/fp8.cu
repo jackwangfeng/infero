@@ -1172,3 +1172,65 @@ extern "C" __global__ void e4m3_qk_dot_accuracy_probe(float* __restrict__ exact_
     exact_out[trial] = exact;
     quant_out[trial] = quant;
 }
+
+// ---- K-tile e4m3 quantization overhead probe -----------------------------
+//
+// The full-tile probe (`ops.cu`) measured QK^T's real speedup once K is
+// already e4m3; this measures the cost `ws4`'s producer would newly pay to
+// get it there -- converting a resident WK=48 x d_head=256 half K tile to
+// e4m3 with a per-key (not per-tile) scale, the granularity the accuracy
+// probe actually validated (a single scale for the whole 48-key tile would
+// quantize far more coarsely and has not itself been checked). One warp,
+// cooperative per-key reduction: each of the 32 lanes owns `d_head/32=8`
+// elements of the key currently being quantized, reduces to that key's
+// max-abs via five `__shfl_xor_sync` steps, then all 32 lanes quantize their
+// own 8 elements against it. 48 keys, unrolled, `outer_iters` tiles' worth.
+extern "C" __global__ void attn_ktile_e4m3_quantize_probe(float* __restrict__ out,
+                                                           int outer_iters) {
+    const int WK = 48;
+    const int krow = 256 + 8;  // ATTN_MMA_KPAD, hardcoded -- ops.cu-only macro.
+    const int per_lane = 256 / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+
+    extern __shared__ char smem[];
+    __half* sk = (__half*)smem;
+    unsigned char* sk8 = (unsigned char*)(sk + (size_t)WK * krow);
+    for (int i = lane; i < WK * krow; i += WARP_SIZE) {
+        const unsigned h = (unsigned)((i * 2654435761u + blockIdx.x) & 0xFFu);
+        sk[i] = __float2half((float)h / 255.0f - 0.5f);
+    }
+    __syncwarp();
+
+    float acc = 0.0f;
+    for (int iter = 0; iter < outer_iters; ++iter) {
+        // Perturb by the (genuinely runtime, unknown-trip-count) outer
+        // counter, not by an accumulator threaded across keys -- the 48
+        // keys within one tile are independent in a real implementation
+        // (parallelizable across warps or within one), and threading a
+        // scalar dependency between them here would serialize a shuffle
+        // reduction's real latency 48 times over, measuring a worst case
+        // no real design would have.
+        const float bias = (float)(iter & 0xFF) * 1e-20f;
+#pragma unroll
+        for (int key = 0; key < WK; ++key) {
+            float v[8];
+            float amax = 0.0f;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                v[e] = __half2float(sk[key * krow + lane * per_lane + e]) + bias;
+                amax = fmaxf(amax, fabsf(v[e]));
+            }
+#pragma unroll
+            for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+                amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
+            }
+            const float scale = fmaxf(amax, 1e-30f) / 448.0f;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                sk8[key * krow + lane * per_lane + e] = f32_to_e4m3(v[e] / scale);
+            }
+            acc += scale;
+        }
+    }
+    if (lane == 0) out[blockIdx.x] = acc;
+}

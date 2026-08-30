@@ -733,6 +733,37 @@ impl Kernels {
         Ok(())
     }
 
+    /// One warp, `ws4`'s WK=48/d_head=256 K tile, converted from resident
+    /// `__half` to e4m3 with a per-key scale, `outer_iters` times. See
+    /// `attn_ktile_e4m3_quantize_probe` in `fp8.cu` — the cost `ws4`'s
+    /// producer would newly pay to feed an e4m3 QK^T, measured before
+    /// deciding how (or whether) to fit it into the existing double-buffered
+    /// pipeline's exact shared-memory budget.
+    pub fn attn_ktile_e4m3_quantize_probe(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        blocks: usize,
+        outer_iters: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_fp8", fp8_src(), "attn_ktile_e4m3_quantize_probe")?;
+        const WK: usize = 48;
+        const KROW: usize = 256 + 8;
+        let shared = (WK * KROW * 2 + WK * KROW) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let iters = outer_iters as i32;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(&iters);
+        unsafe { b.launch(cfg) }.context("attn_ktile_e4m3_quantize_probe")?;
+        Ok(())
+    }
+
     /// `out = W x`, with `W` in FP8 and its block scales, at one token.
     ///
     /// `w` is the whole buffer: quants then grid. `accum` adds into `out`
