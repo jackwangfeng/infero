@@ -3426,6 +3426,13 @@ impl Kernels {
     /// (`kscale` `[position, kv_head]`), matching what
     /// `Self::quantize_k_e4m3` produces directly.
     #[allow(clippy::too_many_arguments)]
+    /// Same chunk/grid.z/partial-buffer mechanism as [`Self::attn_prefill_ws4`]
+    /// (real chunking via [`Self::prefill_chunks`], `attn_flash_reduce_f32`
+    /// combines chunks when there's more than one) -- added after this
+    /// kernel's own real end-to-end benchmark found it 14.5% slower than
+    /// `ws4` at the real 30552-token chunked shape, and losing this exact
+    /// parallelism (this kernel had none before) was one of two diagnosed
+    /// causes. `partial` must be sized via [`Self::attn_partial_floats`].
     #[allow(clippy::too_many_arguments)]
     pub fn attn_prefill_e4m3k(
         &self,
@@ -3439,6 +3446,7 @@ impl Kernels {
         run_tokens: usize,
         kv_len: usize,
         scale: f32,
+        partial: &mut ViewMut<'_, f32>,
     ) -> Result<()> {
         anyhow::ensure!(dims.d_head == 256, "attn_prefill_e4m3k: only this checkpoint's d_head=256 is supported");
         anyhow::ensure!(run_tokens >= 1, "attn_prefill_e4m3k: empty run");
@@ -3449,6 +3457,12 @@ impl Kernels {
         const WK: usize = 48;
         let tile_tokens = NWARPS * tpw;
         let n_tiles = run_tokens.div_ceil(tile_tokens);
+        let (n_chunks, chunk) = self.prefill_chunks(dims.n_kv_heads, n_tiles, kv_len);
+        anyhow::ensure!(
+            n_chunks <= 32,
+            "attn_prefill_e4m3k: {n_chunks} chunks past the partial buffer's 32"
+        );
+        let ms_off = (32 * dims.n_heads * run_tokens * dims.d_head) as i32;
 
         let f = self.dev.kernels().get("infero_ops", ops_src(), "attn_prefill_e4m3k_f32")?;
         let krow = dims.d_head + KPAD;
@@ -3456,21 +3470,42 @@ impl Kernels {
         if shared > 48 * 1024 {
             infero_gpu::set_max_dynamic_shared(&f, shared)?;
         }
+        let single = i32::from(n_chunks == 1);
         let cfg = LaunchConfig {
-            grid_dim: (dims.n_kv_heads as u32, n_tiles as u32, 1),
+            grid_dim: (dims.n_kv_heads as u32, n_tiles as u32, n_chunks),
             block_dim: ((NWARPS + 1) as u32 * 32, 1, 1),
             shared_mem_bytes: shared,
         };
         let (h, kh, dh) = (dims.n_heads as i32, dims.n_kv_heads as i32, dims.d_head as i32);
-        let (kl, gi, tp) = (kv_len as i32, group as i32, tpw as i32);
+        let (ck, kl, gi, tp) = (chunk as i32, kv_len as i32, group as i32, tpw as i32);
         let (rb, rt) = (run_base as i32, run_tokens as i32);
         let mut b = self.dev.stream().launch_builder(&f);
-        b.arg(&mut *out).arg(q).arg(kq).arg(kscale).arg(v)
-            .arg(&h).arg(&kh).arg(&dh).arg(&scale).arg(&kl).arg(&gi).arg(&tp).arg(&rb).arg(&rt);
+        b.arg(&mut *partial).arg(&ms_off).arg(&mut *out).arg(&single)
+            .arg(q).arg(kq).arg(kscale).arg(v)
+            .arg(&h).arg(&kh).arg(&dh).arg(&scale).arg(&ck).arg(&kl).arg(&gi).arg(&tp).arg(&rb).arg(&rt);
         self.dev
             .profile()
             .time("attn_prefill_e4m3k", self.dev.stream(), || {
                 unsafe { b.launch(cfg) }.context("attn_prefill_e4m3k")?;
+                Ok(())
+            })?;
+        if single == 1 {
+            return Ok(());
+        }
+
+        let total = (run_tokens * dims.n_heads * dims.d_head) as u32;
+        let (nt, nc) = (run_tokens as i32, n_chunks as i32);
+        let part = partial.as_view();
+        let r = self.dev.kernels().get("infero_ops", ops_src(), "attn_flash_reduce_f32")?;
+        let run_elems = run_tokens * dims.n_heads * dims.d_head;
+        let out_off = run_base * dims.n_heads * dims.d_head;
+        let mut out_run = out.slice_mut(out_off..out_off + run_elems);
+        let mut rb2 = self.dev.stream().launch_builder(&r);
+        rb2.arg(&mut out_run).arg(&part).arg(&ms_off).arg(&h).arg(&dh).arg(&nt).arg(&nc);
+        self.dev
+            .profile()
+            .time("attn_prefill_e4m3k_reduce", self.dev.stream(), || {
+                unsafe { rb2.launch(elementwise(total)) }.context("attn_prefill_e4m3k_reduce")?;
                 Ok(())
             })?;
         Ok(())

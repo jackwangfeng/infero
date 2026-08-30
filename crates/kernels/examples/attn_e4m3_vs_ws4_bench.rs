@@ -82,6 +82,7 @@ fn main() -> Result<()> {
     // both use the same flat buffer here since `n_slots == n_tokens` for a
     // single fresh sequence, the only case this validation kernel supports).
     let mut out2 = stream.alloc_zeros::<f32>(n_tokens * N_HEADS * D_HEAD)?;
+    let mut part2 = stream.alloc_zeros::<f32>(Kernels::attn_partial_floats(N_HEADS, D_HEAD, BATCH_TOKENS))?;
     let mut kq = stream.alloc_zeros::<u8>(TOTAL_TOKENS * N_KV_HEADS * D_HEAD)?;
     let mut kscale = stream.alloc_zeros::<f32>(TOTAL_TOKENS * N_KV_HEADS)?;
 
@@ -104,7 +105,7 @@ fn main() -> Result<()> {
         Ok(t0.elapsed().as_secs_f64() * 1000.0)
     };
 
-    let run_e4m3 = |out: &mut infero_gpu::Buf<f32>, kq: &mut infero_gpu::Buf<u8>, kscale: &mut infero_gpu::Buf<f32>| -> Result<f64> {
+    let run_e4m3 = |out: &mut infero_gpu::Buf<f32>, part: &mut infero_gpu::Buf<f32>, kq: &mut infero_gpu::Buf<u8>, kscale: &mut infero_gpu::Buf<f32>| -> Result<f64> {
         k.device().synchronize()?;
         let t0 = std::time::Instant::now();
         for _layer in 0..N_LAYERS {
@@ -140,6 +141,7 @@ fn main() -> Result<()> {
                     &mut out.as_view_mut(), &dq.as_view(),
                     &kq.slice(0..k_end), &kscale.slice(0..ks_end), &dv.as_view(),
                     dims_e4m3, base, run_tokens, kv_len, scale,
+                    &mut part.as_view_mut(),
                 )?;
                 base += run_tokens;
             }
@@ -150,13 +152,13 @@ fn main() -> Result<()> {
 
     // Warmup, then best of a few timed reps each.
     run_ws4(&mut out, &mut part)?;
-    run_e4m3(&mut out2, &mut kq, &mut kscale)?;
+    run_e4m3(&mut out2, &mut part2, &mut kq, &mut kscale)?;
 
     let mut best_ws4 = f64::MAX;
     let mut best_e4m3 = f64::MAX;
     for _ in 0..3 {
         best_ws4 = best_ws4.min(run_ws4(&mut out, &mut part)?);
-        best_e4m3 = best_e4m3.min(run_e4m3(&mut out2, &mut kq, &mut kscale)?);
+        best_e4m3 = best_e4m3.min(run_e4m3(&mut out2, &mut part2, &mut kq, &mut kscale)?);
     }
 
     println!("attn_prefill_ws4        best: {best_ws4:.2} ms total ({N_LAYERS} layers x {TOTAL_TOKENS} tokens)");

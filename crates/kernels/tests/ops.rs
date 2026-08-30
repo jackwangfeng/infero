@@ -640,6 +640,7 @@ fn attn_prefill_e4m3k_case(n_heads: usize, n_kv_heads: usize, n_tokens: usize) -
 
     let dims = AttnDims { n_heads, n_kv_heads, d_head, n_slots: 0, n_tokens };
     let mut dout = stream.alloc_zeros::<f32>(n_tokens * n_heads * d_head)?;
+    let mut dpart = stream.alloc_zeros::<f32>(Kernels::attn_partial_floats(n_heads, d_head, n_tokens))?;
     k.attn_prefill_e4m3k(
         &mut dout.as_view_mut(),
         &dq.as_view(),
@@ -651,6 +652,7 @@ fn attn_prefill_e4m3k_case(n_heads: usize, n_kv_heads: usize, n_tokens: usize) -
         n_tokens,
         kv_len,
         scale,
+        &mut dpart.as_view_mut(),
     )?;
     let got = stream.clone_dtoh(&dout)?;
     k.device().synchronize()?;
@@ -776,6 +778,7 @@ fn attn_prefill_e4m3k_chunked_matches_the_single_shot_case() -> Result<()> {
     // deliberately not aligned to `ATTN_E4M3_WK`'s 48 or any tile boundary.
     let dims = AttnDims { n_heads, n_kv_heads, d_head, n_slots: 0, n_tokens };
     let mut dout = stream.alloc_zeros::<f32>(n_tokens * n_heads * d_head)?;
+    let mut dpart = stream.alloc_zeros::<f32>(Kernels::attn_partial_floats(n_heads, d_head, n_tokens))?;
     for &(run_base, run_tokens) in &[(0usize, 55usize), (55, 130 - 55)] {
         k.attn_prefill_e4m3k(
             &mut dout.as_view_mut(),
@@ -788,6 +791,7 @@ fn attn_prefill_e4m3k_chunked_matches_the_single_shot_case() -> Result<()> {
             run_tokens,
             run_base + run_tokens,
             scale,
+            &mut dpart.as_view_mut(),
         )?;
     }
     let got = stream.clone_dtoh(&dout)?;

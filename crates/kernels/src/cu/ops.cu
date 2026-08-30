@@ -5327,13 +5327,15 @@ __device__ __forceinline__ unsigned char attn_e4m3_encode(float f) {
 #define ATTN_E4M3_WK 48
 
 extern "C" __global__ void attn_prefill_e4m3k_f32(
-    float* __restrict__ out, const float* __restrict__ q,
+    float* __restrict__ partial, int ms_off, float* __restrict__ out, int single,
+    const float* __restrict__ q,
     const unsigned char* __restrict__ kq, const float* __restrict__ kscale,
     const __half* __restrict__ v, int n_heads, int n_kv_heads, int d_head,
-    float scale, int kv_len, int group, int tpw, int run_base, int run_tokens) {
+    float scale, int chunk, int kv_len, int group, int tpw, int run_base, int run_tokens) {
     const int WK = ATTN_E4M3_WK;
     const int kv_head = blockIdx.x;
     const int tile = blockIdx.y;
+    const int c = blockIdx.z;
     const int lane = threadIdx.x % WARP_SIZE;
     const int warp = threadIdx.x / WARP_SIZE;
     const bool is_producer = (warp == 0);
@@ -5366,8 +5368,15 @@ extern "C" __global__ void attn_prefill_e4m3k_f32(
     const int tile_base = run_base + tile_local;
     const int tokens_here = min(tile_tokens, run_tokens - tile_local);
     const int last_max = tile_base + tokens_here - 1;
-    const int end = min(kv_len, last_max + 1);
-    const int n_blk = end > 0 ? (end + WK - 1) / WK : 0;
+    // `begin`/`end`: this chunk's own slice of the causal key range, same
+    // shape as `ws4`'s own chunk/grid.z math -- `c`, `chunk`, `single` are
+    // 0/kv_len/1 respectively for a real caller's single-chunk case,
+    // matching this kernel's original behavior exactly when `n_chunks==1`.
+    const int begin = c * chunk;
+    int end = begin + chunk;
+    if (end > kv_len) end = kv_len;
+    if (end > last_max + 1) end = last_max + 1;
+    const int n_blk = end > begin ? (end - begin + WK - 1) / WK : 0;
 
     if (is_producer) {
         for (int b = 0; b < n_blk; ++b) {
@@ -5379,7 +5388,7 @@ extern "C" __global__ void attn_prefill_e4m3k_f32(
             unsigned char* skb = (stage == 0) ? sk0 : sk1;
             __half* svb = (stage == 0) ? sv0 : sv1;
             float* sksb = (stage == 0) ? sks0 : sks1;
-            const int base = b * WK;
+            const int base = begin + b * WK;
             const int n = min(WK, end - base);
             for (int e = lane; e < WK * kchunks; e += WARP_SIZE) {
                 const int r = e / kchunks, w16 = e % kchunks;
@@ -5492,7 +5501,7 @@ extern "C" __global__ void attn_prefill_e4m3k_f32(
         unsigned char* skb = (stage == 0) ? sk0 : sk1;
         __half* svb = (stage == 0) ? sv0 : sv1;
         float* sksb = (stage == 0) ? sks0 : sks1;
-        const int base = b * WK;
+        const int base = begin + b * WK;
         const int n = min(WK, end - base);
 
         // Six 8-key QK^T sub-tiles, same as `ws4` -- the raw e4m3 MMA
@@ -5601,23 +5610,41 @@ extern "C" __global__ void attn_prefill_e4m3k_f32(
         asm volatile("bar.arrive %0, %1;" ::"r"(fbar), "r"(total_threads) : "memory");
     }
 
-    // Direct output (no partial-buffer / out-stage path -- this validation
-    // kernel is single-chunk only).
+    // Output -- `ws4`'s own scattered write, single-chunk direct divide or
+    // multi-chunk partial-buffer, verbatim (this is the exact mechanism
+    // `attn_flash_reduce_f32` already knows how to combine).
+#pragma unroll
     for (int rg = 0; rg < 2; ++rg) {
         if (!row_live[rg]) continue;
         const int abs_row = cr + rg * 8;
-        const int row_j2 = abs_row / group;
-        const int token = tile_base + local0 + row_j2;
+        const int token = tile_base + local0 + row_j[rg];
         const int head = kv_head * group + abs_row % group;
         const float den = l_run[rg];
+        const float m = m_run[rg];
 #pragma unroll
         for (int i = 0; i < ATTN_MMA_MAX_NTILES; ++i) {
             if (i >= ntiles) break;
             const int d0 = i * 8 + cc;
             const float v0 = o[i].x[rg * 2];
             const float v1 = o[i].x[rg * 2 + 1];
-            out[((size_t)token * n_heads + head) * d_head + d0] = den > 0.0f ? v0 / den : 0.0f;
-            out[((size_t)token * n_heads + head) * d_head + d0 + 1] = den > 0.0f ? v1 / den : 0.0f;
+            if (single) {
+                out[((size_t)token * n_heads + head) * d_head + d0] =
+                    den > 0.0f ? v0 / den : 0.0f;
+                out[((size_t)token * n_heads + head) * d_head + d0 + 1] =
+                    den > 0.0f ? v1 / den : 0.0f;
+            } else {
+                const int local_token = tile_local + local0 + row_j[rg];
+                float* dst =
+                    partial + (((size_t)c * run_tokens + local_token) * n_heads + head) * d_head + d0;
+                dst[0] = v0;
+                dst[1] = v1;
+                if (d0 == 0) {
+                    float* ms = partial + ms_off
+                              + (((size_t)c * run_tokens + local_token) * n_heads + head) * 2;
+                    ms[0] = m;
+                    ms[1] = den;
+                }
+            }
         }
     }
 }
