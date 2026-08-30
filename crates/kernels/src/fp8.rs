@@ -701,6 +701,38 @@ impl Kernels {
         Ok(())
     }
 
+    /// One thread a trial: quantizes `q[trial]`/`k[trial]` (`d_head` each) to
+    /// e4m3 per 128-wide group and computes both the exact and the
+    /// quantize-round-tripped dot product. See `e4m3_qk_dot_accuracy_probe`
+    /// in `fp8.cu` for why this exists — the accuracy half of evaluating an
+    /// e4m3 QK^T/PV attention kernel, the throughput half being
+    /// `Self::mma_e4m3_throughput_probe`.
+    pub fn e4m3_qk_dot_accuracy_probe(
+        &self,
+        exact_out: &mut ViewMut<'_, f32>,
+        quant_out: &mut ViewMut<'_, f32>,
+        q: &View<'_, f32>,
+        k: &View<'_, f32>,
+        trials: usize,
+        d_head: usize,
+        group: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_fp8", fp8_src(), "e4m3_qk_dot_accuracy_probe")?;
+        let cfg = LaunchConfig {
+            grid_dim: (trials as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (dh, g) = (d_head as i32, group as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(exact_out).arg(quant_out).arg(q).arg(k).arg(&dh).arg(&g);
+        unsafe { b.launch(cfg) }.context("e4m3_qk_dot_accuracy_probe")?;
+        Ok(())
+    }
+
     /// `out = W x`, with `W` in FP8 and its block scales, at one token.
     ///
     /// `w` is the whole buffer: quants then grid. `accum` adds into `out`

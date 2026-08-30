@@ -1119,3 +1119,56 @@ extern "C" __global__ void bf16_store_or_accum_f32(float* __restrict__ out,
     float* o = &out[(size_t)row * n + col];
     *o = accum ? *o + v : v;
 }
+
+// ---- e4m3 QK^T accuracy probe --------------------------------------------
+//
+// The MMA throughput probe (`ops.cu`) answered whether e4m3 tensor cores are
+// actually faster on this card; this answers the other question a QK^T/PV
+// rewrite would need before it's worth building: how much does the
+// quantization itself cost in accuracy? Unlike a GEMM output, an attention
+// score feeds a softmax, which exponentially amplifies relative error near
+// the max -- so the FP8-GEMM-activation error budget already accepted
+// elsewhere in this codebase is not an automatic precedent here.
+//
+// One thread a trial (accuracy, not throughput -- no need for a real MMA
+// instruction): quantizes `q`/`k` per 128-wide group the same way
+// `quantize_act_e4m3_cutlass_f32` does (max-abs/448 scale), round-trips each
+// element through `f32_to_e4m3`/`e4m3_to_f32`, and sums the dequantized
+// per-group dot products. Mathematically identical to what a real
+// `mma_e4m3` plus a block-scaled epilogue computes (scalar multiplication
+// associates: `sum(q_code*k_code) * qs * ks == sum(q_code*qs * k_code*ks)`),
+// just computed without the tensor core -- this kernel is about the
+// quantization's own error, not instruction throughput.
+extern "C" __global__ void e4m3_qk_dot_accuracy_probe(float* __restrict__ exact_out,
+                                                       float* __restrict__ quant_out,
+                                                       const float* __restrict__ q,
+                                                       const float* __restrict__ k,
+                                                       int d_head, int group) {
+    const int trial = blockIdx.x;
+    if (threadIdx.x != 0) return;
+    const float* qv = q + (size_t)trial * d_head;
+    const float* kv = k + (size_t)trial * d_head;
+
+    float exact = 0.0f;
+    for (int i = 0; i < d_head; ++i) exact += qv[i] * kv[i];
+
+    float quant = 0.0f;
+    for (int g0 = 0; g0 < d_head; g0 += group) {
+        float qmax = 1e-30f, kmax = 1e-30f;
+        for (int i = 0; i < group; ++i) {
+            qmax = fmaxf(qmax, fabsf(qv[g0 + i]));
+            kmax = fmaxf(kmax, fabsf(kv[g0 + i]));
+        }
+        const float qs = qmax / 448.0f, ks = kmax / 448.0f;
+        float partial = 0.0f;
+        for (int i = 0; i < group; ++i) {
+            const float qq = e4m3_to_f32(f32_to_e4m3(qv[g0 + i] / qs)) * qs;
+            const float kq = e4m3_to_f32(f32_to_e4m3(kv[g0 + i] / ks)) * ks;
+            partial += qq * kq;
+        }
+        quant += partial;
+    }
+
+    exact_out[trial] = exact;
+    quant_out[trial] = quant;
+}
