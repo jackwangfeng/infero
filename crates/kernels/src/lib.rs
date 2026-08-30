@@ -6938,6 +6938,42 @@ impl Kernels {
         Ok(())
     }
 
+    /// Same per-tile work as [`Self::attn_full_tile_f16_probe`], reordered
+    /// so tile `i+1`'s QK^T is issued before tile `i`'s softmax+PV finishes
+    /// (a second, independent accumulator set, no register dependency
+    /// between them) -- the software-pipelining pattern FlashAttention-3
+    /// uses to overlap its SFU-bound softmax with tensor-core MMA, minus
+    /// the `wgmma` async completion this GPU's sm_120a doesn't have. See
+    /// `attn_full_tile_pipelined_probe` in `ops.cu`.
+    pub fn attn_full_tile_pipelined_probe(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        blocks: usize,
+        outer_iters: usize,
+        scale: f32,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_ops", ops_src(), "attn_full_tile_pipelined_probe")?;
+        const WK: usize = 48;
+        const KROW: usize = 256 + 8;
+        let shared = (2 * WK * KROW * 2) as u32;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared)?;
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (blocks as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let iters = outer_iters as i32;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(&iters).arg(&scale);
+        unsafe { b.launch(cfg) }.context("attn_full_tile_pipelined_probe")?;
+        Ok(())
+    }
+
     /// The e4m3-QK^T counterpart of [`Self::attn_full_tile_f16_probe`]; PV
     /// stays `mma_f16` in both, isolating the comparison to QK^T only.
     pub fn attn_full_tile_e4m3_probe(

@@ -5281,6 +5281,105 @@ extern "C" __global__ void attn_full_tile_e4m3_probe(float* __restrict__ out, in
     }
 }
 
+__device__ __forceinline__ void attn_full_tile_qkt(mma_c_f32* s2, const mma_a_f16* qa,
+                                                    const __half* sk, int krow, int ksteps,
+                                                    int bc, int k0) {
+#pragma unroll
+    for (int nt = 0; nt < 6; ++nt) {
+        s2[nt].x[0] = s2[nt].x[1] = s2[nt].x[2] = s2[nt].x[3] = 0.0f;
+        const int key0 = nt * 8;
+#pragma unroll
+        for (int t = 0; t < ATTN_MMA_MAX_KSTEPS; ++t) {
+            if (t >= ksteps) break;
+            mma_b_f16 b_;
+            const __half* bp = sk + (key0 + bc) * krow + t * 16 + k0;
+            b_.x[0] = *(const unsigned*)(const void*)bp;
+            b_.x[1] = *(const unsigned*)(const void*)(bp + 8);
+            mma_f16(s2[nt], qa[t], b_);
+        }
+    }
+}
+
+// ---- software-pipelined full-tile probe -----------------------------------
+//
+// Same per-tile work as `attn_full_tile_f16_probe` (QK^T -> online-softmax
+// -> PV, one resident synthetic tile, no producer/cp.async), but reordered:
+// tile `i+1`'s QK^T is issued *before* tile `i`'s softmax+PV finishes,
+// using a second, independent set of `s2` accumulator registers so there is
+// no register-level false dependency between them. This is the "intra-
+// warpgroup" software-pipelining pattern FlashAttention-3 uses to overlap
+// its SFU-bound softmax with tensor-core MMA -- except FA3 does it via
+// Hopper's async `wgmma`, which this GPU's sm_120a does not have (confirmed:
+// no `wgmma`, no `tcgen05`, `mma.sync.aligned` is the only MMA path here).
+// The question this answers: does the *same* overlap show up from pure
+// instruction reordering on top of the ordinary synchronous `mma.sync` this
+// kernel family already uses, with no new hardware primitive at all?
+extern "C" __global__ void attn_full_tile_pipelined_probe(float* __restrict__ out,
+                                                           int outer_iters, float scale) {
+    const int WK = 48;
+    const int krow = 256 + ATTN_MMA_KPAD;
+    const int ksteps = 256 / 16;
+    const int ntiles = 256 / 8;
+    const int quads = 256 / 8;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int bc = mma_b_col(lane);
+    const int k0 = mma_k0_f16(lane);
+    const int cc = mma_c_col(lane);
+
+    extern __shared__ char smem[];
+    __half* sk = (__half*)smem;
+    __half* sv = sk + (size_t)WK * krow;
+    for (int i = lane; i < WK * krow; i += WARP_SIZE) {
+        const unsigned h = (unsigned)((i * 2654435761u + blockIdx.x) & 0xFFu);
+        sk[i] = __float2half((float)h / 255.0f - 0.5f);
+        sv[i] = __float2half((float)(h ^ 0x55u) / 255.0f - 0.5f);
+    }
+    __syncwarp();
+
+    unsigned base = (unsigned)(lane * 2654435761u + blockIdx.x);
+    mma_a_f16 qa[16];
+#pragma unroll
+    for (int t = 0; t < 16; ++t) {
+        qa[t].x[0] = base ^ (unsigned)(t * 4 + 0);
+        qa[t].x[1] = base ^ (unsigned)(t * 4 + 1);
+        qa[t].x[2] = base ^ (unsigned)(t * 4 + 2);
+        qa[t].x[3] = base ^ (unsigned)(t * 4 + 3);
+    }
+
+    mma_c_f32 o[32];
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        o[i].x[0] = o[i].x[1] = o[i].x[2] = o[i].x[3] = 0.0f;
+    }
+    float m_run[2] = {-1e30f, -1e30f};
+    float l_run[2] = {0.0f, 0.0f};
+
+    // Two independent accumulator sets -- `cur` is this iteration's
+    // already-computed scores (about to go through softmax+PV); `nxt` is
+    // where the *next* iteration's QK^T lands, issued before `cur`'s
+    // softmax+PV so the two have no register dependency the scheduler could
+    // serialize on.
+    mma_c_f32 s2_buf[2][6];
+    attn_full_tile_qkt(s2_buf[0], qa, sk, krow, ksteps, bc, k0);
+    int cur = 0;
+
+    for (int iter = 0; iter < outer_iters; ++iter) {
+        const int nxt = cur ^ 1;
+        attn_full_tile_qkt(s2_buf[nxt], qa, sk, krow, ksteps, bc, k0);
+        attn_full_tile_softmax_and_pv(s2_buf[cur], sv, krow, ntiles, quads, cc, k0, bc, scale,
+                                      m_run, l_run, o);
+        qa[0].x[0] ^= __float_as_uint(o[0].x[0]);
+        cur = nxt;
+    }
+
+    if (lane == 0) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 32; ++i) sum += o[i].x[0] + o[i].x[1] + o[i].x[2] + o[i].x[3];
+        out[blockIdx.x] = sum + m_run[0] + l_run[0];
+    }
+}
+
 // ---- validation-only e4m3-QK^T attention kernel ---------------------------
 //
 // Standalone, single-sequence, single-chunk, e4m3-K adaptation of
