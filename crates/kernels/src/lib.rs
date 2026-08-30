@@ -6805,6 +6805,71 @@ impl Kernels {
         unsafe { b.launch(cfg) }.context("mma_e4m3_throughput_probe")?;
         Ok(())
     }
+
+    /// One warp, `ws4`'s exact d_head=256/WK=48 consumer-side per-tile
+    /// instruction shape (QK^T -> online-softmax bookkeeping -> PV) run
+    /// `outer_iters` times against one resident, synthetic K/V tile. See
+    /// `attn_full_tile_f16_probe`/`attn_full_tile_e4m3_probe` in `ops.cu`.
+    pub fn attn_full_tile_f16_probe(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        blocks: usize,
+        outer_iters: usize,
+        scale: f32,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_ops", ops_src(), "attn_full_tile_f16_probe")?;
+        const WK: usize = 48;
+        const KROW: usize = 256 + 8;
+        let shared = (2 * WK * KROW * 2) as u32;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared)?;
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (blocks as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let iters = outer_iters as i32;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(&iters).arg(&scale);
+        unsafe { b.launch(cfg) }.context("attn_full_tile_f16_probe")?;
+        Ok(())
+    }
+
+    /// The e4m3-QK^T counterpart of [`Self::attn_full_tile_f16_probe`]; PV
+    /// stays `mma_f16` in both, isolating the comparison to QK^T only.
+    pub fn attn_full_tile_e4m3_probe(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        blocks: usize,
+        outer_iters: usize,
+        scale: f32,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_ops", ops_src(), "attn_full_tile_e4m3_probe")?;
+        const WK: usize = 48;
+        const KROW: usize = 256 + 8;
+        // V stays f16 (2 bytes/elem); K is e4m3 (1 byte/elem).
+        let shared = (WK * KROW * 2 + WK * KROW) as u32;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared)?;
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (blocks as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let iters = outer_iters as i32;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(&iters).arg(&scale);
+        unsafe { b.launch(cfg) }.context("attn_full_tile_e4m3_probe")?;
+        Ok(())
+    }
 }
 
 /// The shape parameters every attention kernel needs.

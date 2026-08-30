@@ -5048,3 +5048,235 @@ extern "C" __global__ void mma_e4m3_throughput_probe(float* __restrict__ out, in
         out[blockIdx.x] = d.x[0] + d.x[1] + d.x[2] + d.x[3];
     }
 }
+
+// ---- full-tile e4m3-QK^T probe --------------------------------------------
+//
+// The bare MMA-loop probes above answer "is e4m3 faster per instruction";
+// this answers the question that actually matters for `ws4`: does that
+// instruction-level win survive being embedded in the *real* per-tile
+// dependency chain -- QK^T -> online-softmax bookkeeping (two shuffle
+// reductions, an `expf` loop, a correction, an `o[]` rescale) -> PV -- given
+// this session's own `ncu` numbers found that scalar chain, not tensor-core
+// issue rate, to be `ws4`'s dominant stall? Reproduces `ws4`'s exact
+// consumer-side instruction/dependency SHAPE at this checkpoint's real
+// d_head=256, WK=48 for one warp, one resident (already-filled, reused)
+// K/V tile -- no producer, no barriers, no cp.async: that pipeline overlap
+// is orthogonal to what's being measured here, which is the per-tile
+// critical path's own length. PV stays `mma_f16` in both variants, isolating
+// the comparison to QK^T only, matching the accuracy probe's scope. Values
+// are synthetic (not real attention data) -- this is a latency/throughput
+// probe, not a correctness one.
+__device__ __forceinline__ void attn_full_tile_softmax_and_pv(
+    mma_c_f32* s2, __half* sv, int krow, int ntiles, int quads, int cc, int k0,
+    int bc, float scale, float* m_run, float* l_run, mma_c_f32* o) {
+    float sv_score[24];
+#pragma unroll
+    for (int rg = 0; rg < 2; ++rg) {
+#pragma unroll
+        for (int nt = 0; nt < 6; ++nt) {
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                sv_score[rg * 12 + nt * 2 + e] = s2[nt].x[rg * 2 + e] * scale;
+            }
+        }
+    }
+    float p[24];
+#pragma unroll
+    for (int rg = 0; rg < 2; ++rg) {
+        float* svr = sv_score + rg * 12;
+        float m_own = svr[0];
+#pragma unroll
+        for (int i = 1; i < 12; ++i) m_own = fmaxf(m_own, svr[i]);
+        m_own = fmaxf(m_own, __shfl_xor_sync(0xffffffff, m_own, 1, WARP_SIZE));
+        m_own = fmaxf(m_own, __shfl_xor_sync(0xffffffff, m_own, 2, WARP_SIZE));
+        const float m_new = fmaxf(m_run[rg], m_own);
+        float psum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 12; ++i) {
+            p[rg * 12 + i] = __expf(svr[i] - m_new);
+            psum += p[rg * 12 + i];
+        }
+        psum += __shfl_xor_sync(0xffffffff, psum, 1, WARP_SIZE);
+        psum += __shfl_xor_sync(0xffffffff, psum, 2, WARP_SIZE);
+        const float corr = __expf(m_run[rg] - m_new);
+        l_run[rg] = l_run[rg] * corr + psum;
+        m_run[rg] = m_new;
+#pragma unroll
+        for (int i = 0; i < ATTN_MMA_MAX_NTILES; ++i) {
+            if (i >= ntiles) break;
+            o[i].x[rg * 2] *= corr;
+            o[i].x[rg * 2 + 1] *= corr;
+        }
+    }
+#pragma unroll
+    for (int kg = 0; kg < 3; ++kg) {
+        const int nt_lo = kg * 2, nt_hi = kg * 2 + 1;
+        mma_a_f16 pa;
+        const __half2 p_rg0_lo = __floats2half2_rn(p[nt_lo * 2], p[nt_lo * 2 + 1]);
+        const __half2 p_rg1_lo = __floats2half2_rn(p[12 + nt_lo * 2], p[12 + nt_lo * 2 + 1]);
+        const __half2 p_rg0_hi = __floats2half2_rn(p[nt_hi * 2], p[nt_hi * 2 + 1]);
+        const __half2 p_rg1_hi = __floats2half2_rn(p[12 + nt_hi * 2], p[12 + nt_hi * 2 + 1]);
+        pa.x[0] = *(const unsigned*)(const void*)&p_rg0_lo;
+        pa.x[1] = *(const unsigned*)(const void*)&p_rg1_lo;
+        pa.x[2] = *(const unsigned*)(const void*)&p_rg0_hi;
+        pa.x[3] = *(const unsigned*)(const void*)&p_rg1_hi;
+        const int row0 = kg * 16;
+#pragma unroll
+        for (int i = 0; i < ATTN_MMA_MAX_NTILES; ++i) {
+            if (i >= ntiles) break;
+            const int dim = i * 8 + bc;
+            mma_b_f16 b_;
+            b_.x[0] = attn_pack_half2(sv + (row0 + k0) * krow + dim, sv + (row0 + k0 + 1) * krow + dim);
+            b_.x[1] = attn_pack_half2(sv + (row0 + k0 + 8) * krow + dim, sv + (row0 + k0 + 9) * krow + dim);
+            mma_f16(o[i], pa, b_);
+        }
+    }
+}
+
+extern "C" __global__ void attn_full_tile_f16_probe(float* __restrict__ out, int outer_iters,
+                                                     float scale) {
+    const int WK = 48;
+    const int krow = 256 + ATTN_MMA_KPAD;
+    const int ksteps = 256 / 16;
+    const int ntiles = 256 / 8;
+    const int quads = 256 / 8;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int bc = mma_b_col(lane);
+    const int k0 = mma_k0_f16(lane);
+    const int cc = mma_c_col(lane);
+
+    extern __shared__ char smem[];
+    __half* sk = (__half*)smem;
+    __half* sv = sk + (size_t)WK * krow;
+    for (int i = lane; i < WK * krow; i += WARP_SIZE) {
+        const unsigned h = (unsigned)((i * 2654435761u + blockIdx.x) & 0xFFu);
+        sk[i] = __float2half((float)h / 255.0f - 0.5f);
+        sv[i] = __float2half((float)(h ^ 0x55u) / 255.0f - 0.5f);
+    }
+    __syncwarp();
+
+    unsigned base = (unsigned)(lane * 2654435761u + blockIdx.x);
+    mma_a_f16 qa[16];
+#pragma unroll
+    for (int t = 0; t < 16; ++t) {
+        qa[t].x[0] = base ^ (unsigned)(t * 4 + 0);
+        qa[t].x[1] = base ^ (unsigned)(t * 4 + 1);
+        qa[t].x[2] = base ^ (unsigned)(t * 4 + 2);
+        qa[t].x[3] = base ^ (unsigned)(t * 4 + 3);
+    }
+
+    mma_c_f32 o[32];
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        o[i].x[0] = o[i].x[1] = o[i].x[2] = o[i].x[3] = 0.0f;
+    }
+    float m_run[2] = {-1e30f, -1e30f};
+    float l_run[2] = {0.0f, 0.0f};
+
+    for (int iter = 0; iter < outer_iters; ++iter) {
+        mma_c_f32 s2[6];
+#pragma unroll
+        for (int nt = 0; nt < 6; ++nt) {
+            s2[nt].x[0] = s2[nt].x[1] = s2[nt].x[2] = s2[nt].x[3] = 0.0f;
+            const int key0 = nt * 8;
+#pragma unroll
+            for (int t = 0; t < ksteps; ++t) {
+                mma_b_f16 b_;
+                const __half* bp = sk + (key0 + bc) * krow + t * 16 + k0;
+                b_.x[0] = *(const unsigned*)(const void*)bp;
+                b_.x[1] = *(const unsigned*)(const void*)(bp + 8);
+                mma_f16(s2[nt], qa[t], b_);
+            }
+        }
+        attn_full_tile_softmax_and_pv(s2, sv, krow, ntiles, quads, cc, k0, bc, scale, m_run, l_run, o);
+        // Feed the loop's own output back into the next Q fragment so the
+        // compiler can't hoist the loop or fold it into a closed form.
+        qa[0].x[0] ^= __float_as_uint(o[0].x[0]);
+    }
+
+    if (lane == 0) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 32; ++i) sum += o[i].x[0] + o[i].x[1] + o[i].x[2] + o[i].x[3];
+        out[blockIdx.x] = sum + m_run[0] + l_run[0];
+    }
+}
+
+extern "C" __global__ void attn_full_tile_e4m3_probe(float* __restrict__ out, int outer_iters,
+                                                      float scale) {
+    const int WK = 48;
+    const int krow = 256 + ATTN_MMA_KPAD;
+    const int ntiles = 256 / 8;
+    const int quads = 256 / 8;
+    const int e4m3_ksteps = 256 / 32;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int ar = mma_a_row(lane);
+    const int bc = mma_b_col(lane);
+    const int k0s = mma_k0(lane);
+    const int cc = mma_c_col(lane);
+
+    extern __shared__ char smem[];
+    __half* sv = (__half*)smem;
+    // e4m3 K, one byte an element, laid out the same `[row][col]` shape --
+    // packed right after the (still f16) V buffer this probe's PV half needs.
+    unsigned char* sk8 = (unsigned char*)(sv + (size_t)WK * krow);
+    for (int i = lane; i < WK * krow; i += WARP_SIZE) {
+        const unsigned h = (unsigned)((i * 2654435761u + blockIdx.x) & 0xFFu);
+        sv[i] = __float2half((float)h / 255.0f - 0.5f);
+        sk8[i] = (unsigned char)(h ^ 0x2Au);
+    }
+    __syncwarp();
+
+    unsigned base = (unsigned)(lane * 2654435761u + blockIdx.x);
+    mma_a_s8 qa[8];
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        qa[t].x[0] = (int)(base ^ (unsigned)(t * 4 + 0));
+        qa[t].x[1] = (int)(base ^ (unsigned)(t * 4 + 1));
+        qa[t].x[2] = (int)(base ^ (unsigned)(t * 4 + 2));
+        qa[t].x[3] = (int)(base ^ (unsigned)(t * 4 + 3));
+    }
+    // One overall Q/K scale a warp, the way a per-(row,head)/(key,head) e4m3
+    // QK^T would apply it -- a single multiply on the MMA accumulator, no
+    // per-group correction (see `e4m3_qk_dot_accuracy_probe`'s doc comment
+    // for why a single group across the whole d_head is the simple case).
+    const float qk_scale = 1.0f;
+
+    mma_c_f32 o[32];
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        o[i].x[0] = o[i].x[1] = o[i].x[2] = o[i].x[3] = 0.0f;
+    }
+    float m_run[2] = {-1e30f, -1e30f};
+    float l_run[2] = {0.0f, 0.0f};
+
+    for (int iter = 0; iter < outer_iters; ++iter) {
+        mma_c_f32 s2[6];
+#pragma unroll
+        for (int nt = 0; nt < 6; ++nt) {
+            s2[nt].x[0] = s2[nt].x[1] = s2[nt].x[2] = s2[nt].x[3] = 0.0f;
+            const int key0 = nt * 8;
+#pragma unroll
+            for (int t = 0; t < e4m3_ksteps; ++t) {
+                mma_b_s8 b_;
+                const unsigned char* bp = sk8 + (key0 + bc) * krow + t * 32 + k0s;
+                b_.x[0] = *(const int*)(const void*)bp;
+                b_.x[1] = *(const int*)(const void*)(bp + 16);
+                mma_e4m3(s2[nt], qa[t], b_);
+            }
+            s2[nt].x[0] *= qk_scale;
+            s2[nt].x[1] *= qk_scale;
+            s2[nt].x[2] *= qk_scale;
+            s2[nt].x[3] *= qk_scale;
+        }
+        attn_full_tile_softmax_and_pv(s2, sv, krow, ntiles, quads, cc, k0s, bc, scale, m_run, l_run, o);
+        qa[0].x[0] ^= (int)__float_as_uint(o[0].x[0]);
+    }
+
+    if (lane == 0) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 32; ++i) sum += o[i].x[0] + o[i].x[1] + o[i].x[2] + o[i].x[3];
+        out[blockIdx.x] = sum + m_run[0] + l_run[0];
+    }
+}
