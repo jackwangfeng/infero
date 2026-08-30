@@ -3426,6 +3426,7 @@ impl Kernels {
     /// (`kscale` `[position, kv_head]`), matching what
     /// `Self::quantize_k_e4m3` produces directly.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn attn_prefill_e4m3k(
         &self,
         out: &mut ViewMut<'_, f32>,
@@ -3434,11 +3435,12 @@ impl Kernels {
         kscale: &View<'_, f32>,
         v: &View<'_, f16>,
         dims: AttnDims,
+        run_base: usize,
+        run_tokens: usize,
         kv_len: usize,
         scale: f32,
     ) -> Result<()> {
         anyhow::ensure!(dims.d_head == 256, "attn_prefill_e4m3k: only this checkpoint's d_head=256 is supported");
-        let run_tokens = dims.n_tokens;
         anyhow::ensure!(run_tokens >= 1, "attn_prefill_e4m3k: empty run");
         let group = dims.n_heads / dims.n_kv_heads;
         let tpw = (16 / group).max(1);
@@ -3460,10 +3462,11 @@ impl Kernels {
             shared_mem_bytes: shared,
         };
         let (h, kh, dh) = (dims.n_heads as i32, dims.n_kv_heads as i32, dims.d_head as i32);
-        let (kl, gi, tp, rt) = (kv_len as i32, group as i32, tpw as i32, run_tokens as i32);
+        let (kl, gi, tp) = (kv_len as i32, group as i32, tpw as i32);
+        let (rb, rt) = (run_base as i32, run_tokens as i32);
         let mut b = self.dev.stream().launch_builder(&f);
         b.arg(&mut *out).arg(q).arg(kq).arg(kscale).arg(v)
-            .arg(&h).arg(&kh).arg(&dh).arg(&scale).arg(&kl).arg(&gi).arg(&tp).arg(&rt);
+            .arg(&h).arg(&kh).arg(&dh).arg(&scale).arg(&kl).arg(&gi).arg(&tp).arg(&rb).arg(&rt);
         self.dev
             .profile()
             .time("attn_prefill_e4m3k", self.dev.stream(), || {

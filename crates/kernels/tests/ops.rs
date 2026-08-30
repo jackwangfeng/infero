@@ -647,6 +647,8 @@ fn attn_prefill_e4m3k_case(n_heads: usize, n_kv_heads: usize, n_tokens: usize) -
         &dkscale.as_view(),
         &dv.as_view(),
         dims,
+        0,
+        n_tokens,
         kv_len,
         scale,
     )?;
@@ -664,6 +666,136 @@ fn attn_prefill_e4m3k_case(n_heads: usize, n_kv_heads: usize, n_tokens: usize) -
         abs < 2e-3,
         "n_heads={n_heads} n_kv_heads={n_kv_heads} n_tokens={n_tokens}: max abs diff {abs} at {at}, max rel diff {rel}"
     );
+    Ok(())
+}
+
+/// `attn_prefill_e4m3k_f32` called twice with growing `run_base`/`kv_len`
+/// (the real chunked-prefill usage pattern `attn_prefill_pipe_bench.rs`
+/// exercises for `ws4`), against the same single-shot reference the
+/// non-chunked test above uses -- causal attention's output for a given
+/// token depends only on that token and everything at or before it, so
+/// chunking must not change the result. This is the test that would have
+/// caught a `run_base` addressing mistake the single-call test above
+/// cannot: with `run_base` always 0 there, an off-by-`run_base` bug in Q or
+/// output indexing would be invisible.
+#[test]
+fn attn_prefill_e4m3k_chunked_matches_the_single_shot_case() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+
+    let n_heads = 8;
+    let n_kv_heads = 2;
+    let d_head = 256;
+    let n_tokens = 130usize;
+    let kv_len = n_tokens;
+    let scale = 1.0 / (d_head as f32).sqrt();
+
+    let q = pseudo_random(n_tokens * n_heads * d_head, 0x71);
+    let k_host = pseudo_random(kv_len * n_kv_heads * d_head, 0x82);
+    let v_host: Vec<f16> = pseudo_random(kv_len * n_kv_heads * d_head, 0x93)
+        .into_iter()
+        .map(f16::from_f32)
+        .collect();
+
+    let dq = stream.clone_htod(&q)?;
+    let dk = stream.clone_htod(&k_host)?;
+    let dv = stream.clone_htod(&v_host)?;
+
+    let mut dkq = stream.alloc_zeros::<u8>(kv_len * n_kv_heads * d_head)?;
+    let mut dkscale = stream.alloc_zeros::<f32>(kv_len * n_kv_heads)?;
+    k.quantize_k_e4m3(
+        &mut dkq.as_view_mut(),
+        &mut dkscale.as_view_mut(),
+        &dk.as_view(),
+        kv_len,
+        n_kv_heads,
+        d_head,
+    )?;
+    let mut dqq = stream.alloc_zeros::<u8>(n_tokens * n_heads * d_head)?;
+    let mut dqscale = stream.alloc_zeros::<f32>(n_tokens * n_heads)?;
+    k.quantize_k_e4m3(
+        &mut dqq.as_view_mut(),
+        &mut dqscale.as_view_mut(),
+        &dq.as_view(),
+        n_tokens,
+        n_heads,
+        d_head,
+    )?;
+    let kq_bytes = stream.clone_dtoh(&dkq)?;
+    let kscale_host = stream.clone_dtoh(&dkscale)?;
+    let qq_bytes = stream.clone_dtoh(&dqq)?;
+    let qscale_host = stream.clone_dtoh(&dqscale)?;
+    k.device().synchronize()?;
+
+    let dequant = |bytes: &[u8], scales: &[f32], n_rows: usize, n_h: usize| -> Vec<f32> {
+        let mut out = vec![0f32; n_rows * n_h * d_head];
+        for r in 0..n_rows {
+            for h in 0..n_h {
+                let s = scales[r * n_h + h];
+                for i in 0..d_head {
+                    let b = bytes[(r * n_h + h) * d_head + i];
+                    out[(r * n_h + h) * d_head + i] = s * e4m3_to_f32_host(b);
+                }
+            }
+        }
+        out
+    };
+    let q_deq = dequant(&qq_bytes, &qscale_host, n_tokens, n_heads);
+    let k_deq = dequant(&kq_bytes, &kscale_host, kv_len, n_kv_heads);
+
+    let group = n_heads / n_kv_heads;
+    let mut want = vec![0f32; n_tokens * n_heads * d_head];
+    for t in 0..n_tokens {
+        for h in 0..n_heads {
+            let kv_head = h / group;
+            let last = t.min(kv_len - 1);
+            let mut scores = vec![0f32; last + 1];
+            let mut m = f32::NEG_INFINITY;
+            for (kpos, slot) in scores.iter_mut().enumerate() {
+                let mut s = 0f32;
+                for d in 0..d_head {
+                    s += q_deq[(t * n_heads + h) * d_head + d]
+                        * k_deq[(kpos * n_kv_heads + kv_head) * d_head + d];
+                }
+                s *= scale;
+                *slot = s;
+                m = m.max(s);
+            }
+            let probs = softmax_ref(&scores);
+            for d in 0..d_head {
+                let mut acc = 0f32;
+                for (kpos, p) in probs.iter().enumerate() {
+                    acc += p * v_host[(kpos * n_kv_heads + kv_head) * d_head + d].to_f32();
+                }
+                want[(t * n_heads + h) * d_head + d] = acc;
+            }
+        }
+    }
+
+    // Two chunks: [0, 55) then [55, 130), `run_base`/`kv_len` growing --
+    // deliberately not aligned to `ATTN_E4M3_WK`'s 48 or any tile boundary.
+    let dims = AttnDims { n_heads, n_kv_heads, d_head, n_slots: 0, n_tokens };
+    let mut dout = stream.alloc_zeros::<f32>(n_tokens * n_heads * d_head)?;
+    for &(run_base, run_tokens) in &[(0usize, 55usize), (55, 130 - 55)] {
+        k.attn_prefill_e4m3k(
+            &mut dout.as_view_mut(),
+            &dq.as_view(),
+            &dkq.as_view(),
+            &dkscale.as_view(),
+            &dv.as_view(),
+            dims,
+            run_base,
+            run_tokens,
+            run_base + run_tokens,
+            scale,
+        )?;
+    }
+    let got = stream.clone_dtoh(&dout)?;
+    k.device().synchronize()?;
+
+    let (abs, at) = max_abs_diff(&got, &want);
+    let rel = max_rel_diff(&got, &want);
+    assert!(abs < 2e-3, "chunked run: max abs diff {abs} at {at}, max rel diff {rel}");
     Ok(())
 }
 

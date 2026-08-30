@@ -5330,7 +5330,7 @@ extern "C" __global__ void attn_prefill_e4m3k_f32(
     float* __restrict__ out, const float* __restrict__ q,
     const unsigned char* __restrict__ kq, const float* __restrict__ kscale,
     const __half* __restrict__ v, int n_heads, int n_kv_heads, int d_head,
-    float scale, int kv_len, int group, int tpw, int run_tokens) {
+    float scale, int kv_len, int group, int tpw, int run_base, int run_tokens) {
     const int WK = ATTN_E4M3_WK;
     const int kv_head = blockIdx.x;
     const int tile = blockIdx.y;
@@ -5356,8 +5356,15 @@ extern "C" __global__ void attn_prefill_e4m3k_f32(
     float* sks0 = (float*)(sv1 + (size_t)WK * krow);
     float* sks1 = sks0 + WK;
 
-    const int tile_base = tile * tile_tokens;
-    const int tokens_here = min(tile_tokens, run_tokens - tile_base);
+    // `run_base`: where this call's chunk of *new* tokens sits in the full
+    // sequence -- `q`/`out` are sized for the whole sequence (matching
+    // `ws4`'s own convention) so a chunked caller passes the same full
+    // buffers across calls, only `run_base`/`run_tokens`/`kv_len` change.
+    // `kq`/`kscale`/`v` are addressed from absolute position 0 regardless
+    // (the growing, already-quantized prefix), unaffected by `run_base`.
+    const int tile_local = tile * tile_tokens;
+    const int tile_base = run_base + tile_local;
+    const int tokens_here = min(tile_tokens, run_tokens - tile_local);
     const int last_max = tile_base + tokens_here - 1;
     const int end = min(kv_len, last_max + 1);
     const int n_blk = end > 0 ? (end + WK - 1) / WK : 0;
