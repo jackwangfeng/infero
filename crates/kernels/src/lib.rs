@@ -3416,6 +3416,96 @@ impl Kernels {
         Ok(())
     }
 
+    /// Validation-only, single-chunk: the decoupled-role design the
+    /// `attn_prefill_mma_ws4_qkt_only_regcheck_f32` / `..._pvonly_...` /
+    /// `..._decoupled_regcheck_f32` register-count probes (in `ops.cu`)
+    /// found does not cost more than it buys, unlike every warp-
+    /// fragmentation scheme tried before it. 4 warps/block (memory
+    /// producer, QK^T-only, 2 PV-consumers for each d_head half) covering
+    /// one 16-row tile, instead of `ws4`'s 8 warps covering 7 tiles' worth
+    /// -- `n_tiles` grows 7x to compensate. No `partial`/chunking yet
+    /// (deliberately, see `attn_prefill_decoupled_f32`'s doc comment) --
+    /// not the real `ws4` replacement while that's true.
+    pub fn attn_prefill_decoupled(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        q: &View<'_, f32>,
+        k_cache: &View<'_, f16>,
+        v_cache: &View<'_, f16>,
+        batch: BatchLayout<'_>,
+        dims: AttnDims,
+        run_base: usize,
+        run_tokens: usize,
+        kv_len: usize,
+        scale: f32,
+    ) -> Result<()> {
+        anyhow::ensure!(self.prefill_attention(&dims), "attn_prefill_decoupled: unsupported shape");
+        anyhow::ensure!(run_tokens >= 1, "attn_prefill_decoupled: empty run");
+        let group = dims.n_heads / dims.n_kv_heads;
+        let tpw = (16 / group).max(1);
+        const KPAD: usize = 8;
+        // 32, not ws4's 48 -- see `attn_prefill_decoupled_f32`'s doc
+        // comment in `ops.cu`: ws4's K/V double buffer at WK=48 already
+        // spends this GPU's exact 99 KiB shared-memory ceiling, leaving no
+        // room for this design's extra score buffer.
+        const WK: usize = 32;
+        let n_tiles = run_tokens.div_ceil(tpw);
+
+        let f = self.dev.kernels().get("infero_ops", ops_src(), "attn_prefill_decoupled_f32")?;
+        let kv_shared = 4 * WK * (dims.d_head + KPAD) * 2;
+        // Lane-indexed, not key-indexed (see `attn_prefill_decoupled_f32`'s
+        // `sc0` doc comment): 32 lanes x 4 floats per nt sub-tile, x2
+        // double-buffered stages.
+        let score_shared = 2 * (WK / 8) * 32 * 4 * 4;
+        let shared = (kv_shared + score_shared) as u32;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared)?;
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (dims.n_kv_heads as u32, n_tiles as u32, 1),
+            block_dim: (4 * 32, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let (stride, h, kh, dh, ns, kl, gi, tp, rb, rt) = (
+            batch.table_stride as i32,
+            dims.n_heads as i32,
+            dims.n_kv_heads as i32,
+            dims.d_head as i32,
+            dims.n_slots as i32,
+            kv_len as i32,
+            group as i32,
+            tpw as i32,
+            run_base as i32,
+            run_tokens as i32,
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(&mut *out)
+            .arg(q)
+            .arg(k_cache)
+            .arg(v_cache)
+            .arg(batch.seq_of)
+            .arg(batch.positions)
+            .arg(batch.slot_table)
+            .arg(&stride)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ns)
+            .arg(&scale)
+            .arg(&kl)
+            .arg(&gi)
+            .arg(&tp)
+            .arg(&rb)
+            .arg(&rt);
+        self.dev
+            .profile()
+            .time("attn_prefill_decoupled", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("attn_prefill_decoupled")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     /// Validation-only: `ws4` with e4m3 QK^T against a plain contiguous,
     /// single-sequence, single-chunk K (already quantized by
     /// [`Self::quantize_k_e4m3`]) and V, no paged pool, no `BatchLayout`.

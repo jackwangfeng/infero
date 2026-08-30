@@ -1526,6 +1526,117 @@ fn attn_prefill_matches_the_three_kernels() -> Result<()> {
     Ok(())
 }
 
+/// `attn_prefill_decoupled` -- the decoupled QK^T-warp/PV-consumer-warps
+/// design -- against the same three-kernel reference, at this checkpoint's
+/// real shape only (`d_head` is fixed at 256, the only width
+/// `ATTN_DSPLIT_HALF_NTILES` supports; see `attn_prefill_decoupled_f32`'s
+/// doc comment in `ops.cu`). Single-chunk only, no `partial` reduction --
+/// that's not built yet.
+#[test]
+fn attn_prefill_decoupled_matches_the_reference() -> Result<()> {
+    if std::env::var("INFERO_ATTN_MMA").as_deref() != Ok("1") {
+        eprintln!("skipping: needs INFERO_ATTN_MMA=1 set before the test binary starts");
+        return Ok(());
+    }
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+
+    let (n_heads, n_kv_heads, d_head) = (24usize, 4usize, 256usize);
+    let dims_probe = AttnDims { n_heads, n_kv_heads, d_head, n_slots: 1, n_tokens: 1 };
+    if !k.prefill_attention(&dims_probe) {
+        eprintln!("skipping: prefill_attention says this shape is unsupported");
+        return Ok(());
+    }
+    // tpw = (16/group).max(1) = (16/6).max(1) = 2 for this shape, so a tile
+    // is 2 tokens x 6 heads = 12 rows. Cover under, at, and past one tile,
+    // plus a longer run with a real multi-tile kv_len.
+    for (run_tokens, kv_len) in [(1usize, 40usize), (2, 33), (3, 33), (16, 100), (63, 4000)] {
+        let pad = 5usize;
+        let n_tokens = pad + run_tokens + pad;
+        let n_slots = 512usize;
+        let dims = AttnDims { n_heads, n_kv_heads, d_head, n_slots, n_tokens };
+        let scale = 1.0 / (dims.d_head as f32).sqrt();
+        let q = pseudo_random(n_tokens * dims.n_heads * dims.d_head, 0x71);
+        let kv_elems = dims.n_kv_heads * n_slots * dims.d_head;
+        let kh: Vec<f16> = pseudo_random(kv_elems, 0x82).into_iter().map(f16::from_f32).collect();
+        let vh: Vec<f16> = pseudo_random(kv_elems, 0x93).into_iter().map(f16::from_f32).collect();
+
+        let mut seq_of = vec![0i32; n_tokens];
+        let mut positions = vec![0i32; n_tokens];
+        for t in 0..n_tokens {
+            if t >= pad && t < pad + run_tokens {
+                seq_of[t] = 1;
+                positions[t] = (t - pad) as i32;
+            } else {
+                positions[t] = (200 + t) as i32 % (n_slots as i32);
+            }
+        }
+        let table: Vec<i32> = (0..2)
+            .flat_map(|s| (0..kv_len.max(n_slots)).map(move |p| ((p * 2 + s + 1) % n_slots) as i32))
+            .collect();
+        let table_stride = kv_len.max(n_slots);
+
+        let dq = stream.clone_htod(&q)?;
+        let dk = stream.clone_htod(&kh)?;
+        let dv = stream.clone_htod(&vh)?;
+        let dpos = stream.clone_htod(&positions)?;
+        let dseq = stream.clone_htod(&seq_of)?;
+        let dtable = stream.clone_htod(&table)?;
+        let (vseq, vpos, vtable) = (dseq.as_view(), dpos.as_view(), dtable.as_view());
+        let batch = BatchLayout { seq_of: &vseq, positions: &vpos, slot_table: &vtable, table_stride };
+
+        let mut dscores = stream.alloc_zeros::<f32>(dims.n_heads * n_tokens * kv_len)?;
+        let out_len = n_tokens * dims.n_heads * dims.d_head;
+        let mut want_d = stream.alloc_zeros::<f32>(out_len)?;
+        k.attn_scores(&mut dscores.as_view_mut(), &dq.as_view(), &dk.as_view(), batch, dims, kv_len, scale)?;
+        k.attn_softmax(&mut dscores.as_view_mut(), dims.n_heads, n_tokens, kv_len)?;
+        k.attn_output(&mut want_d.as_view_mut(), &dscores.as_view(), &dv.as_view(), batch, dims, kv_len, None)?;
+        let want = stream.clone_dtoh(&want_d)?;
+
+        let mut got_d = stream.clone_htod(&want)?;
+        k.attn_prefill_decoupled(
+            &mut got_d.as_view_mut(),
+            &dq.as_view(),
+            &dk.as_view(),
+            &dv.as_view(),
+            batch,
+            dims,
+            pad,
+            run_tokens,
+            kv_len,
+            scale,
+        )?;
+        let got = stream.clone_dtoh(&got_d)?;
+        k.device().synchronize()?;
+
+        let run_lo = pad * dims.n_heads * dims.d_head;
+        let run_hi = (pad + run_tokens) * dims.n_heads * dims.d_head;
+        let (abs, at) = max_abs_diff(&got[run_lo..run_hi], &want[run_lo..run_hi]);
+        assert!(
+            abs < 2e-3,
+            "attn_prefill_decoupled run {run_tokens} kv {kv_len}: \
+             max abs diff {abs} at {at} (got {}, want {})",
+            got[run_lo + at],
+            want[run_lo + at]
+        );
+        assert!(
+            want[run_lo..run_hi].iter().any(|v| v.abs() > 1e-3),
+            "reference is all zeros"
+        );
+        assert_eq!(
+            &got[..run_lo],
+            &want[..run_lo],
+            "attn_prefill_decoupled run {run_tokens} kv {kv_len}: wrote before the run"
+        );
+        assert_eq!(
+            &got[run_hi..],
+            &want[run_hi..],
+            "attn_prefill_decoupled run {run_tokens} kv {kv_len}: wrote past the run"
+        );
+    }
+    Ok(())
+}
+
 /// The two-kernel option-3 split (`attn_prefill_stats_f32` + `attn_prefill_pv_f32`,
 /// dispatched together by `Kernels::attn_prefill_split`) against the same
 /// three-kernel reference the fused kernels above check against. Only
