@@ -60,6 +60,7 @@ fn main() -> Result<()> {
 
     let mut out_ws4 = stream.alloc_zeros::<f32>(n_tokens * N_HEADS * D_HEAD)?;
     let mut out_dc = stream.alloc_zeros::<f32>(n_tokens * N_HEADS * D_HEAD)?;
+    let mut out_dc2 = stream.alloc_zeros::<f32>(n_tokens * N_HEADS * D_HEAD)?;
     let mut part = stream.alloc_zeros::<f32>(Kernels::attn_partial_floats(N_HEADS, D_HEAD, BATCH_TOKENS))?;
 
     let run_ws4 = |out: &mut infero_gpu::Buf<f32>, part: &mut infero_gpu::Buf<f32>| -> Result<f64> {
@@ -100,24 +101,50 @@ fn main() -> Result<()> {
         Ok(t0.elapsed().as_secs_f64() * 1000.0)
     };
 
+    let run_decoupled2 = |out: &mut infero_gpu::Buf<f32>| -> Result<f64> {
+        k.device().synchronize()?;
+        let t0 = std::time::Instant::now();
+        for _layer in 0..N_LAYERS {
+            let mut base = 0usize;
+            while base < TOTAL_TOKENS {
+                let run_tokens = BATCH_TOKENS.min(TOTAL_TOKENS - base);
+                let kv_len = base + run_tokens;
+                k.attn_prefill_decoupled2(
+                    &mut out.as_view_mut(), &dq.as_view(), &dk.as_view(), &dv.as_view(),
+                    batch, dims, base, run_tokens, kv_len, scale,
+                )?;
+                base += run_tokens;
+            }
+        }
+        k.device().synchronize()?;
+        Ok(t0.elapsed().as_secs_f64() * 1000.0)
+    };
+
     // Warmup, then best of several timed reps each.
     run_ws4(&mut out_ws4, &mut part)?;
     run_decoupled(&mut out_dc)?;
+    run_decoupled2(&mut out_dc2)?;
 
     const REPEATS: usize = 3;
     let mut best_ws4 = f64::MAX;
     let mut best_dc = f64::MAX;
+    let mut best_dc2 = f64::MAX;
     for _ in 0..REPEATS {
         best_ws4 = best_ws4.min(run_ws4(&mut out_ws4, &mut part)?);
         best_dc = best_dc.min(run_decoupled(&mut out_dc)?);
+        best_dc2 = best_dc2.min(run_decoupled2(&mut out_dc2)?);
     }
 
     println!(
         "attn_prefill_ws4        best: {best_ws4:.2} ms total ({N_LAYERS} layers x {TOTAL_TOKENS} tokens)"
     );
     println!(
-        "attn_prefill_decoupled  best: {best_dc:.2} ms total, {:.3}x",
+        "attn_prefill_decoupled  best: {best_dc:.2} ms total, {:.3}x  (T=1)",
         best_ws4 / best_dc
+    );
+    println!(
+        "attn_prefill_decoupled2 best: {best_dc2:.2} ms total, {:.3}x  (T=2)",
+        best_ws4 / best_dc2
     );
     Ok(())
 }
