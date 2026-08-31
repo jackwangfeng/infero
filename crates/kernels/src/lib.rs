@@ -3722,6 +3722,92 @@ impl Kernels {
         Ok(())
     }
 
+    /// [`Self::attn_prefill_decoupled2`], with the PV-consumer role's `o[]`
+    /// accumulated in fp16 instead of fp32 -- unlike `ws4`'s own fp16-
+    /// accumulate experiment (which only captured 21 of a naive 64-register
+    /// saving), this role has no `qa[]`/QK^T competing for live ranges, so
+    /// it captures the full naive 32-register saving (128 -> 96), even
+    /// combined into the real multi-role kernel (confirmed via
+    /// `kernel_registers` before ever launching it). Same launch shape as
+    /// T=2 otherwise -- only the register count differs, which is exactly
+    /// what determines blocks/SM.
+    pub fn attn_prefill_decoupled2_f16acc(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        q: &View<'_, f32>,
+        k_cache: &View<'_, f16>,
+        v_cache: &View<'_, f16>,
+        batch: BatchLayout<'_>,
+        dims: AttnDims,
+        run_base: usize,
+        run_tokens: usize,
+        kv_len: usize,
+        scale: f32,
+    ) -> Result<()> {
+        anyhow::ensure!(self.prefill_attention(&dims), "attn_prefill_decoupled2_f16acc: unsupported shape");
+        anyhow::ensure!(run_tokens >= 1, "attn_prefill_decoupled2_f16acc: empty run");
+        let group = dims.n_heads / dims.n_kv_heads;
+        let tpw = (16 / group).max(1);
+        const KPAD: usize = 8;
+        const WK: usize = 32;
+        const TG: usize = 2;
+        let n_big_tiles = run_tokens.div_ceil(TG * tpw);
+
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_ops", ops_src(), "attn_prefill_decoupled2_f16acc_regcheck_f32")?;
+        let kv_shared = 4 * WK * (dims.d_head + KPAD) * 2;
+        let score_shared = TG * 2 * (WK / 8) * 32 * 4 * 4;
+        let shared = (kv_shared + score_shared) as u32;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared)?;
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (dims.n_kv_heads as u32, n_big_tiles as u32, 1),
+            block_dim: ((1 + 3 * TG) as u32 * 32, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let (stride, h, kh, dh, ns, kl, gi, tp, rb, rt) = (
+            batch.table_stride as i32,
+            dims.n_heads as i32,
+            dims.n_kv_heads as i32,
+            dims.d_head as i32,
+            dims.n_slots as i32,
+            kv_len as i32,
+            group as i32,
+            tpw as i32,
+            run_base as i32,
+            run_tokens as i32,
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(&mut *out)
+            .arg(q)
+            .arg(k_cache)
+            .arg(v_cache)
+            .arg(batch.seq_of)
+            .arg(batch.positions)
+            .arg(batch.slot_table)
+            .arg(&stride)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ns)
+            .arg(&scale)
+            .arg(&kl)
+            .arg(&gi)
+            .arg(&tp)
+            .arg(&rb)
+            .arg(&rt);
+        self.dev
+            .profile()
+            .time("attn_prefill_decoupled2_f16acc", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("attn_prefill_decoupled2_f16acc")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     /// Validation-only: `ws4` with e4m3 QK^T against a plain contiguous,
     /// single-sequence, single-chunk K (already quantized by
     /// [`Self::quantize_k_e4m3`]) and V, no paged pool, no `BatchLayout`.
