@@ -777,6 +777,117 @@ impl Kernels {
         Ok(())
     }
 
+    /// The cross-group fold: walks `n_groups` group totals (from
+    /// [`Self::gdn_group_scan`]'s own `group_a`/`group_b` output)
+    /// SEQUENTIALLY on a `heads`-only grid, folding each one directly
+    /// against the actual running state matrix rather than carrying a
+    /// `(A,B)` transform pair -- see `gdn_group_state_f32`'s own doc comment
+    /// in `gdn.cu`. `group_start_state` (sized `n_groups*heads*128*128`)
+    /// receives the actual state at the START of every group; `state`
+    /// receives the same final total-state output `gdn_chunk_state_f32`
+    /// itself produces (may alias `s_init` -- read happens before write, per
+    /// head). `group_a`/`group_b` sized `n_groups*heads*128*128` each;
+    /// `s_init`/`state` sized `heads*128*128`.
+    pub fn gdn_group_state(
+        &self,
+        group_start_state: &mut ViewMut<'_, f32>,
+        state: &mut ViewMut<'_, f32>,
+        s_init: &View<'_, f32>,
+        group_a: &View<'_, f32>,
+        group_b: &View<'_, f32>,
+        heads: usize,
+        n_groups: usize,
+    ) -> Result<()> {
+        const GDN_DV: usize = 128;
+        let f32_size = std::mem::size_of::<f32>();
+        let f = self.dev.kernels().get("infero_gdn", gdn_src(), "gdn_group_state_f32")?;
+        let shared = (GDN_DV * f32_size) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (heads as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let (h, ng) = (heads as i32, n_groups as i32);
+        let mut bl = self.dev.stream().launch_builder(&f);
+        bl.arg(&mut *group_start_state)
+            .arg(&mut *state)
+            .arg(s_init)
+            .arg(group_a)
+            .arg(group_b)
+            .arg(&h)
+            .arg(&ng);
+        self.dev
+            .profile()
+            .time("gdn_group_state", self.dev.stream(), || {
+                unsafe { bl.launch(cfg) }.context("gdn_group_state")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// The final parallel correction pass: gridded over `(heads, n_chunks)`,
+    /// one block a chunk, fully independent of every other chunk. Combines
+    /// [`Self::gdn_group_scan`]'s own `prefix_a`/`prefix_b` (a chunk's local
+    /// prefix within its own group) with [`Self::gdn_group_state`]'s own
+    /// `group_start_state` (that group's real starting state) to get the
+    /// real `S_before(c)`, then runs the same pred/delta step
+    /// `gdn_chunk_state_f32` computes per chunk -- see `gdn_scan_finish_f32`'s
+    /// own doc comment in `gdn.cu`. A drop-in replacement for
+    /// `gdn_chunk_state_f32`'s `(delta_out, s_before_out)` pair:
+    /// `gdn_chunk_output_f32` (kernel 3) needs zero changes to consume this
+    /// kernel's output instead. `w`/`u` are kernel 1's own output, unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_scan_finish(
+        &self,
+        delta: &mut ViewMut<'_, f32>,
+        s_before: &mut ViewMut<'_, f32>,
+        prefix_a: &View<'_, f32>,
+        prefix_b: &View<'_, f32>,
+        group_start_state: &View<'_, f32>,
+        w: &View<'_, f32>,
+        u: &View<'_, f32>,
+        seqs: &SeqLayout<'_>,
+        heads: usize,
+        n_chunks: usize,
+        group_size: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(seqs.n_seqs == 1, "gdn_scan_finish: single sequence only");
+        const GDN_CHUNK: usize = 32;
+        const GDN_DK: usize = 128;
+        const GDN_DV: usize = 128;
+        const ROW_PAD: usize = GDN_DK + 4;
+        let f32_size = std::mem::size_of::<f32>();
+        let f = self.dev.kernels().get("infero_gdn", gdn_src(), "gdn_scan_finish_f32")?;
+        let shared = (GDN_DV + GDN_CHUNK * ROW_PAD) * f32_size;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared as u32)?;
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (heads as u32, n_chunks as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: shared as u32,
+        };
+        let (h, gs) = (heads as i32, group_size as i32);
+        let mut bl = self.dev.stream().launch_builder(&f);
+        bl.arg(&mut *delta)
+            .arg(&mut *s_before)
+            .arg(prefix_a)
+            .arg(prefix_b)
+            .arg(group_start_state)
+            .arg(w)
+            .arg(u)
+            .arg(seqs.n_tokens)
+            .arg(&h)
+            .arg(&gs);
+        self.dev
+            .profile()
+            .time("gdn_scan_finish", self.dev.stream(), || {
+                unsafe { bl.launch(cfg) }.context("gdn_scan_finish")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     /// Diagnostic-only standalone wrapper for the plain, unmodified
     /// `gdn_chunk_uw_f32` (kernel 1 alone, no `A`/`B` extension) -- built to
     /// check whether a real, direct-against-a-host-reference bug found
@@ -844,6 +955,85 @@ impl Kernels {
             .profile()
             .time("gdn_chunk_uw_only", self.dev.stream(), || {
                 unsafe { bl.launch(cfg) }.context("gdn_chunk_uw_only")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// Diagnostic-only standalone wrapper for the plain, unmodified
+    /// `gdn_chunk_state_f32` (kernel 2 alone, given already-computed `w`/`u`
+    /// from [`Self::gdn_chunk_uw_only`]) -- built to give the scan-based
+    /// replacement (`gdn_group_scan` + `gdn_group_state` + `gdn_scan_finish`)
+    /// a direct, already-verified real-kernel reference for `delta`/
+    /// `s_before` to compare against, rather than a hand-rolled host
+    /// sequential reference in the test itself.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_chunk_state_only(
+        &self,
+        delta: &mut ViewMut<'_, f32>,
+        s_before: &mut ViewMut<'_, f32>,
+        state: &mut ViewMut<'_, f32>,
+        w: &View<'_, f32>,
+        u: &View<'_, f32>,
+        qkv: &View<'_, f32>,
+        g: &View<'_, f32>,
+        seqs: &SeqLayout<'_>,
+        heads: usize,
+        key_heads: usize,
+        dk: usize,
+        dv: usize,
+        offsets: (usize, usize, usize, usize),
+        v_tiled: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(seqs.n_seqs == 1, "gdn_chunk_state_only: single sequence only");
+        anyhow::ensure!(
+            dk == 128 && dv == 128,
+            "gdn_chunk_state_only is instantiated for dk = dv = 128, got {dk}x{dv}"
+        );
+        let (stride, _q_off, k_off, _v_off) = offsets;
+        const GDN_CHUNK: usize = 32;
+        const GDN_DK: usize = 128;
+        const ROW_PAD: usize = GDN_DK + 4;
+        let n_chunks = seqs.total_tokens.div_ceil(GDN_CHUNK).max(1);
+        let f32_size = std::mem::size_of::<f32>();
+
+        let f = self.dev.kernels().get("infero_gdn", gdn_src(), "gdn_chunk_state_f32")?;
+        let shared = (2 * GDN_CHUNK * ROW_PAD + GDN_CHUNK) * f32_size;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared as u32)?;
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (heads as u32, 1, 1),
+            block_dim: (2 * dv as u32, 1, 1),
+            shared_mem_bytes: shared as u32,
+        };
+        let (h, kh) = (heads as i32, key_heads as i32);
+        let (dka, dva) = (dk as i32, dv as i32);
+        let (st, ko) = (stride as i32, k_off as i32);
+        let vt = i32::from(v_tiled);
+        let nc = n_chunks as i32;
+        let mut bl = self.dev.stream().launch_builder(&f);
+        bl.arg(&mut *delta)
+            .arg(&mut *s_before)
+            .arg(&mut *state)
+            .arg(w)
+            .arg(u)
+            .arg(qkv)
+            .arg(g)
+            .arg(seqs.first_token)
+            .arg(seqs.n_tokens)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dka)
+            .arg(&dva)
+            .arg(&st)
+            .arg(&ko)
+            .arg(&vt)
+            .arg(&nc);
+        self.dev
+            .profile()
+            .time("gdn_chunk_state_only", self.dev.stream(), || {
+                unsafe { bl.launch(cfg) }.context("gdn_chunk_state_only")?;
                 Ok(())
             })?;
         Ok(())

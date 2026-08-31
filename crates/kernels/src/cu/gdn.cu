@@ -1739,6 +1739,181 @@ extern "C" __global__ __launch_bounds__(256) void gdn_group_scan_f32(
     }
 }
 
+// Cross-group fold: `n_groups` is small (~sqrt(n_chunks)), so this walks it
+// SEQUENTIALLY on a `heads`-only grid, same shape as `gdn_chunk_state_f32`'s
+// own grid. Unlike `gdn_group_scan_f32`/`gdn_ab_combine_f32`, this does NOT
+// carry a `(A,B)` transform pair -- it folds `gdn_group_scan_f32`'s own
+// `group_a`/`group_b` totals directly against the actual running state
+// matrix (`DK x DV`), which is both cheaper (one GEMM-and-add a step, not
+// two) and exactly the artifact the final correction pass and kernel 3
+// already want. `group_start_state[g]` is the actual state at the START of
+// group `g` (`g=0` reproduces `s_init` exactly); `state` receives the same
+// final total-state output `gdn_chunk_state_f32` itself produces, so a
+// scan-based kernel 2 replacement stays a drop-in for multi-turn state
+// carry. `group_a`/`group_b` sized `n_groups*heads*128*128` each (matching
+// `gdn_group_scan_f32`'s own `group_a_out`/`group_b_out`);
+// `group_start_state` sized `n_groups*heads*128*128`; `state`/`s_init` sized
+// `heads*128*128` (may alias the same buffer, read-before-write per head).
+extern "C" __global__ __launch_bounds__(256) void gdn_group_state_f32(
+        float* __restrict__ group_start_state, float* __restrict__ state,
+        const float* __restrict__ s_init, const float* __restrict__ group_a_in,
+        const float* __restrict__ group_b_in, int heads, int n_groups) {
+    const int head = blockIdx.x;
+    const int lane = threadIdx.x;
+    const int d1 = lane / 2;
+    const int part = lane % 2;
+    const int i0 = part * 64;
+
+    extern __shared__ float gdn_gstate_smem[];
+    float* row_s = gdn_gstate_smem;  // [GDN_DV]
+
+    const float* S0 = s_init + (size_t)head * GDN_DK * GDN_DV;
+    float sc[64];
+#pragma unroll
+    for (int r = 0; r < 64; ++r) sc[r] = S0[(size_t)d1 * GDN_DV + (i0 + r)];
+
+    for (int gr = 0; gr < n_groups; ++gr) {
+        float* out_g = group_start_state + ((size_t)gr * heads + head) * GDN_DK * GDN_DV;
+#pragma unroll
+        for (int r = 0; r < 64; ++r) out_g[(size_t)d1 * GDN_DV + (i0 + r)] = sc[r];
+        __syncthreads();
+
+        const float* a2 = group_a_in + ((size_t)gr * heads + head) * GDN_DK * GDN_DK;
+        const float* b2 = group_b_in + ((size_t)gr * heads + head) * GDN_DK * GDN_DV;
+
+        float new_sc[64];
+#pragma unroll
+        for (int r = 0; r < 64; ++r) new_sc[r] = 0.0f;
+
+        for (int e = 0; e < GDN_DK; ++e) {
+            if (lane < GDN_DV) row_s[lane] = out_g[e * GDN_DV + lane];
+            __syncthreads();
+
+            const float a_val = a2[d1 * GDN_DK + e];
+#pragma unroll
+            for (int r = 0; r < 64; ++r) {
+                new_sc[r] += a_val * row_s[i0 + r];
+            }
+            __syncthreads();
+        }
+
+#pragma unroll
+        for (int r = 0; r < 64; ++r) sc[r] = new_sc[r] + b2[(size_t)d1 * GDN_DV + (i0 + r)];
+    }
+
+    float* S = state + (size_t)head * GDN_DK * GDN_DV;
+#pragma unroll
+    for (int r = 0; r < 64; ++r) S[(size_t)d1 * GDN_DV + (i0 + r)] = sc[r];
+}
+
+// The final parallel correction pass: gridded over `(heads, n_chunks)`, one
+// block a chunk, fully independent of every other chunk -- the actual
+// payoff of the whole scan approach over `gdn_chunk_state_f32`'s own
+// `heads`-only sequential grid. Two phases:
+//
+//   1. `S_before(c) = local_prefix_a[c] @ group_start_state[group(c)] +
+//      local_prefix_b[c]` -- the same row-streaming GEMM
+//      `gdn_ab_combine_f32`/`gdn_group_state_f32` already use, row-owning
+//      convention (`d1` fixed row, two 64-wide column halves), writing
+//      straight to the real `s_before_out` kernel 3 already consumes
+//      unmodified.
+//   2. The same `pp = S_before @ W` / `delta = U - pp` pred step
+//      `gdn_chunk_state_f32`'s own sequential loop computes per chunk --
+//      column-owning convention (`j` fixed column, two 64-wide row halves,
+//      matching that kernel exactly) -- reading `S_before` back from the
+//      global write phase 1 just did (a full-block `__syncthreads()`
+//      separates the two conventions; nothing here relies on any register
+//      carried between them). Deliberately does NOT stage or even take `qkv`/
+//      `g`/`first_token`/key_heads/dk/dv/stride/k_off/v_tiled as parameters:
+//      unlike `gdn_chunk_state_f32`, this kernel never needs `K` (no state
+//      ADVANCE happens here -- the scan already supplies every chunk's own
+//      `S_before` independently) or raw token positions (`w_in`/`u_in` are
+//      already chunk-relative, kernel-1 outputs).
+//
+// A drop-in replacement for `gdn_chunk_state_f32`'s `(delta_out,
+// s_before_out)` pair: `gdn_chunk_output_f32` (kernel 3) needs zero changes
+// to consume this kernel's output instead. `local_prefix_a`/`local_prefix_b`
+// come from `gdn_group_scan_f32`; `group_start_state` comes from
+// `gdn_group_state_f32`; `w_in`/`u_in` come from `gdn_chunk_uw_f32` (kernel
+// 1), unchanged.
+extern "C" __global__ __launch_bounds__(256) void gdn_scan_finish_f32(
+        float* __restrict__ delta_out, float* __restrict__ s_before_out,
+        const float* __restrict__ local_prefix_a_in, const float* __restrict__ local_prefix_b_in,
+        const float* __restrict__ group_start_state_in, const float* __restrict__ w_in,
+        const float* __restrict__ u_in, const int* __restrict__ n_tok, int heads,
+        int group_size) {
+    const int head = blockIdx.x;
+    const int chunk = blockIdx.y;
+    const int seq = 0;
+    const int nt = n_tok[seq];
+    const int c0 = chunk * GDN_CHUNK;
+    if (c0 >= nt) return;
+    const int C = min(GDN_CHUNK, nt - c0);
+    const int group = chunk / group_size;
+    const int lane = threadIdx.x;
+
+    extern __shared__ float gdn_finish_smem[];
+    float* row_s = gdn_finish_smem;      // [GDN_DV]
+    float* sw = row_s + GDN_DV;          // [GDN_CHUNK][GDN_ROW_PAD]
+
+    float* sbefore = s_before_out + ((size_t)chunk * heads + head) * GDN_DK * GDN_DV;
+
+    {
+        const int d1 = lane / 2;
+        const int part = lane % 2;
+        const int i0 = part * 64;
+        const float* a2 = local_prefix_a_in + ((size_t)chunk * heads + head) * GDN_DK * GDN_DK;
+        const float* b2 = local_prefix_b_in + ((size_t)chunk * heads + head) * GDN_DK * GDN_DV;
+        const float* s1 = group_start_state_in + ((size_t)group * heads + head) * GDN_DK * GDN_DV;
+
+        float acc[64];
+#pragma unroll
+        for (int r = 0; r < 64; ++r) acc[r] = 0.0f;
+
+        for (int e = 0; e < GDN_DK; ++e) {
+            if (lane < GDN_DV) row_s[lane] = s1[e * GDN_DV + lane];
+            __syncthreads();
+            const float a_val = a2[d1 * GDN_DK + e];
+#pragma unroll
+            for (int r = 0; r < 64; ++r) acc[r] += a_val * row_s[i0 + r];
+            __syncthreads();
+        }
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            sbefore[(size_t)d1 * GDN_DV + (i0 + r)] = acc[r] + b2[(size_t)d1 * GDN_DV + (i0 + r)];
+        }
+    }
+    __syncthreads();
+
+    const int j = lane / 2;
+    const int part2 = lane % 2;
+    const int i0b = part2 * 64;
+
+    const float* w_chunk = w_in + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DK;
+    const float* u_chunk = u_in + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DV;
+    float* delta_chunk = delta_out + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DV;
+
+    for (int idx = lane; idx < C * GDN_DK; idx += blockDim.x) {
+        const int r = idx / GDN_DK, d = idx % GDN_DK;
+        sw[r * GDN_ROW_PAD + d] = w_chunk[r * GDN_DK + d];
+    }
+    __syncthreads();
+
+    float sc[64];
+#pragma unroll
+    for (int r = 0; r < 64; ++r) sc[r] = sbefore[(size_t)(i0b + r) * GDN_DV + j];
+
+    for (int i = 0; i < C; ++i) {
+        float pp = 0.0f;
+#pragma unroll
+        for (int r = 0; r < 64; ++r) pp += sc[r] * sw[i * GDN_ROW_PAD + i0b + r];
+        pp += __shfl_xor_sync(0xffffffffu, pp, 1, 32);
+        if (part2 == 0) {
+            delta_chunk[i * GDN_DV + j] = u_chunk[i * GDN_DV + j] - pp;
+        }
+    }
+}
+
 extern "C" __global__ __launch_bounds__(256) void gdn_chunk_state_f32(
         float* __restrict__ delta_out, float* __restrict__ s_before_out,
         float* __restrict__ state, const float* __restrict__ w_in,

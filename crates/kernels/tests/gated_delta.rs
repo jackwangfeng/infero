@@ -1674,6 +1674,195 @@ fn the_group_scan_matches_a_host_sequential_scan() -> Result<()> {
     Ok(())
 }
 
+/// The scan-based kernel 2 replacement -- `gdn_group_scan` + `gdn_group_state`
+/// + `gdn_scan_finish` -- checked directly against the already-verified,
+/// real, production `gdn_chunk_state_f32` (plain kernel 2) on the SAME `w`/
+/// `u`/`qkv`/`g` inputs, rather than a hand-rolled host sequential reference.
+/// `t_len = 200` gives `n_chunks = 7`; `group_size = 3` gives 3 groups
+/// (`[0,3)`, `[3,6)`, `[6,7)`), so the cross-group fold and the per-chunk
+/// correction pass both do real work, not a single-group degenerate case
+/// `the_group_scan_matches_a_host_sequential_scan` already covers. `s_init`
+/// is real random data, not zero -- the whole point of `gdn_group_state` is
+/// threading a real initial state through the fold, and zero would not
+/// exercise that.
+#[test]
+fn the_scan_based_kernel2_matches_gdn_chunk_state_f32() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    let t_len = 200usize;
+    const GDN_CHUNK: usize = 32;
+    const DKC: usize = 128;
+    const DVC: usize = 128;
+    let n_chunks = t_len.div_ceil(GDN_CHUNK);
+    let group_size = 3usize;
+    let n_groups = n_chunks.div_ceil(group_size);
+
+    let q_small = pseudo_random(t_len * KEY_HEADS * DK, 0x9001);
+    let k_small = pseudo_random(t_len * KEY_HEADS * DK, 0x9002);
+    let v = pseudo_random(t_len * VAL_HEADS * DV, 0x9003);
+    let g = decaying(t_len * VAL_HEADS, 0x9004, 0.7);
+    let beta = betas(t_len * VAL_HEADS, 0x9005);
+    let (row, off) = packed(&q_small, &k_small, &v, t_len);
+
+    let chunk = stream.clone_htod(&row)?;
+    let hg = stream.clone_htod(&g)?;
+    let hb = stream.clone_htod(&beta)?;
+    let f = stream.clone_htod(&[0i32])?;
+    let n = stream.clone_htod(&[t_len as i32])?;
+    let seqs = infero_kernels::gdn::SeqLayout {
+        first_token: &f.as_view(),
+        n_tokens: &n.as_view(),
+        n_seqs: 1,
+        total_tokens: t_len,
+    };
+
+    let mut w = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DK)?;
+    let mut u = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DV)?;
+    k.gdn_chunk_uw_only(
+        &mut w.as_view_mut(),
+        &mut u.as_view_mut(),
+        &chunk.as_view(),
+        &hg.as_view(),
+        &hb.as_view(),
+        &seqs,
+        VAL_HEADS,
+        KEY_HEADS,
+        DK,
+        DV,
+        off,
+        false,
+    )?;
+
+    let mut a = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * DKC * DKC)?;
+    let mut b = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * DKC * DVC)?;
+    k.gdn_chunk_ab(
+        &mut a.as_view_mut(),
+        &mut b.as_view_mut(),
+        &w.as_view(),
+        &u.as_view(),
+        &chunk.as_view(),
+        &hg.as_view(),
+        &seqs,
+        VAL_HEADS,
+        KEY_HEADS,
+        DK,
+        DV,
+        off,
+        false,
+    )?;
+    k.device().synchronize()?;
+
+    let s_init = pseudo_random(VAL_HEADS * DKC * DVC, 0x9006);
+
+    // Reference: plain sequential kernel 2 on the same w/u/qkv/g, starting
+    // from the same s_init.
+    let mut delta_ref = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DV)?;
+    let mut s_before_ref = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * DKC * DVC)?;
+    let mut state_ref = stream.clone_htod(&s_init)?;
+    k.gdn_chunk_state_only(
+        &mut delta_ref.as_view_mut(),
+        &mut s_before_ref.as_view_mut(),
+        &mut state_ref.as_view_mut(),
+        &w.as_view(),
+        &u.as_view(),
+        &chunk.as_view(),
+        &hg.as_view(),
+        &seqs,
+        VAL_HEADS,
+        KEY_HEADS,
+        DK,
+        DV,
+        off,
+        false,
+    )?;
+    k.device().synchronize()?;
+    let got_delta_ref = stream.clone_dtoh(&delta_ref)?;
+    let got_sbefore_ref = stream.clone_dtoh(&s_before_ref)?;
+    let got_state_ref = stream.clone_dtoh(&state_ref)?;
+
+    // Scan path: group-local scan, cross-group fold, then the parallel
+    // per-chunk correction pass.
+    let mut prefix_a = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * DKC * DKC)?;
+    let mut prefix_b = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * DKC * DVC)?;
+    let mut group_a = stream.alloc_zeros::<f32>(n_groups * VAL_HEADS * DKC * DKC)?;
+    let mut group_b = stream.alloc_zeros::<f32>(n_groups * VAL_HEADS * DKC * DVC)?;
+    k.gdn_group_scan(
+        &mut prefix_a.as_view_mut(),
+        &mut prefix_b.as_view_mut(),
+        &mut group_a.as_view_mut(),
+        &mut group_b.as_view_mut(),
+        &a.as_view(),
+        &b.as_view(),
+        VAL_HEADS,
+        n_chunks,
+        group_size,
+    )?;
+
+    let mut group_start_state = stream.alloc_zeros::<f32>(n_groups * VAL_HEADS * DKC * DVC)?;
+    let mut state_scan = stream.clone_htod(&s_init)?;
+    let s_init_dev = stream.clone_htod(&s_init)?;
+    k.gdn_group_state(
+        &mut group_start_state.as_view_mut(),
+        &mut state_scan.as_view_mut(),
+        &s_init_dev.as_view(),
+        &group_a.as_view(),
+        &group_b.as_view(),
+        VAL_HEADS,
+        n_groups,
+    )?;
+
+    let mut delta_scan = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DV)?;
+    let mut s_before_scan = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * DKC * DVC)?;
+    k.gdn_scan_finish(
+        &mut delta_scan.as_view_mut(),
+        &mut s_before_scan.as_view_mut(),
+        &prefix_a.as_view(),
+        &prefix_b.as_view(),
+        &group_start_state.as_view(),
+        &w.as_view(),
+        &u.as_view(),
+        &seqs,
+        VAL_HEADS,
+        n_chunks,
+        group_size,
+    )?;
+    k.device().synchronize()?;
+    let got_delta_scan = stream.clone_dtoh(&delta_scan)?;
+    let got_sbefore_scan = stream.clone_dtoh(&s_before_scan)?;
+    let got_state_scan = stream.clone_dtoh(&state_scan)?;
+
+    let (dworst, dat) = max_abs_diff(&got_delta_scan, &got_delta_ref);
+    let dpeak = got_delta_ref.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-6);
+    assert!(
+        dworst < 1e-3 * dpeak,
+        "scan-based delta diverged from gdn_chunk_state_f32 by {dworst:.2e} at {dat}: \
+         got {}, want {}",
+        got_delta_scan[dat],
+        got_delta_ref[dat]
+    );
+
+    let (sworst, sat) = max_abs_diff(&got_sbefore_scan, &got_sbefore_ref);
+    let speak = got_sbefore_ref.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-6);
+    assert!(
+        sworst < 1e-3 * speak,
+        "scan-based s_before diverged from gdn_chunk_state_f32 by {sworst:.2e} at {sat}: \
+         got {}, want {}",
+        got_sbefore_scan[sat],
+        got_sbefore_ref[sat]
+    );
+
+    let (fworst, fat) = max_abs_diff(&got_state_scan, &got_state_ref);
+    let fpeak = got_state_ref.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-6);
+    assert!(
+        fworst < 1e-3 * fpeak,
+        "scan-based final state diverged from gdn_chunk_state_f32 by {fworst:.2e} at {fat}: \
+         got {}, want {}",
+        got_state_scan[fat],
+        got_state_ref[fat]
+    );
+    Ok(())
+}
+
 /// The batch properties, held against the fallback kernel by name.
 ///
 /// `two_sequences_in_one_batch_keep_separate_state` above now exercises the
