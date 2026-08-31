@@ -3416,6 +3416,134 @@ impl Kernels {
         Ok(())
     }
 
+    /// Diagnostic only: [`Self::attn_prefill_ws4`] with `NWARPS` exposed as a
+    /// runtime parameter instead of the hardcoded compile-time `7` --
+    /// otherwise byte-for-byte identical, calling the exact same, already-
+    /// correctness-tested `attn_prefill_mma_ws4_f32` kernel (which already
+    /// reads `nwarps` from `blockDim.x` at runtime, so this needs zero
+    /// kernel-side changes). Checks a real, FlashAttention-2-inspired lever
+    /// this session hadn't tried: shrinking the block (fewer consumer warps,
+    /// same per-warp work, same per-thread register count) so more than one
+    /// block's worth of registers fit an SM, at a real but much smaller
+    /// memory-retraffic cost (`7/NWARPS`x more blocks, each still streaming
+    /// the full causal K/V range) than the decoupled-role kernel's 7x tax
+    /// (which came from an 8-way *role* fragmentation, not this simple
+    /// block-shrink). See FA2's own `kernel_traits.h`/`flash_fwd_launch_
+    /// template.h`: its H100 config does exactly this (kBlockM 128->64,
+    /// warps 8->4) to get 2 CTAs/SM at hdim256, with no accumulator
+    /// register trick at all.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prefill_ws4_nw(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        q: &View<'_, f32>,
+        k_cache: &View<'_, f16>,
+        v_cache: &View<'_, f16>,
+        batch: BatchLayout<'_>,
+        dims: AttnDims,
+        run_base: usize,
+        run_tokens: usize,
+        kv_len: usize,
+        scale: f32,
+        partial: &mut ViewMut<'_, f32>,
+        nwarps: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(self.prefill_attention(&dims), "attn_prefill_ws4_nw: unsupported shape");
+        anyhow::ensure!(run_tokens >= 1, "attn_prefill_ws4_nw: empty run");
+        let group = dims.n_heads / dims.n_kv_heads;
+        let tpw = (16 / group).max(1);
+        const KPAD: usize = 8;
+        const WK: usize = 48;
+        let tile_tokens = nwarps * tpw;
+        let n_tiles = run_tokens.div_ceil(tile_tokens);
+        let (n_chunks, chunk) = self.prefill_chunks(dims.n_kv_heads, n_tiles, kv_len);
+        anyhow::ensure!(
+            n_chunks <= 32,
+            "attn_prefill_ws4_nw: {n_chunks} chunks past the partial buffer's 32"
+        );
+        let ms_off = (32 * dims.n_heads * run_tokens * dims.d_head) as i32;
+
+        let f = self.dev.kernels().get("infero_ops", ops_src(), "attn_prefill_mma_ws4_f32")?;
+        let kv_shared = 4 * WK * (dims.d_head + KPAD) * 2;
+        const MAX_DYNAMIC_SHARED: usize = 100 * 1024;
+        let stage_row = if dims.d_head % 32 == 0 { dims.d_head + 4 } else { dims.d_head };
+        let out_stage_shared = nwarps * tpw * group * stage_row * 4;
+        let use_out_stage = out_stage_shared <= MAX_DYNAMIC_SHARED;
+        let shared = if use_out_stage { kv_shared.max(out_stage_shared) } else { kv_shared } as u32;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared)?;
+        }
+        let single = i32::from(n_chunks == 1);
+        let cfg = LaunchConfig {
+            grid_dim: (dims.n_kv_heads as u32, n_tiles as u32, n_chunks),
+            block_dim: ((nwarps + 1) as u32 * 32, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let (stride, h, kh, dh, ns, ck, kl, gi, tp, rb, rt, uos) = (
+            batch.table_stride as i32,
+            dims.n_heads as i32,
+            dims.n_kv_heads as i32,
+            dims.d_head as i32,
+            dims.n_slots as i32,
+            chunk as i32,
+            kv_len as i32,
+            group as i32,
+            tpw as i32,
+            run_base as i32,
+            run_tokens as i32,
+            i32::from(use_out_stage),
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(&mut *partial)
+            .arg(&ms_off)
+            .arg(&mut *out)
+            .arg(&single)
+            .arg(q)
+            .arg(k_cache)
+            .arg(v_cache)
+            .arg(batch.seq_of)
+            .arg(batch.positions)
+            .arg(batch.slot_table)
+            .arg(&stride)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ns)
+            .arg(&scale)
+            .arg(&ck)
+            .arg(&kl)
+            .arg(&gi)
+            .arg(&tp)
+            .arg(&rb)
+            .arg(&rt)
+            .arg(&uos);
+        self.dev
+            .profile()
+            .time("attn_prefill_ws4_nw", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("attn_prefill_ws4_nw")?;
+                Ok(())
+            })?;
+        if single == 1 {
+            return Ok(());
+        }
+        let total = (run_tokens * dims.n_heads * dims.d_head) as u32;
+        let (nt, nc) = (run_tokens as i32, n_chunks as i32);
+        let part = partial.as_view();
+        let r = self.dev.kernels().get("infero_ops", ops_src(), "attn_flash_reduce_f32")?;
+        let run_elems = run_tokens * dims.n_heads * dims.d_head;
+        let out_off = run_base * dims.n_heads * dims.d_head;
+        let mut out_run = out.slice_mut(out_off..out_off + run_elems);
+        let mut rb2 = self.dev.stream().launch_builder(&r);
+        rb2.arg(&mut out_run).arg(&part).arg(&ms_off).arg(&h).arg(&dh).arg(&nt).arg(&nc);
+        self.dev
+            .profile()
+            .time("attn_prefill_ws4_nw_reduce", self.dev.stream(), || {
+                unsafe { rb2.launch(elementwise(total)) }.context("attn_prefill_ws4_nw_reduce")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     /// Validation-only, single-chunk: the decoupled-role design the
     /// `attn_prefill_mma_ws4_qkt_only_regcheck_f32` / `..._pvonly_...` /
     /// `..._decoupled_regcheck_f32` register-count probes (in `ops.cu`)
