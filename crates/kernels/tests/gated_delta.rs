@@ -1144,6 +1144,78 @@ fn the_three_delta_rule_kernels_agree_with_each_other_and_the_reference() -> Res
     Ok(())
 }
 
+/// The three-kernel split (`gdn_chunk_uw_f32` / `gdn_chunk_state_f32` /
+/// `gdn_chunk_output_f32`) against the same host reference every other delta-
+/// rule kernel is checked against -- single sequence, single call, the only
+/// case this first pass claims to handle (see `gdn_chunk_split3_delta_rule`'s
+/// own doc comment in `gdn.rs`). A longer run than the other kernels' tests
+/// (`t_len` past one `GDN_CHUNK` of 32) specifically to exercise more than
+/// one chunk and the sequential kernel-2 loop across them, not just a single
+/// chunk's own parallel kernel-1/kernel-3 math.
+#[test]
+fn the_three_kernel_split_matches_the_reference() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    let t_len = 70;
+
+    let q_small = pseudo_random(t_len * KEY_HEADS * DK, 0xc001);
+    let k_small = pseudo_random(t_len * KEY_HEADS * DK, 0xc002);
+    let v = pseudo_random(t_len * VAL_HEADS * DV, 0xc003);
+    let g = decaying(t_len * VAL_HEADS, 0xc004, 0.7);
+    let beta = betas(t_len * VAL_HEADS, 0xc005);
+    let (row, off) = packed(&q_small, &k_small, &v, t_len);
+    let (want, want_state) = reference(&q_small, &k_small, &v, &g, &beta, t_len);
+
+    let peak = want.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    let speak = want_state.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+
+    let chunk = stream.clone_htod(&row)?;
+    let hg = stream.clone_htod(&g)?;
+    let hb = stream.clone_htod(&beta)?;
+    let f = stream.clone_htod(&[0i32])?;
+    let n = stream.clone_htod(&[t_len as i32])?;
+    let mut out = stream.alloc_zeros::<f32>(t_len * VAL_HEADS * DV)?;
+    let mut state = stream.alloc_zeros::<f32>(VAL_HEADS * DK * DV)?;
+    let seqs = infero_kernels::gdn::SeqLayout {
+        first_token: &f.as_view(),
+        n_tokens: &n.as_view(),
+        n_seqs: 1,
+        total_tokens: t_len,
+    };
+    k.gdn_chunk_split3_delta_rule(
+        &mut out.as_view_mut(),
+        &mut state.as_view_mut(),
+        &chunk.as_view(),
+        &hg.as_view(),
+        &hb.as_view(),
+        &seqs,
+        VAL_HEADS,
+        KEY_HEADS,
+        DK,
+        DV,
+        off,
+        false,
+    )?;
+    k.device().synchronize()?;
+    let got = stream.clone_dtoh(&out)?;
+    let got_state = stream.clone_dtoh(&state)?;
+
+    let (worst, at) = max_abs_diff(&got, &want);
+    assert!(
+        worst < 1e-4 * peak.max(1e-6),
+        "three-kernel split diverged from the reference by {worst:.2e} at {at}: \
+         got {}, reference {}",
+        got[at],
+        want[at]
+    );
+    let (sworst, sat) = max_abs_diff(&got_state, &want_state);
+    assert!(
+        sworst < 1e-4 * speak.max(1e-6),
+        "three-kernel split left a state {sworst:.2e} from the reference's at {sat}"
+    );
+    Ok(())
+}
+
 /// The batch properties, held against the fallback kernel by name.
 ///
 /// `two_sequences_in_one_batch_keep_separate_state` above now exercises the

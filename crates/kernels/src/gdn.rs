@@ -590,6 +590,170 @@ impl Kernels {
         Ok(())
     }
 
+    /// Three-kernel split of the chunked delta rule -- see the doc comment
+    /// on `gdn_chunk_uw_f32` in `gdn.cu` for the full architecture and why
+    /// it's a real, independent re-derivation of SGLang's own real
+    /// production Blackwell GDN kernel structure (which cannot be ported
+    /// directly: it needs `tcgen05`, which sm_120a does not have).
+    ///
+    /// Single sequence only for this first pass (`seqs.n_seqs` must be 1) --
+    /// proving the architecture is correct and measuring its real cost
+    /// against `gdn_delta_rule_reg128_f32`, not yet matching that kernel's
+    /// multi-sequence/incremental-call generality. `dk`/`dv` must be 128,
+    /// same restriction `DeltaVariant::Chunk` already has.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_chunk_split3_delta_rule(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        state: &mut ViewMut<'_, f32>,
+        qkv: &View<'_, f32>,
+        g: &View<'_, f32>,
+        beta: &View<'_, f32>,
+        seqs: &SeqLayout<'_>,
+        heads: usize,
+        key_heads: usize,
+        dk: usize,
+        dv: usize,
+        offsets: (usize, usize, usize, usize),
+        v_tiled: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(seqs.n_seqs == 1, "gdn_chunk_split3_delta_rule: single sequence only");
+        anyhow::ensure!(
+            dk == 128 && dv == 128,
+            "gdn_chunk_split3_delta_rule is instantiated for dk = dv = 128, got {dk}x{dv}"
+        );
+        let (stride, q_off, k_off, v_off) = offsets;
+        const GDN_CHUNK: usize = 32;
+        const GDN_DK: usize = 128;
+        const ROW_PAD: usize = GDN_DK + 4;
+        const A_STRIDE: usize = GDN_CHUNK + 1;
+        let n_chunks = seqs.total_tokens.div_ceil(GDN_CHUNK).max(1);
+        let f32_size = std::mem::size_of::<f32>();
+
+        let stream = self.dev.stream();
+        let mut w_buf = stream.alloc_zeros::<f32>(n_chunks * heads * GDN_CHUNK * GDN_DK)?;
+        let mut u_buf = stream.alloc_zeros::<f32>(n_chunks * heads * GDN_CHUNK * dv)?;
+        let mut delta_buf = stream.alloc_zeros::<f32>(n_chunks * heads * GDN_CHUNK * dv)?;
+        let mut s_before_buf = stream.alloc_zeros::<f32>(n_chunks * heads * GDN_DK * dv)?;
+
+        let (h, kh) = (heads as i32, key_heads as i32);
+        let (a, b_) = (dk as i32, dv as i32);
+        let (st, qo, ko, vo) = (stride as i32, q_off as i32, k_off as i32, v_off as i32);
+        let vt = i32::from(v_tiled);
+
+        // Kernel 1: parallel (head, chunk), no state dependency.
+        {
+            let f = self.dev.kernels().get("infero_gdn", gdn_src(), "gdn_chunk_uw_f32")?;
+            let shared = (3 * GDN_CHUNK * ROW_PAD + 3 * GDN_CHUNK + GDN_CHUNK * A_STRIDE) * f32_size;
+            if shared > 48 * 1024 {
+                infero_gpu::set_max_dynamic_shared(&f, shared as u32)?;
+            }
+            let cfg = LaunchConfig {
+                grid_dim: (heads as u32, n_chunks as u32, 1),
+                block_dim: (2 * dv as u32, 1, 1),
+                shared_mem_bytes: shared as u32,
+            };
+            let mut bl = self.dev.stream().launch_builder(&f);
+            bl.arg(&mut w_buf)
+                .arg(&mut u_buf)
+                .arg(qkv)
+                .arg(g)
+                .arg(beta)
+                .arg(seqs.first_token)
+                .arg(seqs.n_tokens)
+                .arg(&h)
+                .arg(&kh)
+                .arg(&a)
+                .arg(&b_)
+                .arg(&st)
+                .arg(&ko)
+                .arg(&vo)
+                .arg(&vt);
+            self.dev
+                .profile()
+                .time("gdn_chunk_uw", self.dev.stream(), || {
+                    unsafe { bl.launch(cfg) }.context("gdn_chunk_uw")?;
+                    Ok(())
+                })?;
+        }
+
+        // Kernel 2: sequential over chunks, gridded over heads only.
+        {
+            let f = self.dev.kernels().get("infero_gdn", gdn_src(), "gdn_chunk_state_f32")?;
+            let shared = (2 * GDN_CHUNK * ROW_PAD + GDN_CHUNK) * f32_size;
+            if shared > 48 * 1024 {
+                infero_gpu::set_max_dynamic_shared(&f, shared as u32)?;
+            }
+            let cfg = LaunchConfig {
+                grid_dim: (heads as u32, 1, 1),
+                block_dim: (2 * dv as u32, 1, 1),
+                shared_mem_bytes: shared as u32,
+            };
+            let nc = n_chunks as i32;
+            let mut bl = self.dev.stream().launch_builder(&f);
+            bl.arg(&mut delta_buf)
+                .arg(&mut s_before_buf)
+                .arg(&mut *state)
+                .arg(&w_buf)
+                .arg(&u_buf)
+                .arg(qkv)
+                .arg(g)
+                .arg(seqs.first_token)
+                .arg(seqs.n_tokens)
+                .arg(&h)
+                .arg(&kh)
+                .arg(&a)
+                .arg(&b_)
+                .arg(&st)
+                .arg(&ko)
+                .arg(&vt)
+                .arg(&nc);
+            self.dev
+                .profile()
+                .time("gdn_chunk_state", self.dev.stream(), || {
+                    unsafe { bl.launch(cfg) }.context("gdn_chunk_state")?;
+                    Ok(())
+                })?;
+        }
+
+        // Kernel 3: parallel (head, chunk) again, no cross-chunk dependency.
+        {
+            let f = self.dev.kernels().get("infero_gdn", gdn_src(), "gdn_chunk_output_f32")?;
+            let shared = (2 * GDN_CHUNK * ROW_PAD + GDN_CHUNK + GDN_CHUNK * A_STRIDE) * f32_size;
+            if shared > 48 * 1024 {
+                infero_gpu::set_max_dynamic_shared(&f, shared as u32)?;
+            }
+            let cfg = LaunchConfig {
+                grid_dim: (heads as u32, n_chunks as u32, 1),
+                block_dim: (2 * dv as u32, 1, 1),
+                shared_mem_bytes: shared as u32,
+            };
+            let mut bl = self.dev.stream().launch_builder(&f);
+            bl.arg(&mut *out)
+                .arg(&delta_buf)
+                .arg(&s_before_buf)
+                .arg(qkv)
+                .arg(g)
+                .arg(seqs.first_token)
+                .arg(seqs.n_tokens)
+                .arg(&h)
+                .arg(&kh)
+                .arg(&a)
+                .arg(&b_)
+                .arg(&st)
+                .arg(&qo)
+                .arg(&ko)
+                .arg(&vt);
+            self.dev
+                .profile()
+                .time("gdn_chunk_output", self.dev.stream(), || {
+                    unsafe { bl.launch(cfg) }.context("gdn_chunk_output")?;
+                    Ok(())
+                })?;
+        }
+        Ok(())
+    }
+
     /// `out = rms_norm(x, weight) * silu(z)`, over rows of `dv`.
     ///
     /// Normalize first, gate second. The other order runs and is a different

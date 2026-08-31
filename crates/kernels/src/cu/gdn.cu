@@ -1313,6 +1313,364 @@ __device__ __forceinline__ float gdn_pp_output(const float* sc, const float* qc)
     return o[0] + __shfl_xor_sync(0xffffffffu, o[0], 1);
 }
 
+// Three-kernel split of `gdn_chunk_delta_rule_f32`'s own algorithm, following
+// the real dependency structure traced through that kernel's body: forming
+// the system matrix, inverting it, and the WY (`W`/`U`) reconstruction all
+// depend ONLY on a chunk's own K/V/beta/g -- not on the carried state --
+// while only the "history" output term and the state carry-forward itself
+// are genuinely sequential across chunks. Splitting those apart lets the
+// state-independent, expensive part run on a grid of `chunks * heads`
+// blocks instead of being serialized inside a `heads`-only loop (48 blocks
+// on this checkpoint, the same hard ceiling `gdn_delta_rule_reg128_f32`
+// also has) -- exactly the same 3-kernel decomposition SGLang's real
+// production GDN kernel uses for Blackwell (`gdn_blackwell/kernel_h.py`,
+// `kernel_kkt_inv_uw.py`, `kernel_o.py`), independently re-derived from this
+// codebase's own already-reference-checked fused kernel rather than copied
+// -- SGLang's actual implementation is unusable here regardless (it's built
+// entirely on `tcgen05`, Blackwell *datacenter* sm_100/101's tensor-memory
+// MMA, which sm_120a does not have at all, on top of not having the older
+// `wgmma` either).
+//
+// Scoped to a SINGLE sequence for this first pass (`first_token`/`n_tok`
+// still take the same layout as the fused kernel for calling-convention
+// parity, but only index 0 is read) -- proving the architecture is correct
+// and measuring its real cost is the goal here, not yet matching
+// `gdn_chunk_delta_rule_f32`'s full multi-sequence/incremental-call
+// generality.
+//
+// Kernel 1 of 3: parallel over (head, chunk), no state dependency at all.
+// Computes the system matrix `A` (`chunk_scaled_dot_kkt.py`), its unit-
+// lower-triangular inverse via forward substitution (`solve_tril.py`), and
+// the WY reconstruction `W`/`U` (`wy_fast.py`) -- byte-for-byte the same
+// per-chunk math as `gdn_chunk_delta_rule_f32`'s own loop body, just without
+// the state (`sc`) or the intra-chunk causal/output steps, which belong to
+// kernels 2 and 3 below. Needs K, V, beta, g -- NOT Q (`W` folds decay into
+// K, `U` does not touch K at all; neither touches Q), matching
+// `kkt_inv_uw_cutedsl`'s own real argument list exactly (checked against
+// `gdn_blackwell/__init__.py`'s call site).
+extern "C" __global__ __launch_bounds__(256) void gdn_chunk_uw_f32(
+        float* __restrict__ w_out, float* __restrict__ u_out,
+        const float* __restrict__ qkv, const float* __restrict__ g,
+        const float* __restrict__ beta, const int* __restrict__ first_token,
+        const int* __restrict__ n_tok, int heads, int key_heads, int dk, int dv,
+        int stride, int k_off, int v_off, int v_tiled) {
+    (void)dk;
+    (void)dv;
+    const int head = blockIdx.x;
+    const int chunk = blockIdx.y;
+    const int seq = 0;
+    const int nt = n_tok[seq];
+    const int c0 = chunk * GDN_CHUNK;
+    if (c0 >= nt) return;
+    const int t0 = first_token[seq];
+    const int C = min(GDN_CHUNK, nt - c0);
+    const int lane = threadIdx.x;
+    const int khead = v_tiled ? (head % key_heads) : (head / (heads / key_heads));
+
+    extern __shared__ char gdn_uw_smem[];
+    float* sk = (float*)gdn_uw_smem;                    // [GDN_CHUNK][GDN_ROW_PAD]
+    float* sv = sk + GDN_CHUNK * GDN_ROW_PAD;          // [GDN_CHUNK][GDN_ROW_PAD]
+    float* sgc = sv + GDN_CHUNK * GDN_ROW_PAD;         // [GDN_CHUNK]
+    float* sbeta = sgc + GDN_CHUNK;                    // [GDN_CHUNK]
+    float* sbg = sbeta + GDN_CHUNK;                    // [GDN_CHUNK]
+    float* sA = sbg + GDN_CHUNK;                       // [GDN_CHUNK][GDN_A_STRIDE]
+
+    for (int idx = lane; idx < C * GDN_DK; idx += blockDim.x) {
+        const int r = idx / GDN_DK, d = idx % GDN_DK;
+        const float* row = qkv + (size_t)(t0 + c0 + r) * stride;
+        sk[r * GDN_ROW_PAD + d] = row[k_off + (size_t)khead * GDN_DK + d];
+    }
+    for (int idx = lane; idx < C * GDN_DV; idx += blockDim.x) {
+        const int r = idx / GDN_DV, d = idx % GDN_DV;
+        const float* row = qkv + (size_t)(t0 + c0 + r) * stride;
+        sv[r * GDN_ROW_PAD + d] = row[v_off + (size_t)head * GDN_DV + d];
+    }
+    if (lane < C) {
+        sbeta[lane] = beta[(size_t)(t0 + c0 + lane) * heads + head];
+    }
+    if (lane == 0) {
+        float acc = 0.0f;
+        for (int r = 0; r < C; ++r) {
+            acc += g[(size_t)(t0 + c0 + r) * heads + head];
+            sgc[r] = acc;
+        }
+    }
+    __syncthreads();
+
+    if (lane < C) {
+        sbg[lane] = sbeta[lane] * __expf(sgc[lane]);
+    }
+
+    for (int idx = lane; idx < GDN_CHUNK * GDN_CHUNK; idx += blockDim.x) {
+        const int i = idx / GDN_CHUNK, kk = idx % GDN_CHUNK;
+        if (i >= C || kk >= C) continue;
+        float v = 0.0f;
+        if (i > kk) {
+            float dot = 0.0f;
+#pragma unroll
+            for (int d = 0; d < GDN_DK; ++d) {
+                dot += sk[i * GDN_ROW_PAD + d] * sk[kk * GDN_ROW_PAD + d];
+            }
+            v = sbeta[i] * __expf(sgc[i] - sgc[kk]) * dot;
+        }
+        sA[i * GDN_A_STRIDE + kk] = v;
+    }
+    __syncthreads();
+
+    for (int i = 0; i < C; ++i) {
+        const bool active = (lane < C && lane <= i);
+        float acc = 0.0f;
+        if (active) {
+            const int kk = lane;
+            acc = (i == kk) ? 1.0f : 0.0f;
+            for (int m = kk; m < i; ++m) {
+                acc -= sA[i * GDN_A_STRIDE + m] * sA[m * GDN_A_STRIDE + kk];
+            }
+        }
+        __syncwarp();
+        if (active) {
+            sA[i * GDN_A_STRIDE + lane] = acc;
+        }
+        __syncwarp();
+    }
+    __syncthreads();
+
+    float* w_chunk = w_out + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DK;
+    float* u_chunk = u_out + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DV;
+    for (int idx = lane; idx < C * GDN_DK; idx += blockDim.x) {
+        const int i = idx / GDN_DK, d = idx % GDN_DK;
+        float wacc = 0.0f, uacc = 0.0f;
+        for (int kk = 0; kk <= i; ++kk) {
+            const float aik = sA[i * GDN_A_STRIDE + kk];
+            wacc += aik * sbg[kk] * sk[kk * GDN_ROW_PAD + d];
+            uacc += aik * sbeta[kk] * sv[kk * GDN_ROW_PAD + d];
+        }
+        w_chunk[i * GDN_DK + d] = wacc;
+        u_chunk[i * GDN_DV + d] = uacc;  // GDN_DV == GDN_DK == 128 here
+    }
+}
+
+// Kernel 2 of 3: sequential over chunks, gridded over `heads` only (the same
+// ceiling `gdn_delta_rule_reg128_f32` has) -- but now touching only the
+// CHEAP part of each chunk: `pred = W @ S_before`, `delta = U - pred`
+// (`chunk_delta_h.py:174-197`), and the state carry-forward itself
+// (`chunk_delta_h.py:216-228,276-298`). No forward substitution here at
+// all -- that already happened, once, in kernel 1 -- so this kernel's own
+// per-chunk work has none of `gdn_chunk_delta_rule_f32`'s O(GDN_CHUNK)
+// sequential `__syncwarp()` micro-barriers, only O(1) barriers a chunk.
+// Writes `S_before` (the incoming state, BEFORE this chunk's update) for
+// kernel 3's history term -- the real, accepted VRAM cost this design pays
+// (`n_chunks` copies of a full `[GDN_DK, GDN_DV]` state matrix a head) for
+// letting kernel 3 run with no cross-chunk dependency at all. Needs K again
+// (for the state-advance step) -- a real, small, accepted redundant load
+// against kernel 1's own K read.
+extern "C" __global__ __launch_bounds__(256) void gdn_chunk_state_f32(
+        float* __restrict__ delta_out, float* __restrict__ s_before_out,
+        float* __restrict__ state, const float* __restrict__ w_in,
+        const float* __restrict__ u_in, const float* __restrict__ qkv,
+        const float* __restrict__ g, const int* __restrict__ first_token,
+        const int* __restrict__ n_tok, int heads, int key_heads, int dk, int dv,
+        int stride, int k_off, int v_tiled, int n_chunks) {
+    (void)dk;
+    (void)dv;
+    const int head = blockIdx.x;
+    const int seq = 0;
+    const int nt = n_tok[seq];
+    if (nt <= 0) return;
+    const int t0 = first_token[seq];
+    const int lane = threadIdx.x;  // 0..255
+    const int j = lane / 2;
+    const int part = lane % 2;
+    const int i0 = part * 64;
+    const int khead = v_tiled ? (head % key_heads) : (head / (heads / key_heads));
+
+    extern __shared__ char gdn_state_smem[];
+    float* sk = (float*)gdn_state_smem;               // [GDN_CHUNK][GDN_ROW_PAD]
+    float* sgc = sk + GDN_CHUNK * GDN_ROW_PAD;         // [GDN_CHUNK]
+    // `W` staged here too, unlike an earlier version of this kernel that
+    // read it straight from global for every (i, r) pair in the pred loop
+    // below -- up to C*64 real global-memory instructions a thread a
+    // chunk, each paying real per-instruction overhead even on an L1 hit,
+    // not just the one-time bulk copy this staging costs instead. Real,
+    // measured cost of the unstaged version: most of a 5.6x slowdown
+    // against `gdn_delta_rule_reg128_f32` (`gdn_split3_bench`, 30552-token
+    // real shape) that a plain "read straight from global" implementation
+    // did not pay for K/V in kernel 1 (which already stages them) or for Q/K
+    // in kernel 3 (same) -- only this kernel skipped it, and only this
+    // kernel was anomalously slow.
+    float* sw = sgc + GDN_CHUNK;                       // [GDN_CHUNK][GDN_ROW_PAD]
+
+    float* S = state + (size_t)head * GDN_DK * GDN_DV;
+    float sc[64];
+#pragma unroll
+    for (int r = 0; r < 64; ++r) sc[r] = S[(size_t)(i0 + r) * GDN_DV + j];
+
+    for (int chunk = 0; chunk < n_chunks; ++chunk) {
+        const int c0 = chunk * GDN_CHUNK;
+        if (c0 >= nt) break;
+        const int C = min(GDN_CHUNK, nt - c0);
+
+        float* sbefore_chunk = s_before_out + ((size_t)chunk * heads + head) * GDN_DK * GDN_DV;
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            sbefore_chunk[(size_t)(i0 + r) * GDN_DV + j] = sc[r];
+        }
+
+        const float* w_chunk = w_in + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DK;
+        const float* u_chunk = u_in + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DV;
+        float* delta_chunk = delta_out + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DV;
+
+        for (int idx = lane; idx < C * GDN_DK; idx += blockDim.x) {
+            const int r = idx / GDN_DK, d = idx % GDN_DK;
+            const float* row = qkv + (size_t)(t0 + c0 + r) * stride;
+            sk[r * GDN_ROW_PAD + d] = row[k_off + (size_t)khead * GDN_DK + d];
+            sw[r * GDN_ROW_PAD + d] = w_chunk[r * GDN_DK + d];
+        }
+        if (lane == 0) {
+            float acc = 0.0f;
+            for (int r = 0; r < C; ++r) {
+                acc += g[(size_t)(t0 + c0 + r) * heads + head];
+                sgc[r] = acc;
+            }
+        }
+        __syncthreads();
+
+        for (int i = 0; i < C; ++i) {
+            float pp = 0.0f;
+#pragma unroll
+            for (int r = 0; r < 64; ++r) {
+                pp += sc[r] * sw[i * GDN_ROW_PAD + i0 + r];
+            }
+            pp += __shfl_xor_sync(0xffffffffu, pp, 1, 32);
+            if (part == 0) {
+                delta_chunk[i * GDN_DV + j] = u_chunk[i * GDN_DV + j] - pp;
+            }
+        }
+        __syncthreads();
+
+        // Precompute `dt[t]` ONCE a chunk (GDN_CHUNK global reads of
+        // `delta_chunk`), not once per (r, t) pair (up to 64x that) --
+        // `delta_chunk` is GLOBAL memory here, unlike `gdn_chunk_delta_rule_f32`'s
+        // own state-advance loop this was adapted from, where the
+        // equivalent `sD` is shared memory and the same re-read-inside-the-
+        // r-loop pattern is cheap. Measured, not assumed: this exact bug
+        // was 77.7% of this kernel's own real, measured end-to-end cost
+        // before this fix (`gdn_split3_bench`, 30552-token real shape).
+        const float decay_whole = __expf(sgc[C - 1]);
+        float dt_cache[GDN_CHUNK];
+#pragma unroll
+        for (int t = 0; t < GDN_CHUNK; ++t) {
+            dt_cache[t] = (t < C) ? delta_chunk[t * GDN_DV + j] * __expf(sgc[C - 1] - sgc[t]) : 0.0f;
+        }
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            float acc = sc[r] * decay_whole;
+            for (int t = 0; t < C; ++t) {
+                acc += dt_cache[t] * sk[t * GDN_ROW_PAD + i0 + r];
+            }
+            sc[r] = acc;
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < 64; ++r) S[(size_t)(i0 + r) * GDN_DV + j] = sc[r];
+}
+
+// Kernel 3 of 3: parallel over (head, chunk) again, no cross-chunk
+// dependency at all -- consumes `S_before`/`delta` from kernel 2 and
+// recomputes the intra-chunk causal scores (`chunk_o.py:113,120,124-126`,
+// a pure function of this chunk's own Q/K/g) to produce the full output:
+// the history term (`chunk_o.py:111-119`) plus the intra-chunk term
+// (`chunk_o.py:137`) -- exactly `gdn_chunk_delta_rule_f32`'s own two output
+// writes, just reading `S_before`/`delta` from global instead of carrying
+// them in registers/shared across the sequential loop.
+extern "C" __global__ __launch_bounds__(256) void gdn_chunk_output_f32(
+        float* __restrict__ out, const float* __restrict__ delta_in,
+        const float* __restrict__ s_before_in, const float* __restrict__ qkv,
+        const float* __restrict__ g, const int* __restrict__ first_token,
+        const int* __restrict__ n_tok, int heads, int key_heads, int dk, int dv,
+        int stride, int q_off, int k_off, int v_tiled) {
+    (void)dk;
+    (void)dv;
+    const int head = blockIdx.x;
+    const int chunk = blockIdx.y;
+    const int seq = 0;
+    const int nt = n_tok[seq];
+    const int c0 = chunk * GDN_CHUNK;
+    if (c0 >= nt) return;
+    const int t0 = first_token[seq];
+    const int C = min(GDN_CHUNK, nt - c0);
+    const int lane = threadIdx.x;  // 0..255
+    const int j = lane / 2;
+    const int part = lane % 2;
+    const int i0 = part * 64;
+    const int khead = v_tiled ? (head % key_heads) : (head / (heads / key_heads));
+
+    extern __shared__ char gdn_out_smem[];
+    float* sk = (float*)gdn_out_smem;                   // [GDN_CHUNK][GDN_ROW_PAD]
+    float* sq = sk + GDN_CHUNK * GDN_ROW_PAD;          // [GDN_CHUNK][GDN_ROW_PAD]
+    float* sgc = sq + GDN_CHUNK * GDN_ROW_PAD;         // [GDN_CHUNK]
+    float* sAi2 = sgc + GDN_CHUNK;                     // [GDN_CHUNK][GDN_A_STRIDE]
+
+    for (int idx = lane; idx < C * GDN_DK; idx += blockDim.x) {
+        const int r = idx / GDN_DK, d = idx % GDN_DK;
+        const float* row = qkv + (size_t)(t0 + c0 + r) * stride;
+        sk[r * GDN_ROW_PAD + d] = row[k_off + (size_t)khead * GDN_DK + d];
+        sq[r * GDN_ROW_PAD + d] = row[q_off + (size_t)khead * GDN_DK + d];
+    }
+    if (lane == 0) {
+        float acc = 0.0f;
+        for (int r = 0; r < C; ++r) {
+            acc += g[(size_t)(t0 + c0 + r) * heads + head];
+            sgc[r] = acc;
+        }
+    }
+    __syncthreads();
+
+    const float* sbefore = s_before_in + ((size_t)chunk * heads + head) * GDN_DK * GDN_DV;
+    const float* delta_chunk = delta_in + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DV;
+
+    for (int i = 0; i < C; ++i) {
+        float oh = 0.0f;
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            oh += sbefore[(size_t)(i0 + r) * GDN_DV + j] * sq[i * GDN_ROW_PAD + i0 + r];
+        }
+        oh += __shfl_xor_sync(0xffffffffu, oh, 1, 32);
+        if (part == 0) {
+            out[((size_t)(t0 + c0 + i) * heads + head) * GDN_DV + j] = __expf(sgc[i]) * oh;
+        }
+    }
+    __syncthreads();
+
+    for (int idx = lane; idx < GDN_CHUNK * GDN_CHUNK; idx += blockDim.x) {
+        const int i = idx / GDN_CHUNK, kk = idx % GDN_CHUNK;
+        if (i >= C || kk >= C) continue;
+        float v = 0.0f;
+        if (i >= kk) {
+            float dot = 0.0f;
+#pragma unroll
+            for (int d = 0; d < GDN_DK; ++d) {
+                dot += sq[i * GDN_ROW_PAD + d] * sk[kk * GDN_ROW_PAD + d];
+            }
+            v = __expf(sgc[i] - sgc[kk]) * dot;
+        }
+        sAi2[i * GDN_A_STRIDE + kk] = v;
+    }
+    __syncthreads();
+
+    for (int i = 0; i < C; ++i) {
+        if (part == 0) {
+            float acc = 0.0f;
+            for (int kk = 0; kk <= i; ++kk) {
+                acc += sAi2[i * GDN_A_STRIDE + kk] * delta_chunk[kk * GDN_DV + j];
+            }
+            out[((size_t)(t0 + c0 + i) * heads + head) * GDN_DV + j] += acc;
+        }
+    }
+}
+
 // Sequential reference: one warp, both stages, every iteration -- exactly
 // today's real kernel's own per-timestep order, just without the real
 // memory layout.
