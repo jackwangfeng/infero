@@ -4275,7 +4275,19 @@ extern "C" __global__ void attn_prefill_mma_ws4_f32(
                 if (d0 == 0) {
                     float* ms = partial + ms_off
                               + (((size_t)c * run_tokens + local_token) * n_heads + head) * 2;
-                    ms[0] = m;
+                    // `m` is `m_run[rg]`, in log2(e)-scaled units (see this
+                    // kernel's own top-of-file comment on `scale`/`exp2f`) --
+                    // but `attn_flash_reduce_f32` is a SHARED kernel other
+                    // callers (still natural-scale) also feed, and it
+                    // combines chunks via a natural-space `__expf`. Convert
+                    // back here, once, at the point of writing the shared
+                    // buffer -- `* ln(2)` exactly undoes the `* log2(e)`
+                    // this kernel's `scale` parameter carries, since
+                    // `log2(e) * ln(2) == 1` -- so every other caller of
+                    // `attn_flash_reduce_f32` sees the same natural-space
+                    // convention it always has, unaffected by this kernel's
+                    // own internal representation.
+                    ms[0] = m * 0.69314718f;
                     ms[1] = den;
                 }
             }
