@@ -1451,6 +1451,80 @@ fn the_chunk_ab_affine_recurrence_matches_a_host_reference() -> Result<()> {
     Ok(())
 }
 
+/// `gdn_ab_combine_f32` -- the row-streaming `[128,128]@[128,128]` GEMM the
+/// group-scan needs to combine two affine-recurrence pairs, checked against
+/// a direct host matmul on plain random matrices (no GDN-specific setup
+/// needed -- this is pure matrix algebra once `A`/`B` themselves exist).
+/// `A2@A1`/`A2@B1+B2`, not `A1@A2` -- order matters (matrix multiplication
+/// does not commute), matching `(a2,b2)` being applied AFTER `(a1,b1)`.
+#[test]
+fn the_ab_combine_matches_a_host_matmul() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    const DK: usize = 128;
+    const DV: usize = 128;
+
+    let a1 = pseudo_random(DK * DK, 0xe001);
+    let b1 = pseudo_random(DK * DV, 0xe002);
+    let a2 = pseudo_random(DK * DK, 0xe003);
+    let b2 = pseudo_random(DK * DV, 0xe004);
+
+    let da1 = stream.clone_htod(&a1)?;
+    let db1 = stream.clone_htod(&b1)?;
+    let da2 = stream.clone_htod(&a2)?;
+    let db2 = stream.clone_htod(&b2)?;
+    let mut a_out = stream.alloc_zeros::<f32>(DK * DK)?;
+    let mut b_out = stream.alloc_zeros::<f32>(DK * DV)?;
+    k.gdn_ab_combine(
+        &mut a_out.as_view_mut(),
+        &mut b_out.as_view_mut(),
+        &da1.as_view(),
+        &db1.as_view(),
+        &da2.as_view(),
+        &db2.as_view(),
+    )?;
+    k.device().synchronize()?;
+    let got_a = stream.clone_dtoh(&a_out)?;
+    let got_b = stream.clone_dtoh(&b_out)?;
+
+    // Host reference: A2 @ A1, A2 @ B1 + B2.
+    let mut want_a = vec![0.0f32; DK * DK];
+    let mut want_b = vec![0.0f32; DK * DV];
+    for d1 in 0..DK {
+        for d2 in 0..DK {
+            let mut acc = 0.0f32;
+            for e in 0..DK {
+                acc += a2[d1 * DK + e] * a1[e * DK + d2];
+            }
+            want_a[d1 * DK + d2] = acc;
+        }
+        for d2 in 0..DV {
+            let mut acc = 0.0f32;
+            for e in 0..DK {
+                acc += a2[d1 * DK + e] * b1[e * DV + d2];
+            }
+            want_b[d1 * DV + d2] = acc + b2[d1 * DV + d2];
+        }
+    }
+
+    let (aworst, aat) = max_abs_diff(&got_a, &want_a);
+    let apeak = want_a.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(
+        aworst < 1e-3 * apeak.max(1e-6),
+        "combine's A diverged from the host matmul by {aworst:.2e} at {aat}: got {}, want {}",
+        got_a[aat],
+        want_a[aat]
+    );
+    let (bworst, bat) = max_abs_diff(&got_b, &want_b);
+    let bpeak = want_b.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(
+        bworst < 1e-3 * bpeak.max(1e-6),
+        "combine's B diverged from the host matmul by {bworst:.2e} at {bat}: got {}, want {}",
+        got_b[bat],
+        want_b[bat]
+    );
+    Ok(())
+}
 
 /// The batch properties, held against the fallback kernel by name.
 ///

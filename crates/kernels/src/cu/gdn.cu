@@ -1561,6 +1561,76 @@ extern "C" __global__ __launch_bounds__(256) void gdn_chunk_ab_f32(
     }
 }
 
+// Combines two affine-recurrence pairs into one: applying `(A1,B1)` then
+// `(A2,B2)` is equivalent to applying `(A2@A1, A2@B1+B2)` once -- the
+// associative operation `gdn_chunk_ab_f32`'s own doc comment (and
+// `verify_linear_recurrence.py`) already verified. This is the one actually
+// new piece of real GEMM engineering the group-scan needs: naively staging
+// BOTH `[128,128]` operands of `A2@A1` in shared memory at once costs
+// `2*128*128*4 = 128 KiB`, over this GPU's 99 KiB hard per-block ceiling
+// (`cudaDevAttrMaxSharedMemoryPerBlockOptin`) -- confirmed by direct
+// calculation before writing this kernel, not discovered by a failed
+// launch. Solved by streaming the CONTRACTION dimension one row at a time
+// instead of staging whole matrices: for each `e` in `0..128`, stage only
+// row `e` of `A1`/`B1` (256 floats total, negligible) into shared memory,
+// then every thread reads its own `A2[d1][e]` directly from global (one
+// value, not a matrix) and accumulates into its own 64-wide slice of the
+// output row -- the exact same per-thread `(d1, part)` ownership convention
+// `gdn_chunk_ab_f32` and kernel 2/3 already use, just with `A2`/`B2` (not
+// `K`/`W`/`U`) supplying the running accumulation. 128 rounds of a tiny
+// shared load + one `__syncthreads()`, not one 128 KiB-wide load.
+//
+// Standalone (not yet wired into any real group-scan grid): correctness of
+// the row-streaming GEMM technique itself, checked against a host-computed
+// combine, before building the actual scan around it.
+extern "C" __global__ __launch_bounds__(256) void gdn_ab_combine_f32(
+        float* __restrict__ a_out, float* __restrict__ b_out,
+        const float* __restrict__ a1_in, const float* __restrict__ b1_in,
+        const float* __restrict__ a2_in, const float* __restrict__ b2_in) {
+    const int lane = threadIdx.x;  // 0..255
+    const int d1 = lane / 2;
+    const int part = lane % 2;
+    const int i0 = part * 64;
+
+    extern __shared__ float gdn_comb_smem[];
+    float* row_a1 = gdn_comb_smem;        // [GDN_DK]
+    float* row_b1 = row_a1 + GDN_DK;      // [GDN_DV]
+
+    float a_acc[64];
+    float b_acc[64];
+#pragma unroll
+    for (int r = 0; r < 64; ++r) {
+        a_acc[r] = 0.0f;
+        b_acc[r] = 0.0f;
+    }
+
+    for (int e = 0; e < GDN_DK; ++e) {
+        if (lane < GDN_DK) {
+            row_a1[lane] = a1_in[e * GDN_DK + lane];
+        }
+        if (lane < GDN_DV) {
+            row_b1[lane] = b1_in[e * GDN_DV + lane];
+        }
+        __syncthreads();
+
+        const float a2_val = a2_in[d1 * GDN_DK + e];
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            const int d2 = i0 + r;
+            a_acc[r] += a2_val * row_a1[d2];
+            b_acc[r] += a2_val * row_b1[d2];
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < 64; ++r) {
+        const int d2 = i0 + r;
+        a_out[d1 * GDN_DK + d2] = a_acc[r];
+        b_out[d1 * GDN_DV + d2] = b_acc[r] + b2_in[d1 * GDN_DV + d2];
+    }
+}
+
 extern "C" __global__ __launch_bounds__(256) void gdn_chunk_state_f32(
         float* __restrict__ delta_out, float* __restrict__ s_before_out,
         float* __restrict__ state, const float* __restrict__ w_in,

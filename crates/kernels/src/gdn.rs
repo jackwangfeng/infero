@@ -683,6 +683,43 @@ impl Kernels {
         Ok(())
     }
 
+    /// Combines two affine-recurrence pairs, `(a2,b2)` applied after
+    /// `(a1,b1)`, into one: `(a2@a1, a2@b1+b2)`. The one real new piece of
+    /// GEMM engineering the group-scan needs -- see `gdn_ab_combine_f32`'s
+    /// own doc comment in `gdn.cu` for why a naive both-operands-in-shared
+    /// design doesn't fit this GPU's shared-memory ceiling, and the row-
+    /// streaming technique used instead. All four matrices are `128x128`
+    /// (`a1`/`a2`/`a_out`: `DK*DK`; `b1`/`b2`/`b_out`: `DK*DV`). Standalone
+    /// single-block launch -- not yet wired into a real group-scan grid.
+    pub fn gdn_ab_combine(
+        &self,
+        a_out: &mut ViewMut<'_, f32>,
+        b_out: &mut ViewMut<'_, f32>,
+        a1: &View<'_, f32>,
+        b1: &View<'_, f32>,
+        a2: &View<'_, f32>,
+        b2: &View<'_, f32>,
+    ) -> Result<()> {
+        const GDN_DK: usize = 128;
+        let f32_size = std::mem::size_of::<f32>();
+        let f = self.dev.kernels().get("infero_gdn", gdn_src(), "gdn_ab_combine_f32")?;
+        let shared = (2 * GDN_DK * f32_size) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let mut bl = self.dev.stream().launch_builder(&f);
+        bl.arg(&mut *a_out).arg(&mut *b_out).arg(a1).arg(b1).arg(a2).arg(b2);
+        self.dev
+            .profile()
+            .time("gdn_ab_combine", self.dev.stream(), || {
+                unsafe { bl.launch(cfg) }.context("gdn_ab_combine")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     /// Diagnostic-only standalone wrapper for the plain, unmodified
     /// `gdn_chunk_uw_f32` (kernel 1 alone, no `A`/`B` extension) -- built to
     /// check whether a real, direct-against-a-host-reference bug found
