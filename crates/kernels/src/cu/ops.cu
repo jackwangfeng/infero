@@ -4295,6 +4295,317 @@ extern "C" __global__ void attn_prefill_mma_ws4_f32(
     }
 }
 
+// A genuinely different axis than `attn_prefill_mma_ws3_f32`'s own
+// already-reverted wider-tile attempt (see `attn_prefill_mma_ws4_f32`'s own
+// doc comment above): `ws3` widened the K-tile by cutting `NWARPS` 7->4 to
+// stay inside the 99 KiB `cudaDevAttrMaxSharedMemoryPerBlockOptin` ceiling
+// alongside a K/V DOUBLE buffer, and that occupancy loss cost far more than
+// the halved iteration count bought back (3525ms vs. 2277ms). This instead
+// keeps `NWARPS=7` exactly as-is and drops the double buffer down to a
+// SINGLE K/V buffer, spending the freed half of the budget on tile width
+// instead of pipeline depth: `2 * WK * (d_head+8) <= 101376` at `d_head=256`
+// solves to `WK <= 95.8`; `WK=96` (exactly double `ws4`'s 48) lands at
+// 101,376 bytes again -- the identical ceiling, spent a different way.
+//
+// Motivated by actually reading FlashAttention-2's own real CUDA source
+// (`flash_fwd_kernel.h`/`flash_fwd_launch_template.h`), not just its paper
+// or `kernel_traits.h`'s register formulas (already used earlier this
+// session): FA2's own hdim256 launch config picks between two real kernel
+// instantiations depending on available shared memory --
+// `Flash_fwd_kernel_traits<256, 128, 64, 8, ...>` when there's enough for
+// 128 Kib-class budgets, falling back to `<256, 64, 64, 4, ...>` otherwise.
+// Critically, `flash_fwd_kernel.h`'s main loop (`compute_attn_1rowblock`)
+// uses a SINGLE `sK`/`sV` shared-memory tile in both cases -- never a
+// double buffer -- and instead hides K/V load latency by softwarepipelining
+// within the SAME warps that also compute: issue V's `cp.async` while QK^T
+// consumes the already-ready K, then (after waiting for V) issue the NEXT
+// block's K load before finishing softmax+PV on the CURRENT block. FA2
+// spends its shared-memory budget on tile width, not buffer depth, and
+// still hides latency -- just via compute-interleaved single-buffer
+// prefetch instead of a second buffer.
+//
+// This kernel keeps `ws4`'s existing producer/consumer warp split (already
+// measured to beat FA2-style same-warp cooperative loading on this exact
+// problem -- see `attn_prefill_mma_pipev_f32`'s own doc comment: 1.082x
+// standalone for cooperative double-buffered loading vs. `ws4`'s 1.369x for
+// producer/consumer warp specialization) but removes the SECOND buffer,
+// which forces the producer to wait for consumers to fully drain the
+// current tile before loading the next -- a real, expected loss of
+// load/compute overlap that double buffering exists specifically to avoid.
+// Whether halving the iteration count (and therefore halving how often
+// `ws4`'s own already-profiled dominant cost -- `ncu`'s Warp Stall
+// Sampling showing `wait`+`short_scoreboard` at 59% of samples, a
+// dependent-chain stall, not raw memory latency -- gets paid) outweighs
+// that lost overlap is a real, two-sided tradeoff neither FA2's source nor
+// this file's own prior WK-widening attempt (which failed for an entirely
+// different, NWARPS-related reason) settles by reasoning alone; only a
+// real, benchmarked build answers it.
+extern "C" __global__ void attn_prefill_mma_ws5_singlebuf_regcheck_f32(
+    float* __restrict__ partial, int ms_off, float* __restrict__ out, int single,
+    const float* __restrict__ q, const __half* __restrict__ k_cache,
+    const __half* __restrict__ v_cache, const int* __restrict__ seq_of,
+    const int* __restrict__ positions, const int* __restrict__ slot_table,
+    int table_stride, int n_heads, int n_kv_heads, int d_head, int n_slots,
+    float scale, int chunk, int kv_len, int group, int tpw, int run_base,
+    int run_tokens) {
+    const int WK4 = 96;
+    const int kv_head = blockIdx.x;
+    const int tile = blockIdx.y;
+    const int c = blockIdx.z;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const bool is_producer = (warp == 0);
+    const int cwarp = warp - 1;  // valid only for consumers
+    const int nwarps = blockDim.x / WARP_SIZE - 1;  // consumer count
+    const int tile_tokens = nwarps * tpw;
+    const int total_threads = blockDim.x;
+
+    const int krow = d_head + ATTN_MMA_KPAD;
+    const int ksteps = d_head / 16;
+    const int ntiles = d_head / 8;
+    const int quads = d_head / 8;
+
+    // Single K/V buffer -- no `sk1`/`sv1` -- exactly half of `ws4`'s shared
+    // layout, which is what buys `WK4=96` the same 101,376-byte budget.
+    extern __shared__ char attn_ws5_smem[];
+    __half* sk = (__half*)attn_ws5_smem;
+    __half* sv = sk + (size_t)WK4 * krow;
+
+    const int tile_base = run_base + tile * tile_tokens;
+    const int base_last = positions[tile_base];
+    const int* table = slot_table + (size_t)seq_of[tile_base] * table_stride;
+    const __half* kbase = k_cache + (size_t)kv_head * n_slots * d_head;
+    const __half* vbase = v_cache + (size_t)kv_head * n_slots * d_head;
+    const int tokens_here = min(tile_tokens, run_tokens - tile * tile_tokens);
+    const int last_max = base_last + tokens_here - 1;
+    const int begin = c * chunk;
+    int end = begin + chunk;
+    if (end > kv_len) end = kv_len;
+    if (end > last_max + 1) end = last_max + 1;
+    const int n_blk = end > begin ? (end - begin + WK4 - 1) / WK4 : 0;
+
+    if (is_producer) {
+        for (int b = 0; b < n_blk; ++b) {
+            if (b >= 1) {
+                asm volatile("bar.sync %0, %1;" ::"r"(ATTN_WS_BAR_FREE0), "r"(total_threads) : "memory");
+            }
+            const int base = begin + b * WK4;
+            const int n = min(WK4, end - base);
+            for (int e = lane; e < WK4 * quads; e += WARP_SIZE) {
+                const int r = e / quads, w8 = e % quads;
+                const bool hit = r < n;
+                const size_t off = (size_t)table[base + (hit ? r : 0)] * d_head + w8 * 8;
+                cp_async16(sk + r * krow + w8 * 8, kbase + off, hit);
+                cp_async16(sv + r * krow + w8 * 8, vbase + off, hit);
+            }
+            CP_ASYNC_FENCE();
+            CP_ASYNC_WAIT(0);
+            asm volatile("bar.arrive %0, %1;" ::"r"(ATTN_WS_BAR_READY0), "r"(total_threads) : "memory");
+        }
+        return;
+    }
+
+    // Consumer: identical row/Q math to `ws4`.
+    const int local0 = cwarp * tpw;
+    const int ar = mma_a_row(lane);
+    const int bc = mma_b_col(lane);
+    const int k0 = mma_k0_f16(lane);
+    const int cr = mma_c_row(lane);
+    const int cc = mma_c_col(lane);
+
+    int j_lo = ar / group;
+    const bool live_lo = ar < tpw * group && local0 + j_lo < run_tokens;
+    const int token_lo = run_base + tile * tile_tokens + local0 + j_lo;
+    const int head_lo = kv_head * group + ar % group;
+    const float* q_lo = live_lo ? q + ((size_t)token_lo * n_heads + head_lo) * d_head : nullptr;
+
+    const int ar_hi = ar + 8;
+    int j_hi = ar_hi / group;
+    const bool live_hi = ar_hi < tpw * group && local0 + j_hi < run_tokens;
+    const int token_hi = run_base + tile * tile_tokens + local0 + j_hi;
+    const int head_hi = kv_head * group + ar_hi % group;
+    const float* q_hi = live_hi ? q + ((size_t)token_hi * n_heads + head_hi) * d_head : nullptr;
+
+    mma_a_f16 qa[ATTN_MMA_MAX_KSTEPS];
+#pragma unroll
+    for (int t = 0; t < ATTN_MMA_MAX_KSTEPS; ++t) {
+        if (t >= ksteps) break;
+        const int d0 = t * 16 + k0;
+        const __half2 lo0 = __floats2half2_rn(live_lo ? q_lo[d0] : 0.0f, live_lo ? q_lo[d0 + 1] : 0.0f);
+        const __half2 hi0 = __floats2half2_rn(live_hi ? q_hi[d0] : 0.0f, live_hi ? q_hi[d0 + 1] : 0.0f);
+        const __half2 lo1 = __floats2half2_rn(live_lo ? q_lo[d0 + 8] : 0.0f, live_lo ? q_lo[d0 + 9] : 0.0f);
+        const __half2 hi1 = __floats2half2_rn(live_hi ? q_hi[d0 + 8] : 0.0f, live_hi ? q_hi[d0 + 9] : 0.0f);
+        qa[t].x[0] = *(const unsigned*)(const void*)&lo0;
+        qa[t].x[1] = *(const unsigned*)(const void*)&hi0;
+        qa[t].x[2] = *(const unsigned*)(const void*)&lo1;
+        qa[t].x[3] = *(const unsigned*)(const void*)&hi1;
+    }
+
+    mma_c_f32 o[ATTN_MMA_MAX_NTILES];
+#pragma unroll
+    for (int i = 0; i < ATTN_MMA_MAX_NTILES; ++i) {
+        o[i].x[0] = 0.0f;
+        o[i].x[1] = 0.0f;
+        o[i].x[2] = 0.0f;
+        o[i].x[3] = 0.0f;
+    }
+    float m_run[2] = {-INFINITY, -INFINITY};
+    float l_run[2] = {0.0f, 0.0f};
+    int row_j[2], row_last[2];
+    bool row_live[2];
+#pragma unroll
+    for (int rg = 0; rg < 2; ++rg) {
+        const int abs_row = cr + rg * 8;
+        row_j[rg] = abs_row / group;
+        row_last[rg] = base_last + local0 + row_j[rg];
+        row_live[rg] = abs_row < tpw * group && local0 + row_j[rg] < tokens_here;
+    }
+
+    for (int b = 0; b < n_blk; ++b) {
+        asm volatile("bar.sync %0, %1;" ::"r"(ATTN_WS_BAR_READY0), "r"(total_threads) : "memory");
+
+        const int base = begin + b * WK4;
+        const int n = min(WK4, end - base);
+
+        // Twelve 8-key QK^T sub-tiles (WK4/8) -- double `ws4`'s six, since
+        // the tile itself is double the width.
+        mma_c_f32 s2[12];
+#pragma unroll
+        for (int nt = 0; nt < 12; ++nt) {
+            s2[nt].x[0] = 0.0f;
+            s2[nt].x[1] = 0.0f;
+            s2[nt].x[2] = 0.0f;
+            s2[nt].x[3] = 0.0f;
+            const int key0 = nt * 8;
+#pragma unroll
+            for (int t = 0; t < ATTN_MMA_MAX_KSTEPS; ++t) {
+                if (t >= ksteps) break;
+                mma_b_f16 b_;
+                const __half* bp = sk + (key0 + bc) * krow + t * 16 + k0;
+                b_.x[0] = *(const unsigned*)(const void*)bp;
+                b_.x[1] = *(const unsigned*)(const void*)(bp + 8);
+                mma_f16(s2[nt], qa[t], b_);
+            }
+        }
+
+        float sv_score[48];
+#pragma unroll
+        for (int rg = 0; rg < 2; ++rg) {
+#pragma unroll
+            for (int nt = 0; nt < 12; ++nt) {
+#pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    const int key = nt * 8 + cc + e;
+                    const int abs_key = base + key;
+                    sv_score[rg * 24 + nt * 2 + e] =
+                        (row_live[rg] && key < n && abs_key <= row_last[rg])
+                            ? s2[nt].x[rg * 2 + e] * scale
+                            : -INFINITY;
+                }
+            }
+        }
+
+        // Same online-softmax update as `ws4`, over 24 local values per
+        // row-group instead of 12 -- one combined correction per 96-key
+        // tile, a sixth as often per unit of K covered.
+        float p[48];
+#pragma unroll
+        for (int rg = 0; rg < 2; ++rg) {
+            float* svr = sv_score + rg * 24;
+            float m_own = svr[0];
+#pragma unroll
+            for (int i = 1; i < 24; ++i) m_own = fmaxf(m_own, svr[i]);
+            m_own = fmaxf(m_own, __shfl_xor_sync(0xffffffff, m_own, 1, WARP_SIZE));
+            m_own = fmaxf(m_own, __shfl_xor_sync(0xffffffff, m_own, 2, WARP_SIZE));
+            const float m_new = fmaxf(m_run[rg], m_own);
+            float psum = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 24; ++i) {
+                p[rg * 24 + i] = (svr[i] == -INFINITY) ? 0.0f : exp2f(svr[i] - m_new);
+                psum += p[rg * 24 + i];
+            }
+            psum += __shfl_xor_sync(0xffffffff, psum, 1, WARP_SIZE);
+            psum += __shfl_xor_sync(0xffffffff, psum, 2, WARP_SIZE);
+
+            const float corr =
+                (m_run[rg] == -INFINITY) ? 0.0f : exp2f(m_run[rg] - m_new);
+            l_run[rg] = l_run[rg] * corr + psum;
+            m_run[rg] = m_new;
+#pragma unroll
+            for (int i = 0; i < ATTN_MMA_MAX_NTILES; ++i) {
+                if (i >= ntiles) break;
+                o[i].x[rg * 2] *= corr;
+                o[i].x[rg * 2 + 1] *= corr;
+            }
+        }
+
+        // PV-MMA: six 16-key accumulate passes (WK4/16) -- double `ws4`'s
+        // three.
+#pragma unroll
+        for (int kg = 0; kg < 6; ++kg) {
+            const int nt_lo = kg * 2, nt_hi = kg * 2 + 1;
+            mma_a_f16 pa;
+            const __half2 p_rg0_lo = __floats2half2_rn(p[nt_lo * 2], p[nt_lo * 2 + 1]);
+            const __half2 p_rg1_lo = __floats2half2_rn(p[24 + nt_lo * 2], p[24 + nt_lo * 2 + 1]);
+            const __half2 p_rg0_hi = __floats2half2_rn(p[nt_hi * 2], p[nt_hi * 2 + 1]);
+            const __half2 p_rg1_hi = __floats2half2_rn(p[24 + nt_hi * 2], p[24 + nt_hi * 2 + 1]);
+            pa.x[0] = *(const unsigned*)(const void*)&p_rg0_lo;
+            pa.x[1] = *(const unsigned*)(const void*)&p_rg1_lo;
+            pa.x[2] = *(const unsigned*)(const void*)&p_rg0_hi;
+            pa.x[3] = *(const unsigned*)(const void*)&p_rg1_hi;
+            const int row0 = kg * 16;
+#pragma unroll
+            for (int i = 0; i < ATTN_MMA_MAX_NTILES; ++i) {
+                if (i >= ntiles) break;
+                const int dim = i * 8 + bc;
+                mma_b_f16 b_;
+                b_.x[0] = attn_pack_half2(sv + (row0 + k0) * krow + dim, sv + (row0 + k0 + 1) * krow + dim);
+                b_.x[1] = attn_pack_half2(sv + (row0 + k0 + 8) * krow + dim, sv + (row0 + k0 + 9) * krow + dim);
+                mma_f16(o[i], pa, b_);
+            }
+        }
+
+        asm volatile("bar.arrive %0, %1;" ::"r"(ATTN_WS_BAR_FREE0), "r"(total_threads) : "memory");
+    }
+
+    // Same epilogue as `ws4` -- always the scattered-write fallback here
+    // (no output-staging path); this is a probe, not a shipped kernel.
+#pragma unroll
+    for (int rg = 0; rg < 2; ++rg) {
+        if (!row_live[rg]) continue;
+        const int abs_row = cr + rg * 8;
+        const int token = run_base + tile * tile_tokens + local0 + row_j[rg];
+        const int head = kv_head * group + abs_row % group;
+        const float den = l_run[rg];
+        const float m = m_run[rg];
+#pragma unroll
+        for (int i = 0; i < ATTN_MMA_MAX_NTILES; ++i) {
+            if (i >= ntiles) break;
+            const int d0 = i * 8 + cc;
+            const float v0 = o[i].x[rg * 2];
+            const float v1 = o[i].x[rg * 2 + 1];
+            if (single) {
+                out[((size_t)token * n_heads + head) * d_head + d0] =
+                    den > 0.0f ? __fdividef(v0, den) : 0.0f;
+                out[((size_t)token * n_heads + head) * d_head + d0 + 1] =
+                    den > 0.0f ? __fdividef(v1, den) : 0.0f;
+            } else {
+                const int local_token = tile * tile_tokens + local0 + row_j[rg];
+                float* dst =
+                    partial + (((size_t)c * run_tokens + local_token) * n_heads + head) * d_head + d0;
+                dst[0] = v0;
+                dst[1] = v1;
+                if (d0 == 0) {
+                    float* ms = partial + ms_off
+                              + (((size_t)c * run_tokens + local_token) * n_heads + head) * 2;
+                    ms[0] = m * 0.69314718f;
+                    ms[1] = den;
+                }
+            }
+        }
+    }
+}
+
 // Register-count probe only -- NOT launched, NOT correctness-tested. Answers
 // one narrow question before spending any engineering effort on a real
 // warp-paired d_head split: does shrinking `o[]` from `ATTN_MMA_MAX_NTILES`
@@ -6418,8 +6729,15 @@ extern "C" __global__ void attn_prefill_decoupled2_f32(
 #pragma unroll
     for (int g = 0; g < 2; ++g) {
         tile_base[g] = run_base + big_tile * big_tile_tokens + g * tpw;
-        base_last[g] = positions[tile_base[g]];
         tokens_here[g] = min(tpw, run_tokens - (big_tile * big_tile_tokens + g * tpw));
+        // Guarded: this group can be entirely past `run_tokens` on the
+        // last (partial) big_tile, and `tile_base[g]` is then past the
+        // real sequence's positions -- reading it unconditionally is a
+        // real out-of-bounds `positions[]` read (caught by memcheck on
+        // the T=4 kernel, latent but not triggered by T=2/T=3's smaller
+        // tile span in this file's own test padding). `base_last[g]` is
+        // provably unused below when `tokens_here[g] <= 0` anyway.
+        base_last[g] = tokens_here[g] > 0 ? positions[tile_base[g]] : 0;
         last_max[g] = tokens_here[g] > 0 ? base_last[g] + tokens_here[g] - 1 : -1;
     }
     const int* table = slot_table + (size_t)seq_of[tile_base[0]] * table_stride;
@@ -6703,8 +7021,10 @@ extern "C" __global__ void attn_prefill_decoupled2_f16acc_regcheck_f32(
 #pragma unroll
     for (int g = 0; g < 2; ++g) {
         tile_base[g] = run_base + big_tile * big_tile_tokens + g * tpw;
-        base_last[g] = positions[tile_base[g]];
         tokens_here[g] = min(tpw, run_tokens - (big_tile * big_tile_tokens + g * tpw));
+        // Guarded read -- see the identical pattern's doc comment in
+        // `attn_prefill_decoupled2_f32` above for why.
+        base_last[g] = tokens_here[g] > 0 ? positions[tile_base[g]] : 0;
         last_max[g] = tokens_here[g] > 0 ? base_last[g] + tokens_here[g] - 1 : -1;
     }
     const int* table = slot_table + (size_t)seq_of[tile_base[0]] * table_stride;
@@ -6927,6 +7247,1237 @@ extern "C" __global__ void attn_prefill_decoupled2_f16acc_regcheck_f32(
 
         const int fbar2 = (stage == 0) ? ATTN_WS_BAR_FREE0 : ATTN_WS_BAR_FREE1;
         asm volatile("bar.arrive %0, %1;" ::"r"(fbar2), "r"(160) : "memory");
+    }
+
+#pragma unroll
+    for (int rg = 0; rg < 2; ++rg) {
+        if (!row_live[rg]) continue;
+        const int abs_row = cr + rg * 8;
+        const int token = tile_base[g] + row_j[rg];
+        const int head = kv_head * group + abs_row % group;
+        const float den = l_run[rg];
+#pragma unroll
+        for (int i = 0; i < ATTN_DSPLIT_HALF_NTILES; ++i) {
+            const int d0 = (d_tile_offset * ATTN_DSPLIT_HALF_NTILES + i) * 8 + cc;
+            const unsigned* src0 = (rg == 0) ? &o0[i] : &o1[i];
+            const __half2 v = *(const __half2*)(const void*)src0;
+            const float2 vf = __half22float2(v);
+            out[((size_t)token * n_heads + head) * d_head + d0] = den > 0.0f ? __fdividef(vf.x, den) : 0.0f;
+            out[((size_t)token * n_heads + head) * d_head + d0 + 1] = den > 0.0f ? __fdividef(vf.y, den) : 0.0f;
+        }
+    }
+}
+
+// T=3 generalization of `attn_prefill_decoupled2_f16acc_regcheck_f32`,
+// motivated by the memory-tax-vs-occupancy signal that kernel's own real
+// benchmark left behind: T=2 plain and T=2+fp16acc share the identical
+// 3.5x memory tax and differ only in occupancy (2 vs 3 blocks/SM), yet
+// the real gain from that 50% occupancy jump was small (0.527x -> 0.549x)
+// -- evidence that K/V memory bandwidth, not occupancy, is now the
+// binding constraint for this design family. T=3 lowers the tax itself
+// (7/T: 2.33x instead of 3.5x) at 96 registers x 320 threads/block =
+// 30,720 registers/block -> 65536/30720 = 2 resident blocks/SM (20
+// resident warps, vs T=2+fp16acc's 21) -- a real test of whether tax
+// reduction matters more than the occupancy tricks already tried.
+//
+// One real hardware constraint blocks a naive T=2-style extension: named
+// barriers (`bar.sync`/`bar.arrive`) only support IDs 0-15, 16 total per
+// block. T=2's scheme used 4 IDs for the producer (1-4, via the shared
+// ATTN_WS_BAR_* macros) + 4 per group (5..12 for 2 groups) = 12 IDs,
+// comfortably inside the limit. T=3 needs 4 + 4*3 = 16 IDs -- exactly at
+// the limit, but only if the producer's own 4 IDs start at 0 instead of
+// 1 (freeing the top ID that would otherwise overflow to 16, which
+// doesn't exist). This kernel therefore uses its OWN local barrier IDs
+// (0-15) instead of the shared ATTN_WS_BAR_* macros, so as not to
+// perturb those macros' values for every other kernel that already
+// depends on them starting at 1. Barrier ID 0 has no special meaning to
+// bar.sync/bar.arrive (only __syncthreads() implicitly uses it, and this
+// kernel never calls __syncthreads()), so this is safe.
+//
+// Per-group participant counts (1 QK^T warp + 2 PV warps = 96 threads)
+// are unchanged from T=2 -- they only depend on a fixed 3-warps-per-group
+// shape, not on T. Only the producer's own READY/FREE counts scale with
+// T (READY: producer + T QK^T-warps = 32*(1+T); FREE: producer + 2*T
+// PV-warps = 32*(1+2*T)).
+extern "C" __global__ void attn_prefill_decoupled3_f16acc_regcheck_f32(
+    float* __restrict__ out, const float* __restrict__ q,
+    const __half* __restrict__ k_cache, const __half* __restrict__ v_cache,
+    const int* __restrict__ seq_of, const int* __restrict__ positions,
+    const int* __restrict__ slot_table, int table_stride, int n_heads,
+    int n_kv_heads, int d_head, int n_slots, float scale, int kv_len,
+    int group, int tpw, int run_base, int run_tokens) {
+    const int WK4 = 32;
+    const int T = 3;
+    const int LREADY0 = 0, LREADY1 = 1, LFREE0 = 2, LFREE1 = 3;
+    const int kv_head = blockIdx.x;
+    const int big_tile = blockIdx.y;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int total_threads = blockDim.x;
+
+    const int krow = d_head + ATTN_MMA_KPAD;
+    const int ksteps = d_head / 16;
+    const int quads = d_head / 8;
+    const int WK4_NT = WK4 / 8;
+    const int SC_STRIDE = WK4_NT * WARP_SIZE * 4;
+
+    extern __shared__ char attn_ws_smem[];
+    __half* sk0 = (__half*)attn_ws_smem;
+    __half* sk1 = sk0 + (size_t)WK4 * krow;
+    __half* sv0 = sk1 + (size_t)WK4 * krow;
+    __half* sv1 = sv0 + (size_t)WK4 * krow;
+    float* sc = (float*)(sv1 + (size_t)WK4 * krow);
+
+    const int big_tile_tokens = T * tpw;
+    int tile_base[3], base_last[3], tokens_here[3], last_max[3];
+#pragma unroll
+    for (int g = 0; g < 3; ++g) {
+        tile_base[g] = run_base + big_tile * big_tile_tokens + g * tpw;
+        tokens_here[g] = min(tpw, run_tokens - (big_tile * big_tile_tokens + g * tpw));
+        // Guarded read -- see the identical pattern's doc comment in
+        // `attn_prefill_decoupled2_f32` above for why.
+        base_last[g] = tokens_here[g] > 0 ? positions[tile_base[g]] : 0;
+        last_max[g] = tokens_here[g] > 0 ? base_last[g] + tokens_here[g] - 1 : -1;
+    }
+    const int* table = slot_table + (size_t)seq_of[tile_base[0]] * table_stride;
+    const __half* kbase = k_cache + (size_t)kv_head * n_slots * d_head;
+    const __half* vbase = v_cache + (size_t)kv_head * n_slots * d_head;
+    const int begin = 0;
+    const int end = min(kv_len, max(max(last_max[0], last_max[1]), last_max[2]) + 1);
+    const int n_blk = end > begin ? (end - begin + WK4 - 1) / WK4 : 0;
+
+    if (warp == 0) {
+        for (int b = 0; b < n_blk; ++b) {
+            const int stage = b & 1;
+            if (b >= 2) {
+                const int bar = (stage == 0) ? LFREE0 : LFREE1;
+                asm volatile("bar.sync %0, %1;" ::"r"(bar), "r"(32 * (1 + 2 * T)) : "memory");
+            }
+            __half* skb = (stage == 0) ? sk0 : sk1;
+            __half* svb = (stage == 0) ? sv0 : sv1;
+            const int base = begin + b * WK4;
+            const int n = min(WK4, end - base);
+            for (int e = lane; e < WK4 * quads; e += WARP_SIZE) {
+                const int r = e / quads, w8 = e % quads;
+                const bool hit = r < n;
+                const size_t off = (size_t)table[base + (hit ? r : 0)] * d_head + w8 * 8;
+                cp_async16(skb + r * krow + w8 * 8, kbase + off, hit);
+                cp_async16(svb + r * krow + w8 * 8, vbase + off, hit);
+            }
+            CP_ASYNC_FENCE();
+            CP_ASYNC_WAIT(0);
+            const int bar = (stage == 0) ? LREADY0 : LREADY1;
+            asm volatile("bar.arrive %0, %1;" ::"r"(bar), "r"(32 * (1 + T)) : "memory");
+        }
+        return;
+    }
+
+    if (warp >= 1 && warp <= T) {
+        const int g = warp - 1;
+        const float* qbase_lo;
+        const float* qbase_hi;
+        const int ar = mma_a_row(lane);
+        const int bc = mma_b_col(lane);
+        const int k0 = mma_k0_f16(lane);
+        int j_lo = ar / group;
+        const bool live_lo = ar < tpw * group && j_lo < tokens_here[g];
+        const int token_lo = tile_base[g] + j_lo;
+        const int head_lo = kv_head * group + ar % group;
+        qbase_lo = live_lo ? q + ((size_t)token_lo * n_heads + head_lo) * d_head : nullptr;
+        const int ar_hi = ar + 8;
+        int j_hi = ar_hi / group;
+        const bool live_hi = ar_hi < tpw * group && j_hi < tokens_here[g];
+        const int token_hi = tile_base[g] + j_hi;
+        const int head_hi = kv_head * group + ar_hi % group;
+        qbase_hi = live_hi ? q + ((size_t)token_hi * n_heads + head_hi) * d_head : nullptr;
+
+        mma_a_f16 qa[ATTN_MMA_MAX_KSTEPS];
+#pragma unroll
+        for (int t = 0; t < ATTN_MMA_MAX_KSTEPS; ++t) {
+            if (t >= ksteps) break;
+            const int d0 = t * 16 + k0;
+            const __half2 lo0 = __floats2half2_rn(live_lo ? qbase_lo[d0] : 0.0f, live_lo ? qbase_lo[d0 + 1] : 0.0f);
+            const __half2 hi0 = __floats2half2_rn(live_hi ? qbase_hi[d0] : 0.0f, live_hi ? qbase_hi[d0 + 1] : 0.0f);
+            const __half2 lo1 = __floats2half2_rn(live_lo ? qbase_lo[d0 + 8] : 0.0f, live_lo ? qbase_lo[d0 + 9] : 0.0f);
+            const __half2 hi1 = __floats2half2_rn(live_hi ? qbase_hi[d0 + 8] : 0.0f, live_hi ? qbase_hi[d0 + 9] : 0.0f);
+            qa[t].x[0] = *(const unsigned*)(const void*)&lo0;
+            qa[t].x[1] = *(const unsigned*)(const void*)&hi0;
+            qa[t].x[2] = *(const unsigned*)(const void*)&lo1;
+            qa[t].x[3] = *(const unsigned*)(const void*)&hi1;
+        }
+
+        const int sready0 = 4 + g * 4, sready1 = 5 + g * 4;
+        const int sfree0 = 6 + g * 4, sfree1 = 7 + g * 4;
+        for (int b = 0; b < n_blk; ++b) {
+            const int stage = b & 1;
+            const int rbar = (stage == 0) ? LREADY0 : LREADY1;
+            asm volatile("bar.sync %0, %1;" ::"r"(rbar), "r"(32 * (1 + T)) : "memory");
+            if (b >= 2) {
+                const int sbar = (stage == 0) ? sfree0 : sfree1;
+                asm volatile("bar.sync %0, %1;" ::"r"(sbar), "r"(96) : "memory");
+            }
+            __half* skb = (stage == 0) ? sk0 : sk1;
+            float* scb = sc + (size_t)g * 2 * SC_STRIDE + (size_t)stage * SC_STRIDE;
+            const int base = begin + b * WK4;
+#pragma unroll
+            for (int nt = 0; nt < WK4 / 8; ++nt) {
+                mma_c_f32 s2;
+                s2.x[0] = s2.x[1] = s2.x[2] = s2.x[3] = 0.0f;
+                const int key0 = nt * 8;
+#pragma unroll
+                for (int t = 0; t < ATTN_MMA_MAX_KSTEPS; ++t) {
+                    if (t >= ksteps) break;
+                    mma_b_f16 b_;
+                    const __half* bp = skb + (key0 + bc) * krow + t * 16 + k0;
+                    b_.x[0] = *(const unsigned*)(const void*)bp;
+                    b_.x[1] = *(const unsigned*)(const void*)(bp + 8);
+                    mma_f16(s2, qa[t], b_);
+                }
+#pragma unroll
+                for (int e = 0; e < 4; ++e) scb[nt * WARP_SIZE * 4 + lane * 4 + e] = s2.x[e] * scale;
+            }
+            const int sbar = (stage == 0) ? sready0 : sready1;
+            asm volatile("bar.arrive %0, %1;" ::"r"(sbar), "r"(96) : "memory");
+        }
+        return;
+    }
+
+    // PV-consumer: group g = (warp-T-1)/2, d_head half = (warp-T-1)%2,
+    // fp16 accumulation for `o[]` -- see `mma_f16_acc16`.
+    const int idx = warp - T - 1;
+    const int g = idx / 2;
+    const int d_tile_offset = idx % 2;
+    const int bc = mma_b_col(lane);
+    const int k0 = mma_k0_f16(lane);
+    const int cr = mma_c_row(lane);
+    const int cc = mma_c_col(lane);
+    const int sready0 = 4 + g * 4, sready1 = 5 + g * 4;
+    const int sfree0 = 6 + g * 4, sfree1 = 7 + g * 4;
+
+    unsigned o0[ATTN_DSPLIT_HALF_NTILES];
+    unsigned o1[ATTN_DSPLIT_HALF_NTILES];
+#pragma unroll
+    for (int i = 0; i < ATTN_DSPLIT_HALF_NTILES; ++i) {
+        const __half2 z = __floats2half2_rn(0.0f, 0.0f);
+        o0[i] = *(const unsigned*)(const void*)&z;
+        o1[i] = *(const unsigned*)(const void*)&z;
+    }
+    float m_run[2] = {-INFINITY, -INFINITY};
+    float l_run[2] = {0.0f, 0.0f};
+    int row_j[2], row_last[2];
+    bool row_live[2];
+#pragma unroll
+    for (int rg = 0; rg < 2; ++rg) {
+        const int abs_row = cr + rg * 8;
+        row_j[rg] = abs_row / group;
+        row_last[rg] = base_last[g] + row_j[rg];
+        row_live[rg] = abs_row < tpw * group && row_j[rg] < tokens_here[g];
+    }
+
+    for (int b = 0; b < n_blk; ++b) {
+        const int stage = b & 1;
+        const int sbar = (stage == 0) ? sready0 : sready1;
+        asm volatile("bar.sync %0, %1;" ::"r"(sbar), "r"(96) : "memory");
+        __half* svb = (stage == 0) ? sv0 : sv1;
+        float* scb = sc + (size_t)g * 2 * SC_STRIDE + (size_t)stage * SC_STRIDE;
+        const int base = begin + b * WK4;
+        const int n = min(WK4, end - base);
+
+        float sv_score[16];
+#pragma unroll
+        for (int rg = 0; rg < 2; ++rg) {
+#pragma unroll
+            for (int nt = 0; nt < WK4 / 8; ++nt) {
+#pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    const int key = nt * 8 + cc + e;
+                    const int abs_key = base + key;
+                    sv_score[rg * 8 + nt * 2 + e] =
+                        (row_live[rg] && key < n && abs_key <= row_last[rg])
+                            ? scb[nt * WARP_SIZE * 4 + lane * 4 + rg * 2 + e]
+                            : -INFINITY;
+                }
+            }
+        }
+        {
+            const int fbar = (stage == 0) ? sfree0 : sfree1;
+            asm volatile("bar.arrive %0, %1;" ::"r"(fbar), "r"(96) : "memory");
+        }
+
+        float p[16];
+#pragma unroll
+        for (int rg = 0; rg < 2; ++rg) {
+            float* svr = sv_score + rg * 8;
+            float m_own = svr[0];
+#pragma unroll
+            for (int i = 1; i < 8; ++i) m_own = fmaxf(m_own, svr[i]);
+            m_own = fmaxf(m_own, __shfl_xor_sync(0xffffffff, m_own, 1, WARP_SIZE));
+            m_own = fmaxf(m_own, __shfl_xor_sync(0xffffffff, m_own, 2, WARP_SIZE));
+            const float m_new = fmaxf(m_run[rg], m_own);
+            float psum = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                p[rg * 8 + i] = (svr[i] == -INFINITY) ? 0.0f : __expf(svr[i] - m_new);
+                psum += p[rg * 8 + i];
+            }
+            psum += __shfl_xor_sync(0xffffffff, psum, 1, WARP_SIZE);
+            psum += __shfl_xor_sync(0xffffffff, psum, 2, WARP_SIZE);
+            const float corr = (m_run[rg] == -INFINITY) ? 0.0f : __expf(m_run[rg] - m_new);
+            l_run[rg] = l_run[rg] * corr + psum;
+            m_run[rg] = m_new;
+            const __half2 corr2 = __floats2half2_rn(corr, corr);
+#pragma unroll
+            for (int i = 0; i < ATTN_DSPLIT_HALF_NTILES; ++i) {
+                unsigned* dst = (rg == 0) ? &o0[i] : &o1[i];
+                __half2 cur = *(const __half2*)(const void*)dst;
+                __half2 scaled = __hmul2(cur, corr2);
+                *dst = *(const unsigned*)(const void*)&scaled;
+            }
+        }
+
+#pragma unroll
+        for (int kg = 0; kg < WK4 / 16; ++kg) {
+            const int nt_lo = kg * 2, nt_hi = kg * 2 + 1;
+            mma_a_f16 pa;
+            const __half2 p_rg0_lo = __floats2half2_rn(p[nt_lo * 2], p[nt_lo * 2 + 1]);
+            const __half2 p_rg1_lo = __floats2half2_rn(p[8 + nt_lo * 2], p[8 + nt_lo * 2 + 1]);
+            const __half2 p_rg0_hi = __floats2half2_rn(p[nt_hi * 2], p[nt_hi * 2 + 1]);
+            const __half2 p_rg1_hi = __floats2half2_rn(p[8 + nt_hi * 2], p[8 + nt_hi * 2 + 1]);
+            pa.x[0] = *(const unsigned*)(const void*)&p_rg0_lo;
+            pa.x[1] = *(const unsigned*)(const void*)&p_rg1_lo;
+            pa.x[2] = *(const unsigned*)(const void*)&p_rg0_hi;
+            pa.x[3] = *(const unsigned*)(const void*)&p_rg1_hi;
+            const int row0 = kg * 16;
+#pragma unroll
+            for (int i = 0; i < ATTN_DSPLIT_HALF_NTILES; ++i) {
+                const int dim = (d_tile_offset * ATTN_DSPLIT_HALF_NTILES + i) * 8 + bc;
+                mma_b_f16 b_;
+                b_.x[0] = attn_pack_half2(svb + (row0 + k0) * krow + dim, svb + (row0 + k0 + 1) * krow + dim);
+                b_.x[1] = attn_pack_half2(svb + (row0 + k0 + 8) * krow + dim, svb + (row0 + k0 + 9) * krow + dim);
+                mma_f16_acc16(&o0[i], &o1[i], pa, b_);
+            }
+        }
+
+        const int fbar2 = (stage == 0) ? LFREE0 : LFREE1;
+        asm volatile("bar.arrive %0, %1;" ::"r"(fbar2), "r"(32 * (1 + 2 * T)) : "memory");
+    }
+
+#pragma unroll
+    for (int rg = 0; rg < 2; ++rg) {
+        if (!row_live[rg]) continue;
+        const int abs_row = cr + rg * 8;
+        const int token = tile_base[g] + row_j[rg];
+        const int head = kv_head * group + abs_row % group;
+        const float den = l_run[rg];
+#pragma unroll
+        for (int i = 0; i < ATTN_DSPLIT_HALF_NTILES; ++i) {
+            const int d0 = (d_tile_offset * ATTN_DSPLIT_HALF_NTILES + i) * 8 + cc;
+            const unsigned* src0 = (rg == 0) ? &o0[i] : &o1[i];
+            const __half2 v = *(const __half2*)(const void*)src0;
+            const float2 vf = __half22float2(v);
+            out[((size_t)token * n_heads + head) * d_head + d0] = den > 0.0f ? __fdividef(vf.x, den) : 0.0f;
+            out[((size_t)token * n_heads + head) * d_head + d0 + 1] = den > 0.0f ? __fdividef(vf.y, den) : 0.0f;
+        }
+    }
+}
+
+// T=4 generalization -- motivated by T=3's own real result: going from
+// T=2+fp16acc (3.5x tax, 3 blocks/SM, 21 warps) to T=3+fp16acc (2.33x
+// tax, 2 blocks/SM, 20 warps) was a MUCH bigger real win (0.549x ->
+// 0.733x) than T=2's own occupancy-only step (0.527x -> 0.549x) despite
+// LOSING a resident block -- direct evidence that, in this regime, tax
+// reduction dominates occupancy. T=4 pushes tax down further (7/4 =
+// 1.75x) but the same math that worked for T=2->T=3 does NOT carry
+// through cleanly this time: threads/block = (1+3*4)*32 = 416, and at 96
+// registers that is 39,936 registers/block -- 65536/39936 = only 1
+// resident block/SM (13 resident warps), DOWN from T=3's 20. Unlike the
+// T=2->T=3 step (tax improved, occupancy only mildly worse), T=4 is a
+// genuine two-sided tradeoff: better tax, meaningfully worse occupancy --
+// worth measuring directly rather than assuming either direction.
+//
+// T=4 also hits a real, harder version of T=3's own barrier-ID problem:
+// the per-group scheme (4 dedicated named-barrier IDs per group) needs
+// 4 + 4*T IDs total -- 20 for T=4, over the hardware's fixed 16-ID
+// budget (0-15) with no ID-shuffling trick left to recover the gap (T=3
+// already used the only spare one). Fixing this needs an actual
+// redesign, not just renumbering: this kernel's QK^T-warps and PV-warps
+// are ALREADY bulk-synchronous across groups (every warp, in every
+// group, loops the SAME shared `n_blk` bound -- the per-group barriers
+// only ever existed to protect each group's OWN score-buffer slot from
+// early overwrite, not to let groups run at independent paces). Since
+// no group can outrun another anyway, this kernel shares ONE score-ready
+// and ONE score-free barrier pair across ALL T groups instead of one
+// pair per group: all T QK^T-warps arrive on the shared ready barrier
+// once their own group's scores are written; all 2T PV-warps wait on it
+// before reading ANY group's scores, then arrive on the shared free
+// barrier once done, which all T QK^T-warps wait on before the next
+// overwrite. This costs only 4 more IDs (8 total, TOGETHER WITH the K/V
+// producer's own 4) fully independent of T -- and its only real
+// downside is coarser sync (a fast group's QK^T-warp now waits for the
+// SLOWEST group's PV-consumers, not just its own), a cost this kernel's
+// own real benchmark measures directly rather than assumes away.
+extern "C" __global__ void attn_prefill_decoupled4_f16acc_regcheck_f32(
+    float* __restrict__ out, const float* __restrict__ q,
+    const __half* __restrict__ k_cache, const __half* __restrict__ v_cache,
+    const int* __restrict__ seq_of, const int* __restrict__ positions,
+    const int* __restrict__ slot_table, int table_stride, int n_heads,
+    int n_kv_heads, int d_head, int n_slots, float scale, int kv_len,
+    int group, int tpw, int run_base, int run_tokens) {
+    const int WK4 = 32;
+    const int T = 4;
+    const int LREADY0 = 0, LREADY1 = 1, LFREE0 = 2, LFREE1 = 3;
+    const int LSREADY0 = 4, LSREADY1 = 5, LSFREE0 = 6, LSFREE1 = 7;
+    const int kv_head = blockIdx.x;
+    const int big_tile = blockIdx.y;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int total_threads = blockDim.x;
+
+    const int krow = d_head + ATTN_MMA_KPAD;
+    const int ksteps = d_head / 16;
+    const int quads = d_head / 8;
+    const int WK4_NT = WK4 / 8;
+    const int SC_STRIDE = WK4_NT * WARP_SIZE * 4;
+    // All T QK^T-warps + all 2T PV-warps participate in each shared
+    // score barrier (the producer never touches these).
+    const int SBAR_COUNT = 3 * T * 32;
+
+    extern __shared__ char attn_ws_smem[];
+    __half* sk0 = (__half*)attn_ws_smem;
+    __half* sk1 = sk0 + (size_t)WK4 * krow;
+    __half* sv0 = sk1 + (size_t)WK4 * krow;
+    __half* sv1 = sv0 + (size_t)WK4 * krow;
+    float* sc = (float*)(sv1 + (size_t)WK4 * krow);
+
+    const int big_tile_tokens = T * tpw;
+    int tile_base[4], base_last[4], tokens_here[4], last_max[4];
+#pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        tile_base[g] = run_base + big_tile * big_tile_tokens + g * tpw;
+        tokens_here[g] = min(tpw, run_tokens - (big_tile * big_tile_tokens + g * tpw));
+        // Guarded read -- see the identical pattern's doc comment in
+        // `attn_prefill_decoupled2_f32` above for why.
+        base_last[g] = tokens_here[g] > 0 ? positions[tile_base[g]] : 0;
+        last_max[g] = tokens_here[g] > 0 ? base_last[g] + tokens_here[g] - 1 : -1;
+    }
+    const int* table = slot_table + (size_t)seq_of[tile_base[0]] * table_stride;
+    const __half* kbase = k_cache + (size_t)kv_head * n_slots * d_head;
+    const __half* vbase = v_cache + (size_t)kv_head * n_slots * d_head;
+    const int begin = 0;
+    int end = max(last_max[0], last_max[1]);
+    end = max(end, last_max[2]);
+    end = min(kv_len, max(end, last_max[3]) + 1);
+    const int n_blk = end > begin ? (end - begin + WK4 - 1) / WK4 : 0;
+
+    if (warp == 0) {
+        for (int b = 0; b < n_blk; ++b) {
+            const int stage = b & 1;
+            if (b >= 2) {
+                const int bar = (stage == 0) ? LFREE0 : LFREE1;
+                asm volatile("bar.sync %0, %1;" ::"r"(bar), "r"(32 * (1 + 2 * T)) : "memory");
+            }
+            __half* skb = (stage == 0) ? sk0 : sk1;
+            __half* svb = (stage == 0) ? sv0 : sv1;
+            const int base = begin + b * WK4;
+            const int n = min(WK4, end - base);
+            for (int e = lane; e < WK4 * quads; e += WARP_SIZE) {
+                const int r = e / quads, w8 = e % quads;
+                const bool hit = r < n;
+                const size_t off = (size_t)table[base + (hit ? r : 0)] * d_head + w8 * 8;
+                cp_async16(skb + r * krow + w8 * 8, kbase + off, hit);
+                cp_async16(svb + r * krow + w8 * 8, vbase + off, hit);
+            }
+            CP_ASYNC_FENCE();
+            CP_ASYNC_WAIT(0);
+            const int bar = (stage == 0) ? LREADY0 : LREADY1;
+            asm volatile("bar.arrive %0, %1;" ::"r"(bar), "r"(32 * (1 + T)) : "memory");
+        }
+        return;
+    }
+
+    if (warp >= 1 && warp <= T) {
+        const int g = warp - 1;
+        const float* qbase_lo;
+        const float* qbase_hi;
+        const int ar = mma_a_row(lane);
+        const int bc = mma_b_col(lane);
+        const int k0 = mma_k0_f16(lane);
+        int j_lo = ar / group;
+        const bool live_lo = ar < tpw * group && j_lo < tokens_here[g];
+        const int token_lo = tile_base[g] + j_lo;
+        const int head_lo = kv_head * group + ar % group;
+        qbase_lo = live_lo ? q + ((size_t)token_lo * n_heads + head_lo) * d_head : nullptr;
+        const int ar_hi = ar + 8;
+        int j_hi = ar_hi / group;
+        const bool live_hi = ar_hi < tpw * group && j_hi < tokens_here[g];
+        const int token_hi = tile_base[g] + j_hi;
+        const int head_hi = kv_head * group + ar_hi % group;
+        qbase_hi = live_hi ? q + ((size_t)token_hi * n_heads + head_hi) * d_head : nullptr;
+
+        mma_a_f16 qa[ATTN_MMA_MAX_KSTEPS];
+#pragma unroll
+        for (int t = 0; t < ATTN_MMA_MAX_KSTEPS; ++t) {
+            if (t >= ksteps) break;
+            const int d0 = t * 16 + k0;
+            const __half2 lo0 = __floats2half2_rn(live_lo ? qbase_lo[d0] : 0.0f, live_lo ? qbase_lo[d0 + 1] : 0.0f);
+            const __half2 hi0 = __floats2half2_rn(live_hi ? qbase_hi[d0] : 0.0f, live_hi ? qbase_hi[d0 + 1] : 0.0f);
+            const __half2 lo1 = __floats2half2_rn(live_lo ? qbase_lo[d0 + 8] : 0.0f, live_lo ? qbase_lo[d0 + 9] : 0.0f);
+            const __half2 hi1 = __floats2half2_rn(live_hi ? qbase_hi[d0 + 8] : 0.0f, live_hi ? qbase_hi[d0 + 9] : 0.0f);
+            qa[t].x[0] = *(const unsigned*)(const void*)&lo0;
+            qa[t].x[1] = *(const unsigned*)(const void*)&hi0;
+            qa[t].x[2] = *(const unsigned*)(const void*)&lo1;
+            qa[t].x[3] = *(const unsigned*)(const void*)&hi1;
+        }
+
+        for (int b = 0; b < n_blk; ++b) {
+            const int stage = b & 1;
+            const int rbar = (stage == 0) ? LREADY0 : LREADY1;
+            asm volatile("bar.sync %0, %1;" ::"r"(rbar), "r"(32 * (1 + T)) : "memory");
+            if (b >= 2) {
+                const int sbar = (stage == 0) ? LSFREE0 : LSFREE1;
+                asm volatile("bar.sync %0, %1;" ::"r"(sbar), "r"(SBAR_COUNT) : "memory");
+            }
+            __half* skb = (stage == 0) ? sk0 : sk1;
+            float* scb = sc + (size_t)g * 2 * SC_STRIDE + (size_t)stage * SC_STRIDE;
+            const int base = begin + b * WK4;
+#pragma unroll
+            for (int nt = 0; nt < WK4 / 8; ++nt) {
+                mma_c_f32 s2;
+                s2.x[0] = s2.x[1] = s2.x[2] = s2.x[3] = 0.0f;
+                const int key0 = nt * 8;
+#pragma unroll
+                for (int t = 0; t < ATTN_MMA_MAX_KSTEPS; ++t) {
+                    if (t >= ksteps) break;
+                    mma_b_f16 b_;
+                    const __half* bp = skb + (key0 + bc) * krow + t * 16 + k0;
+                    b_.x[0] = *(const unsigned*)(const void*)bp;
+                    b_.x[1] = *(const unsigned*)(const void*)(bp + 8);
+                    mma_f16(s2, qa[t], b_);
+                }
+#pragma unroll
+                for (int e = 0; e < 4; ++e) scb[nt * WARP_SIZE * 4 + lane * 4 + e] = s2.x[e] * scale;
+            }
+            const int sbar = (stage == 0) ? LSREADY0 : LSREADY1;
+            asm volatile("bar.arrive %0, %1;" ::"r"(sbar), "r"(SBAR_COUNT) : "memory");
+        }
+        return;
+    }
+
+    // PV-consumer: group g = (warp-T-1)/2, d_head half = (warp-T-1)%2,
+    // fp16 accumulation for `o[]` -- see `mma_f16_acc16`. Score-ready/free
+    // barriers are the SHARED ones now (see this kernel's own doc
+    // comment) -- every PV-warp across every group waits on and arrives
+    // the same two barrier IDs.
+    const int idx = warp - T - 1;
+    const int g = idx / 2;
+    const int d_tile_offset = idx % 2;
+    const int bc = mma_b_col(lane);
+    const int k0 = mma_k0_f16(lane);
+    const int cr = mma_c_row(lane);
+    const int cc = mma_c_col(lane);
+
+    unsigned o0[ATTN_DSPLIT_HALF_NTILES];
+    unsigned o1[ATTN_DSPLIT_HALF_NTILES];
+#pragma unroll
+    for (int i = 0; i < ATTN_DSPLIT_HALF_NTILES; ++i) {
+        const __half2 z = __floats2half2_rn(0.0f, 0.0f);
+        o0[i] = *(const unsigned*)(const void*)&z;
+        o1[i] = *(const unsigned*)(const void*)&z;
+    }
+    float m_run[2] = {-INFINITY, -INFINITY};
+    float l_run[2] = {0.0f, 0.0f};
+    int row_j[2], row_last[2];
+    bool row_live[2];
+#pragma unroll
+    for (int rg = 0; rg < 2; ++rg) {
+        const int abs_row = cr + rg * 8;
+        row_j[rg] = abs_row / group;
+        row_last[rg] = base_last[g] + row_j[rg];
+        row_live[rg] = abs_row < tpw * group && row_j[rg] < tokens_here[g];
+    }
+
+    for (int b = 0; b < n_blk; ++b) {
+        const int stage = b & 1;
+        const int sbar = (stage == 0) ? LSREADY0 : LSREADY1;
+        asm volatile("bar.sync %0, %1;" ::"r"(sbar), "r"(SBAR_COUNT) : "memory");
+        __half* svb = (stage == 0) ? sv0 : sv1;
+        float* scb = sc + (size_t)g * 2 * SC_STRIDE + (size_t)stage * SC_STRIDE;
+        const int base = begin + b * WK4;
+        const int n = min(WK4, end - base);
+
+        float sv_score[16];
+#pragma unroll
+        for (int rg = 0; rg < 2; ++rg) {
+#pragma unroll
+            for (int nt = 0; nt < WK4 / 8; ++nt) {
+#pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    const int key = nt * 8 + cc + e;
+                    const int abs_key = base + key;
+                    sv_score[rg * 8 + nt * 2 + e] =
+                        (row_live[rg] && key < n && abs_key <= row_last[rg])
+                            ? scb[nt * WARP_SIZE * 4 + lane * 4 + rg * 2 + e]
+                            : -INFINITY;
+                }
+            }
+        }
+        {
+            const int fbar = (stage == 0) ? LSFREE0 : LSFREE1;
+            asm volatile("bar.arrive %0, %1;" ::"r"(fbar), "r"(SBAR_COUNT) : "memory");
+        }
+
+        float p[16];
+#pragma unroll
+        for (int rg = 0; rg < 2; ++rg) {
+            float* svr = sv_score + rg * 8;
+            float m_own = svr[0];
+#pragma unroll
+            for (int i = 1; i < 8; ++i) m_own = fmaxf(m_own, svr[i]);
+            m_own = fmaxf(m_own, __shfl_xor_sync(0xffffffff, m_own, 1, WARP_SIZE));
+            m_own = fmaxf(m_own, __shfl_xor_sync(0xffffffff, m_own, 2, WARP_SIZE));
+            const float m_new = fmaxf(m_run[rg], m_own);
+            float psum = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                p[rg * 8 + i] = (svr[i] == -INFINITY) ? 0.0f : __expf(svr[i] - m_new);
+                psum += p[rg * 8 + i];
+            }
+            psum += __shfl_xor_sync(0xffffffff, psum, 1, WARP_SIZE);
+            psum += __shfl_xor_sync(0xffffffff, psum, 2, WARP_SIZE);
+            const float corr = (m_run[rg] == -INFINITY) ? 0.0f : __expf(m_run[rg] - m_new);
+            l_run[rg] = l_run[rg] * corr + psum;
+            m_run[rg] = m_new;
+            const __half2 corr2 = __floats2half2_rn(corr, corr);
+#pragma unroll
+            for (int i = 0; i < ATTN_DSPLIT_HALF_NTILES; ++i) {
+                unsigned* dst = (rg == 0) ? &o0[i] : &o1[i];
+                __half2 cur = *(const __half2*)(const void*)dst;
+                __half2 scaled = __hmul2(cur, corr2);
+                *dst = *(const unsigned*)(const void*)&scaled;
+            }
+        }
+
+#pragma unroll
+        for (int kg = 0; kg < WK4 / 16; ++kg) {
+            const int nt_lo = kg * 2, nt_hi = kg * 2 + 1;
+            mma_a_f16 pa;
+            const __half2 p_rg0_lo = __floats2half2_rn(p[nt_lo * 2], p[nt_lo * 2 + 1]);
+            const __half2 p_rg1_lo = __floats2half2_rn(p[8 + nt_lo * 2], p[8 + nt_lo * 2 + 1]);
+            const __half2 p_rg0_hi = __floats2half2_rn(p[nt_hi * 2], p[nt_hi * 2 + 1]);
+            const __half2 p_rg1_hi = __floats2half2_rn(p[8 + nt_hi * 2], p[8 + nt_hi * 2 + 1]);
+            pa.x[0] = *(const unsigned*)(const void*)&p_rg0_lo;
+            pa.x[1] = *(const unsigned*)(const void*)&p_rg1_lo;
+            pa.x[2] = *(const unsigned*)(const void*)&p_rg0_hi;
+            pa.x[3] = *(const unsigned*)(const void*)&p_rg1_hi;
+            const int row0 = kg * 16;
+#pragma unroll
+            for (int i = 0; i < ATTN_DSPLIT_HALF_NTILES; ++i) {
+                const int dim = (d_tile_offset * ATTN_DSPLIT_HALF_NTILES + i) * 8 + bc;
+                mma_b_f16 b_;
+                b_.x[0] = attn_pack_half2(svb + (row0 + k0) * krow + dim, svb + (row0 + k0 + 1) * krow + dim);
+                b_.x[1] = attn_pack_half2(svb + (row0 + k0 + 8) * krow + dim, svb + (row0 + k0 + 9) * krow + dim);
+                mma_f16_acc16(&o0[i], &o1[i], pa, b_);
+            }
+        }
+
+        const int fbar2 = (stage == 0) ? LFREE0 : LFREE1;
+        asm volatile("bar.arrive %0, %1;" ::"r"(fbar2), "r"(32 * (1 + 2 * T)) : "memory");
+    }
+
+#pragma unroll
+    for (int rg = 0; rg < 2; ++rg) {
+        if (!row_live[rg]) continue;
+        const int abs_row = cr + rg * 8;
+        const int token = tile_base[g] + row_j[rg];
+        const int head = kv_head * group + abs_row % group;
+        const float den = l_run[rg];
+#pragma unroll
+        for (int i = 0; i < ATTN_DSPLIT_HALF_NTILES; ++i) {
+            const int d0 = (d_tile_offset * ATTN_DSPLIT_HALF_NTILES + i) * 8 + cc;
+            const unsigned* src0 = (rg == 0) ? &o0[i] : &o1[i];
+            const __half2 v = *(const __half2*)(const void*)src0;
+            const float2 vf = __half22float2(v);
+            out[((size_t)token * n_heads + head) * d_head + d0] = den > 0.0f ? __fdividef(vf.x, den) : 0.0f;
+            out[((size_t)token * n_heads + head) * d_head + d0 + 1] = den > 0.0f ? __fdividef(vf.y, den) : 0.0f;
+        }
+    }
+}
+
+// T=5 generalization -- motivated directly by T=4's own real result:
+// unlike the T=2->T=3 step (tax improved, occupancy only mildly worse) or
+// T=3->T=4 (tax improved, occupancy also worse but not enough to matter --
+// 0.701x -> 0.848x, the biggest single-step gain in this whole family),
+// T=4->T=5 is a genuine double win on the register math alone: T=5 at 96
+// registers needs 512 threads/block = 49,152 registers/block, still only 1
+// resident block/SM, but now 16 resident warps (UP from T=4's 13) since a
+// single block simply has more warps at T=5 -- tax also keeps falling
+// (7/5 = 1.4x, down from 1.75x). Uses the same shared (not per-group)
+// score-ready/free barrier scheme as T=4 (still only 8 total named-barrier
+// IDs, independent of T, so no ID-budget issue at T=5).
+extern "C" __global__ void attn_prefill_decoupled5_f16acc_regcheck_f32(
+    float* __restrict__ out, const float* __restrict__ q,
+    const __half* __restrict__ k_cache, const __half* __restrict__ v_cache,
+    const int* __restrict__ seq_of, const int* __restrict__ positions,
+    const int* __restrict__ slot_table, int table_stride, int n_heads,
+    int n_kv_heads, int d_head, int n_slots, float scale, int kv_len,
+    int group, int tpw, int run_base, int run_tokens) {
+    const int WK4 = 32;
+    const int T = 5;
+    const int LREADY0 = 0, LREADY1 = 1, LFREE0 = 2, LFREE1 = 3;
+    const int LSREADY0 = 4, LSREADY1 = 5, LSFREE0 = 6, LSFREE1 = 7;
+    const int kv_head = blockIdx.x;
+    const int big_tile = blockIdx.y;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int total_threads = blockDim.x;
+
+    const int krow = d_head + ATTN_MMA_KPAD;
+    const int ksteps = d_head / 16;
+    const int quads = d_head / 8;
+    const int WK4_NT = WK4 / 8;
+    const int SC_STRIDE = WK4_NT * WARP_SIZE * 4;
+    // All T QK^T-warps + all 2T PV-warps participate in each shared
+    // score barrier (the producer never touches these).
+    const int SBAR_COUNT = 3 * T * 32;
+
+    extern __shared__ char attn_ws_smem[];
+    __half* sk0 = (__half*)attn_ws_smem;
+    __half* sk1 = sk0 + (size_t)WK4 * krow;
+    __half* sv0 = sk1 + (size_t)WK4 * krow;
+    __half* sv1 = sv0 + (size_t)WK4 * krow;
+    float* sc = (float*)(sv1 + (size_t)WK4 * krow);
+
+    const int big_tile_tokens = T * tpw;
+    int tile_base[5], base_last[5], tokens_here[5], last_max[5];
+#pragma unroll
+    for (int g = 0; g < 5; ++g) {
+        tile_base[g] = run_base + big_tile * big_tile_tokens + g * tpw;
+        tokens_here[g] = min(tpw, run_tokens - (big_tile * big_tile_tokens + g * tpw));
+        // Guarded read -- see the identical pattern's doc comment in
+        // `attn_prefill_decoupled2_f32` above for why.
+        base_last[g] = tokens_here[g] > 0 ? positions[tile_base[g]] : 0;
+        last_max[g] = tokens_here[g] > 0 ? base_last[g] + tokens_here[g] - 1 : -1;
+    }
+    const int* table = slot_table + (size_t)seq_of[tile_base[0]] * table_stride;
+    const __half* kbase = k_cache + (size_t)kv_head * n_slots * d_head;
+    const __half* vbase = v_cache + (size_t)kv_head * n_slots * d_head;
+    const int begin = 0;
+    int end = max(last_max[0], last_max[1]);
+    end = max(end, last_max[2]);
+    end = max(end, last_max[3]);
+    end = min(kv_len, max(end, last_max[4]) + 1);
+    const int n_blk = end > begin ? (end - begin + WK4 - 1) / WK4 : 0;
+
+    if (warp == 0) {
+        for (int b = 0; b < n_blk; ++b) {
+            const int stage = b & 1;
+            if (b >= 2) {
+                const int bar = (stage == 0) ? LFREE0 : LFREE1;
+                asm volatile("bar.sync %0, %1;" ::"r"(bar), "r"(32 * (1 + 2 * T)) : "memory");
+            }
+            __half* skb = (stage == 0) ? sk0 : sk1;
+            __half* svb = (stage == 0) ? sv0 : sv1;
+            const int base = begin + b * WK4;
+            const int n = min(WK4, end - base);
+            for (int e = lane; e < WK4 * quads; e += WARP_SIZE) {
+                const int r = e / quads, w8 = e % quads;
+                const bool hit = r < n;
+                const size_t off = (size_t)table[base + (hit ? r : 0)] * d_head + w8 * 8;
+                cp_async16(skb + r * krow + w8 * 8, kbase + off, hit);
+                cp_async16(svb + r * krow + w8 * 8, vbase + off, hit);
+            }
+            CP_ASYNC_FENCE();
+            CP_ASYNC_WAIT(0);
+            const int bar = (stage == 0) ? LREADY0 : LREADY1;
+            asm volatile("bar.arrive %0, %1;" ::"r"(bar), "r"(32 * (1 + T)) : "memory");
+        }
+        return;
+    }
+
+    if (warp >= 1 && warp <= T) {
+        const int g = warp - 1;
+        const float* qbase_lo;
+        const float* qbase_hi;
+        const int ar = mma_a_row(lane);
+        const int bc = mma_b_col(lane);
+        const int k0 = mma_k0_f16(lane);
+        int j_lo = ar / group;
+        const bool live_lo = ar < tpw * group && j_lo < tokens_here[g];
+        const int token_lo = tile_base[g] + j_lo;
+        const int head_lo = kv_head * group + ar % group;
+        qbase_lo = live_lo ? q + ((size_t)token_lo * n_heads + head_lo) * d_head : nullptr;
+        const int ar_hi = ar + 8;
+        int j_hi = ar_hi / group;
+        const bool live_hi = ar_hi < tpw * group && j_hi < tokens_here[g];
+        const int token_hi = tile_base[g] + j_hi;
+        const int head_hi = kv_head * group + ar_hi % group;
+        qbase_hi = live_hi ? q + ((size_t)token_hi * n_heads + head_hi) * d_head : nullptr;
+
+        mma_a_f16 qa[ATTN_MMA_MAX_KSTEPS];
+#pragma unroll
+        for (int t = 0; t < ATTN_MMA_MAX_KSTEPS; ++t) {
+            if (t >= ksteps) break;
+            const int d0 = t * 16 + k0;
+            const __half2 lo0 = __floats2half2_rn(live_lo ? qbase_lo[d0] : 0.0f, live_lo ? qbase_lo[d0 + 1] : 0.0f);
+            const __half2 hi0 = __floats2half2_rn(live_hi ? qbase_hi[d0] : 0.0f, live_hi ? qbase_hi[d0 + 1] : 0.0f);
+            const __half2 lo1 = __floats2half2_rn(live_lo ? qbase_lo[d0 + 8] : 0.0f, live_lo ? qbase_lo[d0 + 9] : 0.0f);
+            const __half2 hi1 = __floats2half2_rn(live_hi ? qbase_hi[d0 + 8] : 0.0f, live_hi ? qbase_hi[d0 + 9] : 0.0f);
+            qa[t].x[0] = *(const unsigned*)(const void*)&lo0;
+            qa[t].x[1] = *(const unsigned*)(const void*)&hi0;
+            qa[t].x[2] = *(const unsigned*)(const void*)&lo1;
+            qa[t].x[3] = *(const unsigned*)(const void*)&hi1;
+        }
+
+        for (int b = 0; b < n_blk; ++b) {
+            const int stage = b & 1;
+            const int rbar = (stage == 0) ? LREADY0 : LREADY1;
+            asm volatile("bar.sync %0, %1;" ::"r"(rbar), "r"(32 * (1 + T)) : "memory");
+            if (b >= 2) {
+                const int sbar = (stage == 0) ? LSFREE0 : LSFREE1;
+                asm volatile("bar.sync %0, %1;" ::"r"(sbar), "r"(SBAR_COUNT) : "memory");
+            }
+            __half* skb = (stage == 0) ? sk0 : sk1;
+            float* scb = sc + (size_t)g * 2 * SC_STRIDE + (size_t)stage * SC_STRIDE;
+            const int base = begin + b * WK4;
+#pragma unroll
+            for (int nt = 0; nt < WK4 / 8; ++nt) {
+                mma_c_f32 s2;
+                s2.x[0] = s2.x[1] = s2.x[2] = s2.x[3] = 0.0f;
+                const int key0 = nt * 8;
+#pragma unroll
+                for (int t = 0; t < ATTN_MMA_MAX_KSTEPS; ++t) {
+                    if (t >= ksteps) break;
+                    mma_b_f16 b_;
+                    const __half* bp = skb + (key0 + bc) * krow + t * 16 + k0;
+                    b_.x[0] = *(const unsigned*)(const void*)bp;
+                    b_.x[1] = *(const unsigned*)(const void*)(bp + 8);
+                    mma_f16(s2, qa[t], b_);
+                }
+#pragma unroll
+                for (int e = 0; e < 4; ++e) scb[nt * WARP_SIZE * 4 + lane * 4 + e] = s2.x[e] * scale;
+            }
+            const int sbar = (stage == 0) ? LSREADY0 : LSREADY1;
+            asm volatile("bar.arrive %0, %1;" ::"r"(sbar), "r"(SBAR_COUNT) : "memory");
+        }
+        return;
+    }
+
+    // PV-consumer: group g = (warp-T-1)/2, d_head half = (warp-T-1)%2,
+    // fp16 accumulation for `o[]` -- see `mma_f16_acc16`. Score-ready/free
+    // barriers are the SHARED ones now (see this kernel's own doc
+    // comment) -- every PV-warp across every group waits on and arrives
+    // the same two barrier IDs.
+    const int idx = warp - T - 1;
+    const int g = idx / 2;
+    const int d_tile_offset = idx % 2;
+    const int bc = mma_b_col(lane);
+    const int k0 = mma_k0_f16(lane);
+    const int cr = mma_c_row(lane);
+    const int cc = mma_c_col(lane);
+
+    unsigned o0[ATTN_DSPLIT_HALF_NTILES];
+    unsigned o1[ATTN_DSPLIT_HALF_NTILES];
+#pragma unroll
+    for (int i = 0; i < ATTN_DSPLIT_HALF_NTILES; ++i) {
+        const __half2 z = __floats2half2_rn(0.0f, 0.0f);
+        o0[i] = *(const unsigned*)(const void*)&z;
+        o1[i] = *(const unsigned*)(const void*)&z;
+    }
+    float m_run[2] = {-INFINITY, -INFINITY};
+    float l_run[2] = {0.0f, 0.0f};
+    int row_j[2], row_last[2];
+    bool row_live[2];
+#pragma unroll
+    for (int rg = 0; rg < 2; ++rg) {
+        const int abs_row = cr + rg * 8;
+        row_j[rg] = abs_row / group;
+        row_last[rg] = base_last[g] + row_j[rg];
+        row_live[rg] = abs_row < tpw * group && row_j[rg] < tokens_here[g];
+    }
+
+    for (int b = 0; b < n_blk; ++b) {
+        const int stage = b & 1;
+        const int sbar = (stage == 0) ? LSREADY0 : LSREADY1;
+        asm volatile("bar.sync %0, %1;" ::"r"(sbar), "r"(SBAR_COUNT) : "memory");
+        __half* svb = (stage == 0) ? sv0 : sv1;
+        float* scb = sc + (size_t)g * 2 * SC_STRIDE + (size_t)stage * SC_STRIDE;
+        const int base = begin + b * WK4;
+        const int n = min(WK4, end - base);
+
+        float sv_score[16];
+#pragma unroll
+        for (int rg = 0; rg < 2; ++rg) {
+#pragma unroll
+            for (int nt = 0; nt < WK4 / 8; ++nt) {
+#pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    const int key = nt * 8 + cc + e;
+                    const int abs_key = base + key;
+                    sv_score[rg * 8 + nt * 2 + e] =
+                        (row_live[rg] && key < n && abs_key <= row_last[rg])
+                            ? scb[nt * WARP_SIZE * 4 + lane * 4 + rg * 2 + e]
+                            : -INFINITY;
+                }
+            }
+        }
+        {
+            const int fbar = (stage == 0) ? LSFREE0 : LSFREE1;
+            asm volatile("bar.arrive %0, %1;" ::"r"(fbar), "r"(SBAR_COUNT) : "memory");
+        }
+
+        float p[16];
+#pragma unroll
+        for (int rg = 0; rg < 2; ++rg) {
+            float* svr = sv_score + rg * 8;
+            float m_own = svr[0];
+#pragma unroll
+            for (int i = 1; i < 8; ++i) m_own = fmaxf(m_own, svr[i]);
+            m_own = fmaxf(m_own, __shfl_xor_sync(0xffffffff, m_own, 1, WARP_SIZE));
+            m_own = fmaxf(m_own, __shfl_xor_sync(0xffffffff, m_own, 2, WARP_SIZE));
+            const float m_new = fmaxf(m_run[rg], m_own);
+            float psum = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                p[rg * 8 + i] = (svr[i] == -INFINITY) ? 0.0f : __expf(svr[i] - m_new);
+                psum += p[rg * 8 + i];
+            }
+            psum += __shfl_xor_sync(0xffffffff, psum, 1, WARP_SIZE);
+            psum += __shfl_xor_sync(0xffffffff, psum, 2, WARP_SIZE);
+            const float corr = (m_run[rg] == -INFINITY) ? 0.0f : __expf(m_run[rg] - m_new);
+            l_run[rg] = l_run[rg] * corr + psum;
+            m_run[rg] = m_new;
+            const __half2 corr2 = __floats2half2_rn(corr, corr);
+#pragma unroll
+            for (int i = 0; i < ATTN_DSPLIT_HALF_NTILES; ++i) {
+                unsigned* dst = (rg == 0) ? &o0[i] : &o1[i];
+                __half2 cur = *(const __half2*)(const void*)dst;
+                __half2 scaled = __hmul2(cur, corr2);
+                *dst = *(const unsigned*)(const void*)&scaled;
+            }
+        }
+
+#pragma unroll
+        for (int kg = 0; kg < WK4 / 16; ++kg) {
+            const int nt_lo = kg * 2, nt_hi = kg * 2 + 1;
+            mma_a_f16 pa;
+            const __half2 p_rg0_lo = __floats2half2_rn(p[nt_lo * 2], p[nt_lo * 2 + 1]);
+            const __half2 p_rg1_lo = __floats2half2_rn(p[8 + nt_lo * 2], p[8 + nt_lo * 2 + 1]);
+            const __half2 p_rg0_hi = __floats2half2_rn(p[nt_hi * 2], p[nt_hi * 2 + 1]);
+            const __half2 p_rg1_hi = __floats2half2_rn(p[8 + nt_hi * 2], p[8 + nt_hi * 2 + 1]);
+            pa.x[0] = *(const unsigned*)(const void*)&p_rg0_lo;
+            pa.x[1] = *(const unsigned*)(const void*)&p_rg1_lo;
+            pa.x[2] = *(const unsigned*)(const void*)&p_rg0_hi;
+            pa.x[3] = *(const unsigned*)(const void*)&p_rg1_hi;
+            const int row0 = kg * 16;
+#pragma unroll
+            for (int i = 0; i < ATTN_DSPLIT_HALF_NTILES; ++i) {
+                const int dim = (d_tile_offset * ATTN_DSPLIT_HALF_NTILES + i) * 8 + bc;
+                mma_b_f16 b_;
+                b_.x[0] = attn_pack_half2(svb + (row0 + k0) * krow + dim, svb + (row0 + k0 + 1) * krow + dim);
+                b_.x[1] = attn_pack_half2(svb + (row0 + k0 + 8) * krow + dim, svb + (row0 + k0 + 9) * krow + dim);
+                mma_f16_acc16(&o0[i], &o1[i], pa, b_);
+            }
+        }
+
+        const int fbar2 = (stage == 0) ? LFREE0 : LFREE1;
+        asm volatile("bar.arrive %0, %1;" ::"r"(fbar2), "r"(32 * (1 + 2 * T)) : "memory");
+    }
+
+#pragma unroll
+    for (int rg = 0; rg < 2; ++rg) {
+        if (!row_live[rg]) continue;
+        const int abs_row = cr + rg * 8;
+        const int token = tile_base[g] + row_j[rg];
+        const int head = kv_head * group + abs_row % group;
+        const float den = l_run[rg];
+#pragma unroll
+        for (int i = 0; i < ATTN_DSPLIT_HALF_NTILES; ++i) {
+            const int d0 = (d_tile_offset * ATTN_DSPLIT_HALF_NTILES + i) * 8 + cc;
+            const unsigned* src0 = (rg == 0) ? &o0[i] : &o1[i];
+            const __half2 v = *(const __half2*)(const void*)src0;
+            const float2 vf = __half22float2(v);
+            out[((size_t)token * n_heads + head) * d_head + d0] = den > 0.0f ? __fdividef(vf.x, den) : 0.0f;
+            out[((size_t)token * n_heads + head) * d_head + d0 + 1] = den > 0.0f ? __fdividef(vf.y, den) : 0.0f;
+        }
+    }
+}
+
+// T=6 generalization -- the practical ceiling of this design at 96
+// registers: threads/block = (1+3*6)*32 = 608, 608*96 = 58,368
+// registers/block, still 1 resident block/SM but 19 resident warps (up
+// from T=5's 16) at tax 7/6 = 1.167x (down from T=5's 1.4x). T=7 would
+// need 704*96 = 67,584 registers/block, over the SM's 65,536-register
+// file entirely -- not a spill, an outright launch failure -- so T=6 is
+// as far as this exact register count goes without a further reduction
+// elsewhere.
+extern "C" __global__ void attn_prefill_decoupled6_f16acc_regcheck_f32(
+    float* __restrict__ out, const float* __restrict__ q,
+    const __half* __restrict__ k_cache, const __half* __restrict__ v_cache,
+    const int* __restrict__ seq_of, const int* __restrict__ positions,
+    const int* __restrict__ slot_table, int table_stride, int n_heads,
+    int n_kv_heads, int d_head, int n_slots, float scale, int kv_len,
+    int group, int tpw, int run_base, int run_tokens) {
+    const int WK4 = 32;
+    const int T = 6;
+    const int LREADY0 = 0, LREADY1 = 1, LFREE0 = 2, LFREE1 = 3;
+    const int LSREADY0 = 4, LSREADY1 = 5, LSFREE0 = 6, LSFREE1 = 7;
+    const int kv_head = blockIdx.x;
+    const int big_tile = blockIdx.y;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int total_threads = blockDim.x;
+
+    const int krow = d_head + ATTN_MMA_KPAD;
+    const int ksteps = d_head / 16;
+    const int quads = d_head / 8;
+    const int WK4_NT = WK4 / 8;
+    const int SC_STRIDE = WK4_NT * WARP_SIZE * 4;
+    // All T QK^T-warps + all 2T PV-warps participate in each shared
+    // score barrier (the producer never touches these).
+    const int SBAR_COUNT = 3 * T * 32;
+
+    extern __shared__ char attn_ws_smem[];
+    __half* sk0 = (__half*)attn_ws_smem;
+    __half* sk1 = sk0 + (size_t)WK4 * krow;
+    __half* sv0 = sk1 + (size_t)WK4 * krow;
+    __half* sv1 = sv0 + (size_t)WK4 * krow;
+    float* sc = (float*)(sv1 + (size_t)WK4 * krow);
+
+    const int big_tile_tokens = T * tpw;
+    int tile_base[6], base_last[6], tokens_here[6], last_max[6];
+#pragma unroll
+    for (int g = 0; g < 6; ++g) {
+        tile_base[g] = run_base + big_tile * big_tile_tokens + g * tpw;
+        tokens_here[g] = min(tpw, run_tokens - (big_tile * big_tile_tokens + g * tpw));
+        // Guarded read -- see the identical pattern's doc comment in
+        // `attn_prefill_decoupled2_f32` above for why.
+        base_last[g] = tokens_here[g] > 0 ? positions[tile_base[g]] : 0;
+        last_max[g] = tokens_here[g] > 0 ? base_last[g] + tokens_here[g] - 1 : -1;
+    }
+    const int* table = slot_table + (size_t)seq_of[tile_base[0]] * table_stride;
+    const __half* kbase = k_cache + (size_t)kv_head * n_slots * d_head;
+    const __half* vbase = v_cache + (size_t)kv_head * n_slots * d_head;
+    const int begin = 0;
+    int end = max(last_max[0], last_max[1]);
+    end = max(end, last_max[2]);
+    end = max(end, last_max[3]);
+    end = max(end, last_max[4]);
+    end = min(kv_len, max(end, last_max[5]) + 1);
+    const int n_blk = end > begin ? (end - begin + WK4 - 1) / WK4 : 0;
+
+    if (warp == 0) {
+        for (int b = 0; b < n_blk; ++b) {
+            const int stage = b & 1;
+            if (b >= 2) {
+                const int bar = (stage == 0) ? LFREE0 : LFREE1;
+                asm volatile("bar.sync %0, %1;" ::"r"(bar), "r"(32 * (1 + 2 * T)) : "memory");
+            }
+            __half* skb = (stage == 0) ? sk0 : sk1;
+            __half* svb = (stage == 0) ? sv0 : sv1;
+            const int base = begin + b * WK4;
+            const int n = min(WK4, end - base);
+            for (int e = lane; e < WK4 * quads; e += WARP_SIZE) {
+                const int r = e / quads, w8 = e % quads;
+                const bool hit = r < n;
+                const size_t off = (size_t)table[base + (hit ? r : 0)] * d_head + w8 * 8;
+                cp_async16(skb + r * krow + w8 * 8, kbase + off, hit);
+                cp_async16(svb + r * krow + w8 * 8, vbase + off, hit);
+            }
+            CP_ASYNC_FENCE();
+            CP_ASYNC_WAIT(0);
+            const int bar = (stage == 0) ? LREADY0 : LREADY1;
+            asm volatile("bar.arrive %0, %1;" ::"r"(bar), "r"(32 * (1 + T)) : "memory");
+        }
+        return;
+    }
+
+    if (warp >= 1 && warp <= T) {
+        const int g = warp - 1;
+        const float* qbase_lo;
+        const float* qbase_hi;
+        const int ar = mma_a_row(lane);
+        const int bc = mma_b_col(lane);
+        const int k0 = mma_k0_f16(lane);
+        int j_lo = ar / group;
+        const bool live_lo = ar < tpw * group && j_lo < tokens_here[g];
+        const int token_lo = tile_base[g] + j_lo;
+        const int head_lo = kv_head * group + ar % group;
+        qbase_lo = live_lo ? q + ((size_t)token_lo * n_heads + head_lo) * d_head : nullptr;
+        const int ar_hi = ar + 8;
+        int j_hi = ar_hi / group;
+        const bool live_hi = ar_hi < tpw * group && j_hi < tokens_here[g];
+        const int token_hi = tile_base[g] + j_hi;
+        const int head_hi = kv_head * group + ar_hi % group;
+        qbase_hi = live_hi ? q + ((size_t)token_hi * n_heads + head_hi) * d_head : nullptr;
+
+        mma_a_f16 qa[ATTN_MMA_MAX_KSTEPS];
+#pragma unroll
+        for (int t = 0; t < ATTN_MMA_MAX_KSTEPS; ++t) {
+            if (t >= ksteps) break;
+            const int d0 = t * 16 + k0;
+            const __half2 lo0 = __floats2half2_rn(live_lo ? qbase_lo[d0] : 0.0f, live_lo ? qbase_lo[d0 + 1] : 0.0f);
+            const __half2 hi0 = __floats2half2_rn(live_hi ? qbase_hi[d0] : 0.0f, live_hi ? qbase_hi[d0 + 1] : 0.0f);
+            const __half2 lo1 = __floats2half2_rn(live_lo ? qbase_lo[d0 + 8] : 0.0f, live_lo ? qbase_lo[d0 + 9] : 0.0f);
+            const __half2 hi1 = __floats2half2_rn(live_hi ? qbase_hi[d0 + 8] : 0.0f, live_hi ? qbase_hi[d0 + 9] : 0.0f);
+            qa[t].x[0] = *(const unsigned*)(const void*)&lo0;
+            qa[t].x[1] = *(const unsigned*)(const void*)&hi0;
+            qa[t].x[2] = *(const unsigned*)(const void*)&lo1;
+            qa[t].x[3] = *(const unsigned*)(const void*)&hi1;
+        }
+
+        for (int b = 0; b < n_blk; ++b) {
+            const int stage = b & 1;
+            const int rbar = (stage == 0) ? LREADY0 : LREADY1;
+            asm volatile("bar.sync %0, %1;" ::"r"(rbar), "r"(32 * (1 + T)) : "memory");
+            if (b >= 2) {
+                const int sbar = (stage == 0) ? LSFREE0 : LSFREE1;
+                asm volatile("bar.sync %0, %1;" ::"r"(sbar), "r"(SBAR_COUNT) : "memory");
+            }
+            __half* skb = (stage == 0) ? sk0 : sk1;
+            float* scb = sc + (size_t)g * 2 * SC_STRIDE + (size_t)stage * SC_STRIDE;
+            const int base = begin + b * WK4;
+#pragma unroll
+            for (int nt = 0; nt < WK4 / 8; ++nt) {
+                mma_c_f32 s2;
+                s2.x[0] = s2.x[1] = s2.x[2] = s2.x[3] = 0.0f;
+                const int key0 = nt * 8;
+#pragma unroll
+                for (int t = 0; t < ATTN_MMA_MAX_KSTEPS; ++t) {
+                    if (t >= ksteps) break;
+                    mma_b_f16 b_;
+                    const __half* bp = skb + (key0 + bc) * krow + t * 16 + k0;
+                    b_.x[0] = *(const unsigned*)(const void*)bp;
+                    b_.x[1] = *(const unsigned*)(const void*)(bp + 8);
+                    mma_f16(s2, qa[t], b_);
+                }
+#pragma unroll
+                for (int e = 0; e < 4; ++e) scb[nt * WARP_SIZE * 4 + lane * 4 + e] = s2.x[e] * scale;
+            }
+            const int sbar = (stage == 0) ? LSREADY0 : LSREADY1;
+            asm volatile("bar.arrive %0, %1;" ::"r"(sbar), "r"(SBAR_COUNT) : "memory");
+        }
+        return;
+    }
+
+    // PV-consumer: group g = (warp-T-1)/2, d_head half = (warp-T-1)%2,
+    // fp16 accumulation for `o[]` -- see `mma_f16_acc16`. Score-ready/free
+    // barriers are the SHARED ones now (see this kernel's own doc
+    // comment) -- every PV-warp across every group waits on and arrives
+    // the same two barrier IDs.
+    const int idx = warp - T - 1;
+    const int g = idx / 2;
+    const int d_tile_offset = idx % 2;
+    const int bc = mma_b_col(lane);
+    const int k0 = mma_k0_f16(lane);
+    const int cr = mma_c_row(lane);
+    const int cc = mma_c_col(lane);
+
+    unsigned o0[ATTN_DSPLIT_HALF_NTILES];
+    unsigned o1[ATTN_DSPLIT_HALF_NTILES];
+#pragma unroll
+    for (int i = 0; i < ATTN_DSPLIT_HALF_NTILES; ++i) {
+        const __half2 z = __floats2half2_rn(0.0f, 0.0f);
+        o0[i] = *(const unsigned*)(const void*)&z;
+        o1[i] = *(const unsigned*)(const void*)&z;
+    }
+    float m_run[2] = {-INFINITY, -INFINITY};
+    float l_run[2] = {0.0f, 0.0f};
+    int row_j[2], row_last[2];
+    bool row_live[2];
+#pragma unroll
+    for (int rg = 0; rg < 2; ++rg) {
+        const int abs_row = cr + rg * 8;
+        row_j[rg] = abs_row / group;
+        row_last[rg] = base_last[g] + row_j[rg];
+        row_live[rg] = abs_row < tpw * group && row_j[rg] < tokens_here[g];
+    }
+
+    for (int b = 0; b < n_blk; ++b) {
+        const int stage = b & 1;
+        const int sbar = (stage == 0) ? LSREADY0 : LSREADY1;
+        asm volatile("bar.sync %0, %1;" ::"r"(sbar), "r"(SBAR_COUNT) : "memory");
+        __half* svb = (stage == 0) ? sv0 : sv1;
+        float* scb = sc + (size_t)g * 2 * SC_STRIDE + (size_t)stage * SC_STRIDE;
+        const int base = begin + b * WK4;
+        const int n = min(WK4, end - base);
+
+        float sv_score[16];
+#pragma unroll
+        for (int rg = 0; rg < 2; ++rg) {
+#pragma unroll
+            for (int nt = 0; nt < WK4 / 8; ++nt) {
+#pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    const int key = nt * 8 + cc + e;
+                    const int abs_key = base + key;
+                    sv_score[rg * 8 + nt * 2 + e] =
+                        (row_live[rg] && key < n && abs_key <= row_last[rg])
+                            ? scb[nt * WARP_SIZE * 4 + lane * 4 + rg * 2 + e]
+                            : -INFINITY;
+                }
+            }
+        }
+        {
+            const int fbar = (stage == 0) ? LSFREE0 : LSFREE1;
+            asm volatile("bar.arrive %0, %1;" ::"r"(fbar), "r"(SBAR_COUNT) : "memory");
+        }
+
+        float p[16];
+#pragma unroll
+        for (int rg = 0; rg < 2; ++rg) {
+            float* svr = sv_score + rg * 8;
+            float m_own = svr[0];
+#pragma unroll
+            for (int i = 1; i < 8; ++i) m_own = fmaxf(m_own, svr[i]);
+            m_own = fmaxf(m_own, __shfl_xor_sync(0xffffffff, m_own, 1, WARP_SIZE));
+            m_own = fmaxf(m_own, __shfl_xor_sync(0xffffffff, m_own, 2, WARP_SIZE));
+            const float m_new = fmaxf(m_run[rg], m_own);
+            float psum = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                p[rg * 8 + i] = (svr[i] == -INFINITY) ? 0.0f : __expf(svr[i] - m_new);
+                psum += p[rg * 8 + i];
+            }
+            psum += __shfl_xor_sync(0xffffffff, psum, 1, WARP_SIZE);
+            psum += __shfl_xor_sync(0xffffffff, psum, 2, WARP_SIZE);
+            const float corr = (m_run[rg] == -INFINITY) ? 0.0f : __expf(m_run[rg] - m_new);
+            l_run[rg] = l_run[rg] * corr + psum;
+            m_run[rg] = m_new;
+            const __half2 corr2 = __floats2half2_rn(corr, corr);
+#pragma unroll
+            for (int i = 0; i < ATTN_DSPLIT_HALF_NTILES; ++i) {
+                unsigned* dst = (rg == 0) ? &o0[i] : &o1[i];
+                __half2 cur = *(const __half2*)(const void*)dst;
+                __half2 scaled = __hmul2(cur, corr2);
+                *dst = *(const unsigned*)(const void*)&scaled;
+            }
+        }
+
+#pragma unroll
+        for (int kg = 0; kg < WK4 / 16; ++kg) {
+            const int nt_lo = kg * 2, nt_hi = kg * 2 + 1;
+            mma_a_f16 pa;
+            const __half2 p_rg0_lo = __floats2half2_rn(p[nt_lo * 2], p[nt_lo * 2 + 1]);
+            const __half2 p_rg1_lo = __floats2half2_rn(p[8 + nt_lo * 2], p[8 + nt_lo * 2 + 1]);
+            const __half2 p_rg0_hi = __floats2half2_rn(p[nt_hi * 2], p[nt_hi * 2 + 1]);
+            const __half2 p_rg1_hi = __floats2half2_rn(p[8 + nt_hi * 2], p[8 + nt_hi * 2 + 1]);
+            pa.x[0] = *(const unsigned*)(const void*)&p_rg0_lo;
+            pa.x[1] = *(const unsigned*)(const void*)&p_rg1_lo;
+            pa.x[2] = *(const unsigned*)(const void*)&p_rg0_hi;
+            pa.x[3] = *(const unsigned*)(const void*)&p_rg1_hi;
+            const int row0 = kg * 16;
+#pragma unroll
+            for (int i = 0; i < ATTN_DSPLIT_HALF_NTILES; ++i) {
+                const int dim = (d_tile_offset * ATTN_DSPLIT_HALF_NTILES + i) * 8 + bc;
+                mma_b_f16 b_;
+                b_.x[0] = attn_pack_half2(svb + (row0 + k0) * krow + dim, svb + (row0 + k0 + 1) * krow + dim);
+                b_.x[1] = attn_pack_half2(svb + (row0 + k0 + 8) * krow + dim, svb + (row0 + k0 + 9) * krow + dim);
+                mma_f16_acc16(&o0[i], &o1[i], pa, b_);
+            }
+        }
+
+        const int fbar2 = (stage == 0) ? LFREE0 : LFREE1;
+        asm volatile("bar.arrive %0, %1;" ::"r"(fbar2), "r"(32 * (1 + 2 * T)) : "memory");
     }
 
 #pragma unroll

@@ -3421,6 +3421,138 @@ impl Kernels {
         Ok(())
     }
 
+    /// Diagnostic only: `ws4`'s exact producer/7-consumer structure, but a
+    /// SINGLE K/V buffer (`WK4=96`, double `ws4`'s 48) instead of a double
+    /// buffer -- the same 101,376-byte ceiling spent on tile width instead
+    /// of pipeline depth. Motivated by reading FlashAttention-2's own real
+    /// source (`flash_fwd_kernel.h`): FA2 never double-buffers K/V either,
+    /// hiding load latency via same-warp software-pipelined prefetch
+    /// instead. See `attn_prefill_mma_ws5_singlebuf_regcheck_f32`'s own doc
+    /// comment in `ops.cu` for why this is a genuinely different axis than
+    /// `ws3`'s already-reverted wider-tile attempt (that one cut `NWARPS`
+    /// to fit; this one doesn't need to -- confirmed via `kernel_registers`
+    /// at exactly 255, identical to `ws4`, before ever building the
+    /// correctness test below).
+    pub fn attn_prefill_ws5_singlebuf(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        q: &View<'_, f32>,
+        k_cache: &View<'_, f16>,
+        v_cache: &View<'_, f16>,
+        batch: BatchLayout<'_>,
+        dims: AttnDims,
+        run_base: usize,
+        run_tokens: usize,
+        kv_len: usize,
+        scale: f32,
+        partial: &mut ViewMut<'_, f32>,
+    ) -> Result<()> {
+        anyhow::ensure!(self.prefill_attention(&dims), "attn_prefill_ws5_singlebuf: unsupported shape");
+        anyhow::ensure!(run_tokens >= 1, "attn_prefill_ws5_singlebuf: empty run");
+        let scale = scale * std::f32::consts::LOG2_E;
+        let group = dims.n_heads / dims.n_kv_heads;
+        let tpw = (16 / group).max(1);
+        const NWARPS: usize = 7;
+        const KPAD: usize = 8;
+        const WK: usize = 96;
+        let tile_tokens = NWARPS * tpw;
+        let n_tiles = run_tokens.div_ceil(tile_tokens);
+        let (n_chunks, chunk) = self.prefill_chunks(dims.n_kv_heads, n_tiles, kv_len);
+        anyhow::ensure!(
+            n_chunks <= 32,
+            "attn_prefill_ws5_singlebuf: {n_chunks} chunks past the partial buffer's 32"
+        );
+        let ms_off = (32 * dims.n_heads * run_tokens * dims.d_head) as i32;
+
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_ops", ops_src(), "attn_prefill_mma_ws5_singlebuf_regcheck_f32")?;
+        // Single K/V buffer -- half of `ws4`'s `4 * WK * (d_head+KPAD) * 2`.
+        let kv_shared = 2 * WK * (dims.d_head + KPAD) * 2;
+        let shared = kv_shared as u32;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared)?;
+        }
+        let single = i32::from(n_chunks == 1);
+        let cfg = LaunchConfig {
+            grid_dim: (dims.n_kv_heads as u32, n_tiles as u32, n_chunks),
+            block_dim: ((NWARPS + 1) as u32 * 32, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let (stride, h, kh, dh, ns, ck, kl, gi, tp, rb, rt) = (
+            batch.table_stride as i32,
+            dims.n_heads as i32,
+            dims.n_kv_heads as i32,
+            dims.d_head as i32,
+            dims.n_slots as i32,
+            chunk as i32,
+            kv_len as i32,
+            group as i32,
+            tpw as i32,
+            run_base as i32,
+            run_tokens as i32,
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(&mut *partial)
+            .arg(&ms_off)
+            .arg(&mut *out)
+            .arg(&single)
+            .arg(q)
+            .arg(k_cache)
+            .arg(v_cache)
+            .arg(batch.seq_of)
+            .arg(batch.positions)
+            .arg(batch.slot_table)
+            .arg(&stride)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ns)
+            .arg(&scale)
+            .arg(&ck)
+            .arg(&kl)
+            .arg(&gi)
+            .arg(&tp)
+            .arg(&rb)
+            .arg(&rt);
+        self.dev
+            .profile()
+            .time("attn_prefill_ws5_singlebuf", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("attn_prefill_ws5_singlebuf")?;
+                Ok(())
+            })?;
+        if single == 1 {
+            return Ok(());
+        }
+
+        let total = (run_tokens * dims.n_heads * dims.d_head) as u32;
+        let (nt, nc) = (run_tokens as i32, n_chunks as i32);
+        let part = partial.as_view();
+        let r = self
+            .dev
+            .kernels()
+            .get("infero_ops", ops_src(), "attn_flash_reduce_f32")?;
+        let run_elems = run_tokens * dims.n_heads * dims.d_head;
+        let out_off = run_base * dims.n_heads * dims.d_head;
+        let mut out_run = out.slice_mut(out_off..out_off + run_elems);
+        let mut rb2 = self.dev.stream().launch_builder(&r);
+        rb2.arg(&mut out_run)
+            .arg(&part)
+            .arg(&ms_off)
+            .arg(&h)
+            .arg(&dh)
+            .arg(&nt)
+            .arg(&nc);
+        self.dev
+            .profile()
+            .time("attn_prefill_reduce", self.dev.stream(), || {
+                unsafe { rb2.launch(elementwise(total)) }.context("attn_prefill_reduce")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     /// Diagnostic only: [`Self::attn_prefill_ws4`] with `NWARPS` exposed as a
     /// runtime parameter instead of the hardcoded compile-time `7` --
     /// otherwise byte-for-byte identical, calling the exact same, already-
@@ -3803,6 +3935,346 @@ impl Kernels {
             .profile()
             .time("attn_prefill_decoupled2_f16acc", self.dev.stream(), || {
                 unsafe { b.launch(cfg) }.context("attn_prefill_decoupled2_f16acc")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// T=3 generalization of [`Self::attn_prefill_decoupled2_f16acc`] --
+    /// lower memory tax (7/T: 2.33x instead of T=2's 3.5x) at 96 registers
+    /// x 320 threads/block = 30,720 regs/block -> 2 resident blocks/SM (20
+    /// resident warps). See `attn_prefill_decoupled3_f16acc_regcheck_f32`'s
+    /// doc comment in `ops.cu` for the named-barrier-ID-budget constraint
+    /// (16 IDs total, 0-15) this required working around.
+    pub fn attn_prefill_decoupled3_f16acc(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        q: &View<'_, f32>,
+        k_cache: &View<'_, f16>,
+        v_cache: &View<'_, f16>,
+        batch: BatchLayout<'_>,
+        dims: AttnDims,
+        run_base: usize,
+        run_tokens: usize,
+        kv_len: usize,
+        scale: f32,
+    ) -> Result<()> {
+        anyhow::ensure!(self.prefill_attention(&dims), "attn_prefill_decoupled3_f16acc: unsupported shape");
+        anyhow::ensure!(run_tokens >= 1, "attn_prefill_decoupled3_f16acc: empty run");
+        let group = dims.n_heads / dims.n_kv_heads;
+        let tpw = (16 / group).max(1);
+        const KPAD: usize = 8;
+        const WK: usize = 32;
+        const TG: usize = 3;
+        let n_big_tiles = run_tokens.div_ceil(TG * tpw);
+
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_ops", ops_src(), "attn_prefill_decoupled3_f16acc_regcheck_f32")?;
+        let kv_shared = 4 * WK * (dims.d_head + KPAD) * 2;
+        let score_shared = TG * 2 * (WK / 8) * 32 * 4 * 4;
+        let shared = (kv_shared + score_shared) as u32;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared)?;
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (dims.n_kv_heads as u32, n_big_tiles as u32, 1),
+            block_dim: ((1 + 3 * TG) as u32 * 32, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let (stride, h, kh, dh, ns, kl, gi, tp, rb, rt) = (
+            batch.table_stride as i32,
+            dims.n_heads as i32,
+            dims.n_kv_heads as i32,
+            dims.d_head as i32,
+            dims.n_slots as i32,
+            kv_len as i32,
+            group as i32,
+            tpw as i32,
+            run_base as i32,
+            run_tokens as i32,
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(&mut *out)
+            .arg(q)
+            .arg(k_cache)
+            .arg(v_cache)
+            .arg(batch.seq_of)
+            .arg(batch.positions)
+            .arg(batch.slot_table)
+            .arg(&stride)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ns)
+            .arg(&scale)
+            .arg(&kl)
+            .arg(&gi)
+            .arg(&tp)
+            .arg(&rb)
+            .arg(&rt);
+        self.dev
+            .profile()
+            .time("attn_prefill_decoupled3_f16acc", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("attn_prefill_decoupled3_f16acc")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// T=4 generalization of [`Self::attn_prefill_decoupled3_f16acc`] --
+    /// lower memory tax (7/T: 1.75x) but only 1 resident block/SM (13
+    /// resident warps, down from T=3's 20) since 416 threads x 96
+    /// registers = 39,936 regs/block leaves no room for a 2nd. Also
+    /// switches the score-ready/free barriers from per-group to shared
+    /// across all T groups (a real synchronization redesign, not just a
+    /// renumbering) because the per-group scheme's 4 + 4*T named-barrier
+    /// IDs would need 20, over the hardware's fixed 16-ID budget. See
+    /// `attn_prefill_decoupled4_f16acc_regcheck_f32`'s doc comment in
+    /// `ops.cu` for why the shared-barrier substitution is safe (every
+    /// warp already loops the same shared `n_blk` bound, so groups never
+    /// ran at independent paces to begin with).
+    pub fn attn_prefill_decoupled4_f16acc(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        q: &View<'_, f32>,
+        k_cache: &View<'_, f16>,
+        v_cache: &View<'_, f16>,
+        batch: BatchLayout<'_>,
+        dims: AttnDims,
+        run_base: usize,
+        run_tokens: usize,
+        kv_len: usize,
+        scale: f32,
+    ) -> Result<()> {
+        anyhow::ensure!(self.prefill_attention(&dims), "attn_prefill_decoupled4_f16acc: unsupported shape");
+        anyhow::ensure!(run_tokens >= 1, "attn_prefill_decoupled4_f16acc: empty run");
+        let group = dims.n_heads / dims.n_kv_heads;
+        let tpw = (16 / group).max(1);
+        const KPAD: usize = 8;
+        const WK: usize = 32;
+        const TG: usize = 4;
+        let n_big_tiles = run_tokens.div_ceil(TG * tpw);
+
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_ops", ops_src(), "attn_prefill_decoupled4_f16acc_regcheck_f32")?;
+        let kv_shared = 4 * WK * (dims.d_head + KPAD) * 2;
+        let score_shared = TG * 2 * (WK / 8) * 32 * 4 * 4;
+        let shared = (kv_shared + score_shared) as u32;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared)?;
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (dims.n_kv_heads as u32, n_big_tiles as u32, 1),
+            block_dim: ((1 + 3 * TG) as u32 * 32, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let (stride, h, kh, dh, ns, kl, gi, tp, rb, rt) = (
+            batch.table_stride as i32,
+            dims.n_heads as i32,
+            dims.n_kv_heads as i32,
+            dims.d_head as i32,
+            dims.n_slots as i32,
+            kv_len as i32,
+            group as i32,
+            tpw as i32,
+            run_base as i32,
+            run_tokens as i32,
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(&mut *out)
+            .arg(q)
+            .arg(k_cache)
+            .arg(v_cache)
+            .arg(batch.seq_of)
+            .arg(batch.positions)
+            .arg(batch.slot_table)
+            .arg(&stride)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ns)
+            .arg(&scale)
+            .arg(&kl)
+            .arg(&gi)
+            .arg(&tp)
+            .arg(&rb)
+            .arg(&rt);
+        self.dev
+            .profile()
+            .time("attn_prefill_decoupled4_f16acc", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("attn_prefill_decoupled4_f16acc")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// T=5 generalization of [`Self::attn_prefill_decoupled4_f16acc`] --
+    /// motivated directly by T=4's own real result (0.701x -> 0.848x, the
+    /// biggest single-step gain in this family): unlike T=2->T=3 or
+    /// T=3->T=4, T=4->T=5 is a genuine double win on the register math --
+    /// 512 threads x 96 registers = 49,152 regs/block, still 1 resident
+    /// block/SM but 16 resident warps (up from T=4's 13), tax down to
+    /// 7/5 = 1.4x. Same shared score-barrier scheme as T=4 (still just 8
+    /// named-barrier IDs, independent of T).
+    pub fn attn_prefill_decoupled5_f16acc(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        q: &View<'_, f32>,
+        k_cache: &View<'_, f16>,
+        v_cache: &View<'_, f16>,
+        batch: BatchLayout<'_>,
+        dims: AttnDims,
+        run_base: usize,
+        run_tokens: usize,
+        kv_len: usize,
+        scale: f32,
+    ) -> Result<()> {
+        anyhow::ensure!(self.prefill_attention(&dims), "attn_prefill_decoupled5_f16acc: unsupported shape");
+        anyhow::ensure!(run_tokens >= 1, "attn_prefill_decoupled5_f16acc: empty run");
+        let group = dims.n_heads / dims.n_kv_heads;
+        let tpw = (16 / group).max(1);
+        const KPAD: usize = 8;
+        const WK: usize = 32;
+        const TG: usize = 5;
+        let n_big_tiles = run_tokens.div_ceil(TG * tpw);
+
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_ops", ops_src(), "attn_prefill_decoupled5_f16acc_regcheck_f32")?;
+        let kv_shared = 4 * WK * (dims.d_head + KPAD) * 2;
+        let score_shared = TG * 2 * (WK / 8) * 32 * 4 * 4;
+        let shared = (kv_shared + score_shared) as u32;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared)?;
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (dims.n_kv_heads as u32, n_big_tiles as u32, 1),
+            block_dim: ((1 + 3 * TG) as u32 * 32, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let (stride, h, kh, dh, ns, kl, gi, tp, rb, rt) = (
+            batch.table_stride as i32,
+            dims.n_heads as i32,
+            dims.n_kv_heads as i32,
+            dims.d_head as i32,
+            dims.n_slots as i32,
+            kv_len as i32,
+            group as i32,
+            tpw as i32,
+            run_base as i32,
+            run_tokens as i32,
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(&mut *out)
+            .arg(q)
+            .arg(k_cache)
+            .arg(v_cache)
+            .arg(batch.seq_of)
+            .arg(batch.positions)
+            .arg(batch.slot_table)
+            .arg(&stride)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ns)
+            .arg(&scale)
+            .arg(&kl)
+            .arg(&gi)
+            .arg(&tp)
+            .arg(&rb)
+            .arg(&rt);
+        self.dev
+            .profile()
+            .time("attn_prefill_decoupled5_f16acc", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("attn_prefill_decoupled5_f16acc")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// T=6 generalization -- the practical ceiling of this family at 96
+    /// registers: 608 threads x 96 registers = 58,368 regs/block, still 1
+    /// resident block/SM, 19 resident warps (up from T=5's 16), tax down
+    /// to 7/6 = 1.167x. T=7 would need 67,584 registers/block, over the
+    /// SM's entire 65,536-register file -- an outright launch failure, not
+    /// a spill -- so this is as far as this exact register count goes.
+    pub fn attn_prefill_decoupled6_f16acc(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        q: &View<'_, f32>,
+        k_cache: &View<'_, f16>,
+        v_cache: &View<'_, f16>,
+        batch: BatchLayout<'_>,
+        dims: AttnDims,
+        run_base: usize,
+        run_tokens: usize,
+        kv_len: usize,
+        scale: f32,
+    ) -> Result<()> {
+        anyhow::ensure!(self.prefill_attention(&dims), "attn_prefill_decoupled6_f16acc: unsupported shape");
+        anyhow::ensure!(run_tokens >= 1, "attn_prefill_decoupled6_f16acc: empty run");
+        let group = dims.n_heads / dims.n_kv_heads;
+        let tpw = (16 / group).max(1);
+        const KPAD: usize = 8;
+        const WK: usize = 32;
+        const TG: usize = 6;
+        let n_big_tiles = run_tokens.div_ceil(TG * tpw);
+
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_ops", ops_src(), "attn_prefill_decoupled6_f16acc_regcheck_f32")?;
+        let kv_shared = 4 * WK * (dims.d_head + KPAD) * 2;
+        let score_shared = TG * 2 * (WK / 8) * 32 * 4 * 4;
+        let shared = (kv_shared + score_shared) as u32;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared)?;
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (dims.n_kv_heads as u32, n_big_tiles as u32, 1),
+            block_dim: ((1 + 3 * TG) as u32 * 32, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let (stride, h, kh, dh, ns, kl, gi, tp, rb, rt) = (
+            batch.table_stride as i32,
+            dims.n_heads as i32,
+            dims.n_kv_heads as i32,
+            dims.d_head as i32,
+            dims.n_slots as i32,
+            kv_len as i32,
+            group as i32,
+            tpw as i32,
+            run_base as i32,
+            run_tokens as i32,
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(&mut *out)
+            .arg(q)
+            .arg(k_cache)
+            .arg(v_cache)
+            .arg(batch.seq_of)
+            .arg(batch.positions)
+            .arg(batch.slot_table)
+            .arg(&stride)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ns)
+            .arg(&scale)
+            .arg(&kl)
+            .arg(&gi)
+            .arg(&tp)
+            .arg(&rb)
+            .arg(&rt);
+        self.dev
+            .profile()
+            .time("attn_prefill_decoupled6_f16acc", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("attn_prefill_decoupled6_f16acc")?;
                 Ok(())
             })?;
         Ok(())
