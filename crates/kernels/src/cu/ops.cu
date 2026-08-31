@@ -4226,8 +4226,8 @@ extern "C" __global__ void attn_prefill_mma_ws4_f32(
                 const int d0 = i * 8 + cc;
                 const float v0 = o[i].x[rg * 2];
                 const float v1 = o[i].x[rg * 2 + 1];
-                mystage[(size_t)abs_row * stage_row + d0] = den > 0.0f ? v0 / den : 0.0f;
-                mystage[(size_t)abs_row * stage_row + d0 + 1] = den > 0.0f ? v1 / den : 0.0f;
+                mystage[(size_t)abs_row * stage_row + d0] = den > 0.0f ? __fdividef(v0, den) : 0.0f;
+                mystage[(size_t)abs_row * stage_row + d0 + 1] = den > 0.0f ? __fdividef(v1, den) : 0.0f;
             }
         }
         __syncthreads();
@@ -4263,9 +4263,9 @@ extern "C" __global__ void attn_prefill_mma_ws4_f32(
             const float v1 = o[i].x[rg * 2 + 1];
             if (single) {
                 out[((size_t)token * n_heads + head) * d_head + d0] =
-                    den > 0.0f ? v0 / den : 0.0f;
+                    den > 0.0f ? __fdividef(v0, den) : 0.0f;
                 out[((size_t)token * n_heads + head) * d_head + d0 + 1] =
-                    den > 0.0f ? v1 / den : 0.0f;
+                    den > 0.0f ? __fdividef(v1, den) : 0.0f;
             } else {
                 const int local_token = tile * tile_tokens + local0 + row_j[rg];
                 float* dst =
