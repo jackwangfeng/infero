@@ -107,7 +107,7 @@ fn main() -> Result<()> {
     println!("  reg128 (deployed)    {reg_ms:>10.2} ms across {LINEAR_LAYERS} layers");
 
     // 3-kernel split.
-    let mut run_split3 = |iters: usize| -> Result<()> {
+    let mut run_split3 = |iters: usize, pipelined: bool| -> Result<()> {
         for it in 0..iters {
             let layer = it % layers;
             let mut slice = d_state.slice_mut(layer * per_layer..(layer + 1) * per_layer);
@@ -124,23 +124,26 @@ fn main() -> Result<()> {
                 DV,
                 offsets,
                 false,
+                pipelined,
             )?;
         }
         Ok(())
     };
-    run_split3(2)?;
-    dev.synchronize()?;
-    let start2 = ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?;
-    let stop2 = ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?;
-    start2.record(&stream)?;
-    run_split3(LINEAR_LAYERS)?;
-    stop2.record(&stream)?;
-    stop2.synchronize()?;
-    let split3_ms = start2.elapsed_ms(&stop2)? as f64;
-    println!(
-        "  3-kernel split       {split3_ms:>10.2} ms across {LINEAR_LAYERS} layers, {:.3}x vs reg128",
-        reg_ms / split3_ms
-    );
+    for (label, pipelined) in [("plain", false), ("pipelined", true)] {
+        run_split3(2, pipelined)?;
+        dev.synchronize()?;
+        let start2 = ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+        let stop2 = ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+        start2.record(&stream)?;
+        run_split3(LINEAR_LAYERS, pipelined)?;
+        stop2.record(&stream)?;
+        stop2.synchronize()?;
+        let split3_ms = start2.elapsed_ms(&stop2)? as f64;
+        println!(
+            "  3-kernel split ({label:<9}) {split3_ms:>10.2} ms across {LINEAR_LAYERS} layers, {:.3}x vs reg128",
+            reg_ms / split3_ms
+        );
+    }
     if std::env::var("INFERO_PROFILE").is_ok_and(|v| v == "1") {
         println!("\n{}", k.device().profile().report());
     }

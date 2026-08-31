@@ -1526,6 +1526,16 @@ extern "C" __global__ __launch_bounds__(256) void gdn_chunk_state_f32(
             sk[r * GDN_ROW_PAD + d] = row[k_off + (size_t)khead * GDN_DK + d];
             sw[r * GDN_ROW_PAD + d] = w_chunk[r * GDN_DK + d];
         }
+        // Zero the ragged last chunk's unwritten `sk` rows: the
+        // state-advance loop below reads `sk[t][...]` for `t` up to
+        // `GDN_CHUNK` (a compile-time bound, for `dt_cache`'s own sake --
+        // see that loop's comment), not just `t < C`, and `dt_cache[t] * 0`
+        // only reliably stays `0` if `sk`'s own value there is finite, not
+        // whatever this shared memory last held.
+        for (int idx = C * GDN_DK + lane; idx < GDN_CHUNK * GDN_DK; idx += blockDim.x) {
+            const int r = idx / GDN_DK, d = idx % GDN_DK;
+            sk[r * GDN_ROW_PAD + d] = 0.0f;
+        }
         if (lane == 0) {
             float acc = 0.0f;
             for (int r = 0; r < C; ++r) {
@@ -1562,10 +1572,182 @@ extern "C" __global__ __launch_bounds__(256) void gdn_chunk_state_f32(
         for (int t = 0; t < GDN_CHUNK; ++t) {
             dt_cache[t] = (t < C) ? delta_chunk[t * GDN_DV + j] * __expf(sgc[C - 1] - sgc[t]) : 0.0f;
         }
+        // `t < GDN_CHUNK` (a compile-time constant), not `t < C` (a runtime
+        // value) -- `dt_cache[t]` is already 0 for `t >= C` (see the fill
+        // loop above), so the extra iterations on a ragged last chunk are
+        // harmless no-ops, and in exchange `#pragma unroll` can fully
+        // unroll this loop with a compile-time-constant index into
+        // `dt_cache`. That's the difference between a real register array
+        // and one the compiler is *forced* to spill to local memory: an
+        // array indexed by a runtime loop bound cannot live in registers at
+        // all, regardless of register pressure -- confirmed via
+        // `gdn_kernel_registers`, both this kernel and the plain
+        // `gdn_chunk_state_f32` reported exactly 128 bytes of spill (== a
+        // 32-float `dt_cache`) before this fix, 0 after.
 #pragma unroll
         for (int r = 0; r < 64; ++r) {
             float acc = sc[r] * decay_whole;
-            for (int t = 0; t < C; ++t) {
+#pragma unroll
+            for (int t = 0; t < GDN_CHUNK; ++t) {
+                acc += dt_cache[t] * sk[t * GDN_ROW_PAD + i0 + r];
+            }
+            sc[r] = acc;
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < 64; ++r) S[(size_t)(i0 + r) * GDN_DV + j] = sc[r];
+}
+
+// Same as `gdn_chunk_state_f32` above, but double-buffered via `cp.async`:
+// chunk `c+1`'s K/W are prefetched while chunk `c`'s pred/delta/state-advance
+// is still computing, instead of the fully synchronous load-sync-compute-
+// sync round trip the plain version pays every one of its ~955 sequential
+// chunk iterations at the real 30552-token shape. This is the same same-
+// warp software-pipelined prefetch technique FlashAttention-2's own real
+// source uses (see `attn_prefill_mma_ws5_singlebuf_regcheck_f32`'s doc
+// comment in `ops.cu` for that read) -- not the cross-warp producer/
+// consumer split this session's attention kernels use elsewhere, since
+// there is only one role here to pipeline against itself, exactly FA2's own
+// situation. A reasoned, not yet `ncu`-confirmed (unavailable on this box,
+// `ERR_NVGPUCTRPERM`) fix for `gdn_chunk_state_f32`'s own real, measured
+// remaining gap against `gdn_delta_rule_reg128_f32` after two other real
+// bugs were already found and fixed in it (see that kernel's own doc
+// comment) -- kept as a separate kernel, not a rewrite in place, so the
+// already-verified plain version stays available for direct comparison.
+extern "C" __global__ __launch_bounds__(256) void gdn_chunk_state_pipelined_f32(
+        float* __restrict__ delta_out, float* __restrict__ s_before_out,
+        float* __restrict__ state, const float* __restrict__ w_in,
+        const float* __restrict__ u_in, const float* __restrict__ qkv,
+        const float* __restrict__ g, const int* __restrict__ first_token,
+        const int* __restrict__ n_tok, int heads, int key_heads, int dk, int dv,
+        int stride, int k_off, int v_tiled, int n_chunks) {
+    (void)dk;
+    (void)dv;
+    const int head = blockIdx.x;
+    const int seq = 0;
+    const int nt = n_tok[seq];
+    if (nt <= 0) return;
+    const int t0 = first_token[seq];
+    const int lane = threadIdx.x;  // 0..255
+    const int j = lane / 2;
+    const int part = lane % 2;
+    const int i0 = part * 64;
+    const int khead = v_tiled ? (head % key_heads) : (head / (heads / key_heads));
+
+    extern __shared__ char gdn_state_pp_smem[];
+    float* sk0 = (float*)gdn_state_pp_smem;            // [GDN_CHUNK][GDN_ROW_PAD]
+    float* sk1 = sk0 + GDN_CHUNK * GDN_ROW_PAD;        // [GDN_CHUNK][GDN_ROW_PAD]
+    float* sw0 = sk1 + GDN_CHUNK * GDN_ROW_PAD;        // [GDN_CHUNK][GDN_ROW_PAD]
+    float* sw1 = sw0 + GDN_CHUNK * GDN_ROW_PAD;        // [GDN_CHUNK][GDN_ROW_PAD]
+    float* sgc = sw1 + GDN_CHUNK * GDN_ROW_PAD;        // [GDN_CHUNK]
+
+    float* S = state + (size_t)head * GDN_DK * GDN_DV;
+    float sc[64];
+#pragma unroll
+    for (int r = 0; r < 64; ++r) sc[r] = S[(size_t)(i0 + r) * GDN_DV + j];
+
+    // Always issues the full `GDN_CHUNK` rows, not just the ragged last
+    // chunk's real `CC` -- `hit=false` rows zero-fill `skb` via
+    // `cp_async16`'s own predicate (see `common.cuh`), which the
+    // state-advance loop below needs: it reads `sk[t][...]` up to the
+    // compile-time `GDN_CHUNK` bound (for `dt_cache`'s own sake, see that
+    // loop's comment), not just `t < CC`, and needs those rows finite, not
+    // whatever this shared buffer's previous chunk left behind. The source
+    // row index is clamped to a real, in-bounds token (not read, since
+    // `hit=false` disables the copy) so the address itself stays valid even
+    // for a chunk past the sequence's own last token.
+    auto issue_load = [&](int chunk_idx, float* skb, float* swb) {
+        const int cc0 = chunk_idx * GDN_CHUNK;
+        const int CC = min(GDN_CHUNK, nt - cc0);
+        const float* w_chunk = w_in + ((size_t)chunk_idx * heads + head) * GDN_CHUNK * GDN_DK;
+        for (int idx = lane; idx < GDN_CHUNK * (GDN_DK / 4); idx += blockDim.x) {
+            const int r = idx / (GDN_DK / 4), w4 = idx % (GDN_DK / 4);
+            const bool hit = r < CC;
+            const int safe_r = hit ? r : 0;
+            const float* row = qkv + (size_t)(t0 + cc0 + safe_r) * stride;
+            cp_async16(skb + r * GDN_ROW_PAD + w4 * 4, row + k_off + (size_t)khead * GDN_DK + w4 * 4, hit);
+            cp_async16(swb + r * GDN_ROW_PAD + w4 * 4, w_chunk + safe_r * GDN_DK + w4 * 4, hit);
+        }
+    };
+
+    if (n_chunks > 0) {
+        issue_load(0, sk0, sw0);
+    }
+    CP_ASYNC_FENCE();
+
+    for (int chunk = 0; chunk < n_chunks; ++chunk) {
+        const int c0 = chunk * GDN_CHUNK;
+        if (c0 >= nt) break;
+        const int C = min(GDN_CHUNK, nt - c0);
+        const int buf = chunk & 1;
+        float* sk = buf ? sk1 : sk0;
+        float* sw = buf ? sw1 : sw0;
+
+        CP_ASYNC_WAIT(0);
+        __syncthreads();
+
+        if (chunk + 1 < n_chunks) {
+            const int nbuf = (chunk + 1) & 1;
+            issue_load(chunk + 1, nbuf ? sk1 : sk0, nbuf ? sw1 : sw0);
+            CP_ASYNC_FENCE();
+        }
+
+        if (lane == 0) {
+            float acc = 0.0f;
+            for (int r = 0; r < C; ++r) {
+                acc += g[(size_t)(t0 + c0 + r) * heads + head];
+                sgc[r] = acc;
+            }
+        }
+        __syncthreads();
+
+        float* sbefore_chunk = s_before_out + ((size_t)chunk * heads + head) * GDN_DK * GDN_DV;
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            sbefore_chunk[(size_t)(i0 + r) * GDN_DV + j] = sc[r];
+        }
+
+        const float* u_chunk = u_in + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DV;
+        float* delta_chunk = delta_out + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DV;
+
+        for (int i = 0; i < C; ++i) {
+            float pp = 0.0f;
+#pragma unroll
+            for (int r = 0; r < 64; ++r) {
+                pp += sc[r] * sw[i * GDN_ROW_PAD + i0 + r];
+            }
+            pp += __shfl_xor_sync(0xffffffffu, pp, 1, 32);
+            if (part == 0) {
+                delta_chunk[i * GDN_DV + j] = u_chunk[i * GDN_DV + j] - pp;
+            }
+        }
+        __syncthreads();
+
+        const float decay_whole = __expf(sgc[C - 1]);
+        float dt_cache[GDN_CHUNK];
+#pragma unroll
+        for (int t = 0; t < GDN_CHUNK; ++t) {
+            dt_cache[t] = (t < C) ? delta_chunk[t * GDN_DV + j] * __expf(sgc[C - 1] - sgc[t]) : 0.0f;
+        }
+        // `t < GDN_CHUNK` (a compile-time constant), not `t < C` (a runtime
+        // value) -- `dt_cache[t]` is already 0 for `t >= C` (see the fill
+        // loop above), so the extra iterations on a ragged last chunk are
+        // harmless no-ops, and in exchange `#pragma unroll` can fully
+        // unroll this loop with a compile-time-constant index into
+        // `dt_cache`. That's the difference between a real register array
+        // and one the compiler is *forced* to spill to local memory: an
+        // array indexed by a runtime loop bound cannot live in registers at
+        // all, regardless of register pressure -- confirmed via
+        // `gdn_kernel_registers`, both this kernel and the plain
+        // `gdn_chunk_state_f32` reported exactly 128 bytes of spill (== a
+        // 32-float `dt_cache`) before this fix, 0 after.
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            float acc = sc[r] * decay_whole;
+#pragma unroll
+            for (int t = 0; t < GDN_CHUNK; ++t) {
                 acc += dt_cache[t] * sk[t * GDN_ROW_PAD + i0 + r];
             }
             sc[r] = acc;

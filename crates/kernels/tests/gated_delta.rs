@@ -1174,45 +1174,49 @@ fn the_three_kernel_split_matches_the_reference() -> Result<()> {
     let hb = stream.clone_htod(&beta)?;
     let f = stream.clone_htod(&[0i32])?;
     let n = stream.clone_htod(&[t_len as i32])?;
-    let mut out = stream.alloc_zeros::<f32>(t_len * VAL_HEADS * DV)?;
-    let mut state = stream.alloc_zeros::<f32>(VAL_HEADS * DK * DV)?;
     let seqs = infero_kernels::gdn::SeqLayout {
         first_token: &f.as_view(),
         n_tokens: &n.as_view(),
         n_seqs: 1,
         total_tokens: t_len,
     };
-    k.gdn_chunk_split3_delta_rule(
-        &mut out.as_view_mut(),
-        &mut state.as_view_mut(),
-        &chunk.as_view(),
-        &hg.as_view(),
-        &hb.as_view(),
-        &seqs,
-        VAL_HEADS,
-        KEY_HEADS,
-        DK,
-        DV,
-        off,
-        false,
-    )?;
-    k.device().synchronize()?;
-    let got = stream.clone_dtoh(&out)?;
-    let got_state = stream.clone_dtoh(&state)?;
 
-    let (worst, at) = max_abs_diff(&got, &want);
-    assert!(
-        worst < 1e-4 * peak.max(1e-6),
-        "three-kernel split diverged from the reference by {worst:.2e} at {at}: \
-         got {}, reference {}",
-        got[at],
-        want[at]
-    );
-    let (sworst, sat) = max_abs_diff(&got_state, &want_state);
-    assert!(
-        sworst < 1e-4 * speak.max(1e-6),
-        "three-kernel split left a state {sworst:.2e} from the reference's at {sat}"
-    );
+    for (label, pipelined) in [("plain", false), ("pipelined", true)] {
+        let mut out = stream.alloc_zeros::<f32>(t_len * VAL_HEADS * DV)?;
+        let mut state = stream.alloc_zeros::<f32>(VAL_HEADS * DK * DV)?;
+        k.gdn_chunk_split3_delta_rule(
+            &mut out.as_view_mut(),
+            &mut state.as_view_mut(),
+            &chunk.as_view(),
+            &hg.as_view(),
+            &hb.as_view(),
+            &seqs,
+            VAL_HEADS,
+            KEY_HEADS,
+            DK,
+            DV,
+            off,
+            false,
+            pipelined,
+        )?;
+        k.device().synchronize()?;
+        let got = stream.clone_dtoh(&out)?;
+        let got_state = stream.clone_dtoh(&state)?;
+
+        let (worst, at) = max_abs_diff(&got, &want);
+        assert!(
+            worst < 1e-4 * peak.max(1e-6),
+            "three-kernel split ({label}) diverged from the reference by {worst:.2e} at {at}: \
+             got {}, reference {}",
+            got[at],
+            want[at]
+        );
+        let (sworst, sat) = max_abs_diff(&got_state, &want_state);
+        assert!(
+            sworst < 1e-4 * speak.max(1e-6),
+            "three-kernel split ({label}) left a state {sworst:.2e} from the reference's at {sat}"
+        );
+    }
     Ok(())
 }
 

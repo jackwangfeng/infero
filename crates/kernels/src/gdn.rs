@@ -601,6 +601,12 @@ impl Kernels {
     /// against `gdn_delta_rule_reg128_f32`, not yet matching that kernel's
     /// multi-sequence/incremental-call generality. `dk`/`dv` must be 128,
     /// same restriction `DeltaVariant::Chunk` already has.
+    ///
+    /// `pipelined` selects kernel 2's own two variants: `gdn_chunk_state_f32`
+    /// (plain, fully synchronous) or `gdn_chunk_state_pipelined_f32`
+    /// (`cp.async`-double-buffered) -- see the latter's doc comment in
+    /// `gdn.cu` for why kernel 2, not kernels 1 or 3, was the whole
+    /// pipeline's real remaining bottleneck.
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_chunk_split3_delta_rule(
         &self,
@@ -616,6 +622,7 @@ impl Kernels {
         dv: usize,
         offsets: (usize, usize, usize, usize),
         v_tiled: bool,
+        pipelined: bool,
     ) -> Result<()> {
         anyhow::ensure!(seqs.n_seqs == 1, "gdn_chunk_split3_delta_rule: single sequence only");
         anyhow::ensure!(
@@ -677,10 +684,18 @@ impl Kernels {
                 })?;
         }
 
-        // Kernel 2: sequential over chunks, gridded over heads only.
+        // Kernel 2: sequential over chunks, gridded over heads only. Plain
+        // or `cp.async`-double-buffered, same shared-memory shape doubled
+        // for the pipelined K/W buffers -- see `gdn_chunk_state_pipelined_f32`'s
+        // doc comment in `gdn.cu`.
         {
-            let f = self.dev.kernels().get("infero_gdn", gdn_src(), "gdn_chunk_state_f32")?;
-            let shared = (2 * GDN_CHUNK * ROW_PAD + GDN_CHUNK) * f32_size;
+            let name = if pipelined { "gdn_chunk_state_pipelined_f32" } else { "gdn_chunk_state_f32" };
+            let f = self.dev.kernels().get("infero_gdn", gdn_src(), name)?;
+            let shared = if pipelined {
+                (4 * GDN_CHUNK * ROW_PAD + GDN_CHUNK) * f32_size
+            } else {
+                (2 * GDN_CHUNK * ROW_PAD + GDN_CHUNK) * f32_size
+            };
             if shared > 48 * 1024 {
                 infero_gpu::set_max_dynamic_shared(&f, shared as u32)?;
             }
