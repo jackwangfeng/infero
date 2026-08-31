@@ -3309,6 +3309,11 @@ impl Kernels {
     ) -> Result<()> {
         anyhow::ensure!(self.prefill_attention(&dims), "attn_prefill_ws4: unsupported shape");
         anyhow::ensure!(run_tokens >= 1, "attn_prefill_ws4: empty run");
+        // Folds `__expf`'s own internal multiply-by-log2(e) into this
+        // multiply, which was already happening before every exponentiation
+        // regardless -- `attn_prefill_mma_ws4_f32` now calls `exp2f`, not
+        // `__expf`; see that kernel's own doc comment in `ops.cu`.
+        let scale = scale * std::f32::consts::LOG2_E;
         let group = dims.n_heads / dims.n_kv_heads;
         let tpw = (16 / group).max(1);
         const NWARPS: usize = 7;
@@ -3450,6 +3455,9 @@ impl Kernels {
     ) -> Result<()> {
         anyhow::ensure!(self.prefill_attention(&dims), "attn_prefill_ws4_nw: unsupported shape");
         anyhow::ensure!(run_tokens >= 1, "attn_prefill_ws4_nw: empty run");
+        // See `attn_prefill_ws4`'s own comment: folds `__expf`'s internal
+        // log2(e) multiply into this existing one.
+        let scale = scale * std::f32::consts::LOG2_E;
         let group = dims.n_heads / dims.n_kv_heads;
         let tpw = (16 / group).max(1);
         const KPAD: usize = 8;

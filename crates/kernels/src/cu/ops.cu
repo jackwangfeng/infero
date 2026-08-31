@@ -3952,6 +3952,18 @@ extern "C" __global__ void attn_prefill_mma_ws_f32(
 // tile -- closer to vLLM's own compiled FA2 kernel's `kBlockN=64` for this
 // shape than either prior attempt reached, and for the first time without
 // paying `NWARPS` to get there.
+// `__expf(x)` is `mul.f32 x, log2(e); ex2.approx.f32` (confirmed from its
+// actual compiled PTX, sm_120a) -- a real, separate multiply on the
+// dependent chain in front of every exponentiation. `scale` here is only
+// ever used once, to turn a raw QK^T score into a real logit right before
+// it's compared/exponentiated (`sv_score = s2 * scale`), so folding
+// log2(e) into `scale` itself (the caller's job -- see
+// `Kernels::attn_prefill_ws4`) and switching to `exp2f` throughout gives
+// the exact same values (`exp2(log2(e)*x) == exp(x)`, an identity, not an
+// approximation change) while removing that multiply from every one of
+// this kernel's ~26 exponentiations a tile, each currently sitting on the
+// same dependent chain this whole investigation has already identified as
+// a real cost.
 extern "C" __global__ void attn_prefill_mma_ws4_f32(
     float* __restrict__ partial, int ms_off, float* __restrict__ out, int single,
     const float* __restrict__ q, const __half* __restrict__ k_cache,
@@ -4147,14 +4159,14 @@ extern "C" __global__ void attn_prefill_mma_ws4_f32(
             float psum = 0.0f;
 #pragma unroll
             for (int i = 0; i < 12; ++i) {
-                p[rg * 12 + i] = (svr[i] == -INFINITY) ? 0.0f : __expf(svr[i] - m_new);
+                p[rg * 12 + i] = (svr[i] == -INFINITY) ? 0.0f : exp2f(svr[i] - m_new);
                 psum += p[rg * 12 + i];
             }
             psum += __shfl_xor_sync(0xffffffff, psum, 1, WARP_SIZE);
             psum += __shfl_xor_sync(0xffffffff, psum, 2, WARP_SIZE);
 
             const float corr =
-                (m_run[rg] == -INFINITY) ? 0.0f : __expf(m_run[rg] - m_new);
+                (m_run[rg] == -INFINITY) ? 0.0f : exp2f(m_run[rg] - m_new);
             l_run[rg] = l_run[rg] * corr + psum;
             m_run[rg] = m_new;
 #pragma unroll
