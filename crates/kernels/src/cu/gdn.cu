@@ -1759,6 +1759,148 @@ extern "C" __global__ __launch_bounds__(256) void gdn_chunk_state_pipelined_f32(
     for (int r = 0; r < 64; ++r) S[(size_t)(i0 + r) * GDN_DV + j] = sc[r];
 }
 
+// Same as `gdn_chunk_state_pipelined_f32`, but splits `GDN_DV`'s 128 columns
+// across 4 blocks a head instead of one, mirroring `gdn_delta_rule_reg128_split4_f32`'s
+// own already-established pattern in this exact file. Legal because the
+// state recurrence is COLUMN-INDEPENDENT: `pred[t,j] = sum_d W[t,d]*S[d,j]`
+// depends on column `j` of `S` alone, and every other quantity in the
+// state-advance (`delta[t,j]`, `S_new[d,j]`) is likewise a per-column-`j`
+// computation with no term that ever mixes two different `j`s together --
+// `W`, `K`, and the decay factors are the only column-independent
+// (broadcast) inputs. So, exactly like `reg128_split4`, this trades a
+// redundant per-group reload of `K`/`W` (`4x` the reads, unavoidable since
+// every group needs the same chunk's `K`/`W` to advance its own quarter of
+// `S`) for `4x` the blocks: 192 instead of 48 on this checkpoint's 48
+// heads, on a 188-SM part -- close to full device occupancy instead of
+// 25.5%, without needing the far larger engineering investment of an
+// associative-scan restructuring (see the doc comment on this file's own
+// linear-recurrence-and-parallel-scan finding, in
+// project_infero_perf_gap.md memory, for why that's a real but much bigger
+// next step than this one).
+extern "C" __global__ __launch_bounds__(256) void gdn_chunk_state_pipelined_split4_f32(
+        float* __restrict__ delta_out, float* __restrict__ s_before_out,
+        float* __restrict__ state, const float* __restrict__ w_in,
+        const float* __restrict__ u_in, const float* __restrict__ qkv,
+        const float* __restrict__ g, const int* __restrict__ first_token,
+        const int* __restrict__ n_tok, int heads, int key_heads, int dk, int dv,
+        int stride, int k_off, int v_tiled, int n_chunks) {
+    (void)dk;
+    (void)dv;
+    const int GCOLS = GDN_DV / 4;
+    const int head = blockIdx.x;
+    const int col_group = blockIdx.y;
+    const int seq = 0;
+    const int nt = n_tok[seq];
+    if (nt <= 0) return;
+    const int t0 = first_token[seq];
+    const int lane = threadIdx.x;  // 0..2*GCOLS-1
+    const int j = lane / 2;        // this block's own local column, 0..GCOLS-1
+    const int jg = col_group * GCOLS + j;  // the real column into S/out/delta
+    const int part = lane % 2;
+    const int i0 = part * 64;
+    const int khead = v_tiled ? (head % key_heads) : (head / (heads / key_heads));
+
+    extern __shared__ char gdn_state_pp4_smem[];
+    float* sk0 = (float*)gdn_state_pp4_smem;           // [GDN_CHUNK][GDN_ROW_PAD]
+    float* sk1 = sk0 + GDN_CHUNK * GDN_ROW_PAD;        // [GDN_CHUNK][GDN_ROW_PAD]
+    float* sw0 = sk1 + GDN_CHUNK * GDN_ROW_PAD;        // [GDN_CHUNK][GDN_ROW_PAD]
+    float* sw1 = sw0 + GDN_CHUNK * GDN_ROW_PAD;        // [GDN_CHUNK][GDN_ROW_PAD]
+    float* sgc = sw1 + GDN_CHUNK * GDN_ROW_PAD;        // [GDN_CHUNK]
+
+    float* S = state + (size_t)head * GDN_DK * GDN_DV;
+    float sc[64];
+#pragma unroll
+    for (int r = 0; r < 64; ++r) sc[r] = S[(size_t)(i0 + r) * GDN_DV + jg];
+
+    auto issue_load = [&](int chunk_idx, float* skb, float* swb) {
+        const int cc0 = chunk_idx * GDN_CHUNK;
+        const int CC = min(GDN_CHUNK, nt - cc0);
+        const float* w_chunk = w_in + ((size_t)chunk_idx * heads + head) * GDN_CHUNK * GDN_DK;
+        for (int idx = lane; idx < GDN_CHUNK * (GDN_DK / 4); idx += blockDim.x) {
+            const int r = idx / (GDN_DK / 4), w4 = idx % (GDN_DK / 4);
+            const bool hit = r < CC;
+            const int safe_r = hit ? r : 0;
+            const float* row = qkv + (size_t)(t0 + cc0 + safe_r) * stride;
+            cp_async16(skb + r * GDN_ROW_PAD + w4 * 4, row + k_off + (size_t)khead * GDN_DK + w4 * 4, hit);
+            cp_async16(swb + r * GDN_ROW_PAD + w4 * 4, w_chunk + safe_r * GDN_DK + w4 * 4, hit);
+        }
+    };
+
+    if (n_chunks > 0) {
+        issue_load(0, sk0, sw0);
+    }
+    CP_ASYNC_FENCE();
+
+    for (int chunk = 0; chunk < n_chunks; ++chunk) {
+        const int c0 = chunk * GDN_CHUNK;
+        if (c0 >= nt) break;
+        const int C = min(GDN_CHUNK, nt - c0);
+        const int buf = chunk & 1;
+        float* sk = buf ? sk1 : sk0;
+        float* sw = buf ? sw1 : sw0;
+
+        CP_ASYNC_WAIT(0);
+        __syncthreads();
+
+        if (chunk + 1 < n_chunks) {
+            const int nbuf = (chunk + 1) & 1;
+            issue_load(chunk + 1, nbuf ? sk1 : sk0, nbuf ? sw1 : sw0);
+            CP_ASYNC_FENCE();
+        }
+
+        if (lane == 0) {
+            float acc = 0.0f;
+            for (int r = 0; r < C; ++r) {
+                acc += g[(size_t)(t0 + c0 + r) * heads + head];
+                sgc[r] = acc;
+            }
+        }
+        __syncthreads();
+
+        float* sbefore_chunk = s_before_out + ((size_t)chunk * heads + head) * GDN_DK * GDN_DV;
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            sbefore_chunk[(size_t)(i0 + r) * GDN_DV + jg] = sc[r];
+        }
+
+        const float* u_chunk = u_in + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DV;
+        float* delta_chunk = delta_out + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DV;
+
+        for (int i = 0; i < C; ++i) {
+            float pp = 0.0f;
+#pragma unroll
+            for (int r = 0; r < 64; ++r) {
+                pp += sc[r] * sw[i * GDN_ROW_PAD + i0 + r];
+            }
+            pp += __shfl_xor_sync(0xffffffffu, pp, 1, 32);
+            if (part == 0) {
+                delta_chunk[i * GDN_DV + jg] = u_chunk[i * GDN_DV + jg] - pp;
+            }
+        }
+        __syncthreads();
+
+        const float decay_whole = __expf(sgc[C - 1]);
+        float dt_cache[GDN_CHUNK];
+#pragma unroll
+        for (int t = 0; t < GDN_CHUNK; ++t) {
+            dt_cache[t] = (t < C) ? delta_chunk[t * GDN_DV + jg] * __expf(sgc[C - 1] - sgc[t]) : 0.0f;
+        }
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            float acc = sc[r] * decay_whole;
+#pragma unroll
+            for (int t = 0; t < GDN_CHUNK; ++t) {
+                acc += dt_cache[t] * sk[t * GDN_ROW_PAD + i0 + r];
+            }
+            sc[r] = acc;
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < 64; ++r) S[(size_t)(i0 + r) * GDN_DV + jg] = sc[r];
+}
+
 // Kernel 3 of 3: parallel over (head, chunk) again, no cross-chunk
 // dependency at all -- consumes `S_before`/`delta` from kernel 2 and
 // recomputes the intra-chunk causal scores (`chunk_o.py:113,120,124-126`,

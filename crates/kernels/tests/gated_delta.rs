@@ -1181,7 +1181,12 @@ fn the_three_kernel_split_matches_the_reference() -> Result<()> {
         total_tokens: t_len,
     };
 
-    for (label, pipelined) in [("plain", false), ("pipelined", true)] {
+    use infero_kernels::gdn::GdnChunkStateVariant;
+    for (label, k2) in [
+        ("plain", GdnChunkStateVariant::Plain),
+        ("pipelined", GdnChunkStateVariant::Pipelined),
+        ("pipelined_split4", GdnChunkStateVariant::PipelinedSplit4),
+    ] {
         let mut out = stream.alloc_zeros::<f32>(t_len * VAL_HEADS * DV)?;
         let mut state = stream.alloc_zeros::<f32>(VAL_HEADS * DK * DV)?;
         k.gdn_chunk_split3_delta_rule(
@@ -1197,7 +1202,7 @@ fn the_three_kernel_split_matches_the_reference() -> Result<()> {
             DV,
             off,
             false,
-            pipelined,
+            k2,
         )?;
         k.device().synchronize()?;
         let got = stream.clone_dtoh(&out)?;

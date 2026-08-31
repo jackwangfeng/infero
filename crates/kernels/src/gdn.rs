@@ -34,6 +34,22 @@ pub struct SeqLayout<'a> {
     pub total_tokens: usize,
 }
 
+/// Which of kernel 2's three real variants [`Kernels::gdn_chunk_split3_delta_rule`]
+/// runs -- see each kernel's own doc comment in `gdn.cu` for what each real,
+/// measured fix did to the whole 3-kernel pipeline's real benchmark result.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GdnChunkStateVariant {
+    /// `gdn_chunk_state_f32` -- fully synchronous, 48 blocks (`heads`).
+    Plain,
+    /// `gdn_chunk_state_pipelined_f32` -- `cp.async` double-buffered, same
+    /// 48-block grid.
+    Pipelined,
+    /// `gdn_chunk_state_pipelined_split4_f32` -- pipelined, and `GDN_DV`'s
+    /// 128 columns split 4 ways (192 blocks instead of 48), legal because
+    /// the state recurrence is column-independent.
+    PipelinedSplit4,
+}
+
 /// Which delta-rule kernel to run.
 ///
 /// The three differ only in where the recurrent state lives while a chunk of
@@ -602,11 +618,10 @@ impl Kernels {
     /// multi-sequence/incremental-call generality. `dk`/`dv` must be 128,
     /// same restriction `DeltaVariant::Chunk` already has.
     ///
-    /// `pipelined` selects kernel 2's own two variants: `gdn_chunk_state_f32`
-    /// (plain, fully synchronous) or `gdn_chunk_state_pipelined_f32`
-    /// (`cp.async`-double-buffered) -- see the latter's doc comment in
-    /// `gdn.cu` for why kernel 2, not kernels 1 or 3, was the whole
-    /// pipeline's real remaining bottleneck.
+    /// `k2` selects kernel 2's own three variants -- see each kernel's doc
+    /// comment in `gdn.cu` for why kernel 2, not kernels 1 or 3, was the
+    /// whole pipeline's real remaining bottleneck, and what each of these
+    /// three real, measured fixes did about it.
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_chunk_split3_delta_rule(
         &self,
@@ -622,7 +637,7 @@ impl Kernels {
         dv: usize,
         offsets: (usize, usize, usize, usize),
         v_tiled: bool,
-        pipelined: bool,
+        k2: GdnChunkStateVariant,
     ) -> Result<()> {
         anyhow::ensure!(seqs.n_seqs == 1, "gdn_chunk_split3_delta_rule: single sequence only");
         anyhow::ensure!(
@@ -684,24 +699,30 @@ impl Kernels {
                 })?;
         }
 
-        // Kernel 2: sequential over chunks, gridded over heads only. Plain
-        // or `cp.async`-double-buffered, same shared-memory shape doubled
-        // for the pipelined K/W buffers -- see `gdn_chunk_state_pipelined_f32`'s
-        // doc comment in `gdn.cu`.
+        // Kernel 2: sequential over chunks. Three variants -- see
+        // `GdnChunkStateVariant`'s own doc comment and each kernel's in
+        // `gdn.cu`. Only `PipelinedSplit4` uses more than one block a head
+        // (`heads * 4` instead of `heads`, its whole point).
         {
-            let name = if pipelined { "gdn_chunk_state_pipelined_f32" } else { "gdn_chunk_state_f32" };
+            let (name, col_groups, block_threads) = match k2 {
+                GdnChunkStateVariant::Plain => ("gdn_chunk_state_f32", 1, 2 * dv),
+                GdnChunkStateVariant::Pipelined => ("gdn_chunk_state_pipelined_f32", 1, 2 * dv),
+                GdnChunkStateVariant::PipelinedSplit4 => {
+                    ("gdn_chunk_state_pipelined_split4_f32", 4, dv / 2)
+                }
+            };
             let f = self.dev.kernels().get("infero_gdn", gdn_src(), name)?;
-            let shared = if pipelined {
-                (4 * GDN_CHUNK * ROW_PAD + GDN_CHUNK) * f32_size
-            } else {
+            let shared = if matches!(k2, GdnChunkStateVariant::Plain) {
                 (2 * GDN_CHUNK * ROW_PAD + GDN_CHUNK) * f32_size
+            } else {
+                (4 * GDN_CHUNK * ROW_PAD + GDN_CHUNK) * f32_size
             };
             if shared > 48 * 1024 {
                 infero_gpu::set_max_dynamic_shared(&f, shared as u32)?;
             }
             let cfg = LaunchConfig {
-                grid_dim: (heads as u32, 1, 1),
-                block_dim: (2 * dv as u32, 1, 1),
+                grid_dim: (heads as u32, col_groups as u32, 1),
+                block_dim: (block_threads as u32, 1, 1),
                 shared_mem_bytes: shared as u32,
             };
             let nc = n_chunks as i32;

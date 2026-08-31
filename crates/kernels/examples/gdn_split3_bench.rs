@@ -10,7 +10,7 @@
 use anyhow::Result;
 use infero_cuda::Device;
 use infero_kernels::Kernels;
-use infero_kernels::gdn::{DeltaVariant, SeqLayout};
+use infero_kernels::gdn::{DeltaVariant, GdnChunkStateVariant, SeqLayout};
 
 const HEADS: usize = 48;
 const KEY_HEADS: usize = 16;
@@ -107,7 +107,7 @@ fn main() -> Result<()> {
     println!("  reg128 (deployed)    {reg_ms:>10.2} ms across {LINEAR_LAYERS} layers");
 
     // 3-kernel split.
-    let mut run_split3 = |iters: usize, pipelined: bool| -> Result<()> {
+    let mut run_split3 = |iters: usize, k2: GdnChunkStateVariant| -> Result<()> {
         for it in 0..iters {
             let layer = it % layers;
             let mut slice = d_state.slice_mut(layer * per_layer..(layer + 1) * per_layer);
@@ -124,23 +124,27 @@ fn main() -> Result<()> {
                 DV,
                 offsets,
                 false,
-                pipelined,
+                k2,
             )?;
         }
         Ok(())
     };
-    for (label, pipelined) in [("plain", false), ("pipelined", true)] {
-        run_split3(2, pipelined)?;
+    for (label, k2) in [
+        ("plain", GdnChunkStateVariant::Plain),
+        ("pipelined", GdnChunkStateVariant::Pipelined),
+        ("pipelined_split4", GdnChunkStateVariant::PipelinedSplit4),
+    ] {
+        run_split3(2, k2)?;
         dev.synchronize()?;
         let start2 = ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?;
         let stop2 = ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?;
         start2.record(&stream)?;
-        run_split3(LINEAR_LAYERS, pipelined)?;
+        run_split3(LINEAR_LAYERS, k2)?;
         stop2.record(&stream)?;
         stop2.synchronize()?;
         let split3_ms = start2.elapsed_ms(&stop2)? as f64;
         println!(
-            "  3-kernel split ({label:<9}) {split3_ms:>10.2} ms across {LINEAR_LAYERS} layers, {:.3}x vs reg128",
+            "  3-kernel split ({label:<17}) {split3_ms:>10.2} ms across {LINEAR_LAYERS} layers, {:.3}x vs reg128",
             reg_ms / split3_ms
         );
     }
