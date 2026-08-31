@@ -783,16 +783,17 @@ impl Kernels {
     /// against the actual running state matrix rather than carrying a
     /// `(A,B)` transform pair -- see `gdn_group_state_f32`'s own doc comment
     /// in `gdn.cu`. `group_start_state` (sized `n_groups*heads*128*128`)
-    /// receives the actual state at the START of every group; `state`
-    /// receives the same final total-state output `gdn_chunk_state_f32`
-    /// itself produces (may alias `s_init` -- read happens before write, per
-    /// head). `group_a`/`group_b` sized `n_groups*heads*128*128` each;
-    /// `s_init`/`state` sized `heads*128*128`.
+    /// receives the actual state at the START of every group; `state` is
+    /// read-then-written IN PLACE (its incoming value is the real initial
+    /// state, its outgoing value is the same final total-state output
+    /// `gdn_chunk_state_f32` itself produces) -- no separate `s_init`
+    /// parameter, so a caller threading the real persistent state buffer
+    /// through has no aliasing question to answer. `group_a`/`group_b` sized
+    /// `n_groups*heads*128*128` each; `state` sized `heads*128*128`.
     pub fn gdn_group_state(
         &self,
         group_start_state: &mut ViewMut<'_, f32>,
         state: &mut ViewMut<'_, f32>,
-        s_init: &View<'_, f32>,
         group_a: &View<'_, f32>,
         group_b: &View<'_, f32>,
         heads: usize,
@@ -811,7 +812,6 @@ impl Kernels {
         let mut bl = self.dev.stream().launch_builder(&f);
         bl.arg(&mut *group_start_state)
             .arg(&mut *state)
-            .arg(s_init)
             .arg(group_a)
             .arg(group_b)
             .arg(&h)
@@ -1209,6 +1209,166 @@ impl Kernels {
                 .arg(&kh)
                 .arg(&a)
                 .arg(&b_)
+                .arg(&st)
+                .arg(&qo)
+                .arg(&ko)
+                .arg(&vt);
+            self.dev
+                .profile()
+                .time("gdn_chunk_output", self.dev.stream(), || {
+                    unsafe { bl.launch(cfg) }.context("gdn_chunk_output")?;
+                    Ok(())
+                })?;
+        }
+        Ok(())
+    }
+
+    /// The scan-based replacement for kernel 2, wired into the full 3-stage
+    /// pipeline: `gdn_chunk_uw_f32` (kernel 1) -> `gdn_chunk_ab_f32` ->
+    /// `gdn_group_scan_f32` -> `gdn_group_state_f32` -> `gdn_scan_finish_f32`
+    /// -> `gdn_chunk_output_f32` (kernel 3). Same single-sequence,
+    /// `dk = dv = 128`-only restriction as [`Self::gdn_chunk_split3_delta_rule`].
+    /// Correctness of the scan replacement itself is already proven directly
+    /// against `gdn_chunk_state_f32`
+    /// (`the_scan_based_kernel2_matches_gdn_chunk_state_f32` in
+    /// `gated_delta.rs`); this wires it into one real end-to-end call so its
+    /// real cost can be measured against `gdn_delta_rule_reg128_f32` and
+    /// `gdn_chunk_split3_delta_rule`'s own kernel-2 variants at real shapes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_scan_split_delta_rule(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        state: &mut ViewMut<'_, f32>,
+        qkv: &View<'_, f32>,
+        g: &View<'_, f32>,
+        beta: &View<'_, f32>,
+        seqs: &SeqLayout<'_>,
+        heads: usize,
+        key_heads: usize,
+        dk: usize,
+        dv: usize,
+        offsets: (usize, usize, usize, usize),
+        v_tiled: bool,
+        group_size: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(seqs.n_seqs == 1, "gdn_scan_split_delta_rule: single sequence only");
+        anyhow::ensure!(
+            dk == 128 && dv == 128,
+            "gdn_scan_split_delta_rule is instantiated for dk = dv = 128, got {dk}x{dv}"
+        );
+        let (stride, q_off, k_off, _v_off) = offsets;
+        const GDN_CHUNK: usize = 32;
+        const GDN_DK: usize = 128;
+        const ROW_PAD: usize = GDN_DK + 4;
+        let n_chunks = seqs.total_tokens.div_ceil(GDN_CHUNK).max(1);
+        let n_groups = n_chunks.div_ceil(group_size).max(1);
+        let f32_size = std::mem::size_of::<f32>();
+
+        let stream = self.dev.stream();
+        let mut w_buf = stream.alloc_zeros::<f32>(n_chunks * heads * GDN_CHUNK * GDN_DK)?;
+        let mut u_buf = stream.alloc_zeros::<f32>(n_chunks * heads * GDN_CHUNK * dv)?;
+        let mut a_buf = stream.alloc_zeros::<f32>(n_chunks * heads * GDN_DK * GDN_DK)?;
+        let mut b_buf = stream.alloc_zeros::<f32>(n_chunks * heads * GDN_DK * dv)?;
+        let mut prefix_a = stream.alloc_zeros::<f32>(n_chunks * heads * GDN_DK * GDN_DK)?;
+        let mut prefix_b = stream.alloc_zeros::<f32>(n_chunks * heads * GDN_DK * dv)?;
+        let mut group_a = stream.alloc_zeros::<f32>(n_groups * heads * GDN_DK * GDN_DK)?;
+        let mut group_b = stream.alloc_zeros::<f32>(n_groups * heads * GDN_DK * dv)?;
+        let mut group_start_state = stream.alloc_zeros::<f32>(n_groups * heads * GDN_DK * dv)?;
+        let mut delta_buf = stream.alloc_zeros::<f32>(n_chunks * heads * GDN_CHUNK * dv)?;
+        let mut s_before_buf = stream.alloc_zeros::<f32>(n_chunks * heads * GDN_DK * dv)?;
+
+        self.gdn_chunk_uw_only(
+            &mut w_buf.as_view_mut(),
+            &mut u_buf.as_view_mut(),
+            qkv,
+            g,
+            beta,
+            seqs,
+            heads,
+            key_heads,
+            dk,
+            dv,
+            offsets,
+            v_tiled,
+        )?;
+        self.gdn_chunk_ab(
+            &mut a_buf.as_view_mut(),
+            &mut b_buf.as_view_mut(),
+            &w_buf.as_view(),
+            &u_buf.as_view(),
+            qkv,
+            g,
+            seqs,
+            heads,
+            key_heads,
+            dk,
+            dv,
+            offsets,
+            v_tiled,
+        )?;
+        self.gdn_group_scan(
+            &mut prefix_a.as_view_mut(),
+            &mut prefix_b.as_view_mut(),
+            &mut group_a.as_view_mut(),
+            &mut group_b.as_view_mut(),
+            &a_buf.as_view(),
+            &b_buf.as_view(),
+            heads,
+            n_chunks,
+            group_size,
+        )?;
+        self.gdn_group_state(
+            &mut group_start_state.as_view_mut(),
+            &mut *state,
+            &group_a.as_view(),
+            &group_b.as_view(),
+            heads,
+            n_groups,
+        )?;
+        self.gdn_scan_finish(
+            &mut delta_buf.as_view_mut(),
+            &mut s_before_buf.as_view_mut(),
+            &prefix_a.as_view(),
+            &prefix_b.as_view(),
+            &group_start_state.as_view(),
+            &w_buf.as_view(),
+            &u_buf.as_view(),
+            seqs,
+            heads,
+            n_chunks,
+            group_size,
+        )?;
+
+        // Kernel 3: parallel (head, chunk), no cross-chunk dependency --
+        // identical launch to `gdn_chunk_split3_delta_rule`'s own.
+        {
+            const A_STRIDE: usize = GDN_CHUNK + 1;
+            let f = self.dev.kernels().get("infero_gdn", gdn_src(), "gdn_chunk_output_f32")?;
+            let shared = (2 * GDN_CHUNK * ROW_PAD + GDN_CHUNK + GDN_CHUNK * A_STRIDE) * f32_size;
+            if shared > 48 * 1024 {
+                infero_gpu::set_max_dynamic_shared(&f, shared as u32)?;
+            }
+            let cfg = LaunchConfig {
+                grid_dim: (heads as u32, n_chunks as u32, 1),
+                block_dim: (2 * dv as u32, 1, 1),
+                shared_mem_bytes: shared as u32,
+            };
+            let (h, kh) = (heads as i32, key_heads as i32);
+            let (dka, dva) = (dk as i32, dv as i32);
+            let (st, qo, ko) = (stride as i32, q_off as i32, k_off as i32);
+            let vt = i32::from(v_tiled);
+            let mut bl = self.dev.stream().launch_builder(&f);
+            bl.arg(&mut *out)
+                .arg(&delta_buf)
+                .arg(&s_before_buf)
+                .arg(qkv)
+                .arg(g)
+                .arg(seqs.first_token)
+                .arg(seqs.n_tokens)
+                .arg(&h)
+                .arg(&kh)
+                .arg(&dka)
+                .arg(&dva)
                 .arg(&st)
                 .arg(&qo)
                 .arg(&ko)

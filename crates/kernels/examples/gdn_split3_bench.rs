@@ -148,6 +148,46 @@ fn main() -> Result<()> {
             reg_ms / split3_ms
         );
     }
+    // Scan-based kernel 2 replacement, wired into the full pipeline.
+    // group_size chosen so n_groups ~ sqrt(n_chunks) at this real shape
+    // (n_chunks = ceil(30552/32) = 955, sqrt ~ 31).
+    let group_size = 31usize;
+    let mut run_scan = |iters: usize| -> Result<()> {
+        for it in 0..iters {
+            let layer = it % layers;
+            let mut slice = d_state.slice_mut(layer * per_layer..(layer + 1) * per_layer);
+            k.gdn_scan_split_delta_rule(
+                &mut d_out.as_view_mut(),
+                &mut slice,
+                &d_row.as_view(),
+                &d_g.as_view(),
+                &d_beta.as_view(),
+                &seqs,
+                HEADS,
+                KEY_HEADS,
+                DK,
+                DV,
+                offsets,
+                false,
+                group_size,
+            )?;
+        }
+        Ok(())
+    };
+    run_scan(2)?;
+    dev.synchronize()?;
+    let start3 = ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+    let stop3 = ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+    start3.record(&stream)?;
+    run_scan(LINEAR_LAYERS)?;
+    stop3.record(&stream)?;
+    stop3.synchronize()?;
+    let scan_ms = start3.elapsed_ms(&stop3)? as f64;
+    println!(
+        "  scan-based split3 (group={group_size:<3})   {scan_ms:>10.2} ms across {LINEAR_LAYERS} layers, {:.3}x vs reg128",
+        reg_ms / scan_ms
+    );
+
     if std::env::var("INFERO_PROFILE").is_ok_and(|v| v == "1") {
         println!("\n{}", k.device().profile().report());
     }

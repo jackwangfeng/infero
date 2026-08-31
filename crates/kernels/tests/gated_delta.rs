@@ -1800,11 +1800,9 @@ fn the_scan_based_kernel2_matches_gdn_chunk_state_f32() -> Result<()> {
 
     let mut group_start_state = stream.alloc_zeros::<f32>(n_groups * VAL_HEADS * DKC * DVC)?;
     let mut state_scan = stream.clone_htod(&s_init)?;
-    let s_init_dev = stream.clone_htod(&s_init)?;
     k.gdn_group_state(
         &mut group_start_state.as_view_mut(),
         &mut state_scan.as_view_mut(),
-        &s_init_dev.as_view(),
         &group_a.as_view(),
         &group_b.as_view(),
         VAL_HEADS,

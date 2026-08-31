@@ -1747,17 +1747,19 @@ extern "C" __global__ __launch_bounds__(256) void gdn_group_scan_f32(
 // matrix (`DK x DV`), which is both cheaper (one GEMM-and-add a step, not
 // two) and exactly the artifact the final correction pass and kernel 3
 // already want. `group_start_state[g]` is the actual state at the START of
-// group `g` (`g=0` reproduces `s_init` exactly); `state` receives the same
-// final total-state output `gdn_chunk_state_f32` itself produces, so a
-// scan-based kernel 2 replacement stays a drop-in for multi-turn state
-// carry. `group_a`/`group_b` sized `n_groups*heads*128*128` each (matching
-// `gdn_group_scan_f32`'s own `group_a_out`/`group_b_out`);
-// `group_start_state` sized `n_groups*heads*128*128`; `state`/`s_init` sized
-// `heads*128*128` (may alias the same buffer, read-before-write per head).
+// group `g` (`g=0` reproduces `state`'s own incoming value exactly);
+// `state` is read-then-written IN PLACE, exactly like `gdn_chunk_state_f32`'s
+// own single `state` pointer (read into registers once at the top, written
+// back once at the bottom, same thread, same program order -- no separate
+// `s_init` pointer, so no aliasing question for a caller that wants the real
+// persistent state buffer threaded straight through). `group_a`/`group_b`
+// sized `n_groups*heads*128*128` each (matching `gdn_group_scan_f32`'s own
+// `group_a_out`/`group_b_out`); `group_start_state` sized
+// `n_groups*heads*128*128`; `state` sized `heads*128*128`.
 extern "C" __global__ __launch_bounds__(256) void gdn_group_state_f32(
         float* __restrict__ group_start_state, float* __restrict__ state,
-        const float* __restrict__ s_init, const float* __restrict__ group_a_in,
-        const float* __restrict__ group_b_in, int heads, int n_groups) {
+        const float* __restrict__ group_a_in, const float* __restrict__ group_b_in,
+        int heads, int n_groups) {
     const int head = blockIdx.x;
     const int lane = threadIdx.x;
     const int d1 = lane / 2;
@@ -1767,7 +1769,7 @@ extern "C" __global__ __launch_bounds__(256) void gdn_group_state_f32(
     extern __shared__ float gdn_gstate_smem[];
     float* row_s = gdn_gstate_smem;  // [GDN_DV]
 
-    const float* S0 = s_init + (size_t)head * GDN_DK * GDN_DV;
+    const float* S0 = state + (size_t)head * GDN_DK * GDN_DV;
     float sc[64];
 #pragma unroll
     for (int r = 0; r < 64; ++r) sc[r] = S0[(size_t)d1 * GDN_DV + (i0 + r)];
