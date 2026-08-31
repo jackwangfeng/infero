@@ -1631,6 +1631,114 @@ extern "C" __global__ __launch_bounds__(256) void gdn_ab_combine_f32(
     }
 }
 
+// The group-local scan: gridded over `(heads, n_groups)`, each block walks
+// its own contiguous range of `group_size` chunks SEQUENTIALLY, combining
+// a running `(A,B)` prefix (starting at `(Identity, 0)`) with each chunk's
+// own `(A(c), B(c))` via the exact same associative rule
+// `gdn_ab_combine_f32` already verified. `n_groups` blocks a head instead
+// of 1 -- this is the actual parallelism gain over `gdn_chunk_state_f32`'s
+// own `heads`-only grid, real but partial (not the full `O(log n_chunks)`
+// depth a complete Blelloch tree would reach), matching the two-level
+// "sqrt decomposition" sketched in project_infero_perf_gap.md memory.
+//
+// Reuses the row-streaming technique without inventing new register-to-
+// shared staging: rather than reading `row e` of the running prefix out of
+// registers (which would need a NEW per-thread "is this my row" broadcast
+// pattern), the running prefix is written to its own PREFIX output buffer
+// first -- needed anyway, since the later correction pass needs every
+// chunk's own incoming prefix -- and then read back row-by-row exactly like
+// `gdn_ab_combine_f32` reads `a1_in`/`b1_in`. A `__syncthreads()` after the
+// write (not needed in the standalone combine kernel, since there both
+// operands are already-published global inputs) makes every thread's own
+// row visible before any thread starts the row-streaming read.
+extern "C" __global__ __launch_bounds__(256) void gdn_group_scan_f32(
+        float* __restrict__ prefix_a_out, float* __restrict__ prefix_b_out,
+        float* __restrict__ group_a_out, float* __restrict__ group_b_out,
+        const float* __restrict__ a_in, const float* __restrict__ b_in,
+        int heads, int n_chunks, int group_size) {
+    const int head = blockIdx.x;
+    const int group = blockIdx.y;
+    const int lane = threadIdx.x;
+    const int d1 = lane / 2;
+    const int part = lane % 2;
+    const int i0 = part * 64;
+
+    const int c_start = group * group_size;
+    if (c_start >= n_chunks) return;
+    const int c_end = min(c_start + group_size, n_chunks);
+
+    extern __shared__ float gdn_gs_smem[];
+    float* row_a = gdn_gs_smem;         // [GDN_DK]
+    float* row_b = row_a + GDN_DK;      // [GDN_DV]
+
+    float pa[64];
+    float pb[64];
+#pragma unroll
+    for (int r = 0; r < 64; ++r) {
+        const int d2 = i0 + r;
+        pa[r] = (d1 == d2) ? 1.0f : 0.0f;
+        pb[r] = 0.0f;
+    }
+
+    for (int c = c_start; c < c_end; ++c) {
+        float* pa_out_c = prefix_a_out + ((size_t)c * heads + head) * GDN_DK * GDN_DK;
+        float* pb_out_c = prefix_b_out + ((size_t)c * heads + head) * GDN_DK * GDN_DV;
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            const int d2 = i0 + r;
+            pa_out_c[d1 * GDN_DK + d2] = pa[r];
+            pb_out_c[d1 * GDN_DV + d2] = pb[r];
+        }
+        __syncthreads();
+
+        const float* a_c = a_in + ((size_t)c * heads + head) * GDN_DK * GDN_DK;
+        const float* b_c = b_in + ((size_t)c * heads + head) * GDN_DK * GDN_DV;
+
+        float new_pa[64];
+        float new_pb[64];
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            new_pa[r] = 0.0f;
+            new_pb[r] = 0.0f;
+        }
+
+        for (int e = 0; e < GDN_DK; ++e) {
+            if (lane < GDN_DK) {
+                row_a[lane] = pa_out_c[e * GDN_DK + lane];
+            }
+            if (lane < GDN_DV) {
+                row_b[lane] = pb_out_c[e * GDN_DV + lane];
+            }
+            __syncthreads();
+
+            const float a_val = a_c[d1 * GDN_DK + e];
+#pragma unroll
+            for (int r = 0; r < 64; ++r) {
+                const int d2 = i0 + r;
+                new_pa[r] += a_val * row_a[d2];
+                new_pb[r] += a_val * row_b[d2];
+            }
+            __syncthreads();
+        }
+
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            const int d2 = i0 + r;
+            pa[r] = new_pa[r];
+            pb[r] = new_pb[r] + b_c[d1 * GDN_DV + d2];
+        }
+    }
+
+    float* ga_out = group_a_out + ((size_t)group * heads + head) * GDN_DK * GDN_DK;
+    float* gb_out = group_b_out + ((size_t)group * heads + head) * GDN_DK * GDN_DV;
+#pragma unroll
+    for (int r = 0; r < 64; ++r) {
+        const int d2 = i0 + r;
+        ga_out[d1 * GDN_DK + d2] = pa[r];
+        gb_out[d1 * GDN_DV + d2] = pb[r];
+    }
+}
+
 extern "C" __global__ __launch_bounds__(256) void gdn_chunk_state_f32(
         float* __restrict__ delta_out, float* __restrict__ s_before_out,
         float* __restrict__ state, const float* __restrict__ w_in,

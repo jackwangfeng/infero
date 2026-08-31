@@ -720,6 +720,63 @@ impl Kernels {
         Ok(())
     }
 
+    /// The group-local scan: `n_groups` blocks a head instead of 1, each
+    /// walking its own `group_size`-chunk range sequentially via
+    /// `gdn_ab_combine_f32`'s own row-streaming combine, reused rather than
+    /// reimplemented. See `gdn_group_scan_f32`'s own doc comment in `gdn.cu`
+    /// for the full design and why it reuses `prefix_a`/`prefix_b`
+    /// (required output, not just scratch) as its row-streaming source
+    /// instead of new register-to-shared staging.
+    ///
+    /// `prefix_a`/`prefix_b` (sized `n_chunks*heads*128*128` /
+    /// `n_chunks*heads*128*128`) receive every chunk's own incoming prefix
+    /// transform, needed by the not-yet-built final correction pass.
+    /// `group_a`/`group_b` (sized `n_groups*heads*128*128`) receive each
+    /// group's own total transform, needed by the not-yet-built cross-group
+    /// combine. `n_groups = n_chunks.div_ceil(group_size)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_group_scan(
+        &self,
+        prefix_a: &mut ViewMut<'_, f32>,
+        prefix_b: &mut ViewMut<'_, f32>,
+        group_a: &mut ViewMut<'_, f32>,
+        group_b: &mut ViewMut<'_, f32>,
+        a_in: &View<'_, f32>,
+        b_in: &View<'_, f32>,
+        heads: usize,
+        n_chunks: usize,
+        group_size: usize,
+    ) -> Result<()> {
+        const GDN_DK: usize = 128;
+        let f32_size = std::mem::size_of::<f32>();
+        let n_groups = n_chunks.div_ceil(group_size).max(1);
+        let f = self.dev.kernels().get("infero_gdn", gdn_src(), "gdn_group_scan_f32")?;
+        let shared = (2 * GDN_DK * f32_size) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (heads as u32, n_groups as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let (h, nc, gs) = (heads as i32, n_chunks as i32, group_size as i32);
+        let mut bl = self.dev.stream().launch_builder(&f);
+        bl.arg(&mut *prefix_a)
+            .arg(&mut *prefix_b)
+            .arg(&mut *group_a)
+            .arg(&mut *group_b)
+            .arg(a_in)
+            .arg(b_in)
+            .arg(&h)
+            .arg(&nc)
+            .arg(&gs);
+        self.dev
+            .profile()
+            .time("gdn_group_scan", self.dev.stream(), || {
+                unsafe { bl.launch(cfg) }.context("gdn_group_scan")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     /// Diagnostic-only standalone wrapper for the plain, unmodified
     /// `gdn_chunk_uw_f32` (kernel 1 alone, no `A`/`B` extension) -- built to
     /// check whether a real, direct-against-a-host-reference bug found

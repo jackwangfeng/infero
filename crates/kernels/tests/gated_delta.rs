@@ -1526,6 +1526,154 @@ fn the_ab_combine_matches_a_host_matmul() -> Result<()> {
     Ok(())
 }
 
+/// `gdn_group_scan_f32` -- one group (`group_size` large enough to cover
+/// every chunk in one block) walking `N` chunks of plain random `(A,B)`
+/// pairs sequentially, checked against a host-computed sequential scan
+/// using the exact same combine rule `the_ab_combine_matches_a_host_matmul`
+/// already verified. Checks BOTH outputs: `prefix[c]` (the running
+/// transform BEFORE chunk `c`, needed by the not-yet-built correction pass)
+/// and the final group total (needed by the not-yet-built cross-group
+/// combine). Pure random `(A,B)` inputs, not real GDN data -- this is a
+/// test of the scan's own loop/indexing correctness, not of GDN's math
+/// (already covered by `the_chunk_ab_affine_recurrence_matches_a_host_reference`).
+#[test]
+fn the_group_scan_matches_a_host_sequential_scan() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    const DK: usize = 128;
+    const DV: usize = 128;
+    let n_chunks = 5usize;
+    let heads = 1usize;
+    // Deliberately smaller than `n_chunks`: 3 groups ([0,2), [2,4), [4,5)),
+    // exercising the actual point of this kernel (multiple independent
+    // blocks a head), not just a single group covering everything.
+    let group_size = 2usize;
+    let n_groups = n_chunks.div_ceil(group_size);
+
+    let mut a_all = vec![0.0f32; n_chunks * DK * DK];
+    let mut b_all = vec![0.0f32; n_chunks * DK * DV];
+    for c in 0..n_chunks {
+        let ac = pseudo_random(DK * DK, 0xf001 + c as u64);
+        let bc = pseudo_random(DK * DV, 0xf101 + c as u64);
+        a_all[c * DK * DK..(c + 1) * DK * DK].copy_from_slice(&ac);
+        b_all[c * DK * DV..(c + 1) * DK * DV].copy_from_slice(&bc);
+    }
+
+    let da = stream.clone_htod(&a_all)?;
+    let db = stream.clone_htod(&b_all)?;
+    let mut prefix_a = stream.alloc_zeros::<f32>(n_chunks * DK * DK)?;
+    let mut prefix_b = stream.alloc_zeros::<f32>(n_chunks * DK * DV)?;
+    let mut group_a = stream.alloc_zeros::<f32>(n_groups * DK * DK)?;
+    let mut group_b = stream.alloc_zeros::<f32>(n_groups * DK * DV)?;
+    k.gdn_group_scan(
+        &mut prefix_a.as_view_mut(),
+        &mut prefix_b.as_view_mut(),
+        &mut group_a.as_view_mut(),
+        &mut group_b.as_view_mut(),
+        &da.as_view(),
+        &db.as_view(),
+        heads,
+        n_chunks,
+        group_size,
+    )?;
+    k.device().synchronize()?;
+    let got_prefix_a = stream.clone_dtoh(&prefix_a)?;
+    let got_prefix_b = stream.clone_dtoh(&prefix_b)?;
+    let got_group_a = stream.clone_dtoh(&group_a)?;
+    let got_group_b = stream.clone_dtoh(&group_b)?;
+
+    // Host sequential scan: same combine rule as the standalone combine
+    // test (A_new = A(c) @ A_running, B_new = A(c) @ B_running + B(c)),
+    // starting from (Identity, 0).
+    let combine = |a_run: &[f32], b_run: &[f32], ac: &[f32], bc: &[f32]| -> (Vec<f32>, Vec<f32>) {
+        let mut a_new = vec![0.0f32; DK * DK];
+        let mut b_new = vec![0.0f32; DK * DV];
+        for d1 in 0..DK {
+            for d2 in 0..DK {
+                let mut acc = 0.0f32;
+                for e in 0..DK {
+                    acc += ac[d1 * DK + e] * a_run[e * DK + d2];
+                }
+                a_new[d1 * DK + d2] = acc;
+            }
+            for d2 in 0..DV {
+                let mut acc = 0.0f32;
+                for e in 0..DK {
+                    acc += ac[d1 * DK + e] * b_run[e * DV + d2];
+                }
+                b_new[d1 * DV + d2] = acc + bc[d1 * DV + d2];
+            }
+        }
+        (a_new, b_new)
+    };
+
+    let identity_a = |d1: usize, d2: usize| if d1 == d2 { 1.0f32 } else { 0.0f32 };
+
+    for group in 0..n_groups {
+        let c_start = group * group_size;
+        let c_end = (c_start + group_size).min(n_chunks);
+
+        // Reset to (Identity, 0) at the START of each group's own range --
+        // groups run independently, none inherit a predecessor's state.
+        let mut want_a = vec![0.0f32; DK * DK];
+        let mut want_b = vec![0.0f32; DK * DV];
+        for d1 in 0..DK {
+            for d2 in 0..DK {
+                want_a[d1 * DK + d2] = identity_a(d1, d2);
+            }
+        }
+
+        for c in c_start..c_end {
+            let want_prefix_slice_a = &got_prefix_a[c * DK * DK..(c + 1) * DK * DK];
+            let want_prefix_slice_b = &got_prefix_b[c * DK * DV..(c + 1) * DK * DV];
+            let (aworst, aat) = max_abs_diff(want_prefix_slice_a, &want_a);
+            let apeak = want_a.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-6);
+            assert!(
+                aworst < 1e-3 * apeak,
+                "group {group} chunk {c}'s prefix A diverged by {aworst:.2e} at {aat}: \
+                 got {}, want {}",
+                want_prefix_slice_a[aat],
+                want_a[aat]
+            );
+            let (bworst, bat) = max_abs_diff(want_prefix_slice_b, &want_b);
+            let bpeak = want_b.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-6);
+            assert!(
+                bworst < 1e-3 * bpeak,
+                "group {group} chunk {c}'s prefix B diverged by {bworst:.2e} at {bat}: \
+                 got {}, want {}",
+                want_prefix_slice_b[bat],
+                want_b[bat]
+            );
+
+            let ac = &a_all[c * DK * DK..(c + 1) * DK * DK];
+            let bc = &b_all[c * DK * DV..(c + 1) * DK * DV];
+            let (na, nb) = combine(&want_a, &want_b, ac, bc);
+            want_a = na;
+            want_b = nb;
+        }
+
+        let got_ga = &got_group_a[group * DK * DK..(group + 1) * DK * DK];
+        let got_gb = &got_group_b[group * DK * DV..(group + 1) * DK * DV];
+        let (gaworst, gaat) = max_abs_diff(got_ga, &want_a);
+        let gapeak = want_a.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-6);
+        assert!(
+            gaworst < 1e-3 * gapeak,
+            "group {group}'s total A diverged by {gaworst:.2e} at {gaat}: got {}, want {}",
+            got_ga[gaat],
+            want_a[gaat]
+        );
+        let (gbworst, gbat) = max_abs_diff(got_gb, &want_b);
+        let gbpeak = want_b.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-6);
+        assert!(
+            gbworst < 1e-3 * gbpeak,
+            "group {group}'s total B diverged by {gbworst:.2e} at {gbat}: got {}, want {}",
+            got_gb[gbat],
+            want_b[gbat]
+        );
+    }
+    Ok(())
+}
+
 /// The batch properties, held against the fallback kernel by name.
 ///
 /// `two_sequences_in_one_batch_keep_separate_state` above now exercises the
