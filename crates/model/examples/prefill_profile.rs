@@ -15,7 +15,15 @@ fn main() -> Result<()> {
     let n_tokens: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(30500);
 
     let dev = infero_cuda::Device::new(0)?;
-    let max_seq = (n_tokens + 128).next_power_of_two().max(8192);
+    // Floor overridable via `INFERO_PREFILL_MIN_SEQ` for memory-constrained
+    // runs on a shared GPU -- the KV pool is preallocated at this size
+    // regardless of `n_tokens`, so a busy box can need a smaller floor to
+    // fit at all even for a short diagnostic run.
+    let min_seq: usize = std::env::var("INFERO_PREFILL_MIN_SEQ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8192);
+    let max_seq = (n_tokens + 128).next_power_of_two().max(min_seq);
     let mut model = Model::load_awq(dev, &dir, max_seq, KvCacheQuant::F16, 32)?;
 
     // Token id 100 for every position: content doesn't matter, only the shape
