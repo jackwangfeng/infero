@@ -3254,19 +3254,52 @@ impl Model {
                 // in `ops.cu` for the full byte-exact shared-memory accounting
                 // and why two prior widening attempts (`_ws2`, `_ws3`) failed.
                 if let Some(run_tokens) = prefill_run.filter(|_| self.kern.prefill_attention(&dims)) {
-                    self.kern.attn_prefill_ws4(
-                        &mut attn_out.slice_mut(..n * da),
-                        &self.act.q.slice(..n * da),
-                        &pool.dense(layer).0.as_view(),
-                        &pool.dense(layer).1.as_view(),
-                        batch,
-                        dims,
-                        0,
-                        run_tokens,
-                        kv_len,
-                        attn_scale,
-                        &mut partial.as_view_mut(),
-                    )?;
+                    // T=6 of the decoupled-role attention family: a real,
+                    // register-checked, correctness-tested (against the
+                    // three-kernel reference), memcheck/racecheck-clean
+                    // (0 hazards), and reproduced-twice real end-to-end win
+                    // over `ws4` (1.082x, 1827ms vs 1976ms on the
+                    // 16-layer/30552-token benchmark) -- see
+                    // `attn_prefill_decoupled6_f16acc_regcheck_f32`'s doc
+                    // comment in `ops.cu`. Fixed at `d_head=256`
+                    // (`ATTN_DSPLIT_HALF_NTILES` assumes it), unlike `ws4`
+                    // which `prefill_attention` allows up to 256 but does
+                    // not require exactly -- guarded here explicitly. No
+                    // multi-chunk (`partial`) path of its own yet, unlike
+                    // `ws4`'s `grid.z` chunking for small-`n_tiles`/huge-
+                    // `kv_len` shapes -- fine for this checkpoint's real
+                    // batch sizes (already exercises multi-chunk `ws4`
+                    // internally in the very benchmark that measured this
+                    // win), but not yet generalized. `INFERO_PREFILL_T6=0`
+                    // falls back to `ws4` if this needs to be rolled back.
+                    if dims.d_head == 256 && !std::env::var("INFERO_PREFILL_T6").is_ok_and(|v| v == "0") {
+                        self.kern.attn_prefill_decoupled6_f16acc(
+                            &mut attn_out.slice_mut(..n * da),
+                            &self.act.q.slice(..n * da),
+                            &pool.dense(layer).0.as_view(),
+                            &pool.dense(layer).1.as_view(),
+                            batch,
+                            dims,
+                            0,
+                            run_tokens,
+                            kv_len,
+                            attn_scale,
+                        )?;
+                    } else {
+                        self.kern.attn_prefill_ws4(
+                            &mut attn_out.slice_mut(..n * da),
+                            &self.act.q.slice(..n * da),
+                            &pool.dense(layer).0.as_view(),
+                            &pool.dense(layer).1.as_view(),
+                            batch,
+                            dims,
+                            0,
+                            run_tokens,
+                            kv_len,
+                            attn_scale,
+                            &mut partial.as_view_mut(),
+                        )?;
+                    }
                 } else if !std::env::var("INFERO_DECODE_ATTN").is_ok_and(|v| v == "0")
                     && self.kern.decode_attention(&dims, kv_len)
                 {
