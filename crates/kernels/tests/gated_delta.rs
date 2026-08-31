@@ -1225,6 +1225,233 @@ fn the_three_kernel_split_matches_the_reference() -> Result<()> {
     Ok(())
 }
 
+/// `gdn_chunk_ab_f32` -- the `(A, B)` affine-recurrence pair,
+/// `S(c+1) = A(c)@S(c) + B(c)`, computed from an already-run
+/// `gdn_chunk_uw_only` call's own `W`/`U` output. Verified against a
+/// HOST-computed `A`/`B` built from that SAME downloaded `W`/`U` plus `K`/`g`
+/// -- this isolates exactly the one thing that's actually new here (the
+/// `A = decay*I - Kd@W`, `B = Kd@U` formula itself), consistent with
+/// `verify_linear_recurrence.py`'s own derivation (see
+/// project_infero_perf_gap.md memory for that numerical check). Also checks
+/// `gdn_chunk_uw_only`'s own `W`/`U` output directly against a from-scratch
+/// host recomputation (forward substitution + WY), since no other test in
+/// this file checks `W`/`U` directly rather than through the full pipeline's
+/// final output.
+///
+/// `w`/`u`/`a`/`b` are all sized for the FULL `VAL_HEADS`, not just head 0,
+/// even though only head 0 is checked -- both kernels grid over `heads`
+/// blocks (`(chunk*heads+head)*...`), so a buffer sized for one head lets
+/// every OTHER head's block write out of bounds. Undersizing these exact
+/// buffers produced a real, long, confusing debugging session while writing
+/// this test: heads 1..11's out-of-bounds writes corrupted whatever GPU
+/// memory the allocator placed next (in practice, the LATER-allocated `a`/
+/// `b` buffers), which looked exactly like `gdn_chunk_uw_f32`'s own,
+/// already-shipped `U` output being wrong -- an early, narrower debug probe
+/// (checking `u` right after computing it, before `a`/`b` existed to be
+/// corrupted) showed it as correct, which was the real tell once connected
+/// to the later failures. It never was wrong; only this test's own buffer
+/// sizing was. Single chunk (`t_len < GDN_CHUNK`) -- this test is about the
+/// formula, not multi-chunk sequencing, which the 3-kernel-split tests
+/// already cover for `W`/`U`.
+#[test]
+fn the_chunk_ab_affine_recurrence_matches_a_host_reference() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    let t_len = 13usize;
+    const GDN_CHUNK: usize = 32;
+
+    let q_small = pseudo_random(t_len * KEY_HEADS * DK, 0xd001);
+    let k_small = pseudo_random(t_len * KEY_HEADS * DK, 0xd002);
+    let v = pseudo_random(t_len * VAL_HEADS * DV, 0xd003);
+    let g = decaying(t_len * VAL_HEADS, 0xd004, 0.7);
+    let beta = betas(t_len * VAL_HEADS, 0xd005);
+    let (row, off) = packed(&q_small, &k_small, &v, t_len);
+
+    let chunk = stream.clone_htod(&row)?;
+    let hg = stream.clone_htod(&g)?;
+    let hb = stream.clone_htod(&beta)?;
+    let f = stream.clone_htod(&[0i32])?;
+    let n = stream.clone_htod(&[t_len as i32])?;
+    let seqs = infero_kernels::gdn::SeqLayout {
+        first_token: &f.as_view(),
+        n_tokens: &n.as_view(),
+        n_seqs: 1,
+        total_tokens: t_len,
+    };
+
+    // Sized for ALL `VAL_HEADS` heads, not just head 0 -- the kernel grids
+    // over `heads` blocks (`(chunk*heads+head)*GDN_CHUNK*GDN_DV`), so a
+    // buffer sized for one head only lets every OTHER head's block write
+    // out of bounds. This exact bug produced a real, deeply confusing
+    // false alarm while building this test: heads 1..11's out-of-bounds
+    // writes corrupted whatever GPU memory the allocator placed next,
+    // which looked like `gdn_chunk_uw_f32`'s own `U` output being wrong --
+    // it wasn't; head 0's own write was always correct, only this buffer's
+    // undersizing was not.
+    let mut w = stream.alloc_zeros::<f32>(VAL_HEADS * GDN_CHUNK * DK)?;
+    let mut u = stream.alloc_zeros::<f32>(VAL_HEADS * GDN_CHUNK * DV)?;
+    k.gdn_chunk_uw_only(
+        &mut w.as_view_mut(),
+        &mut u.as_view_mut(),
+        &chunk.as_view(),
+        &hg.as_view(),
+        &hb.as_view(),
+        &seqs,
+        VAL_HEADS,
+        KEY_HEADS,
+        DK,
+        DV,
+        off,
+        false,
+    )?;
+    k.device().synchronize()?;
+    let got_w = stream.clone_dtoh(&w)?;
+    let got_u = stream.clone_dtoh(&u)?;
+
+    let mut a = stream.alloc_zeros::<f32>(VAL_HEADS * DK * DK)?;
+    let mut b = stream.alloc_zeros::<f32>(VAL_HEADS * DK * DV)?;
+    k.gdn_chunk_ab(
+        &mut a.as_view_mut(),
+        &mut b.as_view_mut(),
+        &w.as_view(),
+        &u.as_view(),
+        &chunk.as_view(),
+        &hg.as_view(),
+        &seqs,
+        VAL_HEADS,
+        KEY_HEADS,
+        DK,
+        DV,
+        off,
+        false,
+    )?;
+    k.device().synchronize()?;
+    let got_a = stream.clone_dtoh(&a)?;
+    let got_b = stream.clone_dtoh(&b)?;
+
+    // Host reference: only head 0's own K and cumulative g (single-head
+    // slice of the packed row/g buffers this kernel itself would read).
+    let (stride, _q_off, k_off, _v_off) = off;
+    let head = 0usize;
+    let khead = head / (VAL_HEADS / KEY_HEADS);
+    let mut kmat = vec![0.0f32; t_len * DK];
+    for t in 0..t_len {
+        for d in 0..DK {
+            kmat[t * DK + d] = row[t * stride + k_off + khead * DK + d];
+        }
+    }
+    let mut gc = vec![0.0f32; t_len];
+    let mut acc = 0.0f32;
+    for t in 0..t_len {
+        acc += g[t * VAL_HEADS + head];
+        gc[t] = acc;
+    }
+    let decay_whole = gc[t_len - 1].exp();
+    let df: Vec<f32> = gc.iter().map(|&x| (gc[t_len - 1] - x).exp()).collect();
+
+    // Independently recompute W/U via the full forward-substitution
+    // algorithm (system matrix -> (I+A)^-1 -> WY) to check `got_w`/`got_u`
+    // directly, not just indirectly through A/B.
+    let hbeta: Vec<f32> = (0..t_len).map(|t| beta[t * VAL_HEADS + head]).collect();
+    let mut amat = vec![0.0f32; t_len * t_len];
+    for i in 0..t_len {
+        for kk in 0..i {
+            let mut dot = 0.0f32;
+            for d in 0..DK {
+                dot += kmat[i * DK + d] * kmat[kk * DK + d];
+            }
+            amat[i * t_len + kk] = hbeta[i] * (gc[i] - gc[kk]).exp() * dot;
+        }
+    }
+    let mut ainv = vec![0.0f32; t_len * t_len];
+    for i in 0..t_len {
+        for kk in 0..=i {
+            let mut acc2 = if i == kk { 1.0f32 } else { 0.0f32 };
+            for m in kk..i {
+                acc2 -= amat[i * t_len + m] * ainv[m * t_len + kk];
+            }
+            ainv[i * t_len + kk] = acc2;
+        }
+    }
+    let sbg: Vec<f32> = (0..t_len).map(|t| hbeta[t] * gc[t].exp()).collect();
+    let vdim = VAL_HEADS * DV;
+    let mut want_w = vec![0.0f32; t_len * DK];
+    let mut want_u = vec![0.0f32; t_len * DV];
+    for i in 0..t_len {
+        for d in 0..DK {
+            let mut wacc = 0.0f32;
+            for kk in 0..=i {
+                wacc += ainv[i * t_len + kk] * sbg[kk] * kmat[kk * DK + d];
+            }
+            want_w[i * DK + d] = wacc;
+        }
+        for d in 0..DV {
+            let mut uacc = 0.0f32;
+            for kk in 0..=i {
+                uacc += ainv[i * t_len + kk] * hbeta[kk] * v[kk * vdim + head * DV + d];
+            }
+            want_u[i * DV + d] = uacc;
+        }
+    }
+    let (wworst, wat) = max_abs_diff(&got_w[..t_len * DK], &want_w);
+    let wpeak = want_w.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(
+        wworst < 1e-3 * wpeak.max(1e-6),
+        "gdn_chunk_uw_only's W diverged from the host reference by {wworst:.2e} at {wat}:          got {}, want {}",
+        got_w[wat],
+        want_w[wat]
+    );
+    let (uworst, uat) = max_abs_diff(&got_u[..t_len * DV], &want_u);
+    let upeak = want_u.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(
+        uworst < 1e-3 * upeak.max(1e-6),
+        "gdn_chunk_uw_only's U diverged from the host reference by {uworst:.2e} at {uat}: \
+         got {}, want {}",
+        got_u[uat],
+        want_u[uat]
+    );
+
+    // Now check A/B, built from `got_w`/`got_u` (already verified above) --
+    // isolates the new formula itself from W/U's own correctness.
+    let mut want_a = vec![0.0f32; DK * DK];
+    let mut want_b = vec![0.0f32; DK * DV];
+    for d1 in 0..DK {
+        for d2 in 0..DK {
+            let mut acc_a = 0.0f32;
+            let mut acc_b = 0.0f32;
+            for t in 0..t_len {
+                let kd = kmat[t * DK + d1] * df[t];
+                acc_a += kd * got_w[t * DK + d2];
+                acc_b += kd * got_u[t * DV + d2];
+            }
+            want_a[d1 * DK + d2] = if d1 == d2 { decay_whole } else { 0.0 } - acc_a;
+            want_b[d1 * DV + d2] = acc_b;
+        }
+    }
+
+    // Head 0's own slice only -- `got_a`/`got_b` (like `got_w`/`got_u`) are
+    // sized for all `VAL_HEADS` heads, since the kernel grids over all of
+    // them; head 0's data sits at offset 0 regardless.
+    let (aworst, aat) = max_abs_diff(&got_a[..DK * DK], &want_a);
+    let apeak = want_a.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(
+        aworst < 1e-3 * apeak.max(1e-6),
+        "A diverged from the host reference by {aworst:.2e} at {aat}: got {}, want {}",
+        got_a[aat],
+        want_a[aat]
+    );
+    let (bworst, bat) = max_abs_diff(&got_b[..DK * DV], &want_b);
+    let bpeak = want_b.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(
+        bworst < 1e-3 * bpeak.max(1e-6),
+        "B diverged from the host reference by {bworst:.2e} at {bat}: got {}, want {}",
+        got_b[bat],
+        want_b[bat]
+    );
+    Ok(())
+}
+
+
 /// The batch properties, held against the fallback kernel by name.
 ///
 /// `two_sequences_in_one_batch_keep_separate_state` above now exercises the

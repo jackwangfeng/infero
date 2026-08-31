@@ -1450,20 +1450,117 @@ extern "C" __global__ __launch_bounds__(256) void gdn_chunk_uw_f32(
     }
 }
 
-// Kernel 2 of 3: sequential over chunks, gridded over `heads` only (the same
-// ceiling `gdn_delta_rule_reg128_f32` has) -- but now touching only the
-// CHEAP part of each chunk: `pred = W @ S_before`, `delta = U - pred`
-// (`chunk_delta_h.py:174-197`), and the state carry-forward itself
-// (`chunk_delta_h.py:216-228,276-298`). No forward substitution here at
-// all -- that already happened, once, in kernel 1 -- so this kernel's own
-// per-chunk work has none of `gdn_chunk_delta_rule_f32`'s O(GDN_CHUNK)
-// sequential `__syncwarp()` micro-barriers, only O(1) barriers a chunk.
-// Writes `S_before` (the incoming state, BEFORE this chunk's update) for
-// kernel 3's history term -- the real, accepted VRAM cost this design pays
-// (`n_chunks` copies of a full `[GDN_DK, GDN_DV]` state matrix a head) for
-// letting kernel 3 run with no cross-chunk dependency at all. Needs K again
-// (for the state-advance step) -- a real, small, accepted redundant load
-// against kernel 1's own K read.
+// A separate, isolated kernel computing the per-chunk affine-recurrence
+// pair `(A(c), B(c))` such that `S(c+1) = A(c) @ S(c) + B(c)` exactly --
+// verified algebraically and numerically (`verify_linear_recurrence.py`,
+// max abs diff ~2e-15 against the direct formula, and the `(A,B)` combine
+// rule itself confirmed associative to ~3e-14) before writing a single line
+// of this kernel; see the derivation and the associative-scan implication in
+// project_infero_perf_gap.md memory. `A = decay_whole*I - Kd@W`,
+// `B = Kd@U`, where `Kd[d,t] = K[t,d]*exp(gc_last - gc_t)` -- both fully
+// determined by this chunk's own K/W/U/decay, zero dependency on the actual
+// running state, so this stays exactly as parallel (`chunks*heads` grid, no
+// cross-chunk dependency) as `gdn_chunk_uw_f32` itself.
+//
+// Reads `W`/`U` back from GLOBAL memory (kernel 1's own already-written
+// output) rather than being fused into kernel 1's body -- kept separate for
+// the ordinary reason (kernel 1 stays untouched and independently testable,
+// following this session's own "validate the risky piece in isolation"
+// discipline), not because of a real bug found in a fused version. An
+// earlier, fused attempt at this same computation DID appear to produce a
+// wrong `B` in testing, but the actual root cause -- found after a long,
+// otherwise-inconclusive debugging session -- turned out to be a test-buffer
+// sizing bug (the test's `w`/`u`/`a`/`b` scratch buffers were sized for one
+// head while the kernel grids over all of them, so every other head's block
+// wrote out of bounds and corrupted whichever buffer the allocator placed
+// next). Neither kernel 1 nor a straightforward fused version of this
+// computation were ever actually wrong; see
+// `the_chunk_ab_affine_recurrence_matches_a_host_reference`'s own doc
+// comment in `gated_delta.rs` for the full account, kept because the
+// specific way this manifested (a real kernel's real, validated output
+// looking wrong purely from an unrelated test's buffer-sizing mistake) is
+// worth remembering.
+//
+// This is the ENABLING step for a real parallel-scan solve of kernel 2's
+// own sequential recurrence -- not the scan itself, which still needs a
+// real group-local-scan + cross-group-combine + parallel-correction
+// pipeline built on top of this kernel's own `(A, B)` output. Not yet wired
+// into the real 3-kernel pipeline.
+extern "C" __global__ __launch_bounds__(256) void gdn_chunk_ab_f32(
+        float* __restrict__ a_out, float* __restrict__ b_out,
+        const float* __restrict__ w_in, const float* __restrict__ u_in,
+        const float* __restrict__ qkv, const float* __restrict__ g,
+        const int* __restrict__ first_token, const int* __restrict__ n_tok,
+        int heads, int key_heads, int dk, int dv,
+        int stride, int k_off, int v_tiled) {
+    (void)dk;
+    (void)dv;
+    const int head = blockIdx.x;
+    const int chunk = blockIdx.y;
+    const int seq = 0;
+    const int nt = n_tok[seq];
+    const int c0 = chunk * GDN_CHUNK;
+    if (c0 >= nt) return;
+    const int t0 = first_token[seq];
+    const int C = min(GDN_CHUNK, nt - c0);
+    const int lane = threadIdx.x;
+    const int khead = v_tiled ? (head % key_heads) : (head / (heads / key_heads));
+
+    extern __shared__ char gdn_ab_smem[];
+    float* sk = (float*)gdn_ab_smem;               // [GDN_CHUNK][GDN_ROW_PAD]
+    float* sgc = sk + GDN_CHUNK * GDN_ROW_PAD;     // [GDN_CHUNK]
+    float* sdf = sgc + GDN_CHUNK;                  // [GDN_CHUNK]
+    float* sw = sdf + GDN_CHUNK;                   // [GDN_CHUNK][GDN_ROW_PAD]
+    float* su = sw + GDN_CHUNK * GDN_ROW_PAD;      // [GDN_CHUNK][GDN_ROW_PAD]
+
+    for (int idx = lane; idx < C * GDN_DK; idx += blockDim.x) {
+        const int r = idx / GDN_DK, d = idx % GDN_DK;
+        const float* row = qkv + (size_t)(t0 + c0 + r) * stride;
+        sk[r * GDN_ROW_PAD + d] = row[k_off + (size_t)khead * GDN_DK + d];
+    }
+    const float* w_chunk = w_in + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DK;
+    const float* u_chunk = u_in + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DV;
+    for (int idx = lane; idx < C * GDN_DK; idx += blockDim.x) {
+        const int r = idx / GDN_DK, d = idx % GDN_DK;
+        sw[r * GDN_ROW_PAD + d] = w_chunk[r * GDN_DK + d];
+        su[r * GDN_ROW_PAD + d] = u_chunk[r * GDN_DV + d];
+    }
+    if (lane == 0) {
+        float acc = 0.0f;
+        for (int r = 0; r < C; ++r) {
+            acc += g[(size_t)(t0 + c0 + r) * heads + head];
+            sgc[r] = acc;
+        }
+    }
+    __syncthreads();
+
+    if (lane < C) {
+        sdf[lane] = __expf(sgc[C - 1] - sgc[lane]);
+    }
+    __syncthreads();
+
+    // A[d1][d2] = decay_whole*(d1==d2) - sum_t K[t,d1]*df[t]*W[t,d2]
+    // B[d1][d2] = sum_t K[t,d1]*df[t]*U[t,d2]
+    const int d1 = lane / 2;
+    const int part2 = lane % 2;
+    const int i0b = part2 * 64;
+    const float decay_whole = __expf(sgc[C - 1]);
+    float* a_chunk = a_out + ((size_t)chunk * heads + head) * GDN_DK * GDN_DK;
+    float* b_chunk = b_out + ((size_t)chunk * heads + head) * GDN_DK * GDN_DV;
+#pragma unroll
+    for (int r = 0; r < 64; ++r) {
+        const int d2 = i0b + r;
+        float a_acc = 0.0f, b_acc = 0.0f;
+        for (int t = 0; t < C; ++t) {
+            const float kd = sk[t * GDN_ROW_PAD + d1] * sdf[t];
+            a_acc += kd * sw[t * GDN_ROW_PAD + d2];
+            b_acc += kd * su[t * GDN_ROW_PAD + d2];
+        }
+        a_chunk[d1 * GDN_DK + d2] = ((d1 == d2) ? decay_whole : 0.0f) - a_acc;
+        b_chunk[d1 * GDN_DV + d2] = b_acc;
+    }
+}
+
 extern "C" __global__ __launch_bounds__(256) void gdn_chunk_state_f32(
         float* __restrict__ delta_out, float* __restrict__ s_before_out,
         float* __restrict__ state, const float* __restrict__ w_in,

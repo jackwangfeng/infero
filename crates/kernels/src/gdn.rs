@@ -606,6 +606,155 @@ impl Kernels {
         Ok(())
     }
 
+    /// A separate, isolated kernel computing the per-chunk affine-recurrence
+    /// pair `(A(c), B(c))` such that `S(c+1) = A(c)@S(c) + B(c)` exactly --
+    /// the enabling step for a real parallel-scan solve of kernel 2's own
+    /// sequential recurrence, not the scan itself. See `gdn_chunk_ab_f32`'s
+    /// own doc comment in `gdn.cu` for the full derivation, why it's
+    /// verified rather than speculative, AND why this reads `w`/`u` back
+    /// from an already-run [`Self::gdn_chunk_uw_only`] call instead of being
+    /// fused into that kernel's own body -- a fused version produced a
+    /// real, confirmed-wrong `B` that this isolated design does not
+    /// reproduce. `a`/`b` must be sized `n_chunks*heads*128*128` each
+    /// (`f32`); `w`/`u` must already hold kernel 1's own output for the same
+    /// chunks (sized `n_chunks*heads*32*128` each).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_chunk_ab(
+        &self,
+        a: &mut ViewMut<'_, f32>,
+        b: &mut ViewMut<'_, f32>,
+        w: &View<'_, f32>,
+        u: &View<'_, f32>,
+        qkv: &View<'_, f32>,
+        g: &View<'_, f32>,
+        seqs: &SeqLayout<'_>,
+        heads: usize,
+        key_heads: usize,
+        dk: usize,
+        dv: usize,
+        offsets: (usize, usize, usize, usize),
+        v_tiled: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(seqs.n_seqs == 1, "gdn_chunk_ab: single sequence only");
+        anyhow::ensure!(dk == 128 && dv == 128, "gdn_chunk_ab is instantiated for dk = dv = 128, got {dk}x{dv}");
+        let (stride, _q_off, k_off, _v_off) = offsets;
+        const GDN_CHUNK: usize = 32;
+        const GDN_DK: usize = 128;
+        const ROW_PAD: usize = GDN_DK + 4;
+        let n_chunks = seqs.total_tokens.div_ceil(GDN_CHUNK).max(1);
+        let f32_size = std::mem::size_of::<f32>();
+
+        let f = self.dev.kernels().get("infero_gdn", gdn_src(), "gdn_chunk_ab_f32")?;
+        let shared = (3 * GDN_CHUNK * ROW_PAD + 2 * GDN_CHUNK) * f32_size;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared as u32)?;
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (heads as u32, n_chunks as u32, 1),
+            block_dim: (2 * dv as u32, 1, 1),
+            shared_mem_bytes: shared as u32,
+        };
+        let (h, kh) = (heads as i32, key_heads as i32);
+        let (dka, dva) = (dk as i32, dv as i32);
+        let (st, ko) = (stride as i32, k_off as i32);
+        let vt = i32::from(v_tiled);
+        let mut bl = self.dev.stream().launch_builder(&f);
+        bl.arg(&mut *a)
+            .arg(&mut *b)
+            .arg(w)
+            .arg(u)
+            .arg(qkv)
+            .arg(g)
+            .arg(seqs.first_token)
+            .arg(seqs.n_tokens)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dka)
+            .arg(&dva)
+            .arg(&st)
+            .arg(&ko)
+            .arg(&vt);
+        self.dev
+            .profile()
+            .time("gdn_chunk_ab", self.dev.stream(), || {
+                unsafe { bl.launch(cfg) }.context("gdn_chunk_ab")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// Diagnostic-only standalone wrapper for the plain, unmodified
+    /// `gdn_chunk_uw_f32` (kernel 1 alone, no `A`/`B` extension) -- built to
+    /// check whether a real, direct-against-a-host-reference bug found
+    /// while testing `gdn_chunk_uw_ab_f32` also affects this already-
+    /// shipped kernel, since no existing test checks `W`/`U` directly (only
+    /// the full 3-kernel pipeline's final output, which may not surface the
+    /// same issue).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_chunk_uw_only(
+        &self,
+        w: &mut ViewMut<'_, f32>,
+        u: &mut ViewMut<'_, f32>,
+        qkv: &View<'_, f32>,
+        g: &View<'_, f32>,
+        beta: &View<'_, f32>,
+        seqs: &SeqLayout<'_>,
+        heads: usize,
+        key_heads: usize,
+        dk: usize,
+        dv: usize,
+        offsets: (usize, usize, usize, usize),
+        v_tiled: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(seqs.n_seqs == 1, "gdn_chunk_uw_only: single sequence only");
+        anyhow::ensure!(dk == 128 && dv == 128, "gdn_chunk_uw_only is instantiated for dk = dv = 128, got {dk}x{dv}");
+        let (stride, _q_off, k_off, v_off) = offsets;
+        const GDN_CHUNK: usize = 32;
+        const GDN_DK: usize = 128;
+        const ROW_PAD: usize = GDN_DK + 4;
+        const A_STRIDE: usize = GDN_CHUNK + 1;
+        let n_chunks = seqs.total_tokens.div_ceil(GDN_CHUNK).max(1);
+        let f32_size = std::mem::size_of::<f32>();
+
+        let f = self.dev.kernels().get("infero_gdn", gdn_src(), "gdn_chunk_uw_f32")?;
+        let shared = (2 * GDN_CHUNK * ROW_PAD + 3 * GDN_CHUNK + GDN_CHUNK * A_STRIDE) * f32_size;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared as u32)?;
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (heads as u32, n_chunks as u32, 1),
+            block_dim: (2 * dv as u32, 1, 1),
+            shared_mem_bytes: shared as u32,
+        };
+        let (h, kh) = (heads as i32, key_heads as i32);
+        let (dka, dva) = (dk as i32, dv as i32);
+        let (st, ko, vo) = (stride as i32, k_off as i32, v_off as i32);
+        let vt = i32::from(v_tiled);
+        let mut bl = self.dev.stream().launch_builder(&f);
+        bl.arg(&mut *w)
+            .arg(&mut *u)
+            .arg(qkv)
+            .arg(g)
+            .arg(beta)
+            .arg(seqs.first_token)
+            .arg(seqs.n_tokens)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dka)
+            .arg(&dva)
+            .arg(&st)
+            .arg(&ko)
+            .arg(&vo)
+            .arg(&vt);
+        self.dev
+            .profile()
+            .time("gdn_chunk_uw_only", self.dev.stream(), || {
+                unsafe { bl.launch(cfg) }.context("gdn_chunk_uw_only")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     /// Three-kernel split of the chunked delta rule -- see the doc comment
     /// on `gdn_chunk_uw_f32` in `gdn.cu` for the full architecture and why
     /// it's a real, independent re-derivation of SGLang's own real
