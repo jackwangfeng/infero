@@ -9,11 +9,14 @@
 //! Shapes follow ggml's convention: a linear weight is `[n_out, k]` row-major,
 //! so `out[t, r] = dot(w[r, :], x[t, :])`.
 
+pub mod attn_backend;
 pub mod awq;
 #[cfg(feature = "cutlass")]
 pub mod cutlass_fp8;
 #[cfg(feature = "cutlass")]
 pub use cutlass_fp8::CutlassWeight;
+#[cfg(feature = "flash_attn2")]
+pub mod flash_attn2;
 pub mod fp8;
 pub mod gdn;
 pub mod turboquant;
@@ -25,6 +28,7 @@ use infero_gpu::{View, ViewMut, LaunchConfig, KernelArg};
 use half::f16;
 use infero_gpu::Device;
 
+pub use attn_backend::{AttentionBackend, AttnCallCtx, HardwareCaps};
 pub use BatchLayout as Batch;
 pub use turboquant::{Codebook, DeviceTables as TqTables, KvQuant};
 pub use weight::WeightType;
@@ -3388,6 +3392,141 @@ impl Kernels {
             .profile()
             .time("attn_prefill_ws4", self.dev.stream(), || {
                 unsafe { b.launch(cfg) }.context("attn_prefill_ws4")?;
+                Ok(())
+            })?;
+        if single == 1 {
+            return Ok(());
+        }
+
+        let total = (run_tokens * dims.n_heads * dims.d_head) as u32;
+        let (nt, nc) = (run_tokens as i32, n_chunks as i32);
+        let part = partial.as_view();
+        let r = self
+            .dev
+            .kernels()
+            .get("infero_ops", ops_src(), "attn_flash_reduce_f32")?;
+        let run_elems = run_tokens * dims.n_heads * dims.d_head;
+        let out_off = run_base * dims.n_heads * dims.d_head;
+        let mut out_run = out.slice_mut(out_off..out_off + run_elems);
+        let mut rb2 = self.dev.stream().launch_builder(&r);
+        rb2.arg(&mut out_run)
+            .arg(&part)
+            .arg(&ms_off)
+            .arg(&h)
+            .arg(&dh)
+            .arg(&nt)
+            .arg(&nc);
+        self.dev
+            .profile()
+            .time("attn_prefill_reduce", self.dev.stream(), || {
+                unsafe { rb2.launch(elementwise(total)) }.context("attn_prefill_reduce")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// Diagnostic only: bulk-synchronous counterpart to [`Self::attn_prefill_ws4`]
+    /// -- see `attn_prefill_mma_bulk48_f32`'s own doc comment in `ops.cu` for
+    /// the hypothesis this tests (no producer/consumer role split, no named
+    /// barriers, every warp free-runs its own QK/softmax/PV after a single
+    /// `__syncthreads()`-gated cooperative tile load, FA2-style). Same WK4=48
+    /// tile and `NWARPS=7` as `ws4`, so `tile_tokens` and grid dims match
+    /// exactly -- the only difference from `ws4`'s launch is no `+1` for a
+    /// producer warp.
+    ///
+    /// Real result: 0.851x vs `ws4` (slower) at the checkpoint's real
+    /// 30552-token/16-layer shape -- see the kernel's own doc comment for
+    /// the measured breakdown and the leading (unconfirmed, `ncu`-blocked)
+    /// explanation.
+    pub fn attn_prefill_bulk48(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        q: &View<'_, f32>,
+        k_cache: &View<'_, f16>,
+        v_cache: &View<'_, f16>,
+        batch: BatchLayout<'_>,
+        dims: AttnDims,
+        run_base: usize,
+        run_tokens: usize,
+        kv_len: usize,
+        scale: f32,
+        partial: &mut ViewMut<'_, f32>,
+    ) -> Result<()> {
+        anyhow::ensure!(self.prefill_attention(&dims), "attn_prefill_bulk48: unsupported shape");
+        anyhow::ensure!(run_tokens >= 1, "attn_prefill_bulk48: empty run");
+        let scale = scale * std::f32::consts::LOG2_E;
+        let group = dims.n_heads / dims.n_kv_heads;
+        let tpw = (16 / group).max(1);
+        const NWARPS: usize = 7;
+        const KPAD: usize = 8;
+        const WK: usize = 48;
+        let tile_tokens = NWARPS * tpw;
+        let n_tiles = run_tokens.div_ceil(tile_tokens);
+        let (n_chunks, chunk) = self.prefill_chunks(dims.n_kv_heads, n_tiles, kv_len);
+        anyhow::ensure!(
+            n_chunks <= 32,
+            "attn_prefill_bulk48: {n_chunks} chunks past the partial buffer's 32"
+        );
+        let ms_off = (32 * dims.n_heads * run_tokens * dims.d_head) as i32;
+
+        let f = self.dev.kernels().get("infero_ops", ops_src(), "attn_prefill_mma_bulk48_f32")?;
+        let kv_shared = 4 * WK * (dims.d_head + KPAD) * 2;
+        const MAX_DYNAMIC_SHARED: usize = 100 * 1024;
+        let stage_row = if dims.d_head % 32 == 0 { dims.d_head + 4 } else { dims.d_head };
+        let out_stage_shared = NWARPS * tpw * group * stage_row * 4;
+        let use_out_stage = out_stage_shared <= MAX_DYNAMIC_SHARED;
+        let shared = if use_out_stage { kv_shared.max(out_stage_shared) } else { kv_shared } as u32;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared)?;
+        }
+        let single = i32::from(n_chunks == 1);
+        let cfg = LaunchConfig {
+            grid_dim: (dims.n_kv_heads as u32, n_tiles as u32, n_chunks),
+            block_dim: (NWARPS as u32 * 32, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let (stride, h, kh, dh, ns, ck, kl, gi, tp, rb, rt, uos) = (
+            batch.table_stride as i32,
+            dims.n_heads as i32,
+            dims.n_kv_heads as i32,
+            dims.d_head as i32,
+            dims.n_slots as i32,
+            chunk as i32,
+            kv_len as i32,
+            group as i32,
+            tpw as i32,
+            run_base as i32,
+            run_tokens as i32,
+            i32::from(use_out_stage),
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(&mut *partial)
+            .arg(&ms_off)
+            .arg(&mut *out)
+            .arg(&single)
+            .arg(q)
+            .arg(k_cache)
+            .arg(v_cache)
+            .arg(batch.seq_of)
+            .arg(batch.positions)
+            .arg(batch.slot_table)
+            .arg(&stride)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ns)
+            .arg(&scale)
+            .arg(&ck)
+            .arg(&kl)
+            .arg(&gi)
+            .arg(&tp)
+            .arg(&rb)
+            .arg(&rt)
+            .arg(&uos);
+        self.dev
+            .profile()
+            .time("attn_prefill_bulk48", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("attn_prefill_bulk48")?;
                 Ok(())
             })?;
         if single == 1 {

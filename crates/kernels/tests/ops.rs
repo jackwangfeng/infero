@@ -1521,6 +1521,102 @@ fn attn_prefill_matches_the_three_kernels() -> Result<()> {
                 "attn_prefill_ws4 {n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
                  wrote past the run"
             );
+
+            // Same reference, the bulk-synchronous (no producer/consumer
+            // roles, no named barriers) counterpart to `ws4`.
+            let mut got_bulk48_d = stream.clone_htod(&want)?;
+            let mut part_bulk48 = stream.alloc_zeros::<f32>(Kernels::attn_partial_floats(
+                dims.n_heads,
+                dims.d_head,
+                run_tokens,
+            ))?;
+            k.attn_prefill_bulk48(
+                &mut got_bulk48_d.as_view_mut(),
+                &dq.as_view(),
+                &dk.as_view(),
+                &dv.as_view(),
+                batch,
+                dims,
+                pad,
+                run_tokens,
+                kv_len,
+                scale,
+                &mut part_bulk48.as_view_mut(),
+            )?;
+            let got_bulk48 = stream.clone_dtoh(&got_bulk48_d)?;
+            k.device().synchronize()?;
+            let (abs_bulk48, at_bulk48) = max_abs_diff(&got_bulk48[run_lo..run_hi], &want[run_lo..run_hi]);
+            assert!(
+                abs_bulk48 < 2e-3,
+                "attn_prefill_bulk48 {n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
+                 max abs diff {abs_bulk48} at {at_bulk48} (got {}, want {})",
+                got_bulk48[run_lo + at_bulk48],
+                want[run_lo + at_bulk48]
+            );
+            assert_eq!(
+                &got_bulk48[..run_lo],
+                &want[..run_lo],
+                "attn_prefill_bulk48 {n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
+                 wrote before the run"
+            );
+            assert_eq!(
+                &got_bulk48[run_hi..],
+                &want[run_hi..],
+                "attn_prefill_bulk48 {n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
+                 wrote past the run"
+            );
+
+            // Same reference, called through the `AttentionBackend` trait's
+            // `InferoHandRolled` implementation rather than the kernel
+            // directly -- proves the trait wrapper is behavior-preserving,
+            // not just that the kernels it delegates to already are.
+            {
+                use infero_kernels::attn_backend::{AttentionBackend, AttnCallCtx, InferoHandRolled};
+                let mut got_hr_d = stream.clone_htod(&want)?;
+                let mut part_hr = stream.alloc_zeros::<f32>(Kernels::attn_partial_floats(
+                    dims.n_heads,
+                    dims.d_head,
+                    run_tokens,
+                ))?;
+                let backend = InferoHandRolled::new(&k);
+                let mut ctx = AttnCallCtx {
+                    out: &mut got_hr_d.as_view_mut(),
+                    q: &dq.as_view(),
+                    k_cache: &dk.as_view(),
+                    v_cache: &dv.as_view(),
+                    batch,
+                    dims,
+                    run_base: pad,
+                    run_tokens,
+                    kv_len,
+                    scale,
+                    partial: &mut part_hr.as_view_mut(),
+                    stream: &stream,
+                };
+                backend.prefill(&mut ctx)?;
+                let got_hr = stream.clone_dtoh(&got_hr_d)?;
+                k.device().synchronize()?;
+                let (abs_hr, at_hr) = max_abs_diff(&got_hr[run_lo..run_hi], &want[run_lo..run_hi]);
+                assert!(
+                    abs_hr < 2e-3,
+                    "InferoHandRolled {n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
+                     max abs diff {abs_hr} at {at_hr} (got {}, want {})",
+                    got_hr[run_lo + at_hr],
+                    want[run_lo + at_hr]
+                );
+                assert_eq!(
+                    &got_hr[..run_lo],
+                    &want[..run_lo],
+                    "InferoHandRolled {n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
+                     wrote before the run"
+                );
+                assert_eq!(
+                    &got_hr[run_hi..],
+                    &want[run_hi..],
+                    "InferoHandRolled {n_heads}q/{n_kv_heads}kv x {d_head}, run {run_tokens} kv {kv_len}: \
+                     wrote past the run"
+                );
+            }
         }
     }
     Ok(())
