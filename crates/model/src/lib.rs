@@ -2809,21 +2809,22 @@ impl Model {
     ///
     /// Verified independent of how `attention` internally dispatches a batch
     /// (mixed-batch-attn-dispatch-split, Task 4 -- see
-    /// `docs/superpowers/sdd/2026-09-05-mixed-batch-attention-dispatch-split/task-4-report.md`
-    /// for the full trace). This block never reads `self.act.attn`/
-    /// `attn_partial` at all -- GDN and regular-attention layers are mutually
-    /// exclusive per layer (`self.layer_kinds[layer]`, dispatched in
-    /// `forward_batch_rows`'s layer loop, `~lib.rs:2192-2196`), so whatever
-    /// Task 5 does inside `attention`'s dispatch branch (one kernel call over
-    /// the whole batch vs. several over sub-batches) cannot reach this
-    /// function at all. What it *does* read -- `self.act.x`/`xb` (here,
-    /// `~lib.rs:2841-2856`) and the per-slot recurrence layout `spans`
-    /// (`pool.set_gdn_layout`, `~lib.rs:2022-2043`) -- is built purely from
-    /// `items`/`starts` while `forward_batch_rows` lays the flat batch out
-    /// (`~lib.rs:1902-1966`), strictly *before* the layer loop and any
-    /// attention dispatch even runs; `spans[slot]` is `(starts[slot].0,
-    /// item.tokens.len())`, i.e. absolute row offset and count, with no
-    /// reference anywhere to which attention kernel populates which rows.
+    /// `docs/superpowers/specs/2026-09-05-mixed-batch-attention-dispatch-split-design.md`
+    /// for the design this verification supports). This block never reads
+    /// `self.act.attn`/`attn_partial` at all -- GDN and regular-attention
+    /// layers are mutually exclusive per layer (`self.layer_kinds[layer]`,
+    /// dispatched in `forward_batch_rows`'s layer loop, `~lib.rs:2192-2196`),
+    /// so whatever Task 5 does inside `attention`'s dispatch branch (one
+    /// kernel call over the whole batch vs. several over sub-batches) cannot
+    /// reach this function at all. What it *does* read -- `self.act.x`/`xb`
+    /// (here, `~lib.rs:2862-2873` and `:2878-2880`) and the per-slot
+    /// recurrence layout `spans` (`pool.set_gdn_layout`, `~lib.rs:2022-2043`)
+    /// -- is built purely from `items`/`starts` while `forward_batch_rows`
+    /// lays the flat batch out (`~lib.rs:1902-1966`), strictly *before* the
+    /// layer loop and any attention dispatch even runs; `spans[slot]` is
+    /// `(starts[slot].0, item.tokens.len())`, i.e. absolute row offset and
+    /// count, with no reference anywhere to which attention kernel
+    /// populates which rows.
     /// `feed_forward` (shared by both layer kinds) and the sampling/logits
     /// path downstream (`take_rows` against `logit_rows`, itself built the
     /// same way at `~lib.rs:1960-1965`) read `self.act.x` the same
