@@ -31,7 +31,7 @@ use anyhow::{Context, Result};
 use infero_cuda::Device;
 use infero_gguf::Gguf;
 use infero_model::tp::RankId;
-use infero_model::{KvCacheQuant, Model, Sampler, SamplingParams};
+use infero_model::{BatchItemKind, KvCacheQuant, Model, Sampler, SamplingParams};
 use infero_tokenizer::{ChatMessage, Tokenizer};
 
 fn main() -> Result<()> {
@@ -88,7 +88,7 @@ fn main() -> Result<()> {
     let mut session = model.new_session()?;
     let mut sampler = Sampler::new(SamplingParams::greedy());
 
-    let logits = model.forward(&tokens, &mut session)?;
+    let logits = model.forward(&tokens, BatchItemKind::Prefill, &mut session)?;
     let mut generated: Vec<u32> = Vec::with_capacity(max_new);
     let mut next = sampler.sample(logits, &generated);
     let mut detok = tokenizer.detokenizer();
@@ -112,7 +112,7 @@ fn main() -> Result<()> {
         // NCCL all-reduces inside it to stay in lockstep across ranks. No
         // rank-specific branching: the whole point of this harness is a
         // single fixed prompt every rank processes the same way.
-        let logits = model.forward(&[next], &mut session)?;
+        let logits = model.forward(&[next], BatchItemKind::Decode, &mut session)?;
         next = sampler.sample(logits, &generated);
     }
     if tp_rank == 0 {

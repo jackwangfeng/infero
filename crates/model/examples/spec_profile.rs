@@ -21,7 +21,7 @@
 //!   cargo run --release -p infero-model --example spec_profile -- <model-dir>
 
 use anyhow::{Context, Result};
-use infero_model::{BatchItem, KvCacheQuant, Model};
+use infero_model::{BatchItem, BatchItemKind, KvCacheQuant, Model};
 
 const REPS: usize = 12;
 
@@ -52,11 +52,11 @@ fn main() -> Result<()> {
 
     // Prefill, then a few plain steps so the caches are warm and the graphs are
     // captured before anything is timed.
-    let item = BatchItem::new(seq, &prompt);
+    let item = BatchItem::new(seq, &prompt, BatchItemKind::Prefill);
     model.forward_batch_device(std::slice::from_ref(&item), &mut pool)?;
     let mut pending = argmax(model.logits_host()?);
     for _ in 0..4 {
-        let it = BatchItem::new(seq, std::slice::from_ref(&pending));
+        let it = BatchItem::new(seq, std::slice::from_ref(&pending), BatchItemKind::Decode);
         model.forward_batch_device(std::slice::from_ref(&it), &mut pool)?;
         pending = argmax(model.logits_host()?);
     }
@@ -66,7 +66,7 @@ fn main() -> Result<()> {
     let plain = time(
         REPS,
         |m: &mut Model| {
-            let it = BatchItem::new(seq, std::slice::from_ref(&pending));
+            let it = BatchItem::new(seq, std::slice::from_ref(&pending), BatchItemKind::Decode);
             m.forward_batch_device(std::slice::from_ref(&it), &mut pool)?;
             // Back to where it started, so a hundred reps do not walk the
             // sequence to its context limit and change the kv length the
@@ -88,7 +88,7 @@ fn main() -> Result<()> {
     let wide = time(
         REPS,
         |m: &mut Model| {
-        let it = BatchItem::new(seq, &rows);
+        let it = BatchItem::new(seq, &rows, BatchItemKind::Decode);
         m.forward_batch_rows(std::slice::from_ref(&it), &mut pool, &tail)?;
         pool.truncate(seq, base_len);
         Ok(())
@@ -117,7 +117,7 @@ fn main() -> Result<()> {
         match time(
             REPS,
             |m: &mut Model| {
-                let it = BatchItem::new(seq, &many);
+                let it = BatchItem::new(seq, &many, BatchItemKind::Decode);
                 m.forward_batch_rows(std::slice::from_ref(&it), &mut pool, &t)?;
                 pool.truncate(seq, base_len);
                 Ok(())
@@ -153,7 +153,7 @@ fn main() -> Result<()> {
         // the prefill for that, on a fresh sequence.
         let mut p2 = model.new_pool(8192, 1)?;
         let s2 = p2.alloc().context("no kv slot")?;
-        let it = BatchItem::new(s2, &prompt);
+        let it = BatchItem::new(s2, &prompt, BatchItemKind::Prefill);
         model.forward_batch_device(std::slice::from_ref(&it), &mut p2)?;
         let first = argmax(model.logits_host()?);
         let feed = infero_model::spec::DraftFeed::after_prefill(&prompt, first);
@@ -161,7 +161,7 @@ fn main() -> Result<()> {
 
         // One decode step, so `mtp_hidden` holds one row at a known position,
         // and that row is what a steady-state round drafts from.
-        let it = BatchItem::new(s2, std::slice::from_ref(&first));
+        let it = BatchItem::new(s2, std::slice::from_ref(&first), BatchItemKind::Decode);
         model.forward_batch_device(std::slice::from_ref(&it), &mut p2)?;
         let second = argmax(model.logits_host()?);
         history.push(first);
@@ -230,7 +230,7 @@ fn main() -> Result<()> {
     let plain_serial = time_serial(
         REPS,
         |m: &mut Model| {
-            let it = BatchItem::new(seq, std::slice::from_ref(&pending));
+            let it = BatchItem::new(seq, std::slice::from_ref(&pending), BatchItemKind::Decode);
             m.forward_batch_device(std::slice::from_ref(&it), &mut pool)?;
             pool.truncate(seq, base_len2);
             Ok(())
@@ -249,7 +249,7 @@ fn main() -> Result<()> {
     let prefill = {
         let mut p3 = model.new_pool(8192, 2)?;
         let s3 = p3.alloc().context("no kv slot")?;
-        let it = BatchItem::new(s3, &prompt);
+        let it = BatchItem::new(s3, &prompt, BatchItemKind::Prefill);
         // One untimed pass so the graph for this width is captured.
         model.forward_batch_device(std::slice::from_ref(&it), &mut p3)?;
         p3.truncate(s3, 0);
@@ -257,7 +257,7 @@ fn main() -> Result<()> {
         let t = time_serial(
             4,
             |m: &mut Model| {
-                let it = BatchItem::new(s3, &prompt);
+                let it = BatchItem::new(s3, &prompt, BatchItemKind::Prefill);
                 m.forward_batch_device(std::slice::from_ref(&it), &mut p3)?;
                 p3.truncate(s3, 0);
                 Ok(())
@@ -305,7 +305,7 @@ fn main() -> Result<()> {
             let _ = time_serial(
                 REPS,
                 |m: &mut Model| {
-                    let it = BatchItem::new(seq, std::slice::from_ref(&pending));
+                    let it = BatchItem::new(seq, std::slice::from_ref(&pending), BatchItemKind::Decode);
                     m.forward_batch_device(std::slice::from_ref(&it), &mut pool)?;
                     pool.truncate(seq, base_len2);
                     Ok(())
@@ -319,7 +319,7 @@ fn main() -> Result<()> {
             let _ = time_serial(
                 REPS,
                 |m: &mut Model| {
-                    let it = BatchItem::new(seq, &rows);
+                    let it = BatchItem::new(seq, &rows, BatchItemKind::Decode);
                     m.forward_batch_rows(std::slice::from_ref(&it), &mut pool, &tail)?;
                     pool.truncate(seq, base_len);
                     Ok(())

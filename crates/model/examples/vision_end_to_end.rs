@@ -12,7 +12,7 @@
 //!   cargo run --release -p infero-model --example vision_end_to_end -- <model-dir>
 
 use anyhow::{Context, Result};
-use infero_model::{BatchItem, KvCacheQuant, Model};
+use infero_model::{BatchItem, BatchItemKind, KvCacheQuant, Model};
 
 /// A solid frame of one colour, `[H, W, 3]` u8 — the crudest possible image
 /// that still has content, and enough for a difference test.
@@ -108,6 +108,7 @@ fn main() -> Result<()> {
         {
             let item = BatchItem {
                 seq,
+                kind: BatchItemKind::Prefill,
                 tokens: &ids,
                 wants_logits: true,
                 vision: Some(&feats),
@@ -120,7 +121,7 @@ fn main() -> Result<()> {
         let mut next = argmax(model.logits_host()?);
         for _ in 0..24 {
             out.push(next);
-            let item = BatchItem::new(seq, std::slice::from_ref(&next));
+            let item = BatchItem::new(seq, std::slice::from_ref(&next), BatchItemKind::Decode);
             model.forward_batch_device(std::slice::from_ref(&item), &mut pool)?;
             next = argmax(model.logits_host()?);
         }

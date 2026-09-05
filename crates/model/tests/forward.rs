@@ -11,7 +11,7 @@ use anyhow::Result;
 use serde::Deserialize;
 use infero_cuda::Device;
 use infero_gguf::Gguf;
-use infero_model::{Model, Sampler, SamplingParams};
+use infero_model::{BatchItemKind, Model, Sampler, SamplingParams};
 use infero_tokenizer::Tokenizer;
 
 #[derive(Deserialize)]
@@ -96,7 +96,7 @@ fn logits_match_huggingface() -> Result<()> {
     let mut failures = Vec::new();
     for case in &fx.cases {
         let mut session = model.new_session()?;
-        let logits: Vec<f32> = model.forward(&case.ids, &mut session)?.to_vec();
+        let logits: Vec<f32> = model.forward(&case.ids, BatchItemKind::Prefill, &mut session)?.to_vec();
         assert_eq!(logits.len(), vocab_size);
 
         let mean = logits.iter().sum::<f32>() / logits.len() as f32;
@@ -158,12 +158,12 @@ fn incremental_decode_equals_batch_prefill() -> Result<()> {
     let ids = &fx.cases[0].ids;
 
     let mut session = model.new_session()?;
-    let batched: Vec<f32> = model.forward(ids, &mut session)?.to_vec();
+    let batched: Vec<f32> = model.forward(ids, BatchItemKind::Prefill, &mut session)?.to_vec();
 
     let mut session = model.new_session()?;
     let mut incremental = Vec::new();
     for &t in ids {
-        incremental = model.forward(&[t], &mut session)?.to_vec();
+        incremental = model.forward(&[t], BatchItemKind::Prefill, &mut session)?.to_vec();
     }
 
     assert_eq!(argmax(&batched), argmax(&incremental));
@@ -207,14 +207,14 @@ fn chunked_prefill_is_seamless() -> Result<()> {
     );
 
     let mut session = model.new_session()?;
-    let all_at_once: Vec<f32> = model.forward(&ids, &mut session)?.to_vec();
+    let all_at_once: Vec<f32> = model.forward(&ids, BatchItemKind::Prefill, &mut session)?.to_vec();
     assert_eq!(session.len(), ids.len());
 
     // Same tokens, but handed over in two calls so the split lands elsewhere.
     let mut session = model.new_session()?;
     let split = ids.len() / 3;
-    model.forward(&ids[..split], &mut session)?;
-    let in_pieces: Vec<f32> = model.forward(&ids[split..], &mut session)?.to_vec();
+    model.forward(&ids[..split], BatchItemKind::Prefill, &mut session)?;
+    let in_pieces: Vec<f32> = model.forward(&ids[split..], BatchItemKind::Prefill, &mut session)?.to_vec();
 
     assert_eq!(argmax(&all_at_once), argmax(&in_pieces));
     let worst = all_at_once
@@ -236,11 +236,11 @@ fn greedy_generation_is_deterministic() -> Result<()> {
         let mut session = model.new_session()?;
         let mut sampler = Sampler::new(SamplingParams::greedy());
         let mut out = Vec::new();
-        let mut logits: Vec<f32> = model.forward(&prompt, &mut session)?.to_vec();
+        let mut logits: Vec<f32> = model.forward(&prompt, BatchItemKind::Prefill, &mut session)?.to_vec();
         for _ in 0..8 {
             let next = sampler.sample(&logits, &out);
             out.push(next);
-            logits = model.forward(&[next], &mut session)?.to_vec();
+            logits = model.forward(&[next], BatchItemKind::Decode, &mut session)?.to_vec();
         }
         Ok(out)
     };
@@ -268,12 +268,12 @@ fn context_overflow_is_an_error_not_a_crash() -> Result<()> {
 
     let tokens: Vec<u32> = vec![100; 65];
     let err = model
-        .forward(&tokens, &mut session)
+        .forward(&tokens, BatchItemKind::Prefill, &mut session)
         .unwrap_err()
         .to_string();
     assert!(err.contains("context overflow"), "{err}");
     // The model must still be usable afterwards.
-    assert!(model.forward(&[100, 200], &mut session).is_ok());
+    assert!(model.forward(&[100, 200], BatchItemKind::Prefill, &mut session).is_ok());
     Ok(())
 }
 
@@ -320,9 +320,9 @@ fn integer_decode_agrees_with_float_decode() -> Result<()> {
         }
         let mut model = Model::load(Device::new(0)?, &gguf, 512)?;
         let mut session = model.new_session()?;
-        model.forward(&ids, &mut session)?;
+        model.forward(&ids, BatchItemKind::Prefill, &mut session)?;
         // A decode step, which is the path under test.
-        Ok(model.forward(&[12095], &mut session)?.to_vec())
+        Ok(model.forward(&[12095], BatchItemKind::Decode, &mut session)?.to_vec())
     };
 
     let float = run(true)?;

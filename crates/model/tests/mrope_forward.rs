@@ -18,7 +18,7 @@ use half::f16;
 use infero_cuda::Device;
 use infero_model::qwen35_vision::interleaved_mrope_axis;
 use infero_model::weights::{AttnWeights, DenseFfn, Layer, Matrix, Weights};
-use infero_model::{BatchItem, Config, KvCacheQuant, KvPool, Model, SeqId};
+use infero_model::{BatchItem, BatchItemKind, Config, KvCacheQuant, KvPool, Model, SeqId};
 
 const PROMPT: &[u32] = &[3, 17, 41, 5, 200, 61, 7, 12, 99];
 const DECODE_STEPS: usize = 6;
@@ -164,13 +164,13 @@ fn argmax(v: &[f32]) -> u32 {
 /// largest.
 fn run(model: &mut Model, pool: &mut KvPool, seq: SeqId) -> Result<Vec<Vec<f32>>> {
     let mut logits = Vec::with_capacity(1 + DECODE_STEPS);
-    let item = BatchItem::new(seq, PROMPT);
+    let item = BatchItem::new(seq, PROMPT, BatchItemKind::Prefill);
     model.forward_batch_device(std::slice::from_ref(&item), pool)?;
     let mut row = model.logits_host()?.to_vec();
     let mut next = argmax(&row);
     logits.push(row);
     for _ in 0..DECODE_STEPS {
-        let item = BatchItem::new(seq, std::slice::from_ref(&next));
+        let item = BatchItem::new(seq, std::slice::from_ref(&next), BatchItemKind::Decode);
         model.forward_batch_device(std::slice::from_ref(&item), pool)?;
         row = model.logits_host()?.to_vec();
         next = argmax(&row);

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use infero_cuda::Device;
 use infero_gguf::Gguf;
-use infero_model::{KvCacheQuant, Model, Sampler, SamplingParams};
+use infero_model::{BatchItemKind, KvCacheQuant, Model, Sampler, SamplingParams};
 use infero_tokenizer::Tokenizer;
 
 const PROMPT: &str = "The capital of France is";
@@ -72,13 +72,13 @@ fn offloaded_logits_are_identical_to_resident_ones() -> Result<()> {
     let ids = tok.encode(PROMPT, Some(false), false);
 
     let mut session = resident.new_session()?;
-    let want: Vec<f32> = resident.forward(&ids, &mut session)?.to_vec();
+    let want: Vec<f32> = resident.forward(&ids, BatchItemKind::Prefill, &mut session)?.to_vec();
     drop(resident);
 
     for n_gpu in [0usize, 1, 12, 23] {
         let (mut model, _) = setup!(n_gpu);
         let mut session = model.new_session()?;
-        let got: Vec<f32> = model.forward(&ids, &mut session)?.to_vec();
+        let got: Vec<f32> = model.forward(&ids, BatchItemKind::Prefill, &mut session)?.to_vec();
         assert_eq!(
             got.len(),
             want.len(),
@@ -107,11 +107,11 @@ fn incremental_decoding_is_identical_too() -> Result<()> {
         let mut session = model.new_session()?;
         let mut sampler = Sampler::new(SamplingParams::greedy());
         let mut out = Vec::new();
-        let mut logits: Vec<f32> = model.forward(&ids, &mut session)?.to_vec();
+        let mut logits: Vec<f32> = model.forward(&ids, BatchItemKind::Prefill, &mut session)?.to_vec();
         for _ in 0..16 {
             let next = sampler.sample(&logits, &out);
             out.push(next);
-            logits = model.forward(&[next], &mut session)?.to_vec();
+            logits = model.forward(&[next], BatchItemKind::Decode, &mut session)?.to_vec();
         }
         Ok(out)
     };
@@ -181,11 +181,11 @@ fn each_offloaded_layer_is_transferred_exactly_once_per_pass() -> Result<()> {
 
     // The prompt is shorter than one prefill chunk, so this is a single pass.
     assert!(ids.len() <= model.batch_tokens());
-    model.forward(&ids, &mut session)?;
+    model.forward(&ids, BatchItemKind::Prefill, &mut session)?;
     assert_eq!(model.weight_transfers(), offloaded as u64);
 
     // One decode step is another pass over the same layers.
-    model.forward(&[ids[0]], &mut session)?;
+    model.forward(&[ids[0]], BatchItemKind::Decode, &mut session)?;
     assert_eq!(model.weight_transfers(), 2 * offloaded as u64);
     Ok(())
 }
@@ -200,14 +200,14 @@ fn a_fully_offloaded_model_still_generates() -> Result<()> {
     let mut session = model.new_session()?;
     let mut sampler = Sampler::new(SamplingParams::greedy());
     let mut out = Vec::new();
-    let mut logits: Vec<f32> = model.forward(&prompt, &mut session)?.to_vec();
+    let mut logits: Vec<f32> = model.forward(&prompt, BatchItemKind::Prefill, &mut session)?.to_vec();
     for _ in 0..24 {
         let next = sampler.sample(&logits, &out);
         if tok.is_eog(next) {
             break;
         }
         out.push(next);
-        logits = model.forward(&[next], &mut session)?.to_vec();
+        logits = model.forward(&[next], BatchItemKind::Decode, &mut session)?.to_vec();
     }
 
     let text = tok.decode(&out, true);

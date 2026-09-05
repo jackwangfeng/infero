@@ -6,7 +6,7 @@
 //!   INFERO_PROFILE=1 cargo run --release -p infero-model --example prefill_profile -- <model-dir> [n_tokens]
 
 use anyhow::{Context, Result};
-use infero_model::{BatchItem, KvCacheQuant, Model};
+use infero_model::{BatchItem, BatchItemKind, KvCacheQuant, Model};
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt().with_max_level(tracing::Level::WARN).init();
@@ -38,7 +38,7 @@ fn main() -> Result<()> {
     println!("chunking {n_tokens} tokens at {budget} a pass");
     let t0 = std::time::Instant::now();
     for chunk in prompt.chunks(budget) {
-        let item = BatchItem::new(seq, chunk);
+        let item = BatchItem::new(seq, chunk, BatchItemKind::Prefill);
         model.forward_batch_device(std::slice::from_ref(&item), &mut pool)?;
     }
     // `forward_batch_device` does not block on the GPU (the real server's own

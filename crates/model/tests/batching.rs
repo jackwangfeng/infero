@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use infero_model::{BatchItem, KvCacheQuant, Model, Sampler, SamplingParams};
+use infero_model::{BatchItem, BatchItemKind, KvCacheQuant, Model, Sampler, SamplingParams};
 use infero_tokenizer::Tokenizer;
 
 const PROMPTS: &[&str] = &[
@@ -95,7 +95,7 @@ fn batched_prefill_matches_solo_prefill() -> Result<()> {
     let mut solo = Vec::new();
     for prompt in &ids {
         let mut session = model.new_session()?;
-        solo.push(model.forward(prompt, &mut session)?.to_vec());
+        solo.push(model.forward(prompt, BatchItemKind::Prefill, &mut session)?.to_vec());
     }
 
     let mut pool = model.new_pool(2048, 8)?;
@@ -103,7 +103,7 @@ fn batched_prefill_matches_solo_prefill() -> Result<()> {
     let items: Vec<BatchItem<'_>> = seqs
         .iter()
         .zip(&ids)
-        .map(|(&seq, p)| BatchItem::new(seq, p))
+        .map(|(&seq, p)| BatchItem::new(seq, p, BatchItemKind::Prefill))
         .collect();
     let batched = model.forward_batch(&items, &mut pool)?.to_vec();
 
@@ -160,11 +160,11 @@ fn batched_decode_tracks_solo_decode() -> Result<()> {
         let mut session = model.new_session()?;
         let mut sampler = Sampler::new(SamplingParams::greedy());
         let mut out = Vec::new();
-        let mut logits: Vec<f32> = model.forward(prompt, &mut session)?.to_vec();
+        let mut logits: Vec<f32> = model.forward(prompt, BatchItemKind::Prefill, &mut session)?.to_vec();
         for _ in 0..STEPS {
             let next = sampler.sample(&logits, &out);
             out.push(next);
-            logits = model.forward(&[next], &mut session)?.to_vec();
+            logits = model.forward(&[next], BatchItemKind::Decode, &mut session)?.to_vec();
         }
         solo.push(out);
     }
@@ -174,7 +174,7 @@ fn batched_decode_tracks_solo_decode() -> Result<()> {
     let items: Vec<BatchItem<'_>> = seqs
         .iter()
         .zip(&ids)
-        .map(|(&seq, p)| BatchItem::new(seq, p))
+        .map(|(&seq, p)| BatchItem::new(seq, p, BatchItemKind::Prefill))
         .collect();
     let logits = model.forward_batch(&items, &mut pool)?.to_vec();
 
@@ -193,7 +193,7 @@ fn batched_decode_tracks_solo_decode() -> Result<()> {
         let step: Vec<BatchItem<'_>> = seqs
             .iter()
             .zip(&next)
-            .map(|(&seq, t)| BatchItem::new(seq, std::slice::from_ref(t)))
+            .map(|(&seq, t)| BatchItem::new(seq, std::slice::from_ref(t), BatchItemKind::Decode))
             .collect();
         let logits = model.forward_batch(&step, &mut pool)?.to_vec();
         for i in 0..ids.len() {
@@ -242,10 +242,10 @@ fn a_batch_does_not_leak_between_its_members() -> Result<()> {
     let logits_for = |model: &mut Model, others: [usize; 2]| -> Result<Vec<f32>> {
         let mut pool = model.new_pool(2048, 8)?;
         let subject = pool.alloc().unwrap();
-        let mut items = vec![BatchItem::new(subject, &ids[0])];
+        let mut items = vec![BatchItem::new(subject, &ids[0], BatchItemKind::Prefill)];
         let extra: Vec<_> = others.iter().map(|_| pool.alloc().unwrap()).collect();
         for (slot, &o) in extra.iter().zip(&others) {
-            items.push(BatchItem::new(*slot, &ids[o]));
+            items.push(BatchItem::new(*slot, &ids[o], BatchItemKind::Prefill));
         }
         let out = model.forward_batch(&items, &mut pool)?.to_vec();
         Ok(out[..vocab].to_vec())
@@ -279,16 +279,16 @@ fn a_sequence_can_join_a_running_batch() -> Result<()> {
     let joiner = tok.encode(PROMPTS[0], Some(false), false);
 
     let mut solo_session = model.new_session()?;
-    let solo_joiner: Vec<f32> = model.forward(&joiner, &mut solo_session)?.to_vec();
+    let solo_joiner: Vec<f32> = model.forward(&joiner, BatchItemKind::Prefill, &mut solo_session)?.to_vec();
 
     let mut pool = model.new_pool(2048, 8)?;
     let a = pool.alloc().unwrap();
-    let items = [BatchItem::new(a, &long)];
+    let items = [BatchItem::new(a, &long, BatchItemKind::Prefill)];
     model.forward_batch(&items, &mut pool)?;
     // A few decode steps for A before B arrives.
     let mut tok_a = 100u32;
     for _ in 0..3 {
-        let items = [BatchItem::new(a, std::slice::from_ref(&tok_a))];
+        let items = [BatchItem::new(a, std::slice::from_ref(&tok_a), BatchItemKind::Decode)];
         let logits = model.forward_batch(&items, &mut pool)?;
         tok_a = argmax(&logits[..vocab]);
     }
@@ -296,8 +296,8 @@ fn a_sequence_can_join_a_running_batch() -> Result<()> {
     // B joins mid-flight, in the same batch as A's next decode step.
     let b = pool.alloc().unwrap();
     let items = [
-        BatchItem::new(a, std::slice::from_ref(&tok_a)),
-        BatchItem::new(b, &joiner),
+        BatchItem::new(a, std::slice::from_ref(&tok_a), BatchItemKind::Decode),
+        BatchItem::new(b, &joiner, BatchItemKind::Prefill),
     ];
     let logits = model.forward_batch(&items, &mut pool)?.to_vec();
     let got_joiner = &logits[vocab..2 * vocab];
@@ -324,14 +324,14 @@ fn a_reused_sequence_row_starts_clean() -> Result<()> {
     let mut pool = model.new_pool(ids.len() + 4, 2)?;
     let a = pool.alloc().unwrap();
     let first = model
-        .forward_batch(&[BatchItem::new(a, &ids)], &mut pool)?
+        .forward_batch(&[BatchItem::new(a, &ids, BatchItemKind::Prefill)], &mut pool)?
         .to_vec();
     pool.free(a);
     assert_eq!(pool.free_slots(), ids.len() + 4);
 
     let b = pool.alloc().unwrap();
     let second = model
-        .forward_batch(&[BatchItem::new(b, &ids)], &mut pool)?
+        .forward_batch(&[BatchItem::new(b, &ids, BatchItemKind::Prefill)], &mut pool)?
         .to_vec();
 
     assert_eq!(argmax(&first[..vocab]), argmax(&second[..vocab]));

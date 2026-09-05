@@ -25,7 +25,7 @@ use anyhow::Result;
 use half::f16;
 use infero_cuda::Device;
 use infero_model::weights::{AttnWeights, DenseFfn, GdnWeights, Layer, Matrix, Weights};
-use infero_model::{BatchItem, Config, KvCacheQuant, KvPool, Model, SeqId};
+use infero_model::{BatchItem, BatchItemKind, Config, KvCacheQuant, KvPool, Model, SeqId};
 
 /// Long enough for a polluted recurrent state to show up in the argmax.
 const STEPS: usize = 24;
@@ -190,7 +190,7 @@ fn argmax(v: &[f32]) -> u32 {
 }
 
 fn prime(model: &mut Model, pool: &mut KvPool, seq: SeqId, prompt: &[u32]) -> Result<u32> {
-    let item = BatchItem::new(seq, prompt);
+    let item = BatchItem::new(seq, prompt, BatchItemKind::Prefill);
     model.forward_batch_device(std::slice::from_ref(&item), pool)?;
     Ok(argmax(model.logits_host()?))
 }
@@ -201,7 +201,7 @@ fn plain_greedy(model: &mut Model, steps: usize) -> Result<Vec<u32>> {
     let mut out = vec![prime(model, &mut pool, seq, PROMPT)?];
     for _ in 0..steps {
         let tok = *out.last().unwrap();
-        let item = BatchItem::new(seq, std::slice::from_ref(&tok));
+        let item = BatchItem::new(seq, std::slice::from_ref(&tok), BatchItemKind::Decode);
         model.forward_batch_device(std::slice::from_ref(&item), &mut pool)?;
         out.push(argmax(model.logits_host()?));
     }
@@ -300,9 +300,9 @@ fn a_prefill_chunk_the_width_of_a_verification_pass_keeps_its_own_graph() -> Res
         for (i, part) in prompt.chunks(chunk).enumerate() {
             let last = (i + 1) * chunk >= n;
             let item = if last {
-                BatchItem::new(seq, part)
+                BatchItem::new(seq, part, BatchItemKind::Prefill)
             } else {
-                BatchItem::without_logits(seq, part)
+                BatchItem::without_logits(seq, part, BatchItemKind::Prefill)
             };
             model.forward_batch_device(std::slice::from_ref(&item), pool)?;
         }
@@ -316,7 +316,7 @@ fn a_prefill_chunk_the_width_of_a_verification_pass_keeps_its_own_graph() -> Res
         let mut out = vec![chunked_prefill(&mut model, &mut pool, seq)?];
         for _ in 0..STEPS {
             let tok = *out.last().unwrap();
-            let item = BatchItem::new(seq, std::slice::from_ref(&tok));
+            let item = BatchItem::new(seq, std::slice::from_ref(&tok), BatchItemKind::Decode);
             model.forward_batch_device(std::slice::from_ref(&item), &mut pool)?;
             out.push(argmax(model.logits_host()?));
         }

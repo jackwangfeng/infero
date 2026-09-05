@@ -81,6 +81,78 @@ pub const MAX_BATCH_TOKENS: usize = 1024;
 /// context multiply. This is the budget that decides which one gives.
 const SCORE_BUDGET: usize = 1 << 30;
 
+/// The shortest single-sequence prefill run worth a dedicated tile-kernel
+/// launch (`decoupled6`/`ws4`/`flash_attn2`).
+///
+/// Below this width the launch overhead isn't worth it, so a short remainder
+/// stays folded into the same generic per-token path a decode step uses --
+/// see `prefill_run`'s own call site for the full reasoning. Hoisted to
+/// module scope (rather than the local `const` it started as) because
+/// `attn_partial_bound` below needs the exact same number: whatever headroom
+/// `prefill_run`'s gate leaves un-tile-kerneled has to still fit in the
+/// decode-only buffer.
+const MIN_PREFILL_RUN: usize = 8;
+
+/// The real ceiling on how many tokens the decode-only dispatch path (see the
+/// mixed-batch-attn-dispatch-split design doc) can be asked to carry in one
+/// step, plus headroom for a short prefill remainder folded into it.
+///
+/// `max_logit_rows` (`== max_seqs.max(spec_k + 1)`, computed once in
+/// `crates/server/src/engine.rs:225`) is the real, evidence-backed bound --
+/// see the long comment above `attn_partial`'s allocation in
+/// `Activations::new` for the full citation trail (mixed-batch-attn-dispatch-
+/// split plan, Task 2's finding). It is NOT `max_seqs * (mtp_k + 1)`, which an
+/// earlier draft of that plan assumed and which Task 2 found to be wrong: the
+/// two paths that could add up that way (an ordinary multi-sequence decode
+/// step and a speculative verification pass) are mutually exclusive within
+/// one step, so their token counts never sum.
+///
+/// `MIN_PREFILL_RUN` is added on top because a lone prefill chunk shorter
+/// than that stays folded into the decode-style call (`prefill_run`'s own
+/// gate) rather than getting its own tile-kernel dispatch -- so the
+/// decode-only buffer has to have room for it too.
+fn attn_partial_bound(max_logit_rows: usize) -> usize {
+    max_logit_rows + MIN_PREFILL_RUN
+}
+
+#[cfg(test)]
+mod attn_partial_bound_tests {
+    use super::*;
+
+    /// Task 2's real, evidence-backed formula (see the long comment above
+    /// `attn_partial`'s allocation in `Activations::new`) is `max_logit_rows +
+    /// MIN_PREFILL_RUN` -- NOT `max_seqs * (mtp_k + 1)`, an earlier draft's
+    /// guess that this test would also (deliberately) satisfy the loose
+    /// bounds of if it were still wrong in a way that happened to stay small.
+    /// The exact-value assertion below is what actually pins the formula down.
+    #[test]
+    fn attn_partial_bound_matches_config() {
+        // `max_logit_rows == max_seqs.max(spec_k + 1)`, computed once in
+        // `crates/server/src/engine.rs:225` -- 2 concurrently-decoding
+        // sequences, no active speculation, collapses to plain `max_seqs`.
+        let bound = attn_partial_bound(/* max_logit_rows */ 2);
+        assert!(
+            bound >= 2,
+            "decode subgroup ceiling must cover every concurrently-decoding sequence"
+        );
+        assert!(
+            bound < 64,
+            "if this is anywhere near batch_tokens-scale, the formula is wrong -- \
+             this defeats the entire point of the change"
+        );
+        assert_eq!(
+            bound,
+            2 + MIN_PREFILL_RUN,
+            "must be exactly max_logit_rows + MIN_PREFILL_RUN headroom"
+        );
+
+        // A wider `max_logit_rows` (more concurrent sequences, or `spec_k + 1`
+        // pushing past `max_seqs`) must raise the bound by exactly as much --
+        // the headroom is a flat additive constant, not a multiplier.
+        assert_eq!(attn_partial_bound(9), 9 + MIN_PREFILL_RUN);
+    }
+}
+
 /// The ceiling `batch_tokens_for` clamps to, raised for a server that has to
 /// admit many sequences at once.
 ///
@@ -273,9 +345,28 @@ impl Session {
     }
 }
 
+/// Whether a [`BatchItem`] is part of a sequence's initial prompt or a
+/// generated continuation.
+///
+/// Carried so `forward_batch_device` can dispatch a batch's decode items and
+/// prefill items separately (see the mixed-batch-attn-dispatch-split design
+/// doc) instead of collapsing everything into the generic `attn_decode`
+/// kernel whenever a batch isn't exactly one item. `Decode` covers both an
+/// ordinary single generated token (`Work::Decode`) and a speculative
+/// verification pass's `k + 1` candidates (`Model::verify_draft`/
+/// `verify_draft_sampled`) -- both are decode-phase, just possibly more than
+/// one row wide.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BatchItemKind {
+    Decode,
+    Prefill,
+}
+
 /// One sequence's contribution to a batch.
 pub struct BatchItem<'a> {
     pub seq: SeqId,
+    /// Initial-prompt chunk or generated continuation -- see [`BatchItemKind`].
+    pub kind: BatchItemKind,
     /// Appended at the sequence's current length.
     pub tokens: &'a [u32],
     /// False for a mid-prompt chunk, whose logits nobody will read.
@@ -327,9 +418,10 @@ pub struct BatchItem<'a> {
 }
 
 impl<'a> BatchItem<'a> {
-    pub fn new(seq: SeqId, tokens: &'a [u32]) -> Self {
+    pub fn new(seq: SeqId, tokens: &'a [u32], kind: BatchItemKind) -> Self {
         Self {
             seq,
+            kind,
             tokens,
             wants_logits: true,
             vision: None,
@@ -339,9 +431,10 @@ impl<'a> BatchItem<'a> {
         }
     }
 
-    pub fn without_logits(seq: SeqId, tokens: &'a [u32]) -> Self {
+    pub fn without_logits(seq: SeqId, tokens: &'a [u32], kind: BatchItemKind) -> Self {
         Self {
             seq,
+            kind,
             tokens,
             wants_logits: false,
             vision: None,
@@ -705,6 +798,12 @@ pub struct Model {
     /// Tokens one forward pass carries, resolved once against this session's
     /// context length. See [`batch_tokens_for`].
     batch_tokens: usize,
+    /// Whether the mixed-batch-attn-dispatch-split path is enabled, resolved
+    /// once at load from `INFERO_SPLIT_MIXED_BATCH` (default on; `="0"`
+    /// reverts to today's single-call-per-batch `attn_decode` fallback and
+    /// the full-`batch_tokens`-wide `attn_partial`). See `attn_partial_bound`
+    /// and its allocation site in `Activations::new`.
+    split_mixed_batch: bool,
     /// Which [`AttentionBackend`] serves the `prefill_run` path, resolved
     /// once at load the same way `batch_tokens` is -- see
     /// `docs/superpowers/specs/2026-09-05-pluggable-attention-backend-design.md`.
@@ -1248,7 +1347,8 @@ impl Model {
             tracing::info!(backend = name, "attention backend selected");
             name
         };
-        // `attn_partial` is sized for `batch_tokens` regardless of which
+        // `attn_partial` was, until the mixed-batch-attn-dispatch-split plan,
+        // unconditionally sized for `batch_tokens` regardless of which
         // backend wins prefill selection: `attn_decode` (every decode step,
         // unconditionally -- see its own doc comment) and `InferoHandRolled`'s
         // prefill path (which `flash_attn2`'s own fallback still routes to
@@ -1258,10 +1358,27 @@ impl Model {
         // reverted: it looked safe from `attn_backend_name` alone but missed
         // those two always-on unconditional readers, which would have written
         // past an undersized buffer.
+        //
+        // `INFERO_SPLIT_MIXED_BATCH` (default on) resolved once here, the
+        // same "resolved once at load" pattern as `batch_tokens`/
+        // `attn_backend_name` above -- Task 4/5 read this field when deciding
+        // whether a batch's decode/prefill items get dispatched separately.
+        // `="0"` reproduces today's exact behavior: `attn_partial` allocated
+        // at the full `batch_tokens` width, same as before this plan. This
+        // resolution only decides `attn_partial`'s size here in Task 3 --
+        // the dispatch split itself that makes the smaller size safe under a
+        // real multi-item batch is Task 5's job, not implemented yet.
+        let split_mixed_batch = !std::env::var("INFERO_SPLIT_MIXED_BATCH").is_ok_and(|v| v == "0");
+        let partial_n_tokens = if split_mixed_batch {
+            attn_partial_bound(max_logit_rows)
+        } else {
+            batch_tokens
+        };
         tracing::info!(
             batch_tokens,
+            split_mixed_batch,
             score_mib = cfg.n_heads * batch_tokens * (if needs_scores { max_seq } else { 1 }) * 4 >> 20,
-            partial_mib = (Kernels::attn_partial_floats(cfg.n_heads, cfg.d_head, batch_tokens) * 4) >> 20,
+            partial_mib = (Kernels::attn_partial_floats(cfg.n_heads, cfg.d_head, partial_n_tokens) * 4) >> 20,
             "tokens a pass carries"
         );
         // Whether any layer's FFN actually got the fused `w_gate_up` matrix
@@ -1280,6 +1397,7 @@ impl Model {
             max_logit_rows,
             needs_scores,
             batch_tokens,
+            partial_n_tokens,
             ffn_fused,
         )?;
         let scratch = Scratch {
@@ -1396,6 +1514,7 @@ impl Model {
             use_graph,
             max_logit_rows,
             batch_tokens,
+            split_mixed_batch,
             attn_backend_name,
             #[cfg(feature = "flash_attn2")]
             flash_attn2_backend: infero_kernels::flash_attn2::FlashAttn2Ffi::default(),
@@ -1439,6 +1558,13 @@ impl Model {
     /// Tokens one forward pass carries. See [`batch_tokens_for`].
     pub fn batch_tokens(&self) -> usize {
         self.batch_tokens
+    }
+
+    /// Whether the mixed-batch-attn-dispatch-split path is enabled
+    /// (`INFERO_SPLIT_MIXED_BATCH`, default on), resolved once at load. See
+    /// `attn_partial_bound`.
+    pub fn split_mixed_batch(&self) -> bool {
+        self.split_mixed_batch
     }
 
     /// Which [`AttentionBackend`] serves `attention()`'s `prefill_run`
@@ -1645,7 +1771,18 @@ impl Model {
     ///
     /// Returns the logits for the final token. A thin wrapper over
     /// [`Model::forward_batch`] with a batch of one.
-    pub fn forward(&mut self, tokens: &[u32], session: &mut Session) -> Result<&[f32]> {
+    ///
+    /// `kind` tags every chunk this call produces (see [`BatchItemKind`]) --
+    /// `Prefill` for an initial or mid-prompt chunk, `Decode` for an
+    /// already-generated continuation token. A single call never mixes the
+    /// two: a caller feeding a long prompt in one shot gets `Prefill` chunks
+    /// throughout, even though only the last one sets `wants_logits`.
+    pub fn forward(
+        &mut self,
+        tokens: &[u32],
+        kind: BatchItemKind,
+        session: &mut Session,
+    ) -> Result<&[f32]> {
         anyhow::ensure!(!tokens.is_empty(), "forward needs at least one token");
         let seq = session.seq;
         anyhow::ensure!(
@@ -1661,9 +1798,9 @@ impl Model {
         for (i, chunk) in tokens.chunks(chunk_len).enumerate() {
             let last = i + 1 == n_chunks;
             let item = if last {
-                BatchItem::new(seq, chunk)
+                BatchItem::new(seq, chunk, kind)
             } else {
-                BatchItem::without_logits(seq, chunk)
+                BatchItem::without_logits(seq, chunk, kind)
             };
             self.forward_batch(std::slice::from_ref(&item), &mut session.pool)?;
         }
@@ -2000,8 +2137,10 @@ impl Model {
         // One block's worth of tiling (four warps of two tokens at this
         // model's group) is the smallest run `attn_prefill` was measured
         // against; below that, `attn_decode`'s one-token-a-block kernel is
-        // both simpler and already fast enough.
-        const MIN_PREFILL_RUN: usize = 8;
+        // both simpler and already fast enough. `MIN_PREFILL_RUN` is a
+        // module-level const (see its own doc comment) so `attn_partial_bound`
+        // can size the decode-only buffer with the same headroom this gate
+        // leaves un-tile-kerneled.
         let prefill_run = single_seq_run.filter(|&t| t >= MIN_PREFILL_RUN);
 
         let armed = self.gdn_rollback.as_ref().is_some_and(|r| r.is_armed());
@@ -5181,6 +5320,7 @@ impl Activations {
         max_logit_rows: usize,
         needs_score_buffer: bool,
         chunk: usize,
+        partial_n_tokens: usize,
         ffn_fused: bool,
     ) -> Result<Self> {
         let stream = dev.stream();
@@ -5302,11 +5442,22 @@ impl Activations {
             // Net: decode-subgroup ceiling = `max_logit_rows`
             // (= `max_seqs.max(spec_k + 1)`), a value already computed once at
             // model construction and available as this struct's own
-            // `max_logit_rows` field/parameter -- Task 3 should size its
-            // decode-only buffer against that, not against a fresh
-            // `max_seqs * (k + 1)` computation.
+            // `max_logit_rows` field/parameter.
+            //
+            // Task 3: `partial_n_tokens` is the caller's resolved
+            // `attn_partial_bound(max_logit_rows)` (== `max_logit_rows +
+            // MIN_PREFILL_RUN`) when `INFERO_SPLIT_MIXED_BATCH` is enabled
+            // (the default), or `chunk` (today's exact behavior) when it's
+            // disabled via `="0"` -- see `from_parts`'s own `split_mixed_batch`
+            // resolution, next to `batch_tokens`/`attn_backend_name`. Passed
+            // in as its own parameter rather than derived here so this
+            // allocation site doesn't need to re-decide the flag itself. Every
+            // OTHER buffer in this struct still uses `chunk` unconditionally
+            // -- this is deliberately the only one Task 3 shrinks; the actual
+            // dispatch split that makes shrinking it safe under real
+            // multi-item batches is Task 5's job, not this one's.
             attn_partial: alloc_f32(
-                Kernels::attn_partial_floats(cfg.n_heads, cfg.d_head, chunk),
+                Kernels::attn_partial_floats(cfg.n_heads, cfg.d_head, partial_n_tokens),
                 "attention partials",
             )?,
             head_in: alloc_f32(max_logit_rows * d, "logit rows")?,

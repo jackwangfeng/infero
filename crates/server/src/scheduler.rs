@@ -20,7 +20,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 use infero_model::qwen35_vision::{Grid, llm_position_ids};
-use infero_model::{BatchItem, KvPool, Model, Sampler, SeqId, VisionFeatures};
+use infero_model::{BatchItem, BatchItemKind, KvPool, Model, Sampler, SeqId, VisionFeatures};
 use infero_tokenizer::Tokenizer;
 
 use crate::engine::{Event, FinishReason, PendingImage, PendingVideo, Request};
@@ -961,6 +961,7 @@ impl Scheduler {
                 match work {
                     Work::Prefill { from, len, last } => BatchItem {
                         seq: r.seq,
+                        kind: BatchItemKind::Prefill,
                         tokens: &r.prompt[*from..*from + *len],
                         wants_logits: *last,
                         vision: r.vision.as_ref(),
@@ -988,6 +989,7 @@ impl Scheduler {
                     },
                     Work::Decode => BatchItem {
                         seq: r.seq,
+                        kind: BatchItemKind::Decode,
                         // Safe: `next` is set before a sequence can be
                         // scheduled for decode.
                         tokens: std::slice::from_ref(r.next.as_ref().unwrap()),

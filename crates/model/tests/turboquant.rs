@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use infero_cuda::Device;
 use infero_gguf::Gguf;
-use infero_model::{KvCacheQuant, Model, Sampler, SamplingParams};
+use infero_model::{BatchItemKind, KvCacheQuant, Model, Sampler, SamplingParams};
 use infero_tokenizer::Tokenizer;
 
 /// Enough prompts, and varied enough, that a two-point difference between
@@ -135,7 +135,7 @@ fn logits_for(quant: KvCacheQuant) -> Result<Option<Vec<Vec<f32>>>> {
     for p in PROMPTS {
         let ids = tok.encode(p, Some(false), false);
         let mut session = model.new_session()?;
-        out.push(model.forward(&ids, &mut session)?.to_vec());
+        out.push(model.forward(&ids, BatchItemKind::Prefill, &mut session)?.to_vec());
     }
     Ok(Some(out))
 }
@@ -251,12 +251,12 @@ fn incremental_and_batched_writes_agree() -> Result<()> {
     let ids = tok.encode(PROMPTS[0], Some(false), false);
 
     let mut session = model.new_session()?;
-    let batched: Vec<f32> = model.forward(&ids, &mut session)?.to_vec();
+    let batched: Vec<f32> = model.forward(&ids, BatchItemKind::Prefill, &mut session)?.to_vec();
 
     let mut session = model.new_session()?;
     let mut incremental = Vec::new();
     for &t in &ids {
-        incremental = model.forward(&[t], &mut session)?.to_vec();
+        incremental = model.forward(&[t], BatchItemKind::Prefill, &mut session)?.to_vec();
     }
 
     // Three sources of divergence stack here, none of them a bug: prefill goes
@@ -322,7 +322,7 @@ fn generation_stays_coherent_over_a_long_run() -> Result<()> {
     let mut session = model.new_session()?;
     let mut sampler = Sampler::new(SamplingParams::greedy());
     let mut generated = Vec::new();
-    let mut logits: Vec<f32> = model.forward(&prompt, &mut session)?.to_vec();
+    let mut logits: Vec<f32> = model.forward(&prompt, BatchItemKind::Prefill, &mut session)?.to_vec();
 
     for _ in 0..120 {
         let next = sampler.sample(&logits, &generated);
@@ -330,7 +330,7 @@ fn generation_stays_coherent_over_a_long_run() -> Result<()> {
             break;
         }
         generated.push(next);
-        logits = model.forward(&[next], &mut session)?.to_vec();
+        logits = model.forward(&[next], BatchItemKind::Decode, &mut session)?.to_vec();
     }
 
     let text = tok.decode(&generated, true);

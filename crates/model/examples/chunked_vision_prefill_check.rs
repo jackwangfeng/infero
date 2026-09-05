@@ -15,7 +15,7 @@
 //!   cargo run --release -p infero-model --example chunked_vision_prefill_check -- <model-dir>
 
 use anyhow::{Context, Result};
-use infero_model::{BatchItem, KvCacheQuant, Model};
+use infero_model::{BatchItem, BatchItemKind, KvCacheQuant, Model};
 
 /// A solid frame of one colour, `[H, W, 3]` u8.
 fn solid(h: usize, w: usize, rgb: [u8; 3]) -> Vec<u8> {
@@ -72,6 +72,7 @@ fn main() -> Result<()> {
     let seq_a = pool_a.alloc().context("no kv slot")?;
     let item_a = BatchItem {
         seq: seq_a,
+        kind: BatchItemKind::Prefill,
         tokens: &prompt,
         wants_logits: true,
         vision: Some(&feats),
@@ -93,6 +94,7 @@ fn main() -> Result<()> {
     let seq_b = pool_b.alloc().context("no kv slot")?;
     let item_b1 = BatchItem {
         seq: seq_b,
+        kind: BatchItemKind::Prefill,
         tokens: &prompt[..split],
         wants_logits: false,
         vision: Some(&feats),
@@ -103,6 +105,7 @@ fn main() -> Result<()> {
     model.forward_batch_device(std::slice::from_ref(&item_b1), &mut pool_b)?;
     let item_b2 = BatchItem {
         seq: seq_b,
+        kind: BatchItemKind::Prefill,
         tokens: &prompt[split..],
         wants_logits: true,
         vision: Some(&feats),
@@ -147,15 +150,16 @@ fn main() -> Result<()> {
 
     let mut pool_c1 = model.new_pool(4096, 1)?;
     let seq_c1 = pool_c1.alloc().context("no kv slot")?;
-    let item_c1 = BatchItem::new(seq_c1, &control_prompt);
+    let item_c1 = BatchItem::new(seq_c1, &control_prompt, BatchItemKind::Prefill);
     model.forward_batch_device(std::slice::from_ref(&item_c1), &mut pool_c1)?;
     let logits_c1 = model.logits_host()?.to_vec();
 
     let mut pool_c2 = model.new_pool(4096, 1)?;
     let seq_c2 = pool_c2.alloc().context("no kv slot")?;
-    let item_c2a = BatchItem::without_logits(seq_c2, &control_prompt[..control_split]);
+    let item_c2a =
+        BatchItem::without_logits(seq_c2, &control_prompt[..control_split], BatchItemKind::Prefill);
     model.forward_batch_device(std::slice::from_ref(&item_c2a), &mut pool_c2)?;
-    let item_c2b = BatchItem::new(seq_c2, &control_prompt[control_split..]);
+    let item_c2b = BatchItem::new(seq_c2, &control_prompt[control_split..], BatchItemKind::Prefill);
     model.forward_batch_device(std::slice::from_ref(&item_c2b), &mut pool_c2)?;
     let logits_c2 = model.logits_host()?.to_vec();
 

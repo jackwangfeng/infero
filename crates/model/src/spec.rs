@@ -57,7 +57,7 @@ use infero_kernels::gdn::SeqLayout;
 
 use crate::config::LinearAttnConfig;
 use crate::qwen35_mtp::{Accepted, accept_greedy};
-use crate::{BatchItem, KvPool, Model, SeqId};
+use crate::{BatchItem, BatchItemKind, KvPool, Model, SeqId};
 
 /// What the drafter needs to know about the tokens the target just confirmed.
 ///
@@ -625,7 +625,7 @@ impl Model {
         let rows = {
             let item = BatchItem {
                 mrope_delta,
-                ..BatchItem::new(seq, &candidates)
+                ..BatchItem::new(seq, &candidates, BatchItemKind::Decode)
             };
             // Every candidate's logits, not just the last: `logits[j]` is the
             // target's own prediction for the token after candidate `j`, and the
@@ -723,7 +723,7 @@ impl Model {
         let rows = {
             let item = BatchItem {
                 mrope_delta,
-                ..BatchItem::new(seq, &candidates)
+                ..BatchItem::new(seq, &candidates, BatchItemKind::Decode)
             };
             let r = self.forward_batch_rows(std::slice::from_ref(&item), pool, &[n]);
             if let (true, Some(j)) = (r.is_err(), self.gdn_rollback.as_mut()) {

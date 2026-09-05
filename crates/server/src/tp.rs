@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use infero_model::{BatchItem, KvPool, Model, SeqId};
+use infero_model::{BatchItem, BatchItemKind, KvPool, Model, SeqId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -107,6 +107,7 @@ pub fn run_follower(mut model: Model, mut pool: KvPool) -> Result<()> {
                                 .unwrap_or_else(|| panic!("seq {seq_id} planned before it was admitted"));
                             BatchItem {
                                 seq,
+                                kind: BatchItemKind::Prefill,
                                 tokens: &prompt[*from..*from + *len],
                                 wants_logits: *wants_logits,
                                 vision: None,
@@ -117,6 +118,7 @@ pub fn run_follower(mut model: Model, mut pool: KvPool) -> Result<()> {
                         }
                         WorkMsg::Decode { token } => BatchItem {
                             seq,
+                            kind: BatchItemKind::Decode,
                             tokens: std::slice::from_ref(token),
                             wants_logits: true,
                             vision: None,

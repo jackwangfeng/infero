@@ -30,7 +30,7 @@ use infero_kernels::Kernels;
 use infero_model::mtp::{HeadDims, MtpHead};
 use infero_model::spec::DraftFeed;
 use infero_model::weights::{AttnWeights, DenseFfn, Layer, Matrix, MtpWeights};
-use infero_model::{BatchItem, KvCacheQuant, KvPool, Model, SeqId};
+use infero_model::{BatchItem, BatchItemKind, KvCacheQuant, KvPool, Model, SeqId};
 use infero_tokenizer::Tokenizer;
 
 const PROMPT: &str = "The capital of France is Paris, and the capital of Japan is";
@@ -91,7 +91,7 @@ fn argmax(v: &[f32]) -> u32 {
 
 /// Prefill and return the first generated token.
 fn prime(model: &mut Model, pool: &mut KvPool, seq: SeqId, prompt: &[u32]) -> Result<u32> {
-    let item = BatchItem::new(seq, prompt);
+    let item = BatchItem::new(seq, prompt, BatchItemKind::Prefill);
     model.forward_batch_device(std::slice::from_ref(&item), pool)?;
     Ok(argmax(model.logits_host()?))
 }
@@ -103,7 +103,7 @@ fn plain_greedy(model: &mut Model, prompt: &[u32], steps: usize) -> Result<Vec<u
     let mut out = vec![prime(model, &mut pool, seq, prompt)?];
     for _ in 0..steps {
         let tok = *out.last().unwrap();
-        let item = BatchItem::new(seq, std::slice::from_ref(&tok));
+        let item = BatchItem::new(seq, std::slice::from_ref(&tok), BatchItemKind::Decode);
         model.forward_batch_device(std::slice::from_ref(&item), &mut pool)?;
         out.push(argmax(model.logits_host()?));
     }
@@ -336,7 +336,7 @@ fn a_rejected_draft_returns_its_kv_slots_and_leaves_the_length_alone() -> Result
     // its argmax is what plain decoding gives after `pending`.
     let next = {
         let tok_in = *outcome.tokens.last().unwrap();
-        let item = BatchItem::new(seq, std::slice::from_ref(&tok_in));
+        let item = BatchItem::new(seq, std::slice::from_ref(&tok_in), BatchItemKind::Decode);
         model.forward_batch_device(std::slice::from_ref(&item), &mut pool)?;
         argmax(model.logits_host()?)
     };
@@ -548,7 +548,7 @@ fn a_real_drafter_reaches_a_useful_acceptance_length() -> Result<()> {
         let mut proposal = Vec::with_capacity(k);
         let mut fed = pending;
         for _ in 0..k {
-            let item = BatchItem::new(dseq, std::slice::from_ref(&fed));
+            let item = BatchItem::new(dseq, std::slice::from_ref(&fed), BatchItemKind::Decode);
             drafter.forward_batch_device(std::slice::from_ref(&item), &mut dpool)?;
             fed = argmax(drafter.logits_host()?);
             proposal.push(fed);
@@ -867,7 +867,7 @@ fn a_forked_sequence_shares_its_prefix_and_computes_from_it() -> Result<()> {
 
     // What the source would produce for the next token, for comparison.
     let want = {
-        let it = BatchItem::new(src, std::slice::from_ref(&pending));
+        let it = BatchItem::new(src, std::slice::from_ref(&pending), BatchItemKind::Decode);
         model.forward_batch_device(std::slice::from_ref(&it), &mut pool)?;
         let v = model.logits_host()?.to_vec();
         pool.truncate(src, src_len);
@@ -891,7 +891,7 @@ fn a_forked_sequence_shares_its_prefix_and_computes_from_it() -> Result<()> {
 
     // The same token on the fork, which owns this one slot.
     let got = {
-        let it = BatchItem::new(dst, std::slice::from_ref(&pending));
+        let it = BatchItem::new(dst, std::slice::from_ref(&pending), BatchItemKind::Decode);
         model.forward_batch_device(std::slice::from_ref(&it), &mut pool)?;
         model.logits_host()?.to_vec()
     };

@@ -9,7 +9,7 @@
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use infero_model::{BatchItem, KvCacheQuant, Model};
+use infero_model::{BatchItem, BatchItemKind, KvCacheQuant, Model};
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("warn").init();
@@ -62,13 +62,13 @@ fn main() -> Result<()> {
         let filler: Vec<u32> = (0..ctx).map(|i| (1000 + i % 5000) as u32).collect();
         for &seq in &seqs {
             for chunk in filler.chunks(infero_model::MAX_BATCH_TOKENS) {
-                model.forward_batch(&[BatchItem::without_logits(seq, chunk)], &mut pool)?;
+                model.forward_batch(&[BatchItem::without_logits(seq, chunk, BatchItemKind::Prefill)], &mut pool)?;
             }
         }
 
         let tok = [42u32];
         let step = |m: &mut Model, p: &mut _| -> Result<()> {
-            let items: Vec<BatchItem<'_>> = seqs.iter().map(|&s| BatchItem::new(s, &tok)).collect();
+            let items: Vec<BatchItem<'_>> = seqs.iter().map(|&s| BatchItem::new(s, &tok, BatchItemKind::Decode)).collect();
             m.forward_batch(&items, p)?;
             Ok(())
         };

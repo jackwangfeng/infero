@@ -12,7 +12,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use infero_cuda::Device;
 use infero_gguf::Gguf;
-use infero_model::{KvCacheQuant, Model, Sampler, SamplingParams};
+use infero_model::{BatchItemKind, KvCacheQuant, Model, Sampler, SamplingParams};
 use infero_tokenizer::{ChatMessage, Tokenizer};
 
 fn main() -> Result<()> {
@@ -115,7 +115,7 @@ fn main() -> Result<()> {
 
     // Prefill: the whole prompt in one call, logits for its last position.
     let t0 = Instant::now();
-    let logits = model.forward(&tokens, &mut session)?;
+    let logits = model.forward(&tokens, BatchItemKind::Prefill, &mut session)?;
     let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_new);
@@ -139,7 +139,7 @@ fn main() -> Result<()> {
             eprintln!("\n\x1b[33m[context full]\x1b[0m");
             break;
         }
-        let logits = model.forward(&[next], &mut session)?;
+        let logits = model.forward(&[next], BatchItemKind::Decode, &mut session)?;
         n_decoded += 1;
         next = sampler.sample(logits, &generated);
     }
