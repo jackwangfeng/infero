@@ -1,0 +1,21 @@
+{
+  "id": "chatcmpl-000000006a9c2adb00000093",
+  "object": "chat.completion",
+  "created": 1788619483,
+  "model": "qwen38-27b-fp8",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "We need answer user: \"Count from 1 to 20, one number per line.\" Simple. Need final only numbers 1..20 each line. Ensure no extra.\n</think>\n\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n"
+      },
+      "finish_reason": "length"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 66,
+    "completion_tokens": 80,
+    "total_tokens": 146
+  }
+}

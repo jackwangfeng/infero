@@ -1,0 +1,44 @@
+{
+  "y": {
+    "id": "chatcmpl-000000006a9c2b2d0000009a",
+    "object": "chat.completion",
+    "created": 1788619565,
+    "model": "qwen38-27b-fp8",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "We need to respond to user: \"Explain how a car engine works in exactly three sentences.\" Need final exactly three sentences. Ensure no extra. Need likely simple explanation. Count sentences carefully. Could be:\n\"A car engine converts fuel into mechanical energy through controlled explosions inside cylinders.\" \n\"Air"
+        },
+        "finish_reason": "length"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 64,
+      "completion_tokens": 60,
+      "total_tokens": 124
+    }
+  },
+  "x": {
+    "id": "chatcmpl-000000006a9c2b2d0000009b",
+    "object": "chat.completion",
+    "created": 1788619565,
+    "model": "qwen38-27b-fp8",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "We need to respond to user: \"Explain photosynthesis in exactly three sentences.\" Need final exactly three sentences. Ensure no extra. Need likely simple explanation. Count sentences: 1) Photosynthesis is the process by which plants, algae, and some bacteria convert light energy into chemical energy. "
+        },
+        "finish_reason": "length"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 61,
+      "completion_tokens": 60,
+      "total_tokens": 121
+    }
+  }
+}

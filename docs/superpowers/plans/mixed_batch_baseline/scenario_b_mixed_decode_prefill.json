@@ -1,0 +1,44 @@
+{
+  "short": {
+    "id": "chatcmpl-000000006a9c2b2900000096",
+    "object": "chat.completion",
+    "created": 1788619561,
+    "model": "qwen38-27b-fp8",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "We need to answer user: \"What"
+        },
+        "finish_reason": "length"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 65,
+      "completion_tokens": 8,
+      "total_tokens": 73
+    }
+  },
+  "long": {
+    "id": "chatcmpl-000000006a9c2b2b00000097",
+    "object": "chat.completion",
+    "created": 1788619563,
+    "model": "qwen38-27b-fp8",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "We need answer user's request. User: \"Please summarize this list in detail, one sentence per item: item number 0 is about topic 0, ...\" It's a huge list from "
+        },
+        "finish_reason": "length"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 50953,
+      "completion_tokens": 40,
+      "total_tokens": 50993
+    }
+  }
+}
