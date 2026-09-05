@@ -210,6 +210,85 @@ impl Gguf {
         Ok(self.data(self.tensor(name)?))
     }
 
+    /// Reads only the rows in `row_range` (torch/row-major order, i.e.
+    /// indices into `t.shape()`'s leading dimension) from `t`, for
+    /// tensor-parallel sharded loading -- never materializes the full
+    /// tensor. `row_bytes` is computed as `t.n_bytes / t.shape()[0]` rather
+    /// than derived from `t.ty`'s per-element width: this holds for any
+    /// ggml encoding, quantized block formats included, as long as a row's
+    /// worth of columns (`t.dims[0]`, ggml's fastest-moving axis) is a whole
+    /// number of that format's blocks -- true for every real model shape
+    /// this crate loads, since ggml itself requires it.
+    pub fn tensor_shard(&self, t: &TensorInfo, row_range: std::ops::Range<usize>) -> Result<Vec<u8>> {
+        let shape = t.shape();
+        anyhow::ensure!(!shape.is_empty(), "cannot shard a scalar tensor");
+        let n_rows = shape[0] as usize;
+        anyhow::ensure!(
+            row_range.end <= n_rows,
+            "shard range {row_range:?} out of bounds for a {n_rows}-row tensor"
+        );
+        anyhow::ensure!(
+            t.n_bytes % n_rows == 0,
+            "tensor byte size {} does not divide evenly into {n_rows} rows -- \
+             ragged block encoding this sharding scheme cannot slice safely",
+            t.n_bytes
+        );
+        let row_bytes = t.n_bytes / n_rows;
+        let full = self.data(t);
+        let start = row_range.start * row_bytes;
+        let end = row_range.end * row_bytes;
+        Ok(full[start..end].to_vec())
+    }
+
+    /// Reads only the columns in `col_range` (ggml's fastest-moving axis,
+    /// `t.dims[0]` -- the *input*/contraction dimension of a `[in, out]`
+    /// linear weight) from every row of `t`, for row-parallel tensor-
+    /// parallel sharding (e.g. an output/down projection, sharded along the
+    /// dimension each rank's own partial input covers). Unlike
+    /// [`Self::tensor_shard`], a column range is NOT one contiguous byte
+    /// run -- ggml stores each row's `dims[0]` columns contiguously, so this
+    /// does one small contiguous read per row rather than a single big one.
+    ///
+    /// Quantized formats (this crate's real checkpoints ship `Q8_0` for
+    /// every sharded weight matrix, confirmed by inspection) pack
+    /// `t.ty.block_size()` elements into one `t.ty.type_size()`-byte block
+    /// with a shared scale -- a column boundary that lands mid-block would
+    /// either be impossible to slice or silently split a scale factor
+    /// between ranks, so `col_range` must be block-aligned; this is
+    /// checked, not assumed.
+    pub fn tensor_shard_cols(&self, t: &TensorInfo, col_range: std::ops::Range<usize>) -> Result<Vec<u8>> {
+        let shape = t.shape();
+        anyhow::ensure!(shape.len() >= 2, "tensor_shard_cols needs a >=2D tensor, got shape {shape:?}");
+        let n_rows = shape[0] as usize;
+        let n_cols = t.dims[0] as usize; // ggml's fastest axis == shape()'s last axis
+        anyhow::ensure!(
+            col_range.end <= n_cols,
+            "shard range {col_range:?} out of bounds for a {n_cols}-column tensor"
+        );
+        let block = t.ty.block_size();
+        anyhow::ensure!(
+            col_range.start % block == 0 && col_range.end % block == 0,
+            "column shard range {col_range:?} is not aligned to {}'s {block}-element block size",
+            t.ty
+        );
+        let type_size = t.ty.type_size();
+        let row_bytes = (n_cols / block) * type_size;
+        anyhow::ensure!(
+            row_bytes * n_rows == t.n_bytes,
+            "computed row size {row_bytes} * {n_rows} rows doesn't match tensor byte size {}",
+            t.n_bytes
+        );
+        let col_start_bytes = (col_range.start / block) * type_size;
+        let shard_row_bytes = ((col_range.end - col_range.start) / block) * type_size;
+        let full = self.data(t);
+        let mut out = Vec::with_capacity(n_rows * shard_row_bytes);
+        for row in 0..n_rows {
+            let row_start = row * row_bytes + col_start_bytes;
+            out.extend_from_slice(&full[row_start..row_start + shard_row_bytes]);
+        }
+        Ok(out)
+    }
+
     // ---- metadata access -------------------------------------------------
 
     pub fn get(&self, key: &str) -> Option<&Value> {

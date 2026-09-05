@@ -246,6 +246,58 @@ impl LinearAttnConfig {
 }
 
 impl Config {
+    /// Divides this model's head counts by `rank.tp_size`, in place, for
+    /// tensor-parallel loading -- called once, right after parsing, before
+    /// any weight is loaded. Every downstream consumer (`KvPool`, `AttnDims`
+    /// construction, kernel dispatch) already parameterizes on `n_heads`/
+    /// `n_kv_heads`/`linear_attn`'s head counts, so sharding them here means
+    /// nothing downstream needs to know tensor parallelism exists at all.
+    /// A no-op at `tp_size == 1` (today's exact behavior).
+    #[cfg(feature = "nccl")]
+    pub fn shard_for_tp(&mut self, rank: &crate::tp::RankId) {
+        if rank.tp_size <= 1 {
+            return;
+        }
+        assert!(
+            self.n_heads % rank.tp_size == 0,
+            "n_heads ({}) must divide tp_size ({})",
+            self.n_heads,
+            rank.tp_size
+        );
+        assert!(
+            self.n_kv_heads % rank.tp_size == 0,
+            "n_kv_heads ({}) must divide tp_size ({})",
+            self.n_kv_heads,
+            rank.tp_size
+        );
+        assert!(
+            self.d_ff % rank.tp_size == 0,
+            "d_ff ({}) must divide tp_size ({}) -- standard Megatron-style MLP \
+             sharding divides the FFN's hidden width across ranks",
+            self.d_ff,
+            rank.tp_size
+        );
+        self.n_heads /= rank.tp_size;
+        self.n_kv_heads /= rank.tp_size;
+        self.d_ff /= rank.tp_size;
+        if let Some(la) = &mut self.linear_attn {
+            assert!(
+                la.key_heads % rank.tp_size == 0,
+                "linear_num_key_heads ({}) must divide tp_size ({})",
+                la.key_heads,
+                rank.tp_size
+            );
+            assert!(
+                la.value_heads % rank.tp_size == 0,
+                "linear_num_value_heads ({}) must divide tp_size ({})",
+                la.value_heads,
+                rank.tp_size
+            );
+            la.key_heads /= rank.tp_size;
+            la.value_heads /= rank.tp_size;
+        }
+    }
+
     /// How wide the attention block is inside, `n_heads · d_head`.
     ///
     /// Equal to `d_model` for every model up to Qwen3.8, which is why the two

@@ -713,6 +713,18 @@ pub struct Model {
     /// `AttnDims`/`KvQuant` -- this field existing does not by itself change
     /// `attention()`'s default behavior.
     attn_backend_name: &'static str,
+    /// The actual, persistent instance `attention()`'s dispatch calls
+    /// `prefill()` on when `attn_backend_name != "handrolled"` -- kept
+    /// separate from the transient `Box<dyn AttentionBackend>` list built
+    /// once inside `from_parts` to *decide* `attn_backend_name` (that list is
+    /// local to the selection block and dropped when it ends). Storing the
+    /// real instance here, not just its name, is what lets `FlashAttn2Ffi`'s
+    /// own scratch-buffer reuse (see its doc comment) actually persist across
+    /// the 64 layer×chunk calls a real prefill makes -- constructing a fresh
+    /// `FlashAttn2Ffi` at each call site, as `attention()` did before this
+    /// field existed, would silently defeat that reuse every single call.
+    #[cfg(feature = "flash_attn2")]
+    flash_attn2_backend: infero_kernels::flash_attn2::FlashAttn2Ffi,
     max_seq: usize,
     /// Per layer, whether it mixes with a recurrence. Cached because the pool
     /// needs it to size the state and the layer loop consults it every block.
@@ -927,6 +939,37 @@ impl Model {
         kern.warm_up()?;
 
         let w = Weights::load(&dev, f, &cfg, n_gpu_layers)?;
+        Self::from_parts(dev, kern, cfg, w, max_seq, kv_quant, max_logit_rows)
+    }
+
+    /// [`Self::load_full`], sharded across a tensor-parallel group. `rank`
+    /// determines this process's slice of every column/row-parallel weight
+    /// (see `Config::shard_for_tp`, `Weights::load_sharded`) -- every other
+    /// rank in the same group must be constructed with the same checkpoint,
+    /// `rank.tp_size`, and a distinct `rank.tp_rank`, or the ranks' forward
+    /// passes silently stop matching shape at the first `ncclAllReduce`.
+    /// `rank.tp_size == 1` is byte-for-byte [`Self::load_full`] (a no-op
+    /// `Config::shard_for_tp`, `Weights::load_sharded(..., None)`).
+    #[cfg(feature = "nccl")]
+    pub fn load_full_tp(
+        dev: Device,
+        f: &Gguf,
+        max_seq: usize,
+        kv_quant: KvQuant,
+        n_gpu_layers: usize,
+        max_logit_rows: usize,
+        rank: &crate::tp::RankId,
+    ) -> Result<Self> {
+        let max_logit_rows = max_logit_rows.clamp(1, MAX_BATCH_TOKENS);
+        let mut cfg = Config::from_gguf(f)?;
+        cfg.shard_for_tp(rank);
+        tracing::info!("{cfg}");
+
+        let kern = Kernels::new(dev.clone());
+        kern.warm_up()?;
+
+        let shard = (rank.tp_size > 1).then_some((rank.tp_rank, rank.tp_size));
+        let w = Weights::load_sharded(&dev, f, &cfg, n_gpu_layers, shard)?;
         Self::from_parts(dev, kern, cfg, w, max_seq, kv_quant, max_logit_rows)
     }
 
@@ -1234,6 +1277,8 @@ impl Model {
             max_logit_rows,
             batch_tokens,
             attn_backend_name,
+            #[cfg(feature = "flash_attn2")]
+            flash_attn2_backend: infero_kernels::flash_attn2::FlashAttn2Ffi::default(),
             max_seq,
             layer_kinds,
             logit_rows: 0,
@@ -3371,7 +3416,7 @@ impl Model {
                             stream: self.dev.stream(),
                             kern: &self.kern,
                         };
-                        infero_kernels::flash_attn2::FlashAttn2Ffi.prefill(&mut ctx)?;
+                        self.flash_attn2_backend.prefill(&mut ctx)?;
                     }
                     #[cfg(not(feature = "flash_attn2"))]
                     {

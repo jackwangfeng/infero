@@ -511,6 +511,30 @@ impl Weights {
     /// resident: the vocab projection is touched once per token and the norms
     /// are negligible.
     pub fn load(dev: &Device, f: &Gguf, cfg: &Config, n_gpu_layers: usize) -> Result<Self> {
+        Self::load_sharded(dev, f, cfg, n_gpu_layers, None)
+    }
+
+    /// [`Self::load`] plus optional tensor-parallel sharding: `(tp_rank,
+    /// tp_size)`, `None` meaning today's exact unsharded behavior. `cfg` is
+    /// expected to already be sharded (`Config::shard_for_tp` called before
+    /// this) -- this function shards the WEIGHT BYTES to match; the two
+    /// disagreeing (e.g. `cfg.n_heads` already halved but the Q/K/V weights
+    /// read in full) would silently build a `Matrix` shaped for the wrong
+    /// number of heads.
+    ///
+    /// Scoped to the non-linear-attention (standard Q/K/V/O + gate/up/down)
+    /// resident-layer path for this pass -- a GDN (`is_linear`) block's own
+    /// sharding needs the same treatment but isn't exercised by the current
+    /// tensor-parallel validation target and isn't implemented here yet; an
+    /// offloaded (`i >= n_gpu_layers`) layer under sharding fails loudly
+    /// rather than silently loading unsharded weights, for the same reason.
+    pub fn load_sharded(
+        dev: &Device,
+        f: &Gguf,
+        cfg: &Config,
+        n_gpu_layers: usize,
+        shard: Option<(usize, usize)>,
+    ) -> Result<Self> {
         let started = std::time::Instant::now();
         let n_gpu_layers = n_gpu_layers.min(cfg.n_layers);
         let mut device_bytes = 0usize;
@@ -602,10 +626,50 @@ impl Weights {
 
             let (matrices, blob) = if i < n_gpu_layers {
                 let mut m = Vec::with_capacity(names.len());
-                for name in &names {
-                    m.push(upload_matrix(dev, f, mapped, name, &mut device_bytes)?);
+                match (shard, is_linear) {
+                    (None, _) => {
+                        for name in &names {
+                            m.push(upload_matrix(dev, f, mapped, name, &mut device_bytes)?);
+                        }
+                    }
+                    (Some(_), true) => {
+                        anyhow::bail!(
+                            "tensor-parallel sharding for a GDN (linear-attention) layer is not \
+                             yet implemented -- layer {i} has one"
+                        );
+                    }
+                    (Some((tp_rank, tp_size)), false) => {
+                        // Standard non-linear block: [q, k, v, o, gate, up, down].
+                        // Column-parallel (shard the output dim, `n`): q/k/v/gate/up.
+                        // Row-parallel (shard the input dim, `k`): o/down.
+                        use ShardAxis::{Input, Output};
+                        let axes = [Output, Output, Output, Input, Output, Output, Input];
+                        anyhow::ensure!(
+                            names.len() == axes.len(),
+                            "layer {i}: expected {} tensors for the standard-attention shard \
+                             pattern, got {}",
+                            axes.len(),
+                            names.len()
+                        );
+                        for (name, axis) in names.iter().zip(axes) {
+                            m.push(upload_matrix_sharded(
+                                dev,
+                                f,
+                                name,
+                                axis,
+                                tp_rank,
+                                tp_size,
+                                &mut device_bytes,
+                            )?);
+                        }
+                    }
                 }
                 (m, None)
+            } else if shard.is_some() {
+                anyhow::bail!(
+                    "tensor-parallel sharding for an offloaded layer ({i} >= n_gpu_layers={n_gpu_layers}) \
+                     is not yet implemented"
+                );
             } else {
                 let (m, blob) = pack_layer(dev, f, &names)
                     .with_context(|| format!("packing layer {i} into host memory"))?;
@@ -2056,6 +2120,78 @@ fn upload_matrix(
             )
         }
     };
+    Ok(Matrix {
+        ty,
+        k,
+        n,
+        n_bytes,
+        storage,
+        cutlass_weight: Default::default(),
+    })
+}
+
+/// Which dimension of a `[k, n]` (ggml `[in, out]`) linear weight a
+/// tensor-parallel rank shards.
+#[derive(Clone, Copy)]
+enum ShardAxis {
+    /// Column-parallel: shard `n` (the output dim). Each rank computes its
+    /// own slice of the output independently -- no communication needed
+    /// until whatever consumes it (Q/K/V, GDN's input projection, FFN
+    /// gate/up).
+    Output,
+    /// Row-parallel: shard `k` (the input/contraction dim). Each rank's
+    /// result is a partial sum over its own slice of the input and needs an
+    /// `ncclAllReduce` with the other ranks before it's the real answer
+    /// (attention/GDN output projections, FFN down).
+    Input,
+}
+
+/// Like [`upload_matrix`], but reads only this rank's `1/tp_size` slice of
+/// `name`'s bytes directly off disk (via [`Gguf::tensor_shard`]/
+/// [`Gguf::tensor_shard_cols`]) rather than the whole tensor -- never
+/// materializes the full weight, on this rank or any other. Always copies
+/// (ignores the `mapped`-file-aliasing optimization `upload_matrix` uses
+/// when available): a shard is a real subset of the file's bytes, not a
+/// contiguous region `map_file`'s whole-file aliasing can express.
+fn upload_matrix_sharded(
+    dev: &Device,
+    f: &Gguf,
+    name: &str,
+    axis: ShardAxis,
+    tp_rank: usize,
+    tp_size: usize,
+    total: &mut usize,
+) -> Result<Matrix> {
+    let ty = WeightType::from_ggml(f.tensor(name)?.ty).with_context(|| format!("tensor {name}"))?;
+    let info = f.tensor(name)?.clone();
+    let (full_k, full_n) = (info.dims[0] as usize, info.dims[1] as usize);
+    let (bytes, k, n) = match axis {
+        ShardAxis::Output => {
+            anyhow::ensure!(
+                full_n % tp_size == 0,
+                "{name}: output width {full_n} does not divide tp_size {tp_size}"
+            );
+            let shard_n = full_n / tp_size;
+            let range = (tp_rank * shard_n)..((tp_rank + 1) * shard_n);
+            (f.tensor_shard(&info, range)?, full_k, shard_n)
+        }
+        ShardAxis::Input => {
+            anyhow::ensure!(
+                full_k % tp_size == 0,
+                "{name}: input width {full_k} does not divide tp_size {tp_size}"
+            );
+            let shard_k = full_k / tp_size;
+            let range = (tp_rank * shard_k)..((tp_rank + 1) * shard_k);
+            (f.tensor_shard_cols(&info, range)?, shard_k, full_n)
+        }
+    };
+    let n_bytes = bytes.len();
+    *total += n_bytes;
+    let storage = Storage::Device(
+        dev.stream()
+            .clone_htod(&bytes)
+            .with_context(|| format!("uploading sharded {name} ({} MiB)", n_bytes >> 20))?,
+    );
     Ok(Matrix {
         ty,
         k,

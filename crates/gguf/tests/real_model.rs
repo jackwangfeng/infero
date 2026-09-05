@@ -135,6 +135,62 @@ fn norm_weights_are_finite_f32() {
 }
 
 #[test]
+fn tensor_shard_reads_only_the_requested_rows() {
+    let f = model_or_skip!();
+    let t = f.tensor("blk.0.attn_q.weight").unwrap().clone();
+    let full = f.tensor_data("blk.0.attn_q.weight").unwrap();
+    let n_rows = t.shape()[0] as usize;
+    let row_bytes = full.len() / n_rows;
+    let half = n_rows / 2;
+
+    let shard = f.tensor_shard(&t, 0..half).unwrap();
+    assert_eq!(shard.len(), half * row_bytes);
+    assert_eq!(&shard[..], &full[..half * row_bytes], "must match the corresponding prefix of a full read");
+
+    let shard2 = f.tensor_shard(&t, half..n_rows).unwrap();
+    assert_eq!(&shard2[..], &full[half * row_bytes..], "must match the corresponding suffix");
+
+    // Every row appears in exactly one shard when tiling the full range.
+    let mut reassembled = shard;
+    reassembled.extend_from_slice(&shard2);
+    assert_eq!(&reassembled[..], full, "the two shards must reassemble to a full read");
+}
+
+#[test]
+fn tensor_shard_cols_reads_only_the_requested_columns() {
+    let f = model_or_skip!();
+    // A real Q8_0-quantized weight, confirmed this session: block_size=32,
+    // type_size=34, dims=[896, 896] -- 896/32=28 blocks a row, evenly
+    // splittable at a 448-column (14-block) boundary for a 2-way shard.
+    let t = f.tensor("blk.0.attn_output.weight").unwrap().clone();
+    assert_eq!(t.ty, GgmlType::Q8_0);
+    let full = f.tensor_data("blk.0.attn_output.weight").unwrap();
+    let n_cols = t.dims[0] as usize;
+    let half = n_cols / 2;
+
+    let shard = f.tensor_shard_cols(&t, 0..half).unwrap();
+    let shard2 = f.tensor_shard_cols(&t, half..n_cols).unwrap();
+    assert_eq!(shard.len(), shard2.len());
+    assert_eq!(shard.len() * 2, full.len());
+
+    // Reassemble row by row and compare against the full read -- proves the
+    // two column shards, interleaved back together, exactly reproduce the
+    // real per-row block layout rather than some other valid-looking but
+    // wrong permutation.
+    let n_rows = t.shape()[0] as usize;
+    let row_bytes = full.len() / n_rows;
+    let half_row_bytes = shard.len() / n_rows;
+    let mut reassembled = vec![0u8; full.len()];
+    for row in 0..n_rows {
+        reassembled[row * row_bytes..row * row_bytes + half_row_bytes]
+            .copy_from_slice(&shard[row * half_row_bytes..(row + 1) * half_row_bytes]);
+        reassembled[row * row_bytes + half_row_bytes..(row + 1) * row_bytes]
+            .copy_from_slice(&shard2[row * half_row_bytes..(row + 1) * half_row_bytes]);
+    }
+    assert_eq!(reassembled, full, "reassembled column shards must exactly match a full read");
+}
+
+#[test]
 fn vocab_matches_token_type_array() {
     let f = model_or_skip!();
     let tokens = f.str_array("tokenizer.ggml.tokens").unwrap();
