@@ -550,6 +550,16 @@ pub fn concat2(a: &[u8], n_a: usize, b: &[u8], n_b: usize, k: usize) -> Vec<u8> 
     concat(&[(a, n_a), (b, n_b)], k)
 }
 
+/// Was a single-thread `extend_from_slice` chain -- correct, but the same
+/// mistake [`pad_rows`]'s own doc comment already found once: a `Vec` this
+/// size (gate+up's quants alone run ~170 MiB a layer on the 27B, 64 layers)
+/// pays for every page's first-touch fault on whichever one thread does the
+/// copying, the exact cost `pad_rows`' fix measured at 13.3-13.5s against a
+/// 16-way split's 1.8-2.0s. Measured here: this was `stack_ms`'s entire real
+/// cost (FFN gate/up fusion alone, 7.0-7.7s of an 18.5s warm load) -- the
+/// scale grid is a few KB even for the widest real matrix (`scale_grid`'s own
+/// `n/128 * k/128` shape), so only the quant region is worth splitting across
+/// threads; the scale region stays a plain sequential copy.
 fn concat(parts: &[(&[u8], usize)], k: usize) -> Vec<u8> {
     let scale_cols = k.div_ceil(FP8_BLOCK);
     let quant_len = |n: usize| n * k;
@@ -558,13 +568,43 @@ fn concat(parts: &[(&[u8], usize)], k: usize) -> Vec<u8> {
         debug_assert!(n.is_multiple_of(FP8_BLOCK));
         debug_assert_eq!(bytes.len(), quant_len(n) + scale_len(n) * 4);
     }
-    let mut out = Vec::with_capacity(parts.iter().map(|(b, _)| b.len()).sum());
-    for &(bytes, n) in parts {
-        out.extend_from_slice(&bytes[..quant_len(n)]);
+    let total_quant: usize = parts.iter().map(|&(_, n)| quant_len(n)).sum();
+    let total_scale: usize = parts.iter().map(|&(_, n)| scale_len(n) * 4).sum();
+    let mut out = vec![0u8; total_quant + total_scale];
+    let (quant_region, scale_region) = out.split_at_mut(total_quant);
+
+    // Split the quant region into one disjoint sub-slice a part first (no
+    // copy, just slicing), then split each part's own sub-slice across
+    // threads the same way `pad_rows` already does -- a wide fusion
+    // (`stacked3`) gets fewer threads a part so the total stays bounded.
+    let threads_per_part = (16usize / parts.len().max(1)).max(1);
+    let mut rest = quant_region;
+    let mut per_part_dst = Vec::with_capacity(parts.len());
+    for &(_, n) in parts {
+        let (chunk, r) = rest.split_at_mut(quant_len(n));
+        per_part_dst.push(chunk);
+        rest = r;
     }
+    std::thread::scope(|scope| {
+        for (&(bytes, n), dst) in parts.iter().zip(per_part_dst) {
+            let ql = quant_len(n);
+            let src = &bytes[..ql];
+            let per_thread = ql.div_ceil(threads_per_part).max(1);
+            for (t, dst_chunk) in dst.chunks_mut(per_thread).enumerate() {
+                let start = t * per_thread;
+                let src_chunk = &src[start..start + dst_chunk.len()];
+                scope.spawn(move || dst_chunk.copy_from_slice(src_chunk));
+            }
+        }
+    });
+
+    let mut off = 0usize;
     for &(bytes, n) in parts {
-        out.extend_from_slice(&bytes[quant_len(n)..]);
-        debug_assert_eq!(bytes.len() - quant_len(n), scale_len(n) * 4);
+        let ql = quant_len(n);
+        let sl = scale_len(n) * 4;
+        scale_region[off..off + sl].copy_from_slice(&bytes[ql..ql + sl]);
+        debug_assert_eq!(bytes.len() - ql, sl);
+        off += sl;
     }
     out
 }
@@ -1294,5 +1334,75 @@ mod pad_rows_tests {
             let got = super::pad_rows(&quants, k, n).expect("pad_rows");
             assert_eq!(got, want, "n={n}");
         }
+    }
+}
+
+#[cfg(test)]
+mod concat_tests {
+    use super::*;
+
+    /// The single-thread `extend_from_slice` chain `concat` used to be --
+    /// kept here, not in the function, as the reference the parallel version
+    /// is checked against.
+    fn concat_serial(parts: &[(&[u8], usize)], k: usize) -> Vec<u8> {
+        let quant_len = |n: usize| n * k;
+        let mut out = Vec::with_capacity(parts.iter().map(|(b, _)| b.len()).sum());
+        for &(bytes, n) in parts {
+            out.extend_from_slice(&bytes[..quant_len(n)]);
+        }
+        for &(bytes, n) in parts {
+            out.extend_from_slice(&bytes[quant_len(n)..]);
+        }
+        out
+    }
+
+    fn fake_part(k: usize, n: usize, seed: u8) -> Vec<u8> {
+        let quant_len = n * k;
+        let scale_len = scale_grid(k, n) * 4;
+        (0..(quant_len + scale_len))
+            .map(|i| ((i as u64).wrapping_mul(31).wrapping_add(seed as u64) % 251) as u8)
+            .collect()
+    }
+
+    #[test]
+    fn concat2_matches_the_serial_reference_at_a_real_ish_shape() {
+        // k/n large enough that the parallel per-part split crosses several
+        // thread-chunk boundaries on any real thread count, and unequal n
+        // between the two parts so the two parts don't get identical thread
+        // splits by coincidence.
+        let k = 5120usize;
+        let (n_a, n_b) = (17408usize, 17408usize + FP8_BLOCK);
+        let a = fake_part(k, n_a, 7);
+        let b = fake_part(k, n_b, 41);
+        let want = concat_serial(&[(&a, n_a), (&b, n_b)], k);
+        let got = super::concat2(&a, n_a, &b, n_b, k);
+        assert_eq!(got.len(), want.len());
+        assert_eq!(got, want, "parallel concat2 must byte-for-byte match the serial reference");
+    }
+
+    #[test]
+    fn concat3_matches_the_serial_reference() {
+        let k = 128usize;
+        let (n_a, n_b, n_c) = (FP8_BLOCK, FP8_BLOCK * 5, FP8_BLOCK * 2);
+        let a = fake_part(k, n_a, 1);
+        let b = fake_part(k, n_b, 2);
+        let c = fake_part(k, n_c, 3);
+        let want = concat_serial(&[(&a, n_a), (&b, n_b), (&c, n_c)], k);
+        let got = super::concat3(&a, n_a, &b, n_b, &c, n_c, k);
+        assert_eq!(got, want, "parallel concat3 must byte-for-byte match the serial reference");
+    }
+
+    #[test]
+    fn concat2_handles_the_smallest_real_shape() {
+        // n at exactly one FP8_BLOCK, k small -- the quant region per part is
+        // smaller than the thread count, so `chunks_mut` produces fewer,
+        // uneven-sized chunks than `threads_per_part`; must still be correct.
+        let k = 8usize;
+        let (n_a, n_b) = (FP8_BLOCK, FP8_BLOCK);
+        let a = fake_part(k, n_a, 5);
+        let b = fake_part(k, n_b, 9);
+        let want = concat_serial(&[(&a, n_a), (&b, n_b)], k);
+        let got = super::concat2(&a, n_a, &b, n_b, k);
+        assert_eq!(got, want);
     }
 }
