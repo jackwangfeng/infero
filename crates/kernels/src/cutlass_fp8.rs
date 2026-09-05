@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use cudarc::driver::{DevicePtr, DevicePtrMut};
 use infero_gpu::{Buf, KernelArg, LaunchConfig, View, ViewMut};
 
+use crate::attn_backend;
 use crate::fp8::{FP8_BLOCK, ROW_GROUP};
 use crate::{Kernels, fp8_src};
 
@@ -215,6 +216,103 @@ mod ffi {
             accum: i32,
             stream: cudarc::driver::sys::CUstream,
         ) -> i32;
+
+        // Hopper/Blackwell-datacenter kernel bodies (real, distinctly-typed
+        // `GemmKernel`s, not the SM120 kernel above recompiled — see
+        // `fp8_bw_gemm.cu`'s own `sm90`/`sm100` namespace comment). Same
+        // signature shape as the SM120 entry points above; which one gets
+        // called is decided in Rust by `Kernels::caps`, never at the C level.
+        pub fn infero_cutlass_fp8_bw_gemm_f32out_workspace_sm90(m: i32, n: i32, k: i32) -> usize;
+        #[allow(clippy::too_many_arguments)]
+        pub fn infero_cutlass_fp8_bw_gemm_f32out_sm90(
+            a: *const c_void,
+            b: *const c_void,
+            sfa: *const f32,
+            sfb: *const f32,
+            d: *mut f32,
+            workspace: *mut c_void,
+            m: i32,
+            n: i32,
+            k: i32,
+            accum: i32,
+            stream: cudarc::driver::sys::CUstream,
+        ) -> i32;
+        pub fn infero_cutlass_fp8_bw_gemm_f32out_workspace_sm100(m: i32, n: i32, k: i32) -> usize;
+        #[allow(clippy::too_many_arguments)]
+        pub fn infero_cutlass_fp8_bw_gemm_f32out_sm100(
+            a: *const c_void,
+            b: *const c_void,
+            sfa: *const f32,
+            sfb: *const f32,
+            d: *mut f32,
+            workspace: *mut c_void,
+            m: i32,
+            n: i32,
+            k: i32,
+            accum: i32,
+            stream: cudarc::driver::sys::CUstream,
+        ) -> i32;
+    }
+}
+
+/// Which real, distinctly-compiled CUTLASS FP8 GEMM kernel body this GPU's
+/// compute capability maps to — `None` means no working kernel exists for
+/// this hardware at all (yet), and the caller must fall back to
+/// `mma_e4m3_block` rather than attempt a mismatched entry point.
+///
+/// Only SM120 (this crate's original target) has ever been executed on real
+/// hardware. SM90/SM100 are real, separately-typed CUTLASS kernel bodies
+/// (see `fp8_bw_gemm.cu`'s `sm90`/`sm100` namespaces, added in `62edc2f`) —
+/// compile-verified and linked, but their *correctness on real hardware* is
+/// unverified, since no SM90/SM100 GPU exists on any box this project has
+/// access to. Routing to them is a real, tested decision (see this file's
+/// `#[cfg(test)] mod gemm_arch_tests`); the kernel body's own numerical
+/// correctness once it actually runs is a separate, still-open claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GemmArchTier {
+    Sm90,
+    Sm100,
+    Sm120,
+}
+
+fn gemm_arch_tier(caps: attn_backend::HardwareCaps) -> Option<GemmArchTier> {
+    match caps.arch {
+        90 => Some(GemmArchTier::Sm90),
+        100 => Some(GemmArchTier::Sm100),
+        120 => Some(GemmArchTier::Sm120),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod gemm_arch_tests {
+    use super::*;
+
+    #[test]
+    fn routes_each_known_arch_to_its_own_kernel_body() {
+        assert_eq!(
+            gemm_arch_tier(attn_backend::HardwareCaps { arch: 90, sm_count: 1 }),
+            Some(GemmArchTier::Sm90)
+        );
+        assert_eq!(
+            gemm_arch_tier(attn_backend::HardwareCaps { arch: 100, sm_count: 1 }),
+            Some(GemmArchTier::Sm100)
+        );
+        assert_eq!(
+            gemm_arch_tier(attn_backend::HardwareCaps { arch: 120, sm_count: 1 }),
+            Some(GemmArchTier::Sm120)
+        );
+    }
+
+    #[test]
+    fn refuses_hardware_with_no_working_kernel_body() {
+        // Ampere: no FP8 tensor-core hardware at all. Ada (89): CUTLASS has
+        // no blockwise-scaling config for it in this project's vendored
+        // checkout yet (see `62edc2f`'s own commit message). Both must come
+        // back `None`, not silently route to a mismatched entry point.
+        assert_eq!(gemm_arch_tier(attn_backend::HardwareCaps { arch: 80, sm_count: 1 }), None);
+        assert_eq!(gemm_arch_tier(attn_backend::HardwareCaps { arch: 89, sm_count: 1 }), None);
+        assert_eq!(gemm_arch_tier(attn_backend::HardwareCaps { arch: 121, sm_count: 1 }), None);
     }
 }
 
@@ -459,11 +557,48 @@ impl Kernels {
         if !k.is_multiple_of(FP8_BLOCK) || !n.is_multiple_of(FP8_BLOCK) || n_tokens == 0 {
             return Ok(false);
         }
+        // No working CUTLASS kernel body exists for this hardware at all
+        // (e.g. Ampere has no FP8 tensor cores; Ada has no blockwise-scaling
+        // config in this project's vendored CUTLASS checkout yet) -- same
+        // "caller falls back to `mma_e4m3_block`" contract as the shape
+        // checks just above, not a crash or a mismatched-entry-point launch.
+        let Some(tier) = gemm_arch_tier(self.caps) else {
+            return Ok(false);
+        };
         debug_assert!(sfa_t.len() >= (k / FP8_BLOCK) * n_tokens);
         debug_assert!(out.len() >= n_tokens * n);
         let stream = self.dev.stream();
-        let ws_bytes =
-            unsafe { ffi::infero_cutlass_fp8_bw_gemm_f32out_workspace(n_tokens as i32, n as i32, k as i32) };
+
+        // Three real, distinctly-compiled kernel bodies (see `fp8_bw_gemm.cu`'s
+        // `sm90`/`sm100` namespaces, `62edc2f`) share this exact signature --
+        // picking the function pointer pair here is the whole dispatch, the
+        // call site below is otherwise identical for all three.
+        #[allow(clippy::type_complexity)]
+        let (workspace_fn, gemm_fn): (
+            unsafe extern "C" fn(i32, i32, i32) -> usize,
+            unsafe extern "C" fn(
+                *const std::ffi::c_void,
+                *const std::ffi::c_void,
+                *const f32,
+                *const f32,
+                *mut f32,
+                *mut std::ffi::c_void,
+                i32,
+                i32,
+                i32,
+                i32,
+                cudarc::driver::sys::CUstream,
+            ) -> i32,
+        ) = match tier {
+            GemmArchTier::Sm90 => {
+                (ffi::infero_cutlass_fp8_bw_gemm_f32out_workspace_sm90, ffi::infero_cutlass_fp8_bw_gemm_f32out_sm90)
+            }
+            GemmArchTier::Sm100 => {
+                (ffi::infero_cutlass_fp8_bw_gemm_f32out_workspace_sm100, ffi::infero_cutlass_fp8_bw_gemm_f32out_sm100)
+            }
+            GemmArchTier::Sm120 => (ffi::infero_cutlass_fp8_bw_gemm_f32out_workspace, ffi::infero_cutlass_fp8_bw_gemm_f32out),
+        };
+        let ws_bytes = unsafe { workspace_fn(n_tokens as i32, n as i32, k as i32) };
 
         CUTLASS_WORKSPACE.with(stream, ws_bytes.max(1), |ws_view| {
             let (a_ptr, _ra) = xq.device_ptr(stream);
@@ -481,7 +616,7 @@ impl Kernels {
                 .profile()
                 .time("cutlass_fp8_gemm_f32out", stream, || {
                     let st = unsafe {
-                        ffi::infero_cutlass_fp8_bw_gemm_f32out(
+                        gemm_fn(
                             a_ptr as *const std::ffi::c_void,
                             b_ptr as *const std::ffi::c_void,
                             sfa_ptr as *const f32,

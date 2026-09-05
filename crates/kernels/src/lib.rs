@@ -265,6 +265,9 @@ pub struct Kernels {
     /// shape. Building one is a host call of a few microseconds; a decode step
     /// wants 128 of them, so they are built once and kept.
     tma: std::sync::Mutex<std::collections::HashMap<(u64, usize, usize), TmaDesc>>,
+    /// Probed once here rather than per-call — see [`attn_backend::HardwareCaps`]'s
+    /// own doc comment. Used by [`cutlass_fp8`]'s multi-arch GEMM dispatch.
+    caps: attn_backend::HardwareCaps,
 }
 
 /// A `CUtensorMap` is 128 opaque bytes that reach the kernel by value.
@@ -346,9 +349,11 @@ fn rms_fits(d: usize) -> bool {
 
 impl Kernels {
     pub fn new(dev: Device) -> Self {
+        let caps = attn_backend::HardwareCaps::probe(&dev);
         Self {
             dev,
             tma: std::sync::Mutex::new(std::collections::HashMap::new()),
+            caps,
         }
     }
 
