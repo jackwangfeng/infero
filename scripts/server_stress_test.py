@@ -181,6 +181,61 @@ def t_tool_calling(base_url: str) -> tuple[bool, str]:
     return has_call or has_text, f"status={status} tool_calls={msg.get('tool_calls')!r} content={msg.get('content')!r}"
 
 
+# A real 64x64 solid-red PNG and a real 2s solid-blue 64x64 h.264 mp4,
+# generated once (PIL / ffmpeg) and embedded so this script has zero extra
+# runtime dependencies. Added 2026-09-05 to close a real 0%-coverage gap
+# (`qwen35_vision_image.rs`) found by this session's own coverage measurement
+# -- vision/video had never been exercised by any test all session.
+TEST_IMAGE_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAX0lEQVR4nO3PQQ0AIBDAMMC/50MEj4ZkVbDtWX87OuBVA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA9oFUoUBf3Xr7AgAAAAASUVORK5CYII="
+)
+TEST_VIDEO_B64 = (
+    "AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAAIZnJlZQAAAwttZGF0AAACrQYF//+p3EXpvebZSLeWLNgg2SPu73gyNjQgLSBjb3JlIDE2NCByMzEwOCAzMWUxOWY5IC0gSC4yNjQvTVBFRy00IEFWQyBjb2RlYyAtIENvcHlsZWZ0IDIwMDMtMjAyMyAtIGh0dHA6Ly93d3cudmlkZW9sYW4ub3JnL3gyNjQuaHRtbCAtIG9wdGlvbnM6IGNhYmFjPTEgcmVmPTMgZGVibG9jaz0xOjA6MCBhbmFseXNlPTB4MzoweDExMyBtZT1oZXggc3VibWU9NyBwc3k9MSBwc3lfcmQ9MS4wMDowLjAwIG1peGVkX3JlZj0xIG1lX3JhbmdlPTE2IGNocm9tYV9tZT0xIHRyZWxsaXM9MSA4eDhkY3Q9MSBjcW09MCBkZWFkem9uZT0yMSwxMSBmYXN0X3Bza2lwPTEgY2hyb21hX3FwX29mZnNldD0tMiB0aHJlYWRzPTIgbG9va2FoZWFkX3RocmVhZHM9MSBzbGljZWRfdGhyZWFkcz0wIG5yPTAgZGVjaW1hdGU9MSBpbnRlcmxhY2VkPTAgYmx1cmF5X2NvbXBhdD0wIGNvbnN0cmFpbmVkX2ludHJhPTAgYmZyYW1lcz0zIGJfcHlyYW1pZD0yIGJfYWRhcHQ9MSBiX2JpYXM9MCBkaXJlY3Q9MSB3ZWlnaHRiPTEgb3Blbl9nb3A9MCB3ZWlnaHRwPTIga2V5aW50PTI1MCBrZXlpbnRfbWluPTIgc2NlbmVjdXQ9NDAgaW50cmFfcmVmcmVzaD0wIHJjX2xvb2thaGVhZD00MCByYz1jcmYgbWJ0cmVlPTEgY3JmPTIzLjAgcWNvbXA9MC42MCBxcG1pbj0wIHFwbWF4PTY5IHFwc3RlcD00IGlwX3JhdGlvPTEuNDAgYXE9MToxLjAwAIAAAAAoZYiEABX//uzPfgU3IDyL9ZQIdLVudeOY06aFdOh0hhIVsUAt6pJMwwAAAApBmiNsQS/+tSvvAAAACEGeQXiCfwExAAAACAGeYmpBLwF7AAADYm1vb3YAAABsbXZoZAAAAAAAAAAAAAAAAAAAA+gAAAfQAAEAAAEAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAKMdHJhawAAAFx0a2hkAAAAAwAAAAAAAAAAAAAAAQAAAAAAAAfQAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAQAAAAABAAAAAQAAAAAAAJGVkdHMAAAAcZWxzdAAAAAAAAAABAAAH0AAAQAAAAQAAAAACBG1kaWEAAAAgbWRoZAAAAAAAAAAAAAAAAAAAQAAAAIAAVcQAAAAAAC1oZGxyAAAAAAAAAAB2aWRlAAAAAAAAAAAAAAAAVmlkZW9IYW5kbGVyAAAAAa9taW5mAAAAFHZtaGQAAAABAAAAAAAAAAAAAAAkZGluZgAAABxkcmVmAAAAAAAAAAEAAAAMdXJsIAAAAAEAAAFvc3RibAAAAL9zdHNkAAAAAAAAAAEAAACvYXZjMQAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAABAAEAASAAAAEgAAAAAAAAAARVMYXZjNjAuMzEuMTAyIGxpYngyNjQAAAAAAAAAAAAAABj//wAAADVhdmNDAWQACv/hABhnZAAKrNlEJsBEAAADAAQAAAMAEDxIllgBAAZo6+PLIsD9+PgAAAAAEHBhc3AAAAABAAAAAQAAABRidHJ0AAAAAAAADAwAAAwMAAAAGHN0dHMAAAAAAAAAAQAAAAQAACAAAAAAFHN0c3MAAAAAAAAAAQAAAAEAAAAoY3R0cwAAAAAAAAADAAAAAQAAQAAAAAABAACAAAAAAAIAACAAAAAAHHN0c2MAAAAAAAAAAQAAAAEAAAAEAAAAAQAAACRzdHN6AAAAAAAAAAAAAAAEAAAC3QAAAA4AAAAMAAAADAAAABRzdGNvAAAAAAAAAAEAAAAwAAAAYnVkdGEAAABabWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAbWRpcmFwcGwAAAAAAAAAAAAAAAAtaWxzdAAAACWpdG9vAAAAHWRhdGEAAAABAAAAAExhdmY2MC4xNi4xMDA="
+)
+
+
+def t_vision_image(base_url: str) -> tuple[bool, str]:
+    status, resp = chat(base_url, [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "What color is this image? Reply with just the color name."},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{TEST_IMAGE_B64}"}},
+        ],
+    }], max_tokens=40)
+    passed = ok(status, resp) and "red" in content_of(resp).lower()
+    return passed, f"status={status} content={content_of(resp) if isinstance(resp, dict) else resp!r}"
+
+
+def t_vision_multiturn(base_url: str) -> tuple[bool, str]:
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "What color is this image? Reply with just the color name."},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{TEST_IMAGE_B64}"}},
+        ],
+    }]
+    status, resp = chat(base_url, messages, max_tokens=40)
+    if not ok(status, resp):
+        return False, f"turn 1 failed: status={status} body={resp!r}"
+    messages.append({"role": "assistant", "content": content_of(resp)})
+    messages.append({"role": "user", "content": "What color did I just show you? One word."})
+    status, resp = chat(base_url, messages, max_tokens=60)
+    passed = ok(status, resp) and "red" in content_of(resp).lower()
+    return passed, f"status={status} content={content_of(resp) if isinstance(resp, dict) else resp!r}"
+
+
+def t_video(base_url: str) -> tuple[bool, str]:
+    status, resp = chat(base_url, [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "What color is this video? One word."},
+            {"type": "video_url", "video_url": {"url": f"data:video/mp4;base64,{TEST_VIDEO_B64}"}},
+        ],
+    }], max_tokens=40)
+    passed = ok(status, resp) and "blue" in content_of(resp).lower()
+    return passed, f"status={status} content={content_of(resp) if isinstance(resp, dict) else resp!r}"
+
+
 CATEGORIES: list[tuple[str, "callable"]] = [
     ("single_turn_short", t_single_turn_short),
     ("single_turn_medium", t_single_turn_medium),
@@ -192,6 +247,9 @@ CATEGORIES: list[tuple[str, "callable"]] = [
     ("concurrent_over_capacity_4", lambda u: t_concurrent(u, 4)),
     ("retire_and_reuse", t_retire_and_reuse),
     ("tool_calling", t_tool_calling),
+    ("vision_image", t_vision_image),
+    ("vision_multiturn", t_vision_multiturn),
+    ("video", t_video),
 ]
 
 
