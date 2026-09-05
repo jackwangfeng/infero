@@ -5249,6 +5249,62 @@ impl Activations {
             // `chunk` width regardless of which backend won prefill
             // selection -- see the "tokens a pass carries" log site's own
             // comment for the attempt that got reverted here.
+            //
+            // Investigated (mixed-batch-attn-dispatch-split plan, task 2) for
+            // whatever *decode-only* successor buffer Task 3 sizes here: the
+            // real ceiling on how many tokens the decode subgroup can carry in
+            // one step is `max_logit_rows` (== `max_seqs.max(spec_k + 1)`,
+            // computed once in `crates/server/src/engine.rs:225` and passed
+            // in as this function's own `max_logit_rows` parameter) -- NOT
+            // `max_seqs` alone, and NOT `max_seqs * (mtp_k + 1)` as an earlier
+            // draft of the plan assumed. Confirmed by reading, not inferred:
+            //   - `Work::Decode` always builds a `BatchItem` with exactly one
+            //     token (`crates/server/src/scheduler.rs:993`,
+            //     `tokens: std::slice::from_ref(r.next.as_ref().unwrap())`);
+            //     `Work` has only `Prefill`/`Decode` variants
+            //     (`crates/server/src/scheduler.rs:141-146`), so an ordinary
+            //     multi-sequence step's decode-subgroup token count is the
+            //     number of concurrently-decoding sequences, at most
+            //     `max_logit_rows` (every decode item wants logits, and
+            //     `forward_batch_rows` enforces
+            //     `n_logit_rows <= self.max_logit_rows` over the whole pass --
+            //     `crates/model/src/lib.rs:1729-1735`).
+            //   - Speculative *verification* is not a separate buffer-free
+            //     pass: `Scheduler::speculative_step` (`scheduler.rs:654`)
+            //     calls `Model::verify_draft_sampled` (`crates/model/src/spec.rs:692`),
+            //     which builds one `BatchItem` of `n = draft.len() + 1`
+            //     (= `k + 1`) tokens (`spec.rs:716-726`) and runs it through
+            //     `forward_batch_rows` (`spec.rs:728`) -- the exact same core
+            //     forward pass `forward_batch_device` wraps
+            //     (`crates/model/src/lib.rs:1679-1690`) and that reads/writes
+            //     this very `attn_partial` buffer (`lib.rs:3578`, `lib.rs:3897`).
+            //     So a speculative round's `k+1` tokens DO flow through this
+            //     buffer, same as an ordinary decode.
+            //   - But `speculative_step` only ever fires with exactly one
+            //     running sequence (`scheduler.rs:655`,
+            //     `if self.spec_k == 0 || self.running.len() != 1 { return Ok(false); }`),
+            //     and it returns before the ordinary `plan()`/`items` path
+            //     runs at all when it does fire (`scheduler.rs:937-939`) --
+            //     the two paths are mutually exclusive within one step, so
+            //     their token counts never add (never `max_seqs * (k+1)`).
+            //   - `k + 1` is itself bounded by `max_logit_rows`, both by
+            //     construction (`crates/server/src/engine.rs:225`,
+            //     `let logit_rows = max_seqs.max(spec_k + 1);`, passed in as
+            //     `max_logit_rows`) and defensively at every verification call
+            //     (`spec.rs:545`, `spec.rs:611`, `spec.rs:704`,
+            //     `n <= self.max_logit_rows`).
+            //   - MTP's *drafting* pass (as opposed to verification) is a
+            //     genuinely separate structure that never touches this buffer:
+            //     `MtpHead` owns its own single-sequence KV cache
+            //     (`crates/model/src/mtp.rs:164`) and its own out/logits
+            //     scratch, and `MtpHead::run` (`mtp.rs:636`) never calls
+            //     `forward_batch_rows`/`forward_batch_device`.
+            // Net: decode-subgroup ceiling = `max_logit_rows`
+            // (= `max_seqs.max(spec_k + 1)`), a value already computed once at
+            // model construction and available as this struct's own
+            // `max_logit_rows` field/parameter -- Task 3 should size its
+            // decode-only buffer against that, not against a fresh
+            // `max_seqs * (k + 1)` computation.
             attn_partial: alloc_f32(
                 Kernels::attn_partial_floats(cfg.n_heads, cfg.d_head, chunk),
                 "attention partials",
