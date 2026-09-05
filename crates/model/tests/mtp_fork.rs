@@ -123,7 +123,7 @@ fn two_branches_at_one_position_keep_their_own_keys() -> Result<()> {
      -> Result<Vec<Vec<f32>>> {
         let (w, embed) = synth(&dev, dm)?;
         // Room for the prefix plus one forked slot a branch.
-        let mut head = MtpHead::new(&dev, w, dm, PREFIX.max(branches), PREFIX + branches, branches)?;
+        let mut head = MtpHead::new(&dev, &kern, w, dm, PREFIX.max(branches), PREFIX + branches, branches)?;
         head.step(&kern, &embed, &ids, &positions, &hidden.as_view(), None)?;
         let rows = run(&mut head, &embed)?;
         rows.into_iter()

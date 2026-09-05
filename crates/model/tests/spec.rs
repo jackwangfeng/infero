@@ -26,6 +26,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use infero_kernels::Kernels;
 use infero_model::mtp::{HeadDims, MtpHead};
 use infero_model::spec::DraftFeed;
 use infero_model::weights::{AttnWeights, DenseFfn, Layer, Matrix, MtpWeights};
@@ -492,7 +493,8 @@ fn synthetic_head_branched(
         },
         device_bytes: 0,
     };
-    MtpHead::new(dev, w, dims, max_rows, max_seq, branches)
+    let kern = Kernels::new(dev.clone());
+    MtpHead::new(dev, &kern, w, dims, max_rows, max_seq, branches)
 }
 
 /// The same, one branch, which is what the linear draft wants.

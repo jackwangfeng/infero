@@ -289,7 +289,8 @@ fn head_from_capture_width(
         },
         device_bytes: 0,
     };
-    MtpHead::new(dev, w, dims, width, 128, branches)
+    let kern = Kernels::new(dev.clone());
+    MtpHead::new(dev, &kern, w, dims, width, 128, branches)
 }
 
 /// The head sized for the capture's whole token run in one step.

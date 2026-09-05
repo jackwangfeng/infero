@@ -380,7 +380,7 @@ impl Engine {
                 Ok(false) => {}
                 // A checkpoint that has a head but cannot use it is worth
                 // saying out loud rather than silently serving without.
-                Err(e) => tracing::warn!(error = %e, "speculation stayed off"),
+                Err(e) => tracing::warn!(error = ?e, "speculation stayed off"),
             }
         }
 

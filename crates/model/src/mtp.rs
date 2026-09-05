@@ -126,7 +126,15 @@ pub struct MtpHead {
     /// The attention output gate, de-interleaved out of `q_proj`'s output.
     attn_gate: Buf<f32>,
     attn: Buf<f32>,
+    /// `[1]` and unused when `use_fast_attn` -- see `MtpHead::new`'s doc
+    /// comment for why this isn't sized `heads * max_tokens * max_seq`
+    /// unconditionally anymore.
     scores: Buf<f32>,
+    /// Decided once at construction (`prefill_attention` plus `d_head ==
+    /// 256`, a pure shape/capability check): whether `run`'s attention block
+    /// uses `attn_prefill_decoupled6_f16acc` (no materialized score buffer)
+    /// or the legacy `attn_scores`/`attn_softmax`/`attn_output` triple.
+    use_fast_attn: bool,
     proj: Buf<f32>,
     /// `[max_tokens, d_model]` — the head's output, after `mtp.norm`. This is
     /// both what `lm_head` scores and what the next draft step feeds back in.
@@ -182,8 +190,26 @@ pub struct MtpHead {
 
 impl MtpHead {
     /// `max_tokens` bounds one draft step's rows; `max_seq` the drafter's cache.
+    ///
+    /// `kern` decides, once, whether this head can use the same non-
+    /// materializing prefill kernel (`attn_prefill_decoupled6_f16acc`) the
+    /// text model's own attention already uses instead of the legacy
+    /// `attn_scores`/`attn_softmax`/`attn_output` triple -- and if so, skips
+    /// the triple's `heads * rows * max_seq` score buffer entirely rather
+    /// than materializing then discarding it. That buffer scales with the
+    /// FULL context length (`max_seq`), not with anything about the draft
+    /// itself (`rows` is a small fixed chunk, `PRIME_CHUNK` in
+    /// `Scheduler::enable_speculation`) -- at a real 65536-token context this
+    /// checkpoint's shape needs ~384 MiB for it alone, competing with the
+    /// text model's own KV pool for the same VRAM and silently disabling
+    /// speculation ("speculation stayed off") when it loses that contest.
+    /// `Model::attention()`'s own `prefill_run` dispatch made exactly this
+    /// same non-materializing-kernel choice for the text model's attention
+    /// earlier this session; the draft head never got it. See `run`'s own
+    /// attention block for the runtime side of this same decision.
     pub fn new(
         dev: &Device,
+        kern: &Kernels,
         w: MtpWeights,
         dims: HeadDims,
         max_tokens: usize,
@@ -202,6 +228,26 @@ impl MtpHead {
                 .alloc_zeros::<f32>(n)
                 .with_context(|| format!("allocating the MTP head's {what}"))
         };
+        // `n_tokens`/`n_slots` don't gate `prefill_attention` (it's a pure
+        // shape/capability check -- head-count ratio, `d_head`, and the
+        // `INFERO_ATTN_MMA=1` env var), so a placeholder here and the real
+        // per-call `attn_dims` in `run` always agree on this decision.
+        let fast_attn_dims = AttnDims {
+            n_heads: dims.heads,
+            n_kv_heads: dims.kv_heads,
+            d_head: dims.d_head,
+            n_slots: max_seq,
+            n_tokens: 0,
+        };
+        // `attn_prefill_decoupled6_f16acc` additionally requires `d_head ==
+        // 256` exactly (see its own doc comment) -- narrower than
+        // `prefill_attention`'s `<= 256`, so both are checked here, not just
+        // the general gate.
+        let use_fast_attn = kern.prefill_attention(&fast_attn_dims) && dims.d_head == 256;
+        // 1, not 0: some `Buf`/`View` slicing in this crate assumes a
+        // non-empty backing allocation even when the fast path never reads
+        // it. A single `f32` is free next to the ~384 MiB this replaces.
+        let scores_len = if use_fast_attn { 1 } else { dims.heads * t * max_seq };
         Ok(Self {
             dev: dev.clone(),
             dims,
@@ -220,7 +266,8 @@ impl MtpHead {
             ffn: alloc(t * dims.d_ff, "ffn hidden")?,
             attn_gate: alloc(t * da, "attention output gate")?,
             attn: alloc(t * da, "attention output")?,
-            scores: alloc(dims.heads * t * max_seq, "attention scores")?,
+            scores: alloc(scores_len, "attention scores")?,
+            use_fast_attn,
             proj: alloc(t * d, "projection")?,
             out: alloc(t * d, "head output")?,
             // One row, not `t`: `logits_row` projects a single row on demand and
@@ -877,8 +924,35 @@ impl MtpHead {
             n_slots: self.max_seq,
             n_tokens: n,
         };
-        let score_len = dims.heads * n * kv_len;
-        {
+        let scale = 1.0 / (dims.d_head as f32).sqrt();
+        if self.use_fast_attn {
+            // Same shape, same `BatchLayout`, same reference this file's own
+            // tests already check the triple below against -- just no
+            // `[heads, n, kv_len]` score matrix ever materialized. See
+            // `MtpHead::new`'s doc comment for why this exists.
+            let seq_of = self.seq_of.slice(..n);
+            let positions_v = self.positions.slice(..n);
+            let table = self.slot_table.as_view();
+            let batch = BatchLayout {
+                seq_of: &seq_of,
+                positions: &positions_v,
+                slot_table: &table,
+                table_stride: self.max_seq,
+            };
+            kern.attn_prefill_decoupled6_f16acc(
+                &mut self.attn.slice_mut(..n * da),
+                &self.q.slice(..n * da),
+                &self.kc.as_view(),
+                &self.vc.as_view(),
+                batch,
+                attn_dims,
+                0,
+                n,
+                kv_len,
+                scale,
+            )?;
+        } else {
+            let score_len = dims.heads * n * kv_len;
             let seq_of = self.seq_of.slice(..n);
             let positions_v = self.positions.slice(..n);
             let table = self.slot_table.as_view();
@@ -895,7 +969,7 @@ impl MtpHead {
                 batch,
                 attn_dims,
                 kv_len,
-                1.0 / (dims.d_head as f32).sqrt(),
+                scale,
             )?;
             kern.attn_softmax(
                 &mut self.scores.slice_mut(..score_len),
@@ -1416,6 +1490,7 @@ impl crate::Model {
         };
         let head = MtpHead::new(
             &self.dev,
+            &self.kern,
             w,
             HeadDims::from_config(&self.cfg),
             max_draft_rows.max(1),
@@ -1451,6 +1526,7 @@ impl crate::Model {
         };
         let head = MtpHead::new(
             &self.dev,
+            &self.kern,
             w,
             HeadDims::from_config(&self.cfg),
             max_draft_rows.max(1),

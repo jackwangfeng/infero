@@ -151,7 +151,7 @@ fn equal_axes_are_bit_identical_to_no_mrope() -> Result<()> {
     let dm = dims();
     let d = dm.d_model;
     let (w, embed) = synth(&dev, dm)?;
-    let mut head = MtpHead::new(&dev, w, dm, T, 64, 1)?;
+    let mut head = MtpHead::new(&dev, &kern, w, dm, T, 64, 1)?;
 
     let ids: Vec<u32> = (0..T as u32).map(|i| (i * 7 + 3) % dm.vocab as u32).collect();
     let positions: Vec<usize> = (0..T).collect();
@@ -184,7 +184,7 @@ fn different_axes_change_the_output() -> Result<()> {
     let dm = dims();
     let d = dm.d_model;
     let (w, embed) = synth(&dev, dm)?;
-    let mut head = MtpHead::new(&dev, w, dm, T, 64, 1)?;
+    let mut head = MtpHead::new(&dev, &kern, w, dm, T, 64, 1)?;
 
     let ids: Vec<u32> = (0..T as u32).map(|i| (i * 7 + 3) % dm.vocab as u32).collect();
     let positions: Vec<usize> = (0..T).collect();
