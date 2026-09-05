@@ -2701,7 +2701,7 @@ fn flash_attn2_matches_the_three_kernels() -> Result<()> {
 
         let mut got_d = stream.alloc_zeros::<f32>(out_len)?;
         let mut part = stream.alloc_zeros::<f32>(1)?; // unused by this backend, AttnCallCtx still requires it
-        let backend = FlashAttn2Ffi;
+        let backend = FlashAttn2Ffi::default();
         let mut ctx = AttnCallCtx {
             out: &mut got_d.as_view_mut(),
             q: &dq.as_view(),

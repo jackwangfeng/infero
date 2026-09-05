@@ -129,9 +129,21 @@ pub fn select_backend<'a>(
 /// behavior-preserving: identical to `Model::attention()`'s own
 /// `prefill_run` branch (the `attn_prefill_decoupled6_f16acc`/
 /// `attn_prefill_ws4` choice, including the `INFERO_PREFILL_T6=0` rollback
-/// escape hatch). Priority 0 — always wins over any vendor backend that
-/// also claims a shape, since the entire point of this crate's own kernels
-/// is to beat a generic vendor kernel on hardware they've been tuned for.
+/// escape hatch).
+///
+/// Priority 100, not 0 — **this used to be the opposite** ("always wins over
+/// any vendor backend... since the entire point of this crate's own kernels
+/// is to beat a generic vendor kernel"), which was true when it was written
+/// but is no longer the measured reality: real, controlled benchmarking this
+/// session found `FlashAttn2Ffi` beats these tuned kernels by ~2.7x at this
+/// model's actual production chunk size (see `FlashAttn2Ffi::supports()`'s
+/// own doc comment for the numbers). `supports()` is unconditional here
+/// (`InferoHandRolled` is always a candidate whenever the hardware/shape gate
+/// passes, regardless of row count) — it is `FlashAttn2Ffi::supports()`'s own
+/// narrower, row-count-gated eligibility that decides which one actually
+/// wins a given call: at small row counts FA2 declines and this wins by
+/// default (the only remaining candidate); at this checkpoint's real chunk
+/// size both are eligible and the lower-numbered priority (FA2's) wins.
 pub struct InferoHandRolled<'k> {
     kern: &'k crate::Kernels,
 }
@@ -148,7 +160,7 @@ impl AttentionBackend for InferoHandRolled<'_> {
     }
 
     fn priority(&self) -> u32 {
-        0
+        100
     }
 
     fn supports(&self, _caps: &HardwareCaps, dims: &AttnDims, _kv_quant: KvQuant) -> bool {
