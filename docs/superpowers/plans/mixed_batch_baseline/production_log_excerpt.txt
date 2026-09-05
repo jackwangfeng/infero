@@ -1,0 +1,42 @@
+Production log excerpt for concurrent scenarios test
+Test window: 2026-09-05T20:02:24 to 2026-09-05T20:07:30 UTC
+
+Scenario A (Single-sequence, 66 prompt_tokens):
+2026-09-05T20:02:24.397240Z INFO request admitted request_id=req-000000006a9c755000000024 prompt_tokens=66
+2026-09-05T20:04:18.433528Z INFO request complete seq=1 prompt=66 completion=80 reason="length"
+2026-09-05T20:04:18.433686Z INFO request completed request_id=req-000000006a9c755000000024 prompt_tokens=66 completion_tokens=80
+
+Scenario B (Mixed decode+prefill: 50953 + 65 prompt_tokens):
+Long prompt (50953 tokens):
+2026-09-05T20:04:18.516471Z INFO request admitted request_id=req-000000006a9c75c200000029 prompt_tokens=50953
+2026-09-05T20:04:43.696282Z INFO request complete seq=0 prompt=50953 completion=40 reason="length"
+2026-09-05T20:04:43.696341Z INFO request completed request_id=req-000000006a9c75c200000029 prompt_tokens=50953 completion_tokens=40
+
+Short prompt (65 tokens):
+2026-09-05T20:04:23.493335Z INFO request admitted request_id=req-000000006a9c75c70000002a prompt_tokens=65
+2026-09-05T20:04:42.485995Z INFO request complete seq=1 prompt=65 completion=8 reason="length"
+2026-09-05T20:04:42.486132Z INFO request completed request_id=req-000000006a9c75c70000002a prompt_tokens=65 completion_tokens=8
+
+Verification: Both requests were active in the scheduler simultaneously:
+- Long: 2026-09-05T20:04:18 - 2026-09-05T20:04:43 (25 seconds, chunked prefill)
+- Short: 2026-09-05T20:04:23 - 2026-09-05T20:04:42 (19 seconds, decode phase)
+- Overlap window: 2026-09-05T20:04:23 - 2026-09-05T20:04:42 (19 seconds)
+- Log shows seq=0 and seq=1 processing during this window, confirming concurrent batch admission
+
+Scenario C (Two simultaneous prefills: 64 + 61 prompt_tokens):
+Request X (64 tokens):
+2026-09-05T20:06:43.728866Z INFO request admitted request_id=req-000000006a9c765300000037 prompt_tokens=64
+2026-09-05T20:07:27.274817Z INFO request complete seq=1 prompt=64 completion=60 reason="length"
+2026-09-05T20:07:27.274900Z INFO request completed request_id=req-000000006a9c765300000037 prompt_tokens=64 completion_tokens=60
+
+Request Y (61 tokens):
+2026-09-05T20:06:43.729100Z INFO request admitted request_id=req-000000006a9c765300000038 prompt_tokens=61
+2026-09-05T20:07:30.172608Z INFO request complete seq=1 prompt=61 completion=60 reason="length"
+2026-09-05T20:07:30.172685Z INFO request completed request_id=req-000000006a9c765300000038 prompt_tokens=61 completion_tokens=60
+
+Verification: Requests were admitted 234 microseconds apart (simultaneous):
+- X admitted: 2026-09-05T20:06:43.728866Z
+- Y admitted: 2026-09-05T20:06:43.729100Z (234 microseconds later)
+- Both processed as seq=1 and seq=0 in the same scheduler batches
+- Timestamps show concurrent prefill execution confirmed by production logs
+

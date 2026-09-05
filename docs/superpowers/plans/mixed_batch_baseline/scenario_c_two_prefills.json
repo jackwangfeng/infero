@@ -1,44 +1,94 @@
 {
-  "y": {
-    "id": "chatcmpl-000000006a9c2b2d0000009a",
-    "object": "chat.completion",
-    "created": 1788619565,
-    "model": "qwen38-27b-fp8",
-    "choices": [
-      {
-        "index": 0,
-        "message": {
-          "role": "assistant",
-          "content": "We need to respond to user: \"Explain how a car engine works in exactly three sentences.\" Need final exactly three sentences. Ensure no extra. Need likely simple explanation. Count sentences carefully. Could be:\n\"A car engine converts fuel into mechanical energy through controlled explosions inside cylinders.\" \n\"Air"
-        },
-        "finish_reason": "length"
+  "scenario": "C (two simultaneous prefills)",
+  "requests": {
+    "x": {
+      "payload": {
+        "model": "qwen38-27b-fp8",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Explain photosynthesis in exactly three sentences."
+          }
+        ],
+        "max_tokens": 60,
+        "temperature": 0.0,
+        "seed": 42424242,
+        "logprobs": false
+      },
+      "timing": {
+        "t_start": 1788638803.7265084,
+        "t_end": 1788638850.1733875
       }
-    ],
-    "usage": {
-      "prompt_tokens": 64,
-      "completion_tokens": 60,
-      "total_tokens": 124
+    },
+    "y": {
+      "payload": {
+        "model": "qwen38-27b-fp8",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Explain how a car engine works in exactly three sentences."
+          }
+        ],
+        "max_tokens": 60,
+        "temperature": 0.0,
+        "seed": 42424242,
+        "logprobs": false
+      },
+      "timing": {
+        "t_start": 1788638803.7271655,
+        "t_end": 1788638847.2757525
+      }
     }
   },
-  "x": {
-    "id": "chatcmpl-000000006a9c2b2d0000009b",
-    "object": "chat.completion",
-    "created": 1788619565,
-    "model": "qwen38-27b-fp8",
-    "choices": [
-      {
-        "index": 0,
-        "message": {
-          "role": "assistant",
-          "content": "We need to respond to user: \"Explain photosynthesis in exactly three sentences.\" Need final exactly three sentences. Ensure no extra. Need likely simple explanation. Count sentences: 1) Photosynthesis is the process by which plants, algae, and some bacteria convert light energy into chemical energy. "
-        },
-        "finish_reason": "length"
+  "responses": {
+    "x": {
+      "id": "chatcmpl-000000006a9c76820000003a",
+      "object": "chat.completion",
+      "created": 1788638850,
+      "model": "qwen38-27b-fp8",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "We need to respond to user: \"Explain photosynthesis in exactly three sentences.\" Need final exactly three sentences. Ensure no extra. Could be: \"Photosynthesis is the process by which plants, algae, and some bacteria convert light energy into chemical energy. They use carbon dioxide and water, along"
+          },
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 61,
+        "completion_tokens": 60,
+        "total_tokens": 121
       }
-    ],
-    "usage": {
-      "prompt_tokens": 61,
-      "completion_tokens": 60,
-      "total_tokens": 121
+    },
+    "y": {
+      "id": "chatcmpl-000000006a9c767f00000039",
+      "object": "chat.completion",
+      "created": 1788638847,
+      "model": "qwen38-27b-fp8",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "We need to respond to user: \"Explain how a car engine works in exactly three sentences.\" Need final exactly three sentences. Ensure no extra. Need likely simple explanation. Count sentences carefully. Could be:\n\"A car engine converts fuel into mechanical energy through controlled explosions inside cylinders.\" \n\"Air"
+          },
+          "finish_reason": "length"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 64,
+        "completion_tokens": 60,
+        "total_tokens": 124
+      }
     }
+  },
+  "concurrency_check": {
+    "x_t_start": 1788638803.7265084,
+    "x_t_end": 1788638850.1733875,
+    "y_t_start": 1788638803.7271655,
+    "y_t_end": 1788638847.2757525,
+    "overlap_detected": true
   }
 }
