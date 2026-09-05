@@ -1248,9 +1248,20 @@ impl Model {
             tracing::info!(backend = name, "attention backend selected");
             name
         };
+        // `attn_partial` is sized for `batch_tokens` regardless of which
+        // backend wins prefill selection: `attn_decode` (every decode step,
+        // unconditionally -- see its own doc comment) and `InferoHandRolled`'s
+        // prefill path (which `flash_attn2`'s own fallback still routes to
+        // whenever a sequence's KV isn't physically contiguous, "real traffic
+        // hits ... regularly" per the comment above) both read/write it at up
+        // to the full chunk width. A conditional-skip here was tried and
+        // reverted: it looked safe from `attn_backend_name` alone but missed
+        // those two always-on unconditional readers, which would have written
+        // past an undersized buffer.
         tracing::info!(
             batch_tokens,
             score_mib = cfg.n_heads * batch_tokens * (if needs_scores { max_seq } else { 1 }) * 4 >> 20,
+            partial_mib = (Kernels::attn_partial_floats(cfg.n_heads, cfg.d_head, batch_tokens) * 4) >> 20,
             "tokens a pass carries"
         );
         let act = Activations::new(&dev, &cfg, max_seq, max_logit_rows, needs_scores, batch_tokens)?;
@@ -5208,6 +5219,15 @@ impl Activations {
             logit_rows: stream.alloc_zeros::<i32>(max_logit_rows)?,
             // Partial sums for the split-K attention output. Sized for the
             // widest split the kernel will pick; it only allocates once.
+            //
+            // Cannot be shrunk the way `scores` above is by backend choice:
+            // `attn_decode` (every decode step, unconditionally) and
+            // `InferoHandRolled`'s own prefill fallback (which a selected
+            // `flash_attn2` still routes to whenever a sequence's KV isn't
+            // physically contiguous) both read/write this at up to the full
+            // `chunk` width regardless of which backend won prefill
+            // selection -- see the "tokens a pass carries" log site's own
+            // comment for the attempt that got reverted here.
             attn_partial: alloc_f32(
                 Kernels::attn_partial_floats(cfg.n_heads, cfg.d_head, chunk),
                 "attention partials",
