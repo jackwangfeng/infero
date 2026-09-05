@@ -35,3 +35,4 @@ cuda-13 = ["cuda", "infero-kernels/cuda-13", "infero-cuda/cuda-13", "cudarc/cuda
 cuda-12 = ["cuda", "infero-kernels/cuda-12", "infero-cuda/cuda-12", "cudarc/cuda-12080", "infero-gpu/cuda-12"]
 metal = ["infero-kernels/metal", "infero-gpu/metal"]
 cutlass = ["infero-kernels/cutlass"]
+flash_attn2 = ["infero-kernels/flash_attn2"]

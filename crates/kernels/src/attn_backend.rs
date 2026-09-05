@@ -96,7 +96,7 @@ pub trait AttentionBackend: Send + Sync {
 /// rather than silently falling back to a different one — a forced choice
 /// that can't run is a config error to surface, not paper over.
 pub fn select_backend<'a>(
-    backends: &'a [Box<dyn AttentionBackend>],
+    backends: &'a [Box<dyn AttentionBackend + 'a>],
     caps: &HardwareCaps,
     dims: &AttnDims,
     kv_quant: KvQuant,

@@ -42,6 +42,9 @@ use half::f16;
 use std::sync::Arc;
 use infero_gpu::Device;
 use infero_gguf::Gguf;
+#[cfg(feature = "flash_attn2")]
+use infero_kernels::attn_backend::AttnCallCtx;
+use infero_kernels::attn_backend::{AttentionBackend, HardwareCaps, InferoHandRolled, select_backend};
 use infero_kernels::{AttnDims, BatchLayout, Kernels, KvQuant, TqTables};
 
 pub use cache::{KvPool, SeqId};
@@ -700,6 +703,14 @@ pub struct Model {
     /// Tokens one forward pass carries, resolved once against this session's
     /// context length. See [`batch_tokens_for`].
     batch_tokens: usize,
+    /// Which [`AttentionBackend`] serves the `prefill_run` path, resolved
+    /// once at load the same way `batch_tokens` is -- see
+    /// `docs/superpowers/specs/2026-09-05-pluggable-attention-backend-design.md`.
+    /// `"handrolled"` on every build without the `flash_attn2` feature, and
+    /// on any build where that backend doesn't claim this model's real
+    /// `AttnDims`/`KvQuant` -- this field existing does not by itself change
+    /// `attention()`'s default behavior.
+    attn_backend_name: &'static str,
     max_seq: usize,
     /// Per layer, whether it mixes with a recurrence. Cached because the pool
     /// needs it to size the state and the layer loop consults it every block.
@@ -998,6 +1009,63 @@ impl Model {
                 "the block stack is not homogeneous"
             );
         }
+        // Which `AttentionBackend` serves `attention()`'s `prefill_run`
+        // path -- resolved once here (mirrors `needs_scores`/`batch_tokens`
+        // below), not per call. `InferoHandRolled` always supports every
+        // shape `prefill_attention` already covers (priority 0), so it wins
+        // by default; a vendor backend only wins when forced via
+        // `INFERO_ATTN_BACKEND` or when it's the only one that supports a
+        // shape this crate has no tuned kernel for -- neither condition
+        // exists yet on `flash_attn2`'s fixed `d_head=256`-only scope on
+        // real hardware infero already has a tuned kernel for. Runtime
+        // selection has no second required env var to "activate" a
+        // compiled-in backend -- once `flash_attn2` is compiled in,
+        // `supports()` alone decides eligibility (see the design doc's
+        // "one footgun this design must not repeat").
+        let attn_backend_name = {
+            let hw_caps = HardwareCaps::probe(&dev);
+            #[allow(unused_mut)] // only mutated when the `flash_attn2` feature adds a second backend
+            let mut backends: Vec<Box<dyn AttentionBackend + '_>> =
+                vec![Box::new(InferoHandRolled::new(&kern))];
+            #[cfg(feature = "flash_attn2")]
+            backends.push(Box::new(infero_kernels::flash_attn2::FlashAttn2Ffi));
+            let dims = AttnDims {
+                n_heads: cfg.n_heads,
+                n_kv_heads: cfg.n_kv_heads,
+                d_head: cfg.d_head,
+                n_slots: 0,
+                n_tokens: 0,
+            };
+            let forced = std::env::var("INFERO_ATTN_BACKEND").ok();
+            let name = match select_backend(&backends, &hw_caps, &dims, kv_quant, forced.as_deref()) {
+                Ok(chosen) => chosen.name(),
+                // `InferoHandRolled::supports()` only covers the shapes
+                // `prefill_attention()` itself gates (e.g. it's off unless
+                // `INFERO_ATTN_MMA=1`, or the GQA/`d_head` shape doesn't
+                // qualify) -- narrower than what `attention()`'s real
+                // dispatch handles, since that cascade has its own further
+                // fallback chain (`decode_attention`, `flash_attention`, the
+                // 3-kernel path) beyond the one sub-case this trait models.
+                // "No backend's narrow `supports()` matches" is therefore
+                // NOT "this model can't run attention" -- it means the
+                // existing cascade's own fallback covers it, which is
+                // exactly what `attn_backend_name == "handrolled"` already
+                // defers to. Only an explicit `INFERO_ATTN_BACKEND` request
+                // should fail loudly here -- an unforced non-match is this
+                // backend's normal, expected case for most shapes.
+                Err(e) if forced.is_none() => {
+                    tracing::debug!(
+                        reason = %e,
+                        "no attention backend's narrow `supports()` matched this shape; \
+                         falling back to `handrolled`, whose own cascade covers it"
+                    );
+                    "handrolled"
+                }
+                Err(e) => return Err(e),
+            };
+            tracing::info!(backend = name, "attention backend selected");
+            name
+        };
         // Resolved here and stored, not recomputed: the buffers below are sized
         // from it and `forward` splits its input by it, and those two disagreeing
         // is the kind of mismatch `add_assign` already cost a day of.
@@ -1152,6 +1220,7 @@ impl Model {
             use_graph,
             max_logit_rows,
             batch_tokens,
+            attn_backend_name,
             max_seq,
             layer_kinds,
             logit_rows: 0,
@@ -1184,6 +1253,14 @@ impl Model {
     /// Tokens one forward pass carries. See [`batch_tokens_for`].
     pub fn batch_tokens(&self) -> usize {
         self.batch_tokens
+    }
+
+    /// Which [`AttentionBackend`] serves `attention()`'s `prefill_run`
+    /// path, resolved once at load. `"handrolled"` unless `flash_attn2` was
+    /// compiled in and either won on its own merits or was forced via
+    /// `INFERO_ATTN_BACKEND`.
+    pub fn attn_backend_name(&self) -> &'static str {
+        self.attn_backend_name
     }
 
     pub fn max_seq(&self) -> usize {
@@ -3253,7 +3330,45 @@ impl Model {
                 // established — see `attn_prefill_mma_ws4_f32`'s doc comment
                 // in `ops.cu` for the full byte-exact shared-memory accounting
                 // and why two prior widening attempts (`_ws2`, `_ws3`) failed.
-                if let Some(run_tokens) = prefill_run.filter(|_| self.kern.prefill_attention(&dims)) {
+                //
+                // A non-`"handrolled"` `attn_backend_name` only exists on a
+                // `flash_attn2` build where that backend actually won
+                // selection at load (see `from_parts`) -- on every other
+                // build, and on this one unless `INFERO_ATTN_BACKEND` forces
+                // it, this is `None` and the branch below it (unchanged from
+                // before this backend existed) runs exactly as it always
+                // has.
+                let vendor_backend_run =
+                    if self.attn_backend_name != "handrolled" { prefill_run } else { None };
+                if let Some(run_tokens) = vendor_backend_run {
+                    #[cfg(feature = "flash_attn2")]
+                    {
+                        let mut ctx = AttnCallCtx {
+                            out: &mut attn_out.slice_mut(..n * da),
+                            q: &self.act.q.slice(..n * da),
+                            k_cache: &pool.dense(layer).0.as_view(),
+                            v_cache: &pool.dense(layer).1.as_view(),
+                            batch,
+                            dims,
+                            run_base: 0,
+                            run_tokens,
+                            kv_len,
+                            scale: attn_scale,
+                            partial: &mut partial.as_view_mut(),
+                            stream: self.dev.stream(),
+                            kern: &self.kern,
+                        };
+                        infero_kernels::flash_attn2::FlashAttn2Ffi.prefill(&mut ctx)?;
+                    }
+                    #[cfg(not(feature = "flash_attn2"))]
+                    {
+                        let _ = run_tokens;
+                        unreachable!(
+                            "attn_backend_name={:?} but the flash_attn2 feature isn't compiled in",
+                            self.attn_backend_name
+                        );
+                    }
+                } else if let Some(run_tokens) = prefill_run.filter(|_| self.kern.prefill_attention(&dims)) {
                     // T=6 of the decoupled-role attention family: a real,
                     // register-checked, correctness-tested (against the
                     // three-kernel reference), memcheck/racecheck-clean
