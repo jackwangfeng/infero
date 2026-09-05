@@ -33,6 +33,11 @@ const BLOB_ALIGN: usize = 256;
 static REPACK_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Same, for the host-to-device upload (`clone_htod`) that follows it.
 static UPLOAD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// TEMPORARY profiling, not for commit.
+static GDN_BLOCK_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ATTN_BLOCK_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FFN_BLOCK_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STACK_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether FP8 weights load as plain `[n,k]` row-major (`fp8::pad_rows`,
 /// CUTLASS's and [`infero_kernels::Kernels::mmv_f8_plain`]'s native layout)
@@ -640,11 +645,102 @@ impl Weights {
                             m.push(upload_matrix(dev, f, mapped, name, &mut device_bytes)?);
                         }
                     }
-                    (Some(_), true) => {
-                        anyhow::bail!(
-                            "tensor-parallel sharding for a GDN (linear-attention) layer is not \
-                             yet implemented -- layer {i} has one"
-                        );
+                    (Some((tp_rank, tp_size)), true) => {
+                        // GDN's own head-count fields are already divided by
+                        // `tp_size` (`Config::shard_for_tp` runs once, before
+                        // any weight loads) -- `key_dim()`/`value_dim()` below
+                        // are each rank's own (post-shard) width, and the
+                        // *full* on-disk segment width is that times
+                        // `tp_size`. Q and K share `key_heads`; V uses
+                        // `value_heads`, a different ratio (GQA-style) -- a
+                        // single uniform row-range across the combined
+                        // `[q|k|v]` tensor would not land on head
+                        // boundaries, so each segment is sharded
+                        // independently by its own head count and the three
+                        // results concatenated (row-range shards are
+                        // contiguous byte runs, so this is a plain
+                        // byte-level concatenation, not an interleave).
+                        let la = cfg.linear_attn.as_ref().with_context(|| {
+                            format!("layer {i}: GDN block but Config has no linear_attn")
+                        })?;
+                        let kd = la.key_dim();
+                        let vd = la.value_dim();
+                        let full_kd = kd * tp_size;
+
+                        let shard3 = |info: &TensorInfo| -> Result<Vec<u8>> {
+                            let mut bytes =
+                                f.tensor_shard(info, (tp_rank * kd)..((tp_rank + 1) * kd))?;
+                            bytes.extend(f.tensor_shard(
+                                info,
+                                (full_kd + tp_rank * kd)..(full_kd + (tp_rank + 1) * kd),
+                            )?);
+                            bytes.extend(f.tensor_shard(
+                                info,
+                                (2 * full_kd + tp_rank * vd)..(2 * full_kd + (tp_rank + 1) * vd),
+                            )?);
+                            Ok(bytes)
+                        };
+                        let upload_bytes = |bytes: Vec<u8>,
+                                             ty: WeightType,
+                                             k: usize,
+                                             n: usize,
+                                             total: &mut usize|
+                         -> Result<Matrix> {
+                            let n_bytes = bytes.len();
+                            *total += n_bytes;
+                            Ok(Matrix {
+                                ty,
+                                k,
+                                n,
+                                n_bytes,
+                                storage: Storage::Device(dev.stream().clone_htod(&bytes)?),
+                                cutlass_weight: Default::default(),
+                            })
+                        };
+
+                        // 0: attn_qkv.weight -- three-segment shard above.
+                        let qkv_info = f.tensor(&names[0])?.clone();
+                        let qkv_ty = WeightType::from_ggml(qkv_info.ty)
+                            .with_context(|| format!("tensor {}", names[0]))?;
+                        let d_model = qkv_info.dims[0] as usize;
+                        m.push(upload_bytes(
+                            shard3(&qkv_info)?,
+                            qkv_ty,
+                            d_model,
+                            2 * kd + vd,
+                            &mut device_bytes,
+                        )?);
+                        // 1: attn_gate.weight -- value-shaped, single segment.
+                        m.push(upload_matrix_sharded(
+                            dev, f, &names[1], ShardAxis::Output, tp_rank, tp_size, &mut device_bytes,
+                        )?);
+                        // 2, 3: ssm_alpha.weight / ssm_beta.weight -- one
+                        // scalar a head (`n = value_heads`, not `value_dim`),
+                        // so the generic per-tp_size division on the whole
+                        // output width is already exactly a per-head split --
+                        // no `*head_dim` multiplier needed here, unlike the
+                        // gate/qkv tensors above.
+                        m.push(upload_matrix_sharded(
+                            dev, f, &names[2], ShardAxis::Output, tp_rank, tp_size, &mut device_bytes,
+                        )?);
+                        m.push(upload_matrix_sharded(
+                            dev, f, &names[3], ShardAxis::Output, tp_rank, tp_size, &mut device_bytes,
+                        )?);
+                        // 4: ssm_out.weight -- row-parallel (input = value_dim).
+                        m.push(upload_matrix_sharded(
+                            dev, f, &names[4], ShardAxis::Input, tp_rank, tp_size, &mut device_bytes,
+                        )?);
+                        // 5, 6, 7: dense FFN gate/up/down -- ordinary
+                        // Megatron-style sharding, identical to the
+                        // standard-attention branch's own FFN handling.
+                        for (name, axis) in names[5..8]
+                            .iter()
+                            .zip([ShardAxis::Output, ShardAxis::Output, ShardAxis::Input])
+                        {
+                            m.push(upload_matrix_sharded(
+                                dev, f, name, axis, tp_rank, tp_size, &mut device_bytes,
+                            )?);
+                        }
                     }
                     (Some((tp_rank, tp_size)), false) => {
                         // Standard non-linear block: [q, k, v, o, gate, up, down].
@@ -704,9 +800,21 @@ impl Weights {
                         // a 5120 contraction -- so unstacked they are two
                         // gemv launches whose bytes are a rounding error next
                         // to their dispatch cost. See `stacked2_gguf`.
-                        in_proj_ba: stacked2_gguf(
-                            dev, f, &t("ssm_alpha.weight"), &t("ssm_beta.weight"),
-                            &mut device_bytes)?,
+                        // Disabled under sharding, same precedent as `w_kv`
+                        // (`dde80b3`): this fusion reads both tensors' bytes
+                        // at their *full*, unsharded width -- it has no
+                        // `shard` parameter and never went through the
+                        // per-rank row-range path above, so fusing it here
+                        // would silently apply a rank's kernel to a
+                        // doubled-width buffer sized for the correctly
+                        // sharded `in_proj_a`/`in_proj_b` pair.
+                        in_proj_ba: if shard.is_some() {
+                            None
+                        } else {
+                            stacked2_gguf(
+                                dev, f, &t("ssm_alpha.weight"), &t("ssm_beta.weight"),
+                                &mut device_bytes)?
+                        },
                         // Tried stacking these with `stacked2_gguf`, the same
                         // trick `in_proj_ba` uses -- `qkv` and `z` are the
                         // same Q8_0 type over the same `k`, and `split2`
@@ -736,11 +844,66 @@ impl Weights {
                         // hundred rows without giving the VRAM back some
                         // other way first.
                         in_proj_qz: None,
-                        conv1d: upload_vector(
-                            dev, f, &t("ssm_conv1d.weight"), &mut device_bytes)?,
-                        a_log: upload_a_log(dev, f, &t("ssm_a"), &mut device_bytes)?,
-                        dt_bias: upload_vector(
-                            dev, f, &t("ssm_dt.bias"), &mut device_bytes)?,
+                        conv1d: match shard {
+                            None => upload_vector(dev, f, &t("ssm_conv1d.weight"), &mut device_bytes)?,
+                            Some((tp_rank, tp_size)) => {
+                                // Same three-segment [q|k|v] channel layout
+                                // as `attn_qkv.weight` above (`conv_channels
+                                // == 2*key_dim + value_dim`), just with
+                                // `conv_k` (kernel taps) as the fast/inner
+                                // axis instead of `d_model` -- sharded the
+                                // same way, by row-range per segment.
+                                let la = cfg.linear_attn.as_ref().unwrap();
+                                let kd = la.key_dim();
+                                let vd = la.value_dim();
+                                let full_kd = kd * tp_size;
+                                let info = f.tensor(&t("ssm_conv1d.weight"))?.clone();
+                                let mut bytes =
+                                    f.tensor_shard(&info, (tp_rank * kd)..((tp_rank + 1) * kd))?;
+                                bytes.extend(f.tensor_shard(
+                                    &info,
+                                    (full_kd + tp_rank * kd)..(full_kd + (tp_rank + 1) * kd),
+                                )?);
+                                bytes.extend(f.tensor_shard(
+                                    &info,
+                                    (2 * full_kd + tp_rank * vd)..(2 * full_kd + (tp_rank + 1) * vd),
+                                )?);
+                                let host = to_f32(&bytes, &info)?;
+                                device_bytes += host.len() * 4;
+                                dev.stream().clone_htod(&host)?
+                            }
+                        },
+                        a_log: match shard {
+                            None => upload_a_log(dev, f, &t("ssm_a"), &mut device_bytes)?,
+                            Some((tp_rank, _tp_size)) => {
+                                let vh = cfg.linear_attn.as_ref().unwrap().value_heads;
+                                let info = f.tensor(&t("ssm_a"))?.clone();
+                                let bytes =
+                                    f.tensor_shard(&info, (tp_rank * vh)..((tp_rank + 1) * vh))?;
+                                let raw = to_f32(&bytes, &info)?;
+                                let host: Vec<f32> = raw
+                                    .iter()
+                                    .map(|a| {
+                                        debug_assert!(*a < 0.0, "ssm_a: {a} is not -exp(A_log)");
+                                        (-a).ln()
+                                    })
+                                    .collect();
+                                device_bytes += host.len() * 4;
+                                dev.stream().clone_htod(&host)?
+                            }
+                        },
+                        dt_bias: match shard {
+                            None => upload_vector(dev, f, &t("ssm_dt.bias"), &mut device_bytes)?,
+                            Some((tp_rank, _tp_size)) => {
+                                let vh = cfg.linear_attn.as_ref().unwrap().value_heads;
+                                let info = f.tensor(&t("ssm_dt.bias"))?.clone();
+                                let bytes =
+                                    f.tensor_shard(&info, (tp_rank * vh)..((tp_rank + 1) * vh))?;
+                                let host = to_f32(&bytes, &info)?;
+                                device_bytes += host.len() * 4;
+                                dev.stream().clone_htod(&host)?
+                            }
+                        },
                         // The one norm in this architecture that is a plain
                         // gain: `Qwen3_5RMSNormGated`. llama.cpp's converter
                         // adds one to every *other* norm weight and leaves this
@@ -1613,6 +1776,20 @@ pub fn load_awq(
         let (bytes, ty, k, n) = projection_bytes(prefix)?;
         upload(&bytes, ty, k, n, total)
     };
+    // Same as `projection`, but also hands back the pre-upload bytes and their
+    // shape/type -- for a caller that is about to fuse this projection with a
+    // sibling one (`stacked`/`stacked_fp8_2`/`stacked2`/`stacked3`) and would
+    // otherwise pay `projection_bytes`'s real cost (the FP8 repack, or the AWQ
+    // unpack/transpose) a second time for bytes it already has in hand. On the
+    // 27B this was 10 of the FFN block's 14 seconds -- gate/up's own read
+    // fetched and repacked twice each, once standalone and once again inside
+    // `stacked_fp8_2`, every one of 64 layers.
+    let projection_with_bytes =
+        |prefix: &str, total: &mut usize| -> Result<(Matrix, Vec<u8>, WeightType, usize, usize)> {
+            let (bytes, ty, k, n) = projection_bytes(prefix)?;
+            let m = upload(&bytes, ty, k, n, total)?;
+            Ok((m, bytes, ty, k, n))
+        };
 
     // `gate` and `up` as one matrix, and `q`/`k`/`v` as another, which is what
     // vLLM's `MergedColumnParallelLinear` and `QKVParallelLinear` amount to. A
@@ -1669,28 +1846,39 @@ pub fn load_awq(
             room
         }
     };
-    let stacked = |a: &str, b: &str, total: &mut usize| -> Result<Option<Matrix>> {
+    // Every `stacked*` helper below takes each input as an already-fetched
+    // `(bytes, type, k, n)` piece — the caller has always already called
+    // `projection_bytes`/`projection_with_bytes` on the same name to build
+    // that input's own standalone `Matrix`, so re-deriving it here a second
+    // time (the shape this file had until this pass) means paying the FP8
+    // repack or AWQ unpack/transpose twice for the same source bytes. On the
+    // 27B, gate/up's own read alone was 10 of the FFN block's 14 seconds this
+    // way, 64 times over — a caller now fetches once and hands the same
+    // bytes to both its own `Matrix` and whichever of these builds the fused
+    // one.
+    type Piece<'a> = (&'a [u8], WeightType, usize, usize);
+    let stacked = |a: Piece<'_>, b: Piece<'_>, total: &mut usize| -> Result<Option<Matrix>> {
         if !fuse_ffn {
             return Ok(None);
         }
-        let (ba, ty_a, k, n_a) = projection_bytes(a)?;
-        let (bb, ty_b, k_b, n_b) = projection_bytes(b)?;
+        let (ba, ty_a, k, n_a) = a;
+        let (bb, ty_b, k_b, n_b) = b;
         // Only the transposed layout stacks: the packed one keeps its scales
         // inside each block, so appending rows is appending bytes and there is
         // nothing to gain by doing it here rather than in the kernel.
         if ty_a != WeightType::Q4G128T || ty_b != ty_a || k_b != k {
             return Ok(None);
         }
-        let c = infero_kernels::awq::concat_t(&ba, n_a, &bb, n_b, k);
+        let c = infero_kernels::awq::concat_t(ba, n_a, bb, n_b, k);
         Ok(Some(upload(&c, ty_a, k, n_a + n_b, total)?))
     };
-    let stacked3 = |a: &str, b: &str, cc: &str, total: &mut usize| -> Result<Option<Matrix>> {
+    let stacked3 = |a: Piece<'_>, b: Piece<'_>, cc: Piece<'_>, total: &mut usize| -> Result<Option<Matrix>> {
         if !fuse_ffn {
             return Ok(None);
         }
-        let (ba, ty, k, n_a) = projection_bytes(a)?;
-        let (bb, ty_b, k_b, n_b) = projection_bytes(b)?;
-        let (bc, ty_c, k_c, n_c) = projection_bytes(cc)?;
+        let (ba, ty, k, n_a) = a;
+        let (bb, ty_b, k_b, n_b) = b;
+        let (bc, ty_c, k_c, n_c) = cc;
         if ty_b != ty || ty_c != ty || k_b != k || k_c != k {
             return Ok(None);
         }
@@ -1706,14 +1894,14 @@ pub fn load_awq(
             {
                 return Ok(None);
             }
-            let abc = infero_kernels::fp8::concat3(&ba, n_a, &bb, n_b, &bc, n_c, k);
+            let abc = infero_kernels::fp8::concat3(ba, n_a, bb, n_b, bc, n_c, k);
             return Ok(Some(upload(&abc, ty, k, n_a + n_b + n_c, total)?));
         }
         if ty != WeightType::Q4G128T {
             return Ok(None);
         }
-        let ab = infero_kernels::awq::concat_t(&ba, n_a, &bb, n_b, k);
-        let abc = infero_kernels::awq::concat_t(&ab, n_a + n_b, &bc, n_c, k);
+        let ab = infero_kernels::awq::concat_t(ba, n_a, bb, n_b, k);
+        let abc = infero_kernels::awq::concat_t(&ab, n_a + n_b, bc, n_c, k);
         Ok(Some(upload(&abc, ty, k, n_a + n_b + n_c, total)?))
     };
     // Two FP8 matrices over the same `k`, stacked the way `stacked3` stacks
@@ -1721,12 +1909,12 @@ pub fn load_awq(
     // Q4G128T-only shape `stacked` (the two-input closure above) expects, and
     // is FP8 where that closure only takes dense F16/F32 — hence its own
     // closure rather than a third case bolted onto either.
-    let stacked_fp8_2 = |a: &str, b: &str, total: &mut usize| -> Result<Option<Matrix>> {
+    let stacked_fp8_2 = |a: Piece<'_>, b: Piece<'_>, total: &mut usize| -> Result<Option<Matrix>> {
         if !fuse_ffn {
             return Ok(None);
         }
-        let (ba, ty, k, n_a) = projection_bytes(a)?;
-        let (bb, ty_b, k_b, n_b) = projection_bytes(b)?;
+        let (ba, ty, k, n_a) = a;
+        let (bb, ty_b, k_b, n_b) = b;
         if ty != WeightType::F8E4M3
             || ty_b != ty
             || k_b != k
@@ -1735,7 +1923,7 @@ pub fn load_awq(
         {
             return Ok(None);
         }
-        let ab = infero_kernels::fp8::concat2(&ba, n_a, &bb, n_b, k);
+        let ab = infero_kernels::fp8::concat2(ba, n_a, bb, n_b, k);
         Ok(Some(upload(&ab, ty, k, n_a + n_b, total)?))
     };
 
@@ -1747,14 +1935,16 @@ pub fn load_awq(
     // stack is byte concatenation and nothing has to be interleaved. Returns
     // `None` when the two are not the same dense type over the same `k`, in
     // which case the caller keeps its two launches.
-    let stacked2 = |a: &str, b: &str, total: &mut usize| -> Result<Option<Matrix>> {
-        let (mut ba, ty, k, n_a) = projection_bytes(a)?;
-        let (bb, ty_b, k_b, n_b) = projection_bytes(b)?;
+    let stacked2 = |a: Piece<'_>, b: Piece<'_>, total: &mut usize| -> Result<Option<Matrix>> {
+        let (ba, ty, k, n_a) = a;
+        let (bb, ty_b, k_b, n_b) = b;
         if ty != ty_b || k != k_b || !matches!(ty, WeightType::F16 | WeightType::F32) {
             return Ok(None);
         }
-        ba.extend_from_slice(&bb);
-        Ok(Some(upload(&ba, ty, k, n_a + n_b, total)?))
+        let mut out = Vec::with_capacity(ba.len() + bb.len());
+        out.extend_from_slice(ba);
+        out.extend_from_slice(bb);
+        Ok(Some(upload(&out, ty, k, n_a + n_b, total)?))
     };
 
     // Where the text model sits. A multimodal export nests it under
@@ -1904,26 +2094,23 @@ pub fn load_awq(
     tracing::info!(prefix = layer_prefix, "decoder layers");
 
     let dense_ffn = |p: &str, total: &mut usize| -> Result<DenseFfn> {
-        Ok(DenseFfn {
-            w_gate: projection(&format!("{p}.mlp.gate_proj"), total)?,
-            w_up: projection(&format!("{p}.mlp.up_proj"), total)?,
-            // `stacked` only takes dense F16/F32; FP8's disjoint quant+scale
-            // layout is `stacked_fp8_2`'s case instead. Exactly one of the two
-            // can match a given `ty`, so trying both in order is safe.
-            w_gate_up: match stacked(
-                &format!("{p}.mlp.gate_proj"),
-                &format!("{p}.mlp.up_proj"),
-                total,
-            )? {
-                Some(m) => Some(m),
-                None => stacked_fp8_2(
-                    &format!("{p}.mlp.gate_proj"),
-                    &format!("{p}.mlp.up_proj"),
-                    total,
-                )?,
-            },
-            w_down: projection(&format!("{p}.mlp.down_proj"), total)?,
-        })
+        let (w_gate, gate_bytes, gate_ty, gate_k, gate_n) =
+            projection_with_bytes(&format!("{p}.mlp.gate_proj"), total)?;
+        let (w_up, up_bytes, up_ty, up_k, up_n) =
+            projection_with_bytes(&format!("{p}.mlp.up_proj"), total)?;
+        let __t_stack = std::time::Instant::now();
+        let a = (gate_bytes.as_slice(), gate_ty, gate_k, gate_n);
+        let b = (up_bytes.as_slice(), up_ty, up_k, up_n);
+        // `stacked` only takes dense F16/F32; FP8's disjoint quant+scale
+        // layout is `stacked_fp8_2`'s case instead. Exactly one of the two
+        // can match a given `ty`, so trying both in order is safe.
+        let w_gate_up = match stacked(a, b, total)? {
+            Some(m) => Some(m),
+            None => stacked_fp8_2(a, b, total)?,
+        };
+        STACK_NS.fetch_add(__t_stack.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        let w_down = projection(&format!("{p}.mlp.down_proj"), total)?;
+        Ok(DenseFfn { w_gate, w_up, w_gate_up, w_down })
     };
 
     // One projection of every expert, concatenated in expert order.
@@ -2039,10 +2226,12 @@ pub fn load_awq(
             (None, false) => false,
         };
 
+        let __t_attn = std::time::Instant::now();
         let attn = if is_linear {
             None
         } else {
-            let wq = projection(&format!("{p}.self_attn.q_proj"), &mut device_bytes)?;
+            let (wq, q_bytes, q_ty, q_k, q_n) =
+                projection_with_bytes(&format!("{p}.self_attn.q_proj"), &mut device_bytes)?;
             // `q_proj` producing twice the attention width means it carries a
             // gate interleaved with the query, per head. Detected from the
             // shape rather than from the config's `attn_output_gate`, because
@@ -2056,10 +2245,27 @@ pub fn load_awq(
                 cfg.d_attn(),
                 2 * cfg.d_attn(),
             );
+            let (wk, k_bytes, k_ty, k_k, k_n) =
+                projection_with_bytes(&format!("{p}.self_attn.k_proj"), &mut device_bytes)?;
+            let (wv, v_bytes, v_ty, v_k, v_n) =
+                projection_with_bytes(&format!("{p}.self_attn.v_proj"), &mut device_bytes)?;
+            // The fused QKV stack assumes three same-shaped projections of
+            // one input; a gated q_proj is twice as wide as the stack
+            // expects, so leave it unfused rather than mis-slice it.
+            let w_qkv = if output_gate {
+                None
+            } else {
+                stacked3(
+                    (q_bytes.as_slice(), q_ty, q_k, q_n),
+                    (k_bytes.as_slice(), k_ty, k_k, k_n),
+                    (v_bytes.as_slice(), v_ty, v_k, v_n),
+                    &mut device_bytes,
+                )?
+            };
             Some(AttnWeights {
                 wq,
-                wk: projection(&format!("{p}.self_attn.k_proj"), &mut device_bytes)?,
-                wv: projection(&format!("{p}.self_attn.v_proj"), &mut device_bytes)?,
+                wk,
+                wv,
                 wo: projection(&format!("{p}.self_attn.o_proj"), &mut device_bytes)?,
                 bq: optional_vector(&format!("{p}.self_attn.q_proj.bias"), &mut device_bytes)?,
                 bk: optional_vector(&format!("{p}.self_attn.k_proj.bias"), &mut device_bytes)?,
@@ -2069,19 +2275,7 @@ pub fn load_awq(
                     &format!("{p}.self_attn.q_norm.weight"), &mut device_bytes)?,
                 k_norm: optional_vector(
                     &format!("{p}.self_attn.k_norm.weight"), &mut device_bytes)?,
-                // The fused QKV stack assumes three same-shaped projections of
-                // one input; a gated q_proj is twice as wide as the stack
-                // expects, so leave it unfused rather than mis-slice it.
-                w_qkv: if output_gate {
-                    None
-                } else {
-                    stacked3(
-                        &format!("{p}.self_attn.q_proj"),
-                        &format!("{p}.self_attn.k_proj"),
-                        &format!("{p}.self_attn.v_proj"),
-                        &mut device_bytes,
-                    )?
-                },
+                w_qkv,
                 // The GGUF loader's narrower fallback for a gated `wq`
                 // (`stacked2_gguf` on `wk`/`wv` alone) is GGUF-specific --
                 // AWQ's `stacked2` only takes F16/F32, and an AWQ
@@ -2092,24 +2286,36 @@ pub fn load_awq(
                 output_gate,
             })
         };
+        ATTN_BLOCK_NS.fetch_add(__t_attn.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 
+        let __t_gdn = std::time::Instant::now();
         let gdn = if is_linear {
             let l = format!("{p}.linear_attn");
+            let (in_proj_qkv, qkv_bytes, qkv_ty, qkv_k, qkv_n) =
+                projection_with_bytes(&format!("{l}.in_proj_qkv"), &mut device_bytes)?;
+            let (in_proj_z, z_bytes, z_ty, z_k, z_n) =
+                projection_with_bytes(&format!("{l}.in_proj_z"), &mut device_bytes)?;
+            let (in_proj_a, a_bytes, a_ty, a_k, a_n) =
+                projection_with_bytes(&format!("{l}.in_proj_a"), &mut device_bytes)?;
+            let (in_proj_b, b_bytes, b_ty, b_k, b_n) =
+                projection_with_bytes(&format!("{l}.in_proj_b"), &mut device_bytes)?;
+            let in_proj_ba = stacked2(
+                (a_bytes.as_slice(), a_ty, a_k, a_n),
+                (b_bytes.as_slice(), b_ty, b_k, b_n),
+                &mut device_bytes,
+            )?;
+            let in_proj_qz = stacked_fp8_2(
+                (qkv_bytes.as_slice(), qkv_ty, qkv_k, qkv_n),
+                (z_bytes.as_slice(), z_ty, z_k, z_n),
+                &mut device_bytes,
+            )?;
             Some(GdnWeights {
-                in_proj_qkv: projection(&format!("{l}.in_proj_qkv"), &mut device_bytes)?,
-                in_proj_z: projection(&format!("{l}.in_proj_z"), &mut device_bytes)?,
-                in_proj_a: projection(&format!("{l}.in_proj_a"), &mut device_bytes)?,
-                in_proj_b: projection(&format!("{l}.in_proj_b"), &mut device_bytes)?,
-                in_proj_ba: stacked2(
-                    &format!("{l}.in_proj_a"),
-                    &format!("{l}.in_proj_b"),
-                    &mut device_bytes,
-                )?,
-                in_proj_qz: stacked_fp8_2(
-                    &format!("{l}.in_proj_qkv"),
-                    &format!("{l}.in_proj_z"),
-                    &mut device_bytes,
-                )?,
+                in_proj_qkv,
+                in_proj_z,
+                in_proj_a,
+                in_proj_b,
+                in_proj_ba,
+                in_proj_qz,
                 conv1d: vector(&format!("{l}.conv1d.weight"), &mut device_bytes)?,
                 a_log: vector(&format!("{l}.A_log"), &mut device_bytes)?,
                 dt_bias: vector(&format!("{l}.dt_bias"), &mut device_bytes)?,
@@ -2119,6 +2325,11 @@ pub fn load_awq(
         } else {
             None
         };
+        GDN_BLOCK_NS.fetch_add(__t_gdn.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+
+        let __t_ffn = std::time::Instant::now();
+        let dense_val = if sparse { None } else { Some(dense_ffn(&p, &mut device_bytes)?) };
+        FFN_BLOCK_NS.fetch_add(__t_ffn.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 
         layers.push(Layer {
             attn_norm: vector(&format!("{p}.input_layernorm.weight"), &mut device_bytes)?,
@@ -2128,7 +2339,7 @@ pub fn load_awq(
                 &format!("{p}.post_attention_layernorm.weight"),
                 &mut device_bytes,
             )?,
-            dense: if sparse { None } else { Some(dense_ffn(&p, &mut device_bytes)?) },
+            dense: dense_val,
             moe: if sparse {
                 Some(expert_block(&p, &mut device_bytes)?)
             } else {
@@ -2144,6 +2355,10 @@ pub fn load_awq(
         ms = started.elapsed().as_millis(),
         repack_ms = REPACK_NS.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
         upload_ms = UPLOAD_NS.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
+        attn_ms = ATTN_BLOCK_NS.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
+        gdn_ms = GDN_BLOCK_NS.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
+        ffn_ms = FFN_BLOCK_NS.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
+        stack_ms = STACK_NS.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
         "awq weights loaded"
     );
     Ok(Weights {
