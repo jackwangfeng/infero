@@ -17,7 +17,7 @@ const KEY_HEADS: usize = 16;
 const DK: usize = 128;
 const DV: usize = 128;
 const LINEAR_LAYERS: usize = 48;
-const TOTAL_TOKENS: usize = 30552;
+const DEFAULT_TOTAL_TOKENS: usize = 30552;
 
 fn pseudo_random(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed | 1;
@@ -43,7 +43,10 @@ fn main() -> Result<()> {
     let val_dim = HEADS * DV;
     let stride = 2 * key_dim + val_dim;
     let offsets = (stride, 0, key_dim, 2 * key_dim);
-    let total = TOTAL_TOKENS;
+    let total = std::env::var("GDN_BENCH_TOTAL_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_TOTAL_TOKENS);
 
     let row = pseudo_random(total * stride, 0xe317);
     let g: Vec<f32> = pseudo_random(total * HEADS, 0xe318).iter().map(|v| -v.abs() * 0.6).collect();
@@ -133,6 +136,7 @@ fn main() -> Result<()> {
         ("plain", GdnChunkStateVariant::Plain),
         ("pipelined", GdnChunkStateVariant::Pipelined),
         ("pipelined_split4", GdnChunkStateVariant::PipelinedSplit4),
+        ("mma", GdnChunkStateVariant::Mma),
     ] {
         run_split3(2, k2)?;
         dev.synchronize()?;

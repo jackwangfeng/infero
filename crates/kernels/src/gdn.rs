@@ -48,6 +48,10 @@ pub enum GdnChunkStateVariant {
     /// 128 columns split 4 ways (192 blocks instead of 48), legal because
     /// the state recurrence is column-independent.
     PipelinedSplit4,
+    /// `gdn_chunk_state_mma_f32` -- tensor-core `pred=W@S`/state-advance,
+    /// same 48-block (`heads`-only) grid as `Plain`. See that kernel's own
+    /// doc comment in `gdn.cu`.
+    Mma,
 }
 
 /// Which delta-rule kernel to run.
@@ -1214,9 +1218,16 @@ impl Kernels {
                 GdnChunkStateVariant::PipelinedSplit4 => {
                     ("gdn_chunk_state_pipelined_split4_f32", 4, dv / 2)
                 }
+                GdnChunkStateVariant::Mma => ("gdn_chunk_state_mma_f32", 1, 2 * dv),
             };
             let f = self.dev.kernels().get("infero_gdn", gdn_src(), name)?;
-            let shared = if matches!(k2, GdnChunkStateVariant::Plain) {
+            let f16_size = std::mem::size_of::<u16>();
+            let shared = if matches!(k2, GdnChunkStateVariant::Mma) {
+                // sS[128][128]+sW[GDN_CHUNK][128]+sKT[128][GDN_CHUNK]+sDT[128][GDN_CHUNK], f16,
+                // plus sgc[GDN_CHUNK] f32 -- see gdn_chunk_state_mma_f32's own shared-memory comment.
+                (GDN_DK * GDN_DK + GDN_CHUNK * GDN_DK + GDN_DK * GDN_CHUNK + GDN_DK * GDN_CHUNK) * f16_size
+                    + GDN_CHUNK * f32_size
+            } else if matches!(k2, GdnChunkStateVariant::Plain) {
                 (2 * GDN_CHUNK * ROW_PAD + GDN_CHUNK) * f32_size
             } else {
                 (4 * GDN_CHUNK * ROW_PAD + GDN_CHUNK) * f32_size

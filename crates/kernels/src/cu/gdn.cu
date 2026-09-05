@@ -2239,6 +2239,207 @@ extern "C" __global__ __launch_bounds__(256) void gdn_chunk_state_f32(
     for (int r = 0; r < 64; ++r) S[(size_t)(i0 + r) * GDN_DV + j] = sc[r];
 }
 
+// Tensor-core version of `gdn_chunk_state_f32`'s two matmul-shaped steps
+// (`pred = W @ S`, `S += Kd^T @ delta_scaled`), using the register<->MMA-
+// fragment bridge validated in isolation by `gdn_state_bridge_probe`
+// (`mma.cuh`) before this kernel existed -- see that probe's own doc comment
+// for exactly what it derisks, and `gdn_chunk_uw_mma_f32`'s doc comment above
+// for the real, specific "vLLM uses tensor cores here, we didn't" finding
+// this kernel is the second half of testing.
+//
+// Same per-thread state layout as `gdn_chunk_state_f32`: 256 threads, thread
+// `lane` owns `S[i0+r][j]` (`j=lane/2`, `part=lane%2`, `i0=part*64`, `r` in
+// [0,64)) across the whole sequential chunk sweep -- unchanged. What's new:
+// every chunk, `S` is staged into shared memory (transposed, f16 -- `sS[j][d]`,
+// exactly `gdn_state_bridge_probe`'s validated layout) to serve first as
+// `pred=W@S`'s B-operand, then as the state-advance's accumulator write-back
+// target, then read back into the SAME per-thread registers for the next
+// chunk.
+//
+// `pred = W @ S`: [C,128]x[128,128]->[C,128]. `m16n8k16` tiles it as M=32 (2
+// m-tiles, the full `GDN_CHUNK` regardless of the real `C` -- ragged rows
+// zero-fill, same discipline as kernel 1) x N=128 (16 n-tiles) x K=128 (8
+// k-tiles) = 32 output tiles / 8 warps = 4 tiles a warp (`m_tile=warp%2`,
+// `n_tile=(warp/2)*4+sub`). Each tile's own raw accumulator becomes
+// `delta[t][j] = u[t][j] - pred[t][j]`, then `delta_scaled[t][j] =
+// delta[t][j] * exp(gc[C-1]-gc[t])` (the same per-row decay
+// `gdn_chunk_state_f32`'s own `dt_cache` applies) written straight into
+// `sDT`, transposed (`sDT[j][t]`) for the next step -- no separate `pred`
+// buffer, no re-reading `delta` from global the way the scalar kernel's own
+// history already flagged as a real, measured 77.7%-of-cost bug once (see
+// that kernel's own comment on `dt_cache`).
+//
+// `S += Kd^T @ delta_scaled` (`Kd[t][d]=K[t][d]`, decay already folded into
+// `delta_scaled`): contracting over `t` (<=32), output [128,128] (d,j).
+// Tiled as M=128 (8 m-tiles) x N=128 (16 n-tiles) x K=32 (2 k-tiles) = 128
+// output tiles / 8 warps = 16 tiles a warp. `K` and `delta_scaled` both need
+// staging TRANSPOSED (`t` as the contiguous index) for their MMA-operand
+// roles -- a matter of which index a thread's write treats as row vs column
+// when staging, not a real transpose (the same triviality
+// `gdn_state_bridge_probe` already established for `S`). The accumulator's
+// output writes back into `sS` at the exact cell the original per-thread
+// layout reads next, closing the loop `gdn_state_bridge_probe` validated.
+//
+// No `cp.async` double-buffering here (unlike `gdn_chunk_state_pipelined_f32`)
+// -- this is a first, correctness-and-tensor-core-focused pass built directly
+// off the plain kernel; whether the two techniques compose is a real,
+// separate follow-up, not attempted here.
+extern "C" __global__ __launch_bounds__(256) void gdn_chunk_state_mma_f32(
+        float* __restrict__ delta_out, float* __restrict__ s_before_out,
+        float* __restrict__ state, const float* __restrict__ w_in,
+        const float* __restrict__ u_in, const float* __restrict__ qkv,
+        const float* __restrict__ g, const int* __restrict__ first_token,
+        const int* __restrict__ n_tok, int heads, int key_heads, int dk, int dv,
+        int stride, int k_off, int v_tiled, int n_chunks) {
+    (void)dk;
+    (void)dv;
+    const int head = blockIdx.x;
+    const int seq = 0;
+    const int nt = n_tok[seq];
+    if (nt <= 0) return;
+    const int t0 = first_token[seq];
+    const int lane = threadIdx.x;  // 0..255
+    const int j = lane / 2;
+    const int part = lane % 2;
+    const int i0 = part * 64;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int mlane = threadIdx.x % WARP_SIZE;
+    const int khead = v_tiled ? (head % key_heads) : (head / (heads / key_heads));
+
+    extern __shared__ char gdn_state_mma_smem[];
+    __half* sS = (__half*)gdn_state_mma_smem;         // [128][128] transposed: sS[j*128+d] = S[d][j]
+    __half* sW = sS + GDN_DK * GDN_DV;                // [GDN_CHUNK][GDN_DK] natural
+    float* sgc = (float*)(sW + GDN_CHUNK * GDN_DK);   // [GDN_CHUNK]
+    __half* sKT = (__half*)(sgc + GDN_CHUNK);         // [GDN_DK][GDN_CHUNK] transposed: sKT[d*GDN_CHUNK+t] = K[t][d]
+    __half* sDT = sKT + GDN_DK * GDN_CHUNK;           // [GDN_DV][GDN_CHUNK] transposed: sDT[j*GDN_CHUNK+t] = delta_scaled[t][j]
+
+    float* S = state + (size_t)head * GDN_DK * GDN_DV;
+    float sc[64];
+#pragma unroll
+    for (int r = 0; r < 64; ++r) sc[r] = S[(size_t)(i0 + r) * GDN_DV + j];
+
+    for (int chunk = 0; chunk < n_chunks; ++chunk) {
+        const int c0 = chunk * GDN_CHUNK;
+        if (c0 >= nt) break;
+        const int C = min(GDN_CHUNK, nt - c0);
+
+        float* sbefore_chunk = s_before_out + ((size_t)chunk * heads + head) * GDN_DK * GDN_DV;
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            sbefore_chunk[(size_t)(i0 + r) * GDN_DV + j] = sc[r];
+            sS[(size_t)j * GDN_DK + (i0 + r)] = __float2half(sc[r]);
+        }
+
+        const float* w_chunk = w_in + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DK;
+        const float* u_chunk = u_in + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DV;
+        float* delta_chunk = delta_out + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DV;
+
+        for (int idx = lane; idx < GDN_CHUNK * GDN_DK; idx += blockDim.x) {
+            const int t = idx / GDN_DK, d = idx % GDN_DK;
+            if (t < C) {
+                const float* row = qkv + (size_t)(t0 + c0 + t) * stride;
+                const float kv = row[k_off + (size_t)khead * GDN_DK + d];
+                sW[t * GDN_DK + d] = __float2half(w_chunk[t * GDN_DK + d]);
+                sKT[(size_t)d * GDN_CHUNK + t] = __float2half(kv);
+            } else {
+                sW[t * GDN_DK + d] = __float2half(0.0f);
+                sKT[(size_t)d * GDN_CHUNK + t] = __float2half(0.0f);
+            }
+        }
+        if (lane == 0) {
+            float acc = 0.0f;
+            for (int r = 0; r < C; ++r) {
+                acc += g[(size_t)(t0 + c0 + r) * heads + head];
+                sgc[r] = acc;
+            }
+        }
+        __syncthreads();
+
+        {
+            const int m_tile = warp % 2;
+            const int n_group = warp / 2;
+#pragma unroll
+            for (int sub = 0; sub < 4; ++sub) {
+                const int n_tile = n_group * 4 + sub;
+                mma_c_f32 acc = {{0.0f, 0.0f, 0.0f, 0.0f}};
+#pragma unroll
+                for (int kt = 0; kt < GDN_DK / 16; ++kt) {
+                    mma_a_f16 a;
+                    mma_b_f16 b;
+                    ldmatrix_a_f16(a, sW + m_tile * 16 * GDN_DK + kt * 16, GDN_DK * (int)sizeof(__half));
+                    ldmatrix_b_f16(b, sS + n_tile * 8 * GDN_DK + kt * 16, GDN_DK * (int)sizeof(__half));
+                    mma_f16(acc, a, b);
+                }
+                __syncwarp();
+                const int cr = mma_c_row(mlane);
+                const int cc = mma_c_col(mlane);
+                const int rows[2] = {m_tile * 16 + cr, m_tile * 16 + cr + 8};
+                const int cols[2] = {n_tile * 8 + cc, n_tile * 8 + cc + 1};
+                const float raw[4] = {acc.x[0], acc.x[1], acc.x[2], acc.x[3]};
+#pragma unroll
+                for (int rr = 0; rr < 2; ++rr) {
+                    const int t = rows[rr];
+#pragma unroll
+                    for (int cci = 0; cci < 2; ++cci) {
+                        const int jj = cols[cci];
+                        if (t < C) {
+                            const float d_val = u_chunk[t * GDN_DV + jj] - raw[rr * 2 + cci];
+                            delta_chunk[t * GDN_DV + jj] = d_val;
+                            const float decay_row = __expf(sgc[C - 1] - sgc[t]);
+                            sDT[(size_t)jj * GDN_CHUNK + t] = __float2half(d_val * decay_row);
+                        } else {
+                            sDT[(size_t)jj * GDN_CHUNK + t] = __float2half(0.0f);
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        const float decay_whole = __expf(sgc[C - 1]);
+        {
+#pragma unroll
+            for (int sub = 0; sub < 16; ++sub) {
+                const int tile = warp * 16 + sub;
+                const int m_tile = tile / 16;
+                const int n_tile = tile % 16;
+                mma_c_f32 acc = {{0.0f, 0.0f, 0.0f, 0.0f}};
+#pragma unroll
+                for (int kt = 0; kt < GDN_CHUNK / 16; ++kt) {
+                    mma_a_f16 a;
+                    mma_b_f16 b;
+                    ldmatrix_a_f16(a, sKT + m_tile * 16 * GDN_CHUNK + kt * 16, GDN_CHUNK * (int)sizeof(__half));
+                    ldmatrix_b_f16(b, sDT + n_tile * 8 * GDN_CHUNK + kt * 16, GDN_CHUNK * (int)sizeof(__half));
+                    mma_f16(acc, a, b);
+                }
+                __syncwarp();
+                const int cr = mma_c_row(mlane);
+                const int cc = mma_c_col(mlane);
+                const int rows[2] = {m_tile * 16 + cr, m_tile * 16 + cr + 8};
+                const int cols[2] = {n_tile * 8 + cc, n_tile * 8 + cc + 1};
+                const float raw[4] = {acc.x[0], acc.x[1], acc.x[2], acc.x[3]};
+#pragma unroll
+                for (int rr = 0; rr < 2; ++rr) {
+#pragma unroll
+                    for (int cci = 0; cci < 2; ++cci) {
+                        sS[(size_t)cols[cci] * GDN_DK + rows[rr]] = __float2half(raw[rr * 2 + cci]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            sc[r] = sc[r] * decay_whole + __half2float(sS[(size_t)j * GDN_DK + (i0 + r)]);
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < 64; ++r) S[(size_t)(i0 + r) * GDN_DV + j] = sc[r];
+}
+
 // Same as `gdn_chunk_state_f32` above, but double-buffered via `cp.async`:
 // chunk `c+1`'s K/W are prefetched while chunk `c`'s pred/delta/state-advance
 // is still computing, instead of the fully synchronous load-sync-compute-

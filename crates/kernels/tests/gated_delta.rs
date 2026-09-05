@@ -1586,6 +1586,141 @@ fn the_mma_chunk_uw_matches_the_same_host_reference() -> Result<()> {
     Ok(())
 }
 
+/// `gdn_chunk_state_mma_f32` -- the tensor-core version of kernel 2 (the
+/// cross-chunk state recurrence), checked directly against the plain,
+/// already-trusted `gdn_chunk_state_f32` on identical `w`/`u`/`qkv`/`g` and a
+/// real non-zero initial state -- the same "compare against the real kernel,
+/// not a hand-rolled host reference" style
+/// `the_scan_based_kernel2_matches_gdn_chunk_state_f32` already uses.
+/// `t_len = 200` over `GDN_CHUNK = 32` gives 7 chunks, the last one ragged
+/// (8 real tokens) -- exercising the same zero-fill discipline kernel 1's
+/// MMA version already relies on, this time for two matmuls instead of one.
+#[test]
+fn the_mma_chunk_state_matches_gdn_chunk_state_f32() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    let t_len = 200usize;
+    const GDN_CHUNK: usize = 32;
+    const DKC: usize = 128;
+    const DVC: usize = 128;
+    let n_chunks = t_len.div_ceil(GDN_CHUNK);
+
+    let q_small = pseudo_random(t_len * KEY_HEADS * DK, 0xA001);
+    let k_small = pseudo_random(t_len * KEY_HEADS * DK, 0xA002);
+    let v = pseudo_random(t_len * VAL_HEADS * DV, 0xA003);
+    let g = decaying(t_len * VAL_HEADS, 0xA004, 0.7);
+    let beta = betas(t_len * VAL_HEADS, 0xA005);
+    let (row, off) = packed(&q_small, &k_small, &v, t_len);
+
+    let chunk = stream.clone_htod(&row)?;
+    let hg = stream.clone_htod(&g)?;
+    let hb = stream.clone_htod(&beta)?;
+    let f = stream.clone_htod(&[0i32])?;
+    let n = stream.clone_htod(&[t_len as i32])?;
+    let seqs = infero_kernels::gdn::SeqLayout {
+        first_token: &f.as_view(),
+        n_tokens: &n.as_view(),
+        n_seqs: 1,
+        total_tokens: t_len,
+    };
+
+    let mut w = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DK)?;
+    let mut u = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DV)?;
+    k.gdn_chunk_uw_only(
+        &mut w.as_view_mut(),
+        &mut u.as_view_mut(),
+        &chunk.as_view(),
+        &hg.as_view(),
+        &hb.as_view(),
+        &seqs,
+        VAL_HEADS,
+        KEY_HEADS,
+        DK,
+        DV,
+        off,
+        false,
+    )?;
+    k.device().synchronize()?;
+
+    let s_init = pseudo_random(VAL_HEADS * DKC * DVC, 0xA006);
+
+    let mut delta_ref = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DV)?;
+    let mut s_before_ref = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * DKC * DVC)?;
+    let mut state_ref = stream.clone_htod(&s_init)?;
+    k.gdn_chunk_state_only(
+        &mut delta_ref.as_view_mut(),
+        &mut s_before_ref.as_view_mut(),
+        &mut state_ref.as_view_mut(),
+        &w.as_view(),
+        &u.as_view(),
+        &chunk.as_view(),
+        &hg.as_view(),
+        &seqs,
+        VAL_HEADS,
+        KEY_HEADS,
+        DK,
+        DV,
+        off,
+        false,
+    )?;
+
+    let mut delta_mma = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DV)?;
+    let mut s_before_mma = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * DKC * DVC)?;
+    let mut state_mma = stream.clone_htod(&s_init)?;
+    k.gdn_chunk_state_mma_only(
+        &mut delta_mma.as_view_mut(),
+        &mut s_before_mma.as_view_mut(),
+        &mut state_mma.as_view_mut(),
+        &w.as_view(),
+        &u.as_view(),
+        &chunk.as_view(),
+        &hg.as_view(),
+        &seqs,
+        VAL_HEADS,
+        KEY_HEADS,
+        DK,
+        DV,
+        off,
+        false,
+    )?;
+    k.device().synchronize()?;
+
+    let got_delta_ref = stream.clone_dtoh(&delta_ref)?;
+    let got_sbefore_ref = stream.clone_dtoh(&s_before_ref)?;
+    let got_state_ref = stream.clone_dtoh(&state_ref)?;
+    let got_delta_mma = stream.clone_dtoh(&delta_mma)?;
+    let got_sbefore_mma = stream.clone_dtoh(&s_before_mma)?;
+    let got_state_mma = stream.clone_dtoh(&state_mma)?;
+
+    // f16-operand round trip, same 1e-2-relative tolerance kernel 1's own
+    // MMA test uses, not the plain kernels' tighter exact/near-exact bars.
+    let (dworst, dat) = max_abs_diff(&got_delta_mma, &got_delta_ref);
+    let dpeak = got_delta_ref.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(
+        dworst < 1e-2 * dpeak.max(1e-6),
+        "delta diverged from gdn_chunk_state_f32 by {dworst:.2e} at {dat}: got {}, want {}",
+        got_delta_mma[dat],
+        got_delta_ref[dat]
+    );
+    let (sbworst, sbat) = max_abs_diff(&got_sbefore_mma, &got_sbefore_ref);
+    let sbpeak = got_sbefore_ref.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(
+        sbworst < 1e-2 * sbpeak.max(1e-6),
+        "s_before diverged from gdn_chunk_state_f32 by {sbworst:.2e} at {sbat}: got {}, want {}",
+        got_sbefore_mma[sbat],
+        got_sbefore_ref[sbat]
+    );
+    let (stworst, stat) = max_abs_diff(&got_state_mma, &got_state_ref);
+    let stpeak = got_state_ref.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(
+        stworst < 1e-2 * stpeak.max(1e-6),
+        "final state diverged from gdn_chunk_state_f32 by {stworst:.2e} at {stat}: got {}, want {}",
+        got_state_mma[stat],
+        got_state_ref[stat]
+    );
+    Ok(())
+}
+
 /// `gdn_ab_combine_f32` -- the row-streaming `[128,128]@[128,128]` GEMM the
 /// group-scan needs to combine two affine-recurrence pairs, checked against
 /// a direct host matmul on plain random matrices (no GDN-specific setup
@@ -2330,6 +2465,38 @@ fn the_chunked_kernels_register_state_does_not_spill() -> Result<()> {
         "the chunked delta rule fits no block an SM at all: {regs} registers \
          over 2 * {DV} threads plus {shared} B shared is past this device's \
          budget"
+    );
+    Ok(())
+}
+
+/// Same check as `the_chunked_kernels_register_state_does_not_spill`, for
+/// `gdn_chunk_state_mma_f32`'s `sc[64]` -- the MMA rewrite touches every use
+/// of `sc` (staged into `sS` each chunk, read back from it each chunk) but
+/// keeps the exact same fully-unrolled per-thread layout, so it is exactly
+/// as vulnerable to silently spilling to local memory as the plain kernel.
+#[test]
+fn the_mma_chunk_state_register_state_does_not_spill() -> Result<()> {
+    let k = kernels()?;
+    const GDN_CHUNK: usize = 32;
+    let shared = (DK * DV + GDN_CHUNK * DK + DK * GDN_CHUNK + DV * GDN_CHUNK) * 2 // sS+sW+sKT+sDT, f16
+        + GDN_CHUNK * 4; // sgc, f32
+    let (regs, stat, spill) = k.gdn_kernel_registers("gdn_chunk_state_mma_f32")?;
+    let blocks = k.gdn_occupancy_blocks("gdn_chunk_state_mma_f32", 2 * DV as u32, shared)?;
+    eprintln!(
+        "  gdn_chunk_state_mma_f32: {regs} regs, {stat} B static shared, \
+         {spill} B spill, {blocks} blocks/SM ({shared} B dynamic shared)"
+    );
+    assert_eq!(
+        spill, 0,
+        "gdn_chunk_state_mma_f32 spills {spill} bytes a thread -- the same \
+         silent, correctness-preserving performance regression this file's \
+         other register-state checks exist to catch"
+    );
+    assert!(
+        blocks >= 1,
+        "gdn_chunk_state_mma_f32 fits no block an SM at all: {regs} \
+         registers over {} threads is past this device's budget",
+        2 * DV
     );
     Ok(())
 }
