@@ -26,6 +26,14 @@ use crate::qwen35_vision::interleaved_mrope_axis;
 /// ggml block type's alignment and keeps each sub-copy DMA-friendly.
 const BLOB_ALIGN: usize = 256;
 
+/// Cumulative time this process has spent in the FP8 host-side repack step
+/// (`fp8::repack_rows`/`pad_rows`) across every tensor `load_awq` has loaded,
+/// reported alongside the total load time so a slow load's breakdown is
+/// visible in the log rather than needing a profiler to find.
+static REPACK_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Same, for the host-to-device upload (`clone_htod`) that follows it.
+static UPLOAD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Whether FP8 weights load as plain `[n,k]` row-major (`fp8::pad_rows`,
 /// CUTLASS's and [`infero_kernels::Kernels::mmv_f8_plain`]'s native layout)
 /// instead of [`infero_kernels::fp8::repack_rows`]'s `ROW_GROUP`-interleaved
@@ -1420,12 +1428,15 @@ pub fn load_awq(
 
     let upload = |bytes: &[u8], ty: WeightType, k: usize, n: usize, total: &mut usize| -> Result<Matrix> {
         *total += bytes.len();
+        let __t0 = std::time::Instant::now();
+        let storage = Storage::Device(dev.stream().clone_htod(bytes)?);
+        UPLOAD_NS.fetch_add(__t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(Matrix {
             ty,
             k,
             n,
             n_bytes: bytes.len(),
-            storage: Storage::Device(dev.stream().clone_htod(bytes)?),
+            storage,
                 cutlass_weight: Default::default(),
         })
     };
@@ -1529,11 +1540,13 @@ pub fn load_awq(
                 // against this copy's 25.7 s of the 27B's ~60 s load. Reusing
                 // it and only growing it for the scale tail turns that
                 // second full pass into nothing.
+                let __t0 = std::time::Instant::now();
                 let mut bytes = if fp8_unified_layout() {
                     infero_kernels::fp8::pad_rows(t.data, k, n)?
                 } else {
                     infero_kernels::fp8::repack_rows(t.data, k, n)?
                 };
+                REPACK_NS.fetch_add(__t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 bytes.reserve_exact(scales.len() * 4);
                 for v in &scales {
                     bytes.extend_from_slice(&v.to_le_bytes());
@@ -2129,6 +2142,8 @@ pub fn load_awq(
         layers = cfg.n_layers,
         vram_mib = device_bytes >> 20,
         ms = started.elapsed().as_millis(),
+        repack_ms = REPACK_NS.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
+        upload_ms = UPLOAD_NS.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
         "awq weights loaded"
     );
     Ok(Weights {

@@ -147,18 +147,53 @@ impl Tensor<'_> {
             Dtype::BF16 => {
                 let (head, body, _) = unsafe { self.data.align_to::<u16>() };
                 anyhow::ensure!(head.is_empty(), "{} is not 2-byte aligned", self.name);
-                let mut out = Vec::with_capacity(self.n_elements());
-                for b in &body[..self.n_elements()] {
-                    let wide = f32::from_bits((*b as u32) << 16);
-                    let narrow = half::f16::from_f32(wide);
-                    anyhow::ensure!(
-                        narrow.is_finite() || !wide.is_finite(),
-                        "{} has a value outside f16 range ({wide:e}); \
-                         narrowing it would silently become infinity",
-                        self.name
+                let n = self.n_elements();
+                let body = &body[..n];
+                // A vocab-sized matrix (embeddings, lm_head) is ~1.3e9 elements
+                // here; on one core that was 4.3-4.5 s of a 27B checkpoint's
+                // ~35 s load, all of it in this one narrowing loop. `repack_rows`
+                // already parallelizes an analogous per-element pass across
+                // threads for exactly this reason — mirror it, rather than
+                // paying this serially every load.
+                let mut out: Vec<half::f16> = Vec::with_capacity(n);
+                let out_spare = out.spare_capacity_mut();
+                let threads = std::thread::available_parallelism()
+                    .map(|t| t.get().min(16))
+                    .unwrap_or(1);
+                let per_thread = n.div_ceil(threads).max(1);
+                let name = self.name;
+                let bad: std::sync::Mutex<Option<(usize, f32)>> = std::sync::Mutex::new(None);
+                std::thread::scope(|scope| {
+                    for (t, (in_chunk, out_chunk)) in body
+                        .chunks(per_thread)
+                        .zip(out_spare.chunks_mut(per_thread))
+                        .enumerate()
+                    {
+                        let bad = &bad;
+                        scope.spawn(move || {
+                            for (i, (b, slot)) in in_chunk.iter().zip(out_chunk.iter_mut()).enumerate() {
+                                let wide = f32::from_bits((*b as u32) << 16);
+                                let narrow = half::f16::from_f32(wide);
+                                if !(narrow.is_finite() || !wide.is_finite()) {
+                                    let mut guard = bad.lock().unwrap();
+                                    if guard.is_none() {
+                                        *guard = Some((t * per_thread + i, wide));
+                                    }
+                                }
+                                slot.write(narrow);
+                            }
+                        });
+                    }
+                });
+                if let Some((_, wide)) = *bad.lock().unwrap() {
+                    anyhow::bail!(
+                        "{name} has a value outside f16 range ({wide:e}); \
+                         narrowing it would silently become infinity"
                     );
-                    out.push(narrow);
                 }
+                // Safety: every element in `0..n` was just written above, one
+                // write per index across the disjoint `chunks_mut` windows.
+                unsafe { out.set_len(n) };
                 Ok(std::borrow::Cow::Owned(out))
             }
             other => bail!("{} is {other:?}, not a half-width float", self.name),
