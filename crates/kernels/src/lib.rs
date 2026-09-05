@@ -127,7 +127,10 @@ fn ops_src() -> &'static str {
 #[cfg(feature = "cuda")]
 fn gdn_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    SRC.get_or_init(|| format!("{COMMON_CUH}\n{GDN_CU}"))
+    // MMA_CUH: `gdn_chunk_uw_mma_f32` uses the same `m16n8k16` f16 tensor-core
+    // fragments the attention/GEMM kernels do, for the chunk-local K·Kᵀ
+    // system-matrix product -- see that kernel's own doc comment in `gdn.cu`.
+    SRC.get_or_init(|| format!("{COMMON_CUH}\n{MMA_CUH}\n{GDN_CU}"))
 }
 #[cfg(not(feature = "cuda"))]
 fn gdn_src() -> &'static str {

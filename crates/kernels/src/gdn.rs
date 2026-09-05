@@ -960,6 +960,77 @@ impl Kernels {
         Ok(())
     }
 
+    /// Same as [`Self::gdn_chunk_uw_only`], but launches `gdn_chunk_uw_mma_f32`
+    /// -- the tensor-core version of kernel 1's system-matrix (`A = K@Kᵀ`)
+    /// computation. Identical inputs/outputs/shape contract; see that
+    /// kernel's own doc comment in `gdn.cu` for what actually differs and why.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_chunk_uw_mma_only(
+        &self,
+        w: &mut ViewMut<'_, f32>,
+        u: &mut ViewMut<'_, f32>,
+        qkv: &View<'_, f32>,
+        g: &View<'_, f32>,
+        beta: &View<'_, f32>,
+        seqs: &SeqLayout<'_>,
+        heads: usize,
+        key_heads: usize,
+        dk: usize,
+        dv: usize,
+        offsets: (usize, usize, usize, usize),
+        v_tiled: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(seqs.n_seqs == 1, "gdn_chunk_uw_mma_only: single sequence only");
+        anyhow::ensure!(dk == 128 && dv == 128, "gdn_chunk_uw_mma_only is instantiated for dk = dv = 128, got {dk}x{dv}");
+        let (stride, _q_off, k_off, v_off) = offsets;
+        const GDN_CHUNK: usize = 32;
+        const GDN_DK: usize = 128;
+        const ROW_PAD: usize = GDN_DK + 4;
+        const A_STRIDE: usize = GDN_CHUNK + 1;
+        let n_chunks = seqs.total_tokens.div_ceil(GDN_CHUNK).max(1);
+        let f32_size = std::mem::size_of::<f32>();
+        let f16_size = std::mem::size_of::<u16>();
+
+        let f = self.dev.kernels().get("infero_gdn", gdn_src(), "gdn_chunk_uw_mma_f32")?;
+        let shared = (2 * GDN_CHUNK * ROW_PAD + 3 * GDN_CHUNK + GDN_CHUNK * A_STRIDE) * f32_size
+            + GDN_CHUNK * GDN_DK * f16_size;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared as u32)?;
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (heads as u32, n_chunks as u32, 1),
+            block_dim: (2 * dv as u32, 1, 1),
+            shared_mem_bytes: shared as u32,
+        };
+        let (h, kh) = (heads as i32, key_heads as i32);
+        let (dka, dva) = (dk as i32, dv as i32);
+        let (st, ko, vo) = (stride as i32, k_off as i32, v_off as i32);
+        let vt = i32::from(v_tiled);
+        let mut bl = self.dev.stream().launch_builder(&f);
+        bl.arg(&mut *w)
+            .arg(&mut *u)
+            .arg(qkv)
+            .arg(g)
+            .arg(beta)
+            .arg(seqs.first_token)
+            .arg(seqs.n_tokens)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dka)
+            .arg(&dva)
+            .arg(&st)
+            .arg(&ko)
+            .arg(&vo)
+            .arg(&vt);
+        self.dev
+            .profile()
+            .time("gdn_chunk_uw_mma_only", self.dev.stream(), || {
+                unsafe { bl.launch(cfg) }.context("gdn_chunk_uw_mma_only")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     /// Diagnostic-only standalone wrapper for the plain, unmodified
     /// `gdn_chunk_state_f32` (kernel 2 alone, given already-computed `w`/`u`
     /// from [`Self::gdn_chunk_uw_only`]) -- built to give the scan-based

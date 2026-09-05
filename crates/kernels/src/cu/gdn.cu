@@ -1450,6 +1450,193 @@ extern "C" __global__ __launch_bounds__(256) void gdn_chunk_uw_f32(
     }
 }
 
+// Tensor-core version of `gdn_chunk_uw_f32` above -- identical inputs,
+// outputs, and downstream forward-substitution/WY math, byte-for-byte the
+// same as the plain kernel except for how the system matrix `A`'s raw dot
+// products (`K @ Kᵀ`) get computed.
+//
+// Real, specific finding behind this kernel (see project_infero_perf_gap.md
+// memory for the full account): reading vLLM's real production GDN
+// implementation (`vllm.third_party.flash_linear_attention`, a real,
+// vendored Triton-JIT kernel family, NOT a guess) found it uses the exact
+// same chunked delta-rule decomposition this codebase already built and
+// measured as a net regression (`gdn_chunk_uw_f32`/`gdn_chunk_state_f32`/
+// `gdn_chunk_output_f32`, best 0.356x vs `gdn_delta_rule_reg128_f32`) -- so
+// neither the algorithm nor the on-chip state-residency strategy explain why
+// vLLM's version is faster. What actually differs: vLLM's Triton kernels do
+// every chunk-local matmul-shaped step (`chunk_scaled_dot_kkt_fwd`'s A
+// matrix among them) via `tl.dot`, which lowers to real tensor-core MMA
+// instructions. This codebase's own abandoned `gdn_chunk_uw_f32` computes
+// the SAME A matrix as a scalar per-thread dot-product loop (the `for (int
+// d = 0; d < GDN_DK; ++d) dot += sk[...] * sk[...]` loop just above, in
+// `gdn_chunk_uw_f32`) -- a matmul-shaped computation done without tensor
+// cores. This kernel is the direct test of that specific, portable
+// hypothesis: reimplement just that one step with `mma.sync` (the same
+// `m16n8k16` f16 atom `attn_prefill_mma_ws4_f32`/`ldmatrix_a_s8`/
+// `ldmatrix_b_s8` in `mma.cuh` already use, verified correct there by
+// `mma_f16_probe`/`ldmatrix_a_probe`/`ldmatrix_b_probe`), everything else
+// unchanged.
+//
+// Tiling: `GDN_CHUNK=32` means the `A = K @ Kᵀ` product is a
+// [32,128]x[128,32] matmul. `m16n8k16` tiles that as M=32 (2 m16-tiles) x
+// N=32 (4 n8-tiles) x K=128 (8 k16-tiles) = 8 output tiles, one per warp
+// (this kernel already launches 256 threads = 8 warps, and unlike the
+// per-timestep recurrence kernels, this one has no state to keep resident,
+// so there is no register-pressure reason not to give each warp a full
+// accumulator). `warp = m_tile*4 + n_tile`. Computing the SAME K tile as
+// both the A and B operand is exactly `K @ Kᵀ`: `ldmatrix_b_s8`'s own doc
+// comment already establishes it reads "row c holding column c" of a
+// column-major B -- which is precisely what a row-major K tile already is
+// when B is meant to be `Kᵀ` (row c of the stored tile = column c of `Kᵀ`).
+// `ldmatrix_a_s8`/`ldmatrix_b_s8` work unchanged on f16 data per their own
+// header comment ("a `.b16` instruction that was only ever moving bytes");
+// this file adds two 1-line f16-typed forwarding wrappers rather than
+// touching `mma.cuh` itself, since that header is shared with every other
+// kernel using these primitives.
+//
+// The full 32x32 tile is computed regardless of the chunk's real length `C`
+// (`mma.sync` has no per-element predicate) -- `sk_h`'s rows `C..GDN_CHUNK`
+// are explicitly zero-filled below so a ragged last chunk's out-of-range
+// rows contribute exactly `0`, not NaN/garbage, into the (masked-out-anyway)
+// unused corner of the tile, the same "read a full compile-time-sized
+// range, rely on a zero fill for the ragged case" discipline
+// `gdn_chunk_state_f32`'s own `dt_cache` fill already uses.
+__device__ __forceinline__ void ldmatrix_a_f16(mma_a_f16& a, const __half* base, int stride_bytes) {
+    ldmatrix_a_s8(*reinterpret_cast<mma_a_s8*>(&a), reinterpret_cast<const int8_t*>(base), stride_bytes);
+}
+__device__ __forceinline__ void ldmatrix_b_f16(mma_b_f16& b, const __half* base, int stride_bytes) {
+    ldmatrix_b_s8(*reinterpret_cast<mma_b_s8*>(&b), reinterpret_cast<const int8_t*>(base), stride_bytes);
+}
+
+extern "C" __global__ __launch_bounds__(256) void gdn_chunk_uw_mma_f32(
+        float* __restrict__ w_out, float* __restrict__ u_out,
+        const float* __restrict__ qkv, const float* __restrict__ g,
+        const float* __restrict__ beta, const int* __restrict__ first_token,
+        const int* __restrict__ n_tok, int heads, int key_heads, int dk, int dv,
+        int stride, int k_off, int v_off, int v_tiled) {
+    (void)dk;
+    (void)dv;
+    const int head = blockIdx.x;
+    const int chunk = blockIdx.y;
+    const int seq = 0;
+    const int nt = n_tok[seq];
+    const int c0 = chunk * GDN_CHUNK;
+    if (c0 >= nt) return;
+    const int t0 = first_token[seq];
+    const int C = min(GDN_CHUNK, nt - c0);
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int mlane = threadIdx.x % WARP_SIZE;
+    const int khead = v_tiled ? (head % key_heads) : (head / (heads / key_heads));
+
+    extern __shared__ char gdn_uw_mma_smem[];
+    float* sk = (float*)gdn_uw_mma_smem;                // [GDN_CHUNK][GDN_ROW_PAD]
+    float* sv = sk + GDN_CHUNK * GDN_ROW_PAD;          // [GDN_CHUNK][GDN_ROW_PAD]
+    float* sgc = sv + GDN_CHUNK * GDN_ROW_PAD;         // [GDN_CHUNK]
+    float* sbeta = sgc + GDN_CHUNK;                    // [GDN_CHUNK]
+    float* sbg = sbeta + GDN_CHUNK;                    // [GDN_CHUNK]
+    float* sA = sbg + GDN_CHUNK;                       // [GDN_CHUNK][GDN_A_STRIDE]
+    __half* sk_h = (__half*)(sA + GDN_CHUNK * GDN_A_STRIDE);  // [GDN_CHUNK][GDN_DK], tight
+
+    for (int idx = lane; idx < C * GDN_DK; idx += blockDim.x) {
+        const int r = idx / GDN_DK, d = idx % GDN_DK;
+        const float* row = qkv + (size_t)(t0 + c0 + r) * stride;
+        const float kv = row[k_off + (size_t)khead * GDN_DK + d];
+        sk[r * GDN_ROW_PAD + d] = kv;
+        sk_h[r * GDN_DK + d] = __float2half(kv);
+    }
+    for (int idx = C * GDN_DK + lane; idx < GDN_CHUNK * GDN_DK; idx += blockDim.x) {
+        const int r = idx / GDN_DK, d = idx % GDN_DK;
+        sk_h[r * GDN_DK + d] = __float2half(0.0f);
+    }
+    for (int idx = lane; idx < C * GDN_DV; idx += blockDim.x) {
+        const int r = idx / GDN_DV, d = idx % GDN_DV;
+        const float* row = qkv + (size_t)(t0 + c0 + r) * stride;
+        sv[r * GDN_ROW_PAD + d] = row[v_off + (size_t)head * GDN_DV + d];
+    }
+    if (lane < C) {
+        sbeta[lane] = beta[(size_t)(t0 + c0 + lane) * heads + head];
+    }
+    if (lane == 0) {
+        float acc = 0.0f;
+        for (int r = 0; r < C; ++r) {
+            acc += g[(size_t)(t0 + c0 + r) * heads + head];
+            sgc[r] = acc;
+        }
+    }
+    __syncthreads();
+
+    if (lane < C) {
+        sbg[lane] = sbeta[lane] * __expf(sgc[lane]);
+    }
+
+    // 8 warps, one per (m_tile, n_tile) output tile of the 2x4-tile A product.
+    {
+        const int m_tile = warp / 4;   // 0..1, rows [m_tile*16, +16)
+        const int n_tile = warp % 4;   // 0..3, cols [n_tile*8, +8)
+        mma_c_f32 acc = {{0.0f, 0.0f, 0.0f, 0.0f}};
+#pragma unroll
+        for (int kt = 0; kt < GDN_DK / 16; ++kt) {
+            mma_a_f16 a;
+            mma_b_f16 b;
+            ldmatrix_a_f16(a, sk_h + m_tile * 16 * GDN_DK + kt * 16, GDN_DK * (int)sizeof(__half));
+            ldmatrix_b_f16(b, sk_h + n_tile * 8 * GDN_DK + kt * 16, GDN_DK * (int)sizeof(__half));
+            mma_f16(acc, a, b);
+        }
+        const int cr = mma_c_row(mlane);
+        const int cc = mma_c_col(mlane);
+        const int rows[2] = {m_tile * 16 + cr, m_tile * 16 + cr + 8};
+        const int cols[2] = {n_tile * 8 + cc, n_tile * 8 + cc + 1};
+        const float raw[4] = {acc.x[0], acc.x[1], acc.x[2], acc.x[3]};
+#pragma unroll
+        for (int rr = 0; rr < 2; ++rr) {
+#pragma unroll
+            for (int cci = 0; cci < 2; ++cci) {
+                const int i = rows[rr];
+                const int kk = cols[cci];
+                float v = 0.0f;
+                if (i < C && kk < C && i > kk) {
+                    v = sbeta[i] * __expf(sgc[i] - sgc[kk]) * raw[rr * 2 + cci];
+                }
+                sA[i * GDN_A_STRIDE + kk] = v;
+            }
+        }
+    }
+    __syncthreads();
+
+    for (int i = 0; i < C; ++i) {
+        const bool active = (lane < C && lane <= i);
+        float acc = 0.0f;
+        if (active) {
+            const int kk = lane;
+            acc = (i == kk) ? 1.0f : 0.0f;
+            for (int m = kk; m < i; ++m) {
+                acc -= sA[i * GDN_A_STRIDE + m] * sA[m * GDN_A_STRIDE + kk];
+            }
+        }
+        __syncwarp();
+        if (active) {
+            sA[i * GDN_A_STRIDE + lane] = acc;
+        }
+        __syncwarp();
+    }
+    __syncthreads();
+
+    float* w_chunk = w_out + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DK;
+    float* u_chunk = u_out + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DV;
+    for (int idx = lane; idx < C * GDN_DK; idx += blockDim.x) {
+        const int i = idx / GDN_DK, d = idx % GDN_DK;
+        float wacc = 0.0f, uacc = 0.0f;
+        for (int kk = 0; kk <= i; ++kk) {
+            const float aik = sA[i * GDN_A_STRIDE + kk];
+            wacc += aik * sbg[kk] * sk[kk * GDN_ROW_PAD + d];
+            uacc += aik * sbeta[kk] * sv[kk * GDN_ROW_PAD + d];
+        }
+        w_chunk[i * GDN_DK + d] = wacc;
+        u_chunk[i * GDN_DV + d] = uacc;  // GDN_DV == GDN_DK == 128 here
+    }
+}
+
 // A separate, isolated kernel computing the per-chunk affine-recurrence
 // pair `(A(c), B(c))` such that `S(c+1) = A(c) @ S(c) + B(c)` exactly --
 // verified algebraically and numerically (`verify_linear_recurrence.py`,

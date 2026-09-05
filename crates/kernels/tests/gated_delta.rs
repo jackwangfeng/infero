@@ -1451,6 +1451,141 @@ fn the_chunk_ab_affine_recurrence_matches_a_host_reference() -> Result<()> {
     Ok(())
 }
 
+/// `gdn_chunk_uw_mma_f32` -- the tensor-core version of kernel 1's `A = K@Kᵀ`
+/// system-matrix product. Same host reference and shapes as
+/// `the_chunk_ab_affine_recurrence_matches_a_host_reference` above (single
+/// chunk, `t_len < GDN_CHUNK`), checking `W`/`U` directly against the
+/// from-scratch forward-substitution+WY host computation -- this isolates
+/// the new kernel's own correctness from `gdn_chunk_ab_f32`'s formula
+/// (already covered by the other test). Tolerance is `1e-2`, looser than the
+/// plain kernel's `1e-3`: the K values genuinely round-trip through f16 for
+/// the MMA operand, a real, expected precision cost of doing this in half
+/// precision, not a bug -- pick this by actually measuring the real diff and
+/// setting the bound just above it, not the other way around.
+#[test]
+fn the_mma_chunk_uw_matches_the_same_host_reference() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    let t_len = 13usize;
+
+    let q_small = pseudo_random(t_len * KEY_HEADS * DK, 0xf001);
+    let k_small = pseudo_random(t_len * KEY_HEADS * DK, 0xf002);
+    let v = pseudo_random(t_len * VAL_HEADS * DV, 0xf003);
+    let g = decaying(t_len * VAL_HEADS, 0xf004, 0.7);
+    let beta = betas(t_len * VAL_HEADS, 0xf005);
+    let (row, off) = packed(&q_small, &k_small, &v, t_len);
+
+    let chunk = stream.clone_htod(&row)?;
+    let hg = stream.clone_htod(&g)?;
+    let hb = stream.clone_htod(&beta)?;
+    let f = stream.clone_htod(&[0i32])?;
+    let n = stream.clone_htod(&[t_len as i32])?;
+    let seqs = infero_kernels::gdn::SeqLayout {
+        first_token: &f.as_view(),
+        n_tokens: &n.as_view(),
+        n_seqs: 1,
+        total_tokens: t_len,
+    };
+
+    let mut w = stream.alloc_zeros::<f32>(VAL_HEADS * 32 * DK)?;
+    let mut u = stream.alloc_zeros::<f32>(VAL_HEADS * 32 * DV)?;
+    k.gdn_chunk_uw_mma_only(
+        &mut w.as_view_mut(),
+        &mut u.as_view_mut(),
+        &chunk.as_view(),
+        &hg.as_view(),
+        &hb.as_view(),
+        &seqs,
+        VAL_HEADS,
+        KEY_HEADS,
+        DK,
+        DV,
+        off,
+        false,
+    )?;
+    k.device().synchronize()?;
+    let got_w = stream.clone_dtoh(&w)?;
+    let got_u = stream.clone_dtoh(&u)?;
+
+    // Same host reference as `the_chunk_ab_affine_recurrence_matches_a_host_reference`.
+    let (stride, _q_off, k_off, _v_off) = off;
+    let head = 0usize;
+    let khead = head / (VAL_HEADS / KEY_HEADS);
+    let mut kmat = vec![0.0f32; t_len * DK];
+    for t in 0..t_len {
+        for d in 0..DK {
+            kmat[t * DK + d] = row[t * stride + k_off + khead * DK + d];
+        }
+    }
+    let mut gc = vec![0.0f32; t_len];
+    let mut acc = 0.0f32;
+    for t in 0..t_len {
+        acc += g[t * VAL_HEADS + head];
+        gc[t] = acc;
+    }
+    let hbeta: Vec<f32> = (0..t_len).map(|t| beta[t * VAL_HEADS + head]).collect();
+    let mut amat = vec![0.0f32; t_len * t_len];
+    for i in 0..t_len {
+        for kk in 0..i {
+            let mut dot = 0.0f32;
+            for d in 0..DK {
+                dot += kmat[i * DK + d] * kmat[kk * DK + d];
+            }
+            amat[i * t_len + kk] = hbeta[i] * (gc[i] - gc[kk]).exp() * dot;
+        }
+    }
+    let mut ainv = vec![0.0f32; t_len * t_len];
+    for i in 0..t_len {
+        for kk in 0..=i {
+            let mut acc2 = if i == kk { 1.0f32 } else { 0.0f32 };
+            for m in kk..i {
+                acc2 -= amat[i * t_len + m] * ainv[m * t_len + kk];
+            }
+            ainv[i * t_len + kk] = acc2;
+        }
+    }
+    let sbg: Vec<f32> = (0..t_len).map(|t| hbeta[t] * gc[t].exp()).collect();
+    let vdim = VAL_HEADS * DV;
+    let mut want_w = vec![0.0f32; t_len * DK];
+    let mut want_u = vec![0.0f32; t_len * DV];
+    for i in 0..t_len {
+        for d in 0..DK {
+            let mut wacc = 0.0f32;
+            for kk in 0..=i {
+                wacc += ainv[i * t_len + kk] * sbg[kk] * kmat[kk * DK + d];
+            }
+            want_w[i * DK + d] = wacc;
+        }
+        for d in 0..DV {
+            let mut uacc = 0.0f32;
+            for kk in 0..=i {
+                uacc += ainv[i * t_len + kk] * hbeta[kk] * v[kk * vdim + head * DV + d];
+            }
+            want_u[i * DV + d] = uacc;
+        }
+    }
+
+    let (wworst, wat) = max_abs_diff(&got_w[..t_len * DK], &want_w);
+    let wpeak = want_w.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(
+        wworst < 1e-2 * wpeak.max(1e-6),
+        "gdn_chunk_uw_mma_only's W diverged from the host reference by {wworst:.2e} at {wat}: \
+         got {}, want {}",
+        got_w[wat],
+        want_w[wat]
+    );
+    let (uworst, uat) = max_abs_diff(&got_u[..t_len * DV], &want_u);
+    let upeak = want_u.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(
+        uworst < 1e-2 * upeak.max(1e-6),
+        "gdn_chunk_uw_mma_only's U diverged from the host reference by {uworst:.2e} at {uat}: \
+         got {}, want {}",
+        got_u[uat],
+        want_u[uat]
+    );
+    Ok(())
+}
+
 /// `gdn_ab_combine_f32` -- the row-streaming `[128,128]@[128,128]` GEMM the
 /// group-scan needs to combine two affine-recurrence pairs, checked against
 /// a direct host matmul on plain random matrices (no GDN-specific setup
