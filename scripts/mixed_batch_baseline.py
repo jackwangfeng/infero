@@ -86,22 +86,26 @@ def run_scenario_b_attempt(initial_delay):
     """Run scenario B with given initial delay before second request. Returns output_b or None if retry needed."""
     results_b = {}
     errors_b = {}
+    long_started = threading.Event()  # Signal when long request actually starts
 
     def run_long():
         try:
+            long_started.set()  # Signal that this thread is about to call chat()
             results_b["long_req"], results_b["long_resp"], results_b["long_time"] = \
                 chat([{"role": "user", "content": long_prompt}], max_tokens=40)
         except Exception as e:
             errors_b["long"] = str(e)
 
     def run_short():
-        # Poll: wait until long request is in flight, then fire short request.
+        # Poll: wait until long request has started (event signaled), then fire short request.
+        # This gives the long request time to be admitted to the scheduler first.
         max_wait = 5.0
-        start = time.time()
-        while time.time() - start < max_wait:
-            if "long_time" in results_b and results_b["long_time"]["t_start"] > 0:
-                break
-            time.sleep(0.01)
+        if long_started.wait(timeout=max_wait):
+            # Long request thread has started; fire short request now
+            pass
+        else:
+            # Timeout - long request thread didn't start, but continue anyway
+            print(f"    (warning: long request didn't start within {max_wait}s, continuing)")
         try:
             results_b["short_req"], results_b["short_resp"], results_b["short_time"] = \
                 chat([{"role": "user", "content": "What is 2+2? Answer with just the number."}], max_tokens=8)
@@ -278,13 +282,20 @@ def capture_log_excerpt():
     print(f"  ({earliest:.1f} to {latest:.1f} Unix time)")
 
     # Remote: grep for request admission/completion lines and seq= lines during this window
+    # Use actual computed timestamps, not hardcoded literals
+    dt_start_str = dt_start.isoformat()[:19]  # e.g., "2026-09-05T20:02:24"
+    dt_end_str = dt_end.isoformat()[:19]      # e.g., "2026-09-05T20:07:30"
+
     try:
-        # Use awk to filter by timestamp, then grep for relevant lines
+        # Grep for relevant lines in the time range. Note: log has ANSI color codes before timestamps.
+        # Strategy: grep for request/seq lines, then filter by date since color codes are before timestamp.
+        date_str = dt_start.strftime("%Y-%m-%d")  # e.g., "2026-09-05"
         result = subprocess.run(
             [
                 "ssh", "bw",
-                f"awk '/2026-09-05T19:59:58/,/2026-09-05T20:01:46/' /tmp/infero_27b_live.log | "
-                "grep -E '(request admitted|request complete|seq=)' | tail -50"
+                f"grep '{date_str}' /tmp/infero_27b_live.log | "
+                f"grep -E '(request admitted|request complete|seq=.*prompt)' | "
+                f"tail -100"
             ],
             capture_output=True, text=True, timeout=10
         )
@@ -306,23 +317,34 @@ def capture_log_excerpt():
                 f.write(f"Scenario B: long (50953) + short (65) prompts overlapping in time\n")
                 f.write(f"Scenario C: two prefills (64 and 61 prompt_tokens) with nearby admission times\n")
             print(f"  saved {excerpt_path}")
+            return True  # Success
         else:
-            print("  (log excerpt empty; checking if log is rotated)")
-            # Fallback: just grab the tail of the log
+            print(f"  (log excerpt empty for time range {dt_start_str} to {dt_end_str}; checking tail of log)")
+            # Fallback: grab lines around the end time
             result2 = subprocess.run(
-                ["ssh", "bw", "tail -50 /tmp/infero_27b_live.log | grep -E '(request admitted|seq=)'"],
+                ["ssh", "bw", "grep -E '(request admitted|request complete|seq=)' /tmp/infero_27b_live.log | tail -50"],
                 capture_output=True, text=True, timeout=10
             )
             if result2.stdout.strip():
                 os.makedirs(OUT_DIR, exist_ok=True)
                 excerpt_path = f"{OUT_DIR}/production_log_excerpt.txt"
                 with open(excerpt_path, "w") as f:
-                    f.write("Production log excerpt (tail of /tmp/infero_27b_live.log, last request admitted/seq lines)\n\n")
+                    f.write(f"Production log excerpt (fallback: recent requests from /tmp/infero_27b_live.log)\n")
+                    f.write(f"Intended window was {dt_start_str} to {dt_end_str}, but time-based grep was empty.\n")
+                    f.write(f"Showing recent request/seq activity:\n\n")
                     f.write(result2.stdout)
-                print(f"  saved {excerpt_path} (fallback tail)")
+                print(f"  saved {excerpt_path} (fallback recent tail)")
+                return False  # Fallback, not ideal but better than nothing
+            else:
+                print(f"  ERROR: could not capture log excerpt (both time-based and fallback tail empty)")
+                return False  # Failure
     except Exception as e:
-        print(f"  (warning: could not capture log excerpt: {e})")
+        print(f"  ERROR: could not capture log excerpt: {e}")
+        return False  # Failure
 
-capture_log_excerpt()
+log_success = capture_log_excerpt()
+if not log_success:
+    print("ERROR: Log excerpt capture failed. This evidence is needed for Task 7 verification.")
+    sys.exit(1)
 
 print("\ndone")

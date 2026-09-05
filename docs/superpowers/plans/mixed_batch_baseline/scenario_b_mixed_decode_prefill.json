@@ -16,8 +16,8 @@
         "logprobs": false
       },
       "timing": {
-        "t_start": 1788638658.4376612,
-        "t_end": 1788638683.6972582
+        "t_start": 1788640226.8929286,
+        "t_end": 1788640275.7781148
       }
     },
     "short": {
@@ -35,37 +35,37 @@
         "logprobs": false
       },
       "timing": {
-        "t_start": 1788638663.4894907,
-        "t_end": 1788638682.48703
+        "t_start": 1788640226.943755,
+        "t_end": 1788640250.1114645
       }
     }
   },
   "responses": {
     "long": {
-      "id": "chatcmpl-000000006a9c75db0000002e",
+      "id": "chatcmpl-000000006a9c7c13000000e8",
       "object": "chat.completion",
-      "created": 1788638683,
+      "created": 1788640275,
       "model": "qwen38-27b-fp8",
       "choices": [
         {
           "index": 0,
           "message": {
             "role": "assistant",
-            "content": "We need answer user's request. User: \"Please summarize this list in detail, one sentence per item: item number 0 is about topic 0, ...\" It's a huge list from "
+            "content": "We need"
           },
           "finish_reason": "length"
         }
       ],
       "usage": {
         "prompt_tokens": 50953,
-        "completion_tokens": 40,
-        "total_tokens": 50993
+        "completion_tokens": 2,
+        "total_tokens": 50955
       }
     },
     "short": {
-      "id": "chatcmpl-000000006a9c75da0000002d",
+      "id": "chatcmpl-000000006a9c7bfa000000e7",
       "object": "chat.completion",
-      "created": 1788638682,
+      "created": 1788640250,
       "model": "qwen38-27b-fp8",
       "choices": [
         {
@@ -85,10 +85,10 @@
     }
   },
   "concurrency_check": {
-    "long_t_start": 1788638658.4376612,
-    "long_t_end": 1788638683.6972582,
-    "short_t_start": 1788638663.4894907,
-    "short_t_end": 1788638682.48703,
+    "long_t_start": 1788640226.8929286,
+    "long_t_end": 1788640275.7781148,
+    "short_t_start": 1788640226.943755,
+    "short_t_end": 1788640250.1114645,
     "overlap_detected": true
   }
 }

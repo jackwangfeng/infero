@@ -16,8 +16,8 @@
         "logprobs": false
       },
       "timing": {
-        "t_start": 1788638803.7265084,
-        "t_end": 1788638850.1733875
+        "t_start": 1788640395.845908,
+        "t_end": 1788640409.3140166
       }
     },
     "y": {
@@ -35,16 +35,16 @@
         "logprobs": false
       },
       "timing": {
-        "t_start": 1788638803.7271655,
-        "t_end": 1788638847.2757525
+        "t_start": 1788640395.8464744,
+        "t_end": 1788640412.3119674
       }
     }
   },
   "responses": {
     "x": {
-      "id": "chatcmpl-000000006a9c76820000003a",
+      "id": "chatcmpl-000000006a9c7c99000000f2",
       "object": "chat.completion",
-      "created": 1788638850,
+      "created": 1788640409,
       "model": "qwen38-27b-fp8",
       "choices": [
         {
@@ -63,16 +63,16 @@
       }
     },
     "y": {
-      "id": "chatcmpl-000000006a9c767f00000039",
+      "id": "chatcmpl-000000006a9c7c9c000000f3",
       "object": "chat.completion",
-      "created": 1788638847,
+      "created": 1788640412,
       "model": "qwen38-27b-fp8",
       "choices": [
         {
           "index": 0,
           "message": {
             "role": "assistant",
-            "content": "We need to respond to user: \"Explain how a car engine works in exactly three sentences.\" Need final exactly three sentences. Ensure no extra. Need likely simple explanation. Count sentences carefully. Could be:\n\"A car engine converts fuel into mechanical energy through controlled explosions inside cylinders.\" \n\"Air"
+            "content": "We need to respond to user: \"Explain how a car engine works in exactly three sentences.\" Need final exactly three sentences. Ensure count. Could be: \"A car engine converts fuel into mechanical energy through controlled explosions inside cylinders.\" \"Air and fuel are compressed, ignited by spark plugs, and"
           },
           "finish_reason": "length"
         }
@@ -85,10 +85,10 @@
     }
   },
   "concurrency_check": {
-    "x_t_start": 1788638803.7265084,
-    "x_t_end": 1788638850.1733875,
-    "y_t_start": 1788638803.7271655,
-    "y_t_end": 1788638847.2757525,
+    "x_t_start": 1788640395.845908,
+    "x_t_end": 1788640409.3140166,
+    "y_t_start": 1788640395.8464744,
+    "y_t_end": 1788640412.3119674,
     "overlap_detected": true
   }
 }

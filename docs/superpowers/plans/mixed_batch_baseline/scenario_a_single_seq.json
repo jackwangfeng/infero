@@ -14,9 +14,9 @@
     "logprobs": false
   },
   "response": {
-    "id": "chatcmpl-000000006a9c75c200000028",
+    "id": "chatcmpl-000000006a9c7a62000000ba",
     "object": "chat.completion",
-    "created": 1788638658,
+    "created": 1788639842,
     "model": "qwen38-27b-fp8",
     "choices": [
       {
@@ -35,7 +35,7 @@
     }
   },
   "timing": {
-    "t_start": 1788638544.3943293,
-    "t_end": 1788638658.4346929
+    "t_start": 1788639822.9453552,
+    "t_end": 1788639842.4396825
   }
 }

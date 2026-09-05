@@ -1,42 +1,45 @@
-Production log excerpt for concurrent scenarios test
-Test window: 2026-09-05T20:02:24 to 2026-09-05T20:07:30 UTC
-
-Scenario A (Single-sequence, 66 prompt_tokens):
-2026-09-05T20:02:24.397240Z INFO request admitted request_id=req-000000006a9c755000000024 prompt_tokens=66
-2026-09-05T20:04:18.433528Z INFO request complete seq=1 prompt=66 completion=80 reason="length"
-2026-09-05T20:04:18.433686Z INFO request completed request_id=req-000000006a9c755000000024 prompt_tokens=66 completion_tokens=80
-
-Scenario B (Mixed decode+prefill: 50953 + 65 prompt_tokens):
-Long prompt (50953 tokens):
-2026-09-05T20:04:18.516471Z INFO request admitted request_id=req-000000006a9c75c200000029 prompt_tokens=50953
-2026-09-05T20:04:43.696282Z INFO request complete seq=0 prompt=50953 completion=40 reason="length"
-2026-09-05T20:04:43.696341Z INFO request completed request_id=req-000000006a9c75c200000029 prompt_tokens=50953 completion_tokens=40
-
-Short prompt (65 tokens):
-2026-09-05T20:04:23.493335Z INFO request admitted request_id=req-000000006a9c75c70000002a prompt_tokens=65
-2026-09-05T20:04:42.485995Z INFO request complete seq=1 prompt=65 completion=8 reason="length"
-2026-09-05T20:04:42.486132Z INFO request completed request_id=req-000000006a9c75c70000002a prompt_tokens=65 completion_tokens=8
-
-Verification: Both requests were active in the scheduler simultaneously:
-- Long: 2026-09-05T20:04:18 - 2026-09-05T20:04:43 (25 seconds, chunked prefill)
-- Short: 2026-09-05T20:04:23 - 2026-09-05T20:04:42 (19 seconds, decode phase)
-- Overlap window: 2026-09-05T20:04:23 - 2026-09-05T20:04:42 (19 seconds)
-- Log shows seq=0 and seq=1 processing during this window, confirming concurrent batch admission
-
-Scenario C (Two simultaneous prefills: 64 + 61 prompt_tokens):
-Request X (64 tokens):
-2026-09-05T20:06:43.728866Z INFO request admitted request_id=req-000000006a9c765300000037 prompt_tokens=64
-2026-09-05T20:07:27.274817Z INFO request complete seq=1 prompt=64 completion=60 reason="length"
-2026-09-05T20:07:27.274900Z INFO request completed request_id=req-000000006a9c765300000037 prompt_tokens=64 completion_tokens=60
-
-Request Y (61 tokens):
-2026-09-05T20:06:43.729100Z INFO request admitted request_id=req-000000006a9c765300000038 prompt_tokens=61
-2026-09-05T20:07:30.172608Z INFO request complete seq=1 prompt=61 completion=60 reason="length"
-2026-09-05T20:07:30.172685Z INFO request completed request_id=req-000000006a9c765300000038 prompt_tokens=61 completion_tokens=60
-
-Verification: Requests were admitted 234 microseconds apart (simultaneous):
-- X admitted: 2026-09-05T20:06:43.728866Z
-- Y admitted: 2026-09-05T20:06:43.729100Z (234 microseconds later)
-- Both processed as seq=1 and seq=0 in the same scheduler batches
-- Timestamps show concurrent prefill execution confirmed by production logs
-
+[2m2026-09-05T20:29:00.812038Z[0m [32m INFO[0m request complete [3mseq[0m[2m=[0m1 [3mprompt[0m[2m=[0m61011 [3mcompletion[0m[2m=[0m202 [3mqueued_ms[0m[2m=[0m49278 [3mtotal_ms[0m[2m=[0m57349 [3mreason[0m[2m=[0m"stop"
+[2m2026-09-05T20:29:00.812103Z[0m [32m INFO[0m request completed [3mrequest_id[0m[2m=[0mreq-000000006a9c7b45000000d0 [3mprompt_tokens[0m[2m=[0m61011 [3mcompletion_tokens[0m[2m=[0m202 [3mlatency_ms[0m[2m=[0m71507 [3mfinish_reason[0m[2m=[0m"stop"
+[2m2026-09-05T20:29:01.046036Z[0m [32m INFO[0m request admitted [3mrequest_id[0m[2m=[0mreq-000000006a9c7b8d000000d7 [3mendpoint[0m[2m=[0m"chat_completions" [3mprompt_tokens[0m[2m=[0m42520 [3mstream[0m[2m=[0mfalse
+[2m2026-09-05T20:29:39.983067Z[0m [32m INFO[0m request complete [3mseq[0m[2m=[0m0 [3mprompt[0m[2m=[0m37248 [3mcompletion[0m[2m=[0m4 [3mqueued_ms[0m[2m=[0m18016 [3mtotal_ms[0m[2m=[0m39170 [3mreason[0m[2m=[0m"length"
+[2m2026-09-05T20:29:39.983134Z[0m [32m INFO[0m request completed [3mrequest_id[0m[2m=[0mreq-000000006a9c7b7a000000d4 [3mprompt_tokens[0m[2m=[0m37248 [3mcompletion_tokens[0m[2m=[0m4 [3mlatency_ms[0m[2m=[0m57403 [3mfinish_reason[0m[2m=[0m"length"
+[2m2026-09-05T20:29:40.186528Z[0m [32m INFO[0m request admitted [3mrequest_id[0m[2m=[0mreq-000000006a9c7bb4000000d8 [3mendpoint[0m[2m=[0m"chat_completions" [3mprompt_tokens[0m[2m=[0m37305 [3mstream[0m[2m=[0mtrue
+[2m2026-09-05T20:29:44.183150Z[0m [32m INFO[0m request complete [3mseq[0m[2m=[0m1 [3mprompt[0m[2m=[0m42520 [3mcompletion[0m[2m=[0m7 [3mqueued_ms[0m[2m=[0m41941 [3mtotal_ms[0m[2m=[0m42166 [3mreason[0m[2m=[0m"stop"
+[2m2026-09-05T20:29:44.183207Z[0m [32m INFO[0m request completed [3mrequest_id[0m[2m=[0mreq-000000006a9c7b8d000000d7 [3mprompt_tokens[0m[2m=[0m42520 [3mcompletion_tokens[0m[2m=[0m7 [3mlatency_ms[0m[2m=[0m43137 [3mfinish_reason[0m[2m=[0m"stop"
+[2m2026-09-05T20:29:44.527183Z[0m [32m INFO[0m request admitted [3mrequest_id[0m[2m=[0mreq-000000006a9c7bb8000000db [3mendpoint[0m[2m=[0m"chat_completions" [3mprompt_tokens[0m[2m=[0m61238 [3mstream[0m[2m=[0mtrue
+[2m2026-09-05T20:29:46.000995Z[0m [32m INFO[0m request admitted [3mrequest_id[0m[2m=[0mreq-000000006a9c7bba000000dd [3mendpoint[0m[2m=[0m"chat_completions" [3mprompt_tokens[0m[2m=[0m66 [3mstream[0m[2m=[0mfalse
+[2m2026-09-05T20:29:52.029433Z[0m [32m INFO[0m request complete [3mseq[0m[2m=[0m0 [3mprompt[0m[2m=[0m37305 [3mcompletion[0m[2m=[0m4 [3mqueued_ms[0m[2m=[0m7695 [3mtotal_ms[0m[2m=[0m7845 [3mreason[0m[2m=[0m"stop"
+[2m2026-09-05T20:29:52.029491Z[0m [32m INFO[0m request completed [3mrequest_id[0m[2m=[0mreq-000000006a9c7bb4000000d8 [3mprompt_tokens[0m[2m=[0m37305 [3mcompletion_tokens[0m[2m=[0m4 [3mlatency_ms[0m[2m=[0m11842 [3mfinish_reason[0m[2m=[0m"stop"
+[2m2026-09-05T20:29:52.128421Z[0m [32m INFO[0m request admitted [3mrequest_id[0m[2m=[0mreq-000000006a9c7bc0000000de [3mendpoint[0m[2m=[0m"chat_completions" [3mprompt_tokens[0m[2m=[0m743 [3mstream[0m[2m=[0mtrue
+[2m2026-09-05T20:29:52.273575Z[0m [32m INFO[0m request admitted [3mrequest_id[0m[2m=[0mreq-000000006a9c7bc0000000e0 [3mendpoint[0m[2m=[0m"chat_completions" [3mprompt_tokens[0m[2m=[0m37244 [3mstream[0m[2m=[0mtrue
+[2m2026-09-05T20:30:26.888420Z[0m [32m INFO[0m request complete [3mseq[0m[2m=[0m1 [3mprompt[0m[2m=[0m66 [3mcompletion[0m[2m=[0m80 [3mqueued_ms[0m[2m=[0m30987 [3mtotal_ms[0m[2m=[0m34858 [3mreason[0m[2m=[0m"length"
+[2m2026-09-05T20:30:26.888486Z[0m [32m INFO[0m request completed [3mrequest_id[0m[2m=[0mreq-000000006a9c7bba000000dd [3mprompt_tokens[0m[2m=[0m66 [3mcompletion_tokens[0m[2m=[0m80 [3mlatency_ms[0m[2m=[0m40887 [3mfinish_reason[0m[2m=[0m"length"
+[2m2026-09-05T20:30:26.945095Z[0m [32m INFO[0m request admitted [3mrequest_id[0m[2m=[0mreq-000000006a9c7be2000000e3 [3mendpoint[0m[2m=[0m"chat_completions" [3mprompt_tokens[0m[2m=[0m65 [3mstream[0m[2m=[0mfalse
+[2m2026-09-05T20:30:27.001371Z[0m [32m INFO[0m request admitted [3mrequest_id[0m[2m=[0mreq-000000006a9c7be3000000e4 [3mendpoint[0m[2m=[0m"chat_completions" [3mprompt_tokens[0m[2m=[0m50953 [3mstream[0m[2m=[0mfalse
+[2m2026-09-05T20:30:30.492210Z[0m [32m INFO[0m request complete [3mseq[0m[2m=[0m1 [3mprompt[0m[2m=[0m743 [3mcompletion[0m[2m=[0m67 [3mqueued_ms[0m[2m=[0m340 [3mtotal_ms[0m[2m=[0m3603 [3mreason[0m[2m=[0m"stop"
+[2m2026-09-05T20:30:30.492267Z[0m [32m INFO[0m request completed [3mrequest_id[0m[2m=[0mreq-000000006a9c7bc0000000de [3mprompt_tokens[0m[2m=[0m743 [3mcompletion_tokens[0m[2m=[0m67 [3mlatency_ms[0m[2m=[0m38363 [3mfinish_reason[0m[2m=[0m"stop"
+[2m2026-09-05T20:30:32.696416Z[0m [32m INFO[0m request complete [3mseq[0m[2m=[0m0 [3mprompt[0m[2m=[0m61238 [3mcompletion[0m[2m=[0m202 [3mqueued_ms[0m[2m=[0m30987 [3mtotal_ms[0m[2m=[0m40666 [3mreason[0m[2m=[0m"stop"
+[2m2026-09-05T20:30:32.696476Z[0m [32m INFO[0m request completed [3mrequest_id[0m[2m=[0mreq-000000006a9c7bb8000000db [3mprompt_tokens[0m[2m=[0m61238 [3mcompletion_tokens[0m[2m=[0m202 [3mlatency_ms[0m[2m=[0m48169 [3mfinish_reason[0m[2m=[0m"stop"
+[2m2026-09-05T20:30:32.961177Z[0m [32m INFO[0m request admitted [3mrequest_id[0m[2m=[0mreq-000000006a9c7be8000000e6 [3mendpoint[0m[2m=[0m"chat_completions" [3mprompt_tokens[0m[2m=[0m42717 [3mstream[0m[2m=[0mfalse
+[2m2026-09-05T20:30:50.110740Z[0m [32m INFO[0m request complete [3mseq[0m[2m=[0m1 [3mprompt[0m[2m=[0m65 [3mcompletion[0m[2m=[0m8 [3mqueued_ms[0m[2m=[0m17095 [3mtotal_ms[0m[2m=[0m17414 [3mreason[0m[2m=[0m"length"
+[2m2026-09-05T20:30:50.110802Z[0m [32m INFO[0m request completed [3mrequest_id[0m[2m=[0mreq-000000006a9c7be2000000e3 [3mprompt_tokens[0m[2m=[0m65 [3mcompletion_tokens[0m[2m=[0m8 [3mlatency_ms[0m[2m=[0m23165 [3mfinish_reason[0m[2m=[0m"length"
+[2m2026-09-05T20:30:50.810426Z[0m [32m INFO[0m request complete [3mseq[0m[2m=[0m0 [3mprompt[0m[2m=[0m37244 [3mcompletion[0m[2m=[0m27 [3mqueued_ms[0m[2m=[0m17095 [3mtotal_ms[0m[2m=[0m18113 [3mreason[0m[2m=[0m"stop"
+[2m2026-09-05T20:30:50.810459Z[0m [32m INFO[0m request completed [3mrequest_id[0m[2m=[0mreq-000000006a9c7bc0000000e0 [3mprompt_tokens[0m[2m=[0m37244 [3mcompletion_tokens[0m[2m=[0m27 [3mlatency_ms[0m[2m=[0m58536 [3mfinish_reason[0m[2m=[0m"stop"
+[2m2026-09-05T20:31:15.777275Z[0m [32m INFO[0m request complete [3mseq[0m[2m=[0m0 [3mprompt[0m[2m=[0m50953 [3mcompletion[0m[2m=[0m2 [3mqueued_ms[0m[2m=[0m19820 [3mtotal_ms[0m[2m=[0m24966 [3mreason[0m[2m=[0m"length"
+[2m2026-09-05T20:31:15.777338Z[0m [32m INFO[0m request completed [3mrequest_id[0m[2m=[0mreq-000000006a9c7be3000000e4 [3mprompt_tokens[0m[2m=[0m50953 [3mcompletion_tokens[0m[2m=[0m2 [3mlatency_ms[0m[2m=[0m48775 [3mfinish_reason[0m[2m=[0m"length"
+[2m2026-09-05T20:31:15.782346Z[0m [32m INFO[0m request admitted [3mrequest_id[0m[2m=[0mreq-000000006a9c7c13000000e9 [3mendpoint[0m[2m=[0m"chat_completions" [3mprompt_tokens[0m[2m=[0m61 [3mstream[0m[2m=[0mfalse
+[2m2026-09-05T20:31:15.782971Z[0m [32m INFO[0m request admitted [3mrequest_id[0m[2m=[0mreq-000000006a9c7c13000000ea [3mendpoint[0m[2m=[0m"chat_completions" [3mprompt_tokens[0m[2m=[0m64 [3mstream[0m[2m=[0mfalse
+[2m2026-09-05T20:31:32.717846Z[0m [32m INFO[0m request complete [3mseq[0m[2m=[0m1 [3mprompt[0m[2m=[0m42717 [3mcompletion[0m[2m=[0m7 [3mqueued_ms[0m[2m=[0m41625 [3mtotal_ms[0m[2m=[0m41907 [3mreason[0m[2m=[0m"stop"
+[2m2026-09-05T20:31:32.717910Z[0m [32m INFO[0m request completed [3mrequest_id[0m[2m=[0mreq-000000006a9c7be8000000e6 [3mprompt_tokens[0m[2m=[0m42717 [3mcompletion_tokens[0m[2m=[0m7 [3mlatency_ms[0m[2m=[0m59756 [3mfinish_reason[0m[2m=[0m"stop"
+[2m2026-09-05T20:31:33.092223Z[0m [32m INFO[0m request admitted [3mrequest_id[0m[2m=[0mreq-000000006a9c7c25000000ec [3mendpoint[0m[2m=[0m"chat_completions" [3mprompt_tokens[0m[2m=[0m61465 [3mstream[0m[2m=[0mtrue
+[2m2026-09-05T20:31:34.647130Z[0m [32m INFO[0m request complete [3mseq[0m[2m=[0m0 [3mprompt[0m[2m=[0m61 [3mcompletion[0m[2m=[0m60 [3mqueued_ms[0m[2m=[0m15073 [3mtotal_ms[0m[2m=[0m17283 [3mreason[0m[2m=[0m"length"
+[2m2026-09-05T20:31:34.647200Z[0m [32m INFO[0m request completed [3mrequest_id[0m[2m=[0mreq-000000006a9c7c13000000e9 [3mprompt_tokens[0m[2m=[0m61 [3mcompletion_tokens[0m[2m=[0m60 [3mlatency_ms[0m[2m=[0m18864 [3mfinish_reason[0m[2m=[0m"length"
+[2m2026-09-05T20:31:44.585081Z[0m [32m INFO[0m request admitted [3mrequest_id[0m[2m=[0mreq-000000006a9c7c30000000ef [3mendpoint[0m[2m=[0m"chat_completions" [3mprompt_tokens[0m[2m=[0m56 [3mstream[0m[2m=[0mfalse
+[2m2026-09-05T20:33:15.847209Z[0m [32m INFO[0m request admitted [3mrequest_id[0m[2m=[0mreq-000000006a9c7c8b000000f0 [3mendpoint[0m[2m=[0m"chat_completions" [3mprompt_tokens[0m[2m=[0m61 [3mstream[0m[2m=[0mfalse
+[2m2026-09-05T20:33:15.847625Z[0m [32m INFO[0m request admitted [3mrequest_id[0m[2m=[0mreq-000000006a9c7c8b000000f1 [3mendpoint[0m[2m=[0m"chat_completions" [3mprompt_tokens[0m[2m=[0m64 [3mstream[0m[2m=[0mfalse
+[2m2026-09-05T20:33:29.313199Z[0m [32m INFO[0m request complete [3mseq[0m[2m=[0m1 [3mprompt[0m[2m=[0m61 [3mcompletion[0m[2m=[0m60 [3mqueued_ms[0m[2m=[0m89 [3mtotal_ms[0m[2m=[0m2987 [3mreason[0m[2m=[0m"length"
+[2m2026-09-05T20:33:29.313281Z[0m [32m INFO[0m request completed [3mrequest_id[0m[2m=[0mreq-000000006a9c7c8b000000f0 [3mprompt_tokens[0m[2m=[0m61 [3mcompletion_tokens[0m[2m=[0m60 [3mlatency_ms[0m[2m=[0m13466 [3mfinish_reason[0m[2m=[0m"length"
+[2m2026-09-05T20:33:32.311298Z[0m [32m INFO[0m request complete [3mseq[0m[2m=[0m1 [3mprompt[0m[2m=[0m64 [3mcompletion[0m[2m=[0m60 [3mqueued_ms[0m[2m=[0m107 [3mtotal_ms[0m[2m=[0m2998 [3mreason[0m[2m=[0m"length"
+[2m2026-09-05T20:33:32.311349Z[0m [32m INFO[0m request completed [3mrequest_id[0m[2m=[0mreq-000000006a9c7c8b000000f1 [3mprompt_tokens[0m[2m=[0m64 [3mcompletion_tokens[0m[2m=[0m60 [3mlatency_ms[0m[2m=[0m16463 [3mfinish_reason[0m[2m=[0m"length"
+[2m2026-09-05T20:33:35.603341Z[0m [32m INFO[0m request complete [3mseq[0m[2m=[0m0 [3mprompt[0m[2m=[0m61465 [3mcompletion[0m[2m=[0m202 [3mqueued_ms[0m[2m=[0m111678 [3mtotal_ms[0m[2m=[0m120956 [3mreason[0m[2m=[0m"stop"
+[2m2026-09-05T20:33:35.603402Z[0m [32m INFO[0m request completed [3mrequest_id[0m[2m=[0mreq-000000006a9c7c25000000ec [3mprompt_tokens[0m[2m=[0m61465 [3mcompletion_tokens[0m[2m=[0m202 [3mlatency_ms[0m[2m=[0m122510 [3mfinish_reason[0m[2m=[0m"stop"
