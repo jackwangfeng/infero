@@ -38,6 +38,7 @@ fn server() -> Option<SocketAddr> {
             16,
             infero_server::video::DEFAULT_TARGET_FPS,
             0.0,
+            None,
         )
         .expect("starting engine");
         let app = routes::router(engine, infero_server::auth::AuthConfig::new(None, None)).layer(

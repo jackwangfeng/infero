@@ -39,15 +39,80 @@ INFERO_CUTLASS_DIR=/tmp/cutlass_src INFERO_FLASH_ATTN_DIR=/tmp/flash_attn_src \
   --features "infero-model/cutlass,infero-model/flash_attn2" --summary-only
 ```
 
-**Not attempted in this pass**: the GPU-dependent run above, deliberately —
-at the time of this measurement, `bw`'s shared working tree had a different,
-concurrent, uncommitted fix in flight in exactly the files an instrumented
-build would touch (`crates/kernels/src/flash_attn2.rs`,
-`crates/model/src/lib.rs`). Building an instrumented binary against a
-mid-edit tree risked either a spurious build failure or interference with
-that fork's own live testing on the same machine. Run the command above
-once that tree is back to a clean, committed state — it's a real gap in
-this baseline, not a limitation of the tooling.
+**Now measured** (this pass, on `lenserver`'s own local A4000 rather than
+`bw` — `bw`'s GPUs were all either running the live production server or
+near-full with other users' work at the time; a local GPU with ~6.8 GiB
+free was enough for these tests' real but modest CUDA usage). Run with
+**default features only** — `cutlass`/`flash_attn2`/`nccl` need toolchains
+(`INFERO_CUTLASS_DIR`/`INFERO_FLASH_ATTN_DIR`/`INFERO_NCCL_DIR`) that only
+exist on `bw`, so this run does **not** cover the CUTLASS GEMM, FA2 FFI
+shim, or TP/NCCL code paths at all — that's a real, separate gap, not
+folded into the numbers below. Re-run the `bw` command above (features
+included) once that's convenient, to get the full picture.
+
+**A real, pre-existing bug found and fixed just getting this to build**:
+`crates/server/tests/http.rs`'s `Engine::start(...)` call was missing the
+12th argument (`tp: Option<(usize, usize, String)>`, added by today's
+tensor-parallel work) — the whole `infero-server` test binary failed to
+compile. Fixed (`None`, matching every other non-TP caller's convention)
+and verified: all 17 `http.rs` integration tests pass.
+
+```
+Crate/file                        Lines Cover   Note
+kernels/src/attn_backend.rs        46.59%
+kernels/src/awq.rs                 59.07%
+kernels/src/fp8.rs                 66.63%
+kernels/src/gdn.rs                 84.40%
+kernels/src/lib.rs                 46.55%
+kernels/src/turboquant.rs          86.54%
+kernels/src/vision.rs              86.49%
+kernels/src/weight.rs              73.23%
+model/src/cache.rs                 37.03%  <- KV pool; implicated in today's wedge bug
+model/src/config.rs                64.75%
+model/src/gdn_state.rs             71.79%
+model/src/lib.rs                   40.86%
+model/src/mtp.rs                   44.98%
+model/src/qwen35.rs                65.93%
+model/src/qwen35_mtp.rs            23.26%
+model/src/qwen35_vision.rs         82.73%
+model/src/qwen35_vision_image.rs    0.00%  <- real gap, matches FUNCTIONAL_COVERAGE's "vision/video never tested"
+model/src/sampling.rs               95.70%
+model/src/spec.rs                  69.55%
+model/src/weights.rs                10.79%  <- real gap; every real sharding bug found today lived here
+server/src/api.rs                  76.64%
+server/src/auth.rs                  0.00%  <- likely the same attribution anomaly, see below
+server/src/engine.rs                0.00%  <- likely the same attribution anomaly, see below
+server/src/main.rs                  0.00%  <- likely the same attribution anomaly, see below
+server/src/metrics.rs               0.00%  <- likely the same attribution anomaly, see below
+server/src/prefix.rs                24.81%
+server/src/routes.rs                0.00%  <- likely the same attribution anomaly, see below
+server/src/scheduler.rs             12.24%  <- scheduler; implicated in today's wedge bug
+server/src/stop.rs                  84.06%
+server/src/tool_call.rs             95.48%
+server/src/video.rs                 49.62%
+server/src/vision.rs                94.92%
+TOTAL (these 3 crates)              46.85% lines / 51.94% functions
+```
+
+**The same llvm-cov attribution anomaly documented above for
+`gguf/src/lib.rs`, now confirmed in a second crate**: `server/src/engine.rs`
+reports 0.00% despite `Engine::start` being called directly by all 17
+passing `http.rs` tests (same for `routes.rs`/`auth.rs`/`main.rs`/
+`metrics.rs` — all exercised indirectly through the same real HTTP
+requests). Not a real gap; treat these five files' true coverage as
+"exercised by the http.rs suite, real number unknown until the tooling
+issue is root-caused" — the same honest caveat as `gguf/src/lib.rs`.
+
+**Real, genuine gaps worth prioritizing** (not anomalies): `model/src/weights.rs`
+(10.79%) is the file every real weight-sharding bug found this session
+(the qwen2.5 bias-vector bug, the `w_kv` fusion bug, the GDN tiled-value-head
+bug) actually lived in — the lowest coverage of any file that matters this
+much is the single most actionable finding in this whole pass.
+`model/src/cache.rs` (37.03%) and `server/src/scheduler.rs` (12.24%) are the
+KV-pool/scheduler files implicated in today's "one failure wedges the whole
+server" incident. `model/src/qwen35_vision_image.rs` (a real, literal 0%)
+independently confirms `docs/FUNCTIONAL_COVERAGE.md`'s own flagged gap that
+vision/video requests were never exercised by any test this session.
 
 ## Real baseline (GPU-independent crates), measured this pass
 
