@@ -1592,6 +1592,7 @@ fn attn_prefill_matches_the_three_kernels() -> Result<()> {
                     scale,
                     partial: &mut part_hr.as_view_mut(),
                     stream: &stream,
+                    kern: &k,
                 };
                 backend.prefill(&mut ctx)?;
                 let got_hr = stream.clone_dtoh(&got_hr_d)?;
@@ -2642,5 +2643,93 @@ fn reg_phase_probe_shows_whether_ptxas_reuses_registers_across_phases() -> Resul
     let (overlap_regs, _) = k.kernel_registers("infero_ops", "reg_phase_probe_overlap_f32")?;
     let (phased_regs, _) = k.kernel_registers("infero_ops", "reg_phase_probe_phased_f32")?;
     eprintln!("reg_phase_probe: overlap={overlap_regs} regs, phased={phased_regs} regs");
+    Ok(())
+}
+
+/// `FlashAttn2Ffi` (the torch-free vendor FFI backend, `flash_attn2`
+/// feature) against the same three-kernel reference every other prefill
+/// kernel in this file is checked against. Scoped to exactly this backend's
+/// supported case: `d_head=256` (this shim only instantiates that one
+/// `Kernel_traits`), a single sequence with an identity (contiguous)
+/// slot table -- the one physical-layout precondition
+/// `FlashAttn2Ffi::prefill` itself verifies host-side before ever calling
+/// into CUDA, so this test also exercises that check on its way to a pass.
+#[cfg(feature = "flash_attn2")]
+#[test]
+fn flash_attn2_matches_the_three_kernels() -> Result<()> {
+    use infero_kernels::attn_backend::{AttentionBackend, AttnCallCtx};
+    use infero_kernels::flash_attn2::FlashAttn2Ffi;
+
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+
+    let (n_heads, n_kv_heads, d_head) = (24usize, 4usize, 256usize);
+    for (run_tokens, kv_len) in [(1usize, 1usize), (7, 7), (40, 40), (63, 63)] {
+        let n_tokens = run_tokens;
+        let n_slots = kv_len;
+        let dims = AttnDims { n_heads, n_kv_heads, d_head, n_slots, n_tokens };
+        let scale = 1.0 / (dims.d_head as f32).sqrt();
+        let q = pseudo_random(n_tokens * dims.n_heads * dims.d_head, 0x71);
+        let kv_elems = dims.n_kv_heads * n_slots * dims.d_head;
+        let kh: Vec<f16> = pseudo_random(kv_elems, 0x82).into_iter().map(f16::from_f32).collect();
+        let vh: Vec<f16> = pseudo_random(kv_elems, 0x93).into_iter().map(f16::from_f32).collect();
+
+        // A single fresh sequence, identity slot table: logical position p
+        // lives at physical slot p -- the contiguous-KV precondition this
+        // backend requires, by construction.
+        let seq_of = vec![0i32; n_tokens];
+        let positions: Vec<i32> = (0..n_tokens as i32).collect();
+        let table: Vec<i32> = (0..n_slots as i32).collect();
+        let table_stride = n_slots;
+
+        let dq = stream.clone_htod(&q)?;
+        let dk = stream.clone_htod(&kh)?;
+        let dv = stream.clone_htod(&vh)?;
+        let dpos = stream.clone_htod(&positions)?;
+        let dseq = stream.clone_htod(&seq_of)?;
+        let dtable = stream.clone_htod(&table)?;
+        let (vseq, vpos, vtable) = (dseq.as_view(), dpos.as_view(), dtable.as_view());
+        let batch = BatchLayout { seq_of: &vseq, positions: &vpos, slot_table: &vtable, table_stride };
+
+        let mut dscores = stream.alloc_zeros::<f32>(dims.n_heads * n_tokens * kv_len)?;
+        let out_len = n_tokens * dims.n_heads * dims.d_head;
+        let mut want_d = stream.alloc_zeros::<f32>(out_len)?;
+        k.attn_scores(&mut dscores.as_view_mut(), &dq.as_view(), &dk.as_view(), batch, dims, kv_len, scale)?;
+        k.attn_softmax(&mut dscores.as_view_mut(), dims.n_heads, n_tokens, kv_len)?;
+        k.attn_output(&mut want_d.as_view_mut(), &dscores.as_view(), &dv.as_view(), batch, dims, kv_len, None)?;
+        let want = stream.clone_dtoh(&want_d)?;
+
+        let mut got_d = stream.alloc_zeros::<f32>(out_len)?;
+        let mut part = stream.alloc_zeros::<f32>(1)?; // unused by this backend, AttnCallCtx still requires it
+        let backend = FlashAttn2Ffi;
+        let mut ctx = AttnCallCtx {
+            out: &mut got_d.as_view_mut(),
+            q: &dq.as_view(),
+            k_cache: &dk.as_view(),
+            v_cache: &dv.as_view(),
+            batch,
+            dims,
+            run_base: 0,
+            run_tokens,
+            kv_len,
+            scale,
+            partial: &mut part.as_view_mut(),
+            stream: &stream,
+            kern: &k,
+        };
+        backend.prefill(&mut ctx)?;
+        let got = stream.clone_dtoh(&got_d)?;
+        k.device().synchronize()?;
+
+        let (abs, at) = max_abs_diff(&got, &want);
+        assert!(
+            abs < 2e-3,
+            "flash_attn2 run {run_tokens} kv {kv_len}: max abs diff {abs} at {at} \
+             (got {}, want {})",
+            got[at],
+            want[at]
+        );
+        assert!(want.iter().any(|v| v.abs() > 1e-3), "reference is all zeros");
+    }
     Ok(())
 }

@@ -36,6 +36,15 @@ metal = ["infero-gpu/metal"]
 # checkout (INFERO_CUTLASS_DIR); see build.rs. Off by default: every other
 # kernel needs neither.
 cutlass = ["cuda"]
+# AOT-compiles crates/kernels/src/cu_vendor/flash_attn2_shim.cu with nvcc and
+# links it in -- needs a full CUDA Toolkit (INFERO_NVCC), an NVIDIA/cutlass
+# checkout (INFERO_CUTLASS_DIR, same one the `cutlass` feature uses -- FA2's
+# own kernel_traits.h is itself built on CUTLASS's CuTe), and a
+# Dao-AILab/flash-attention checkout (INFERO_FLASH_ATTN_DIR); see build.rs.
+# Provides a second, vendor-sourced `AttentionBackend` alongside this crate's
+# own tuned kernels -- see `attn_backend.rs` and the design doc at
+# docs/superpowers/specs/2026-09-05-pluggable-attention-backend-design.md.
+flash_attn2 = ["cuda"]
 
 [[example]]
 name = "cutlass_vs_block"

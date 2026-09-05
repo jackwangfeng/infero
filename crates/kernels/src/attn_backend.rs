@@ -63,6 +63,14 @@ pub struct AttnCallCtx<'a> {
     /// own `&Kernels` handle) — it exists for `FlashAttn2Ffi`, which has no
     /// `Kernels` of its own to pull one from.
     pub stream: &'a std::sync::Arc<infero_gpu::Stream>,
+    /// `InferoHandRolled` ignores this too (it already holds its own
+    /// `&Kernels`) — `FlashAttn2Ffi` needs it for one thing this trait
+    /// doesn't otherwise expose: converting `q` (infero's real activation
+    /// dtype, f32) into the f16 buffer its vendored kernel actually expects,
+    /// via the existing `Kernels::to_f16`, rather than duplicating that
+    /// kernel or reinterpreting f32 bytes as f16 (which is wrong, not just
+    /// imprecise — see `flash_attn2.rs`'s own comment on this field's use).
+    pub kern: &'a crate::Kernels,
 }
 
 /// One implementation of standard (non-GDN) attention's prefill path.
