@@ -289,6 +289,66 @@ impl Gguf {
         Ok(out)
     }
 
+    /// Like [`Self::tensor_shard_cols`], but for `ranges.len() > 1` disjoint
+    /// column ranges that together form one rank's shard -- interleaved
+    /// *per row* into one compact buffer, which simple concatenation of
+    /// separate `tensor_shard_cols` calls cannot produce: each of those
+    /// calls already returns a full `[n_rows, that_range's_width]` buffer,
+    /// so end-to-end concatenation would place one range's entire column
+    /// block after every row of the other's, not the per-row-interleaved
+    /// layout a real multi-segment column shard needs downstream. Exists for
+    /// GDN's `v_heads_tiled` value-head sharding, where one rank's columns
+    /// are `heads_per_key` disjoint ranges within the full column axis
+    /// (llama.cpp's tiled reordering means a rank's key heads' value data
+    /// is scattered across `heads_per_key` separate column bands, not one
+    /// contiguous range) rather than a single range.
+    pub fn tensor_shard_cols_multi(
+        &self,
+        t: &TensorInfo,
+        ranges: &[std::ops::Range<usize>],
+    ) -> Result<Vec<u8>> {
+        let shape = t.shape();
+        anyhow::ensure!(
+            shape.len() >= 2,
+            "tensor_shard_cols_multi needs a >=2D tensor, got shape {shape:?}"
+        );
+        let n_rows = shape[0] as usize;
+        let n_cols = t.dims[0] as usize;
+        let block = t.ty.block_size();
+        for r in ranges {
+            anyhow::ensure!(
+                r.end <= n_cols,
+                "shard range {r:?} out of bounds for a {n_cols}-column tensor"
+            );
+            anyhow::ensure!(
+                r.start % block == 0 && r.end % block == 0,
+                "column shard range {r:?} is not aligned to {}'s {block}-element block size",
+                t.ty
+            );
+        }
+        let type_size = t.ty.type_size();
+        let row_bytes = (n_cols / block) * type_size;
+        anyhow::ensure!(
+            row_bytes * n_rows == t.n_bytes,
+            "computed row size {row_bytes} * {n_rows} rows doesn't match tensor byte size {}",
+            t.n_bytes
+        );
+        let full = self.data(t);
+        let per_range_bytes: Vec<usize> = ranges
+            .iter()
+            .map(|r| ((r.end - r.start) / block) * type_size)
+            .collect();
+        let total_span_bytes: usize = per_range_bytes.iter().sum();
+        let mut out = Vec::with_capacity(n_rows * total_span_bytes);
+        for row in 0..n_rows {
+            for (r, &span) in ranges.iter().zip(&per_range_bytes) {
+                let start_bytes = row * row_bytes + (r.start / block) * type_size;
+                out.extend_from_slice(&full[start_bytes..start_bytes + span]);
+            }
+        }
+        Ok(out)
+    }
+
     // ---- metadata access -------------------------------------------------
 
     pub fn get(&self, key: &str) -> Option<&Value> {

@@ -191,6 +191,77 @@ fn tensor_shard_cols_reads_only_the_requested_columns() {
 }
 
 #[test]
+fn tensor_shard_cols_multi_interleaves_per_row_not_end_to_end() {
+    let f = model_or_skip!();
+    let t = f.tensor("blk.0.attn_output.weight").unwrap().clone();
+    assert_eq!(t.ty, GgmlType::Q8_0);
+    let full = f.tensor_data("blk.0.attn_output.weight").unwrap();
+    let n_cols = t.dims[0] as usize;
+    let n_rows = t.shape()[0] as usize;
+    let row_bytes = full.len() / n_rows;
+
+    // Four disjoint quarter-column ranges, taken as two separate "tiles" --
+    // mirrors GDN's real `heads_per_key` tiling, where one rank's columns
+    // are several disjoint bands, not one contiguous range.
+    let q = n_cols / 4;
+    let ranges = [q..2 * q, 3 * q..4 * q];
+
+    let multi = f.tensor_shard_cols_multi(&t, &ranges).unwrap();
+    let piece0 = f.tensor_shard_cols(&t, ranges[0].clone()).unwrap();
+    let piece1 = f.tensor_shard_cols(&t, ranges[1].clone()).unwrap();
+    assert_eq!(multi.len(), piece0.len() + piece1.len());
+
+    // The real requirement: per-row interleaving, not the two pieces stuck
+    // end to end (which is what a naive `.extend()` of two separate
+    // `tensor_shard_cols` calls would silently produce -- the exact bug
+    // this primitive exists to avoid).
+    let piece_row_bytes = piece0.len() / n_rows;
+    assert_eq!(piece_row_bytes, piece1.len() / n_rows);
+    let mut expected = Vec::with_capacity(multi.len());
+    for row in 0..n_rows {
+        expected.extend_from_slice(&piece0[row * piece_row_bytes..(row + 1) * piece_row_bytes]);
+        expected.extend_from_slice(&piece1[row * piece_row_bytes..(row + 1) * piece_row_bytes]);
+    }
+    assert_eq!(multi, expected, "must interleave per row, not concatenate the two pieces end to end");
+    assert_ne!(
+        multi,
+        [piece0.clone(), piece1.clone()].concat(),
+        "sanity: per-row interleaving must actually differ from naive end-to-end concatenation \
+         for a >1-row tensor, or this test isn't exercising the real bug"
+    );
+
+    // And it must reproduce the true bytes: reassemble against a full read.
+    let mut reassembled = vec![0u8; full.len()];
+    let col_start_bytes = |range: &std::ops::Range<usize>| {
+        let block = t.ty.block_size();
+        (range.start / block) * t.ty.type_size()
+    };
+    for row in 0..n_rows {
+        let a = col_start_bytes(&ranges[0]);
+        reassembled[row * row_bytes + a..row * row_bytes + a + piece_row_bytes]
+            .copy_from_slice(&multi[row * multi.len() / n_rows..row * multi.len() / n_rows + piece_row_bytes]);
+        let b = col_start_bytes(&ranges[1]);
+        let off = row * multi.len() / n_rows + piece_row_bytes;
+        reassembled[row * row_bytes + b..row * row_bytes + b + piece_row_bytes]
+            .copy_from_slice(&multi[off..off + piece_row_bytes]);
+    }
+    for row in 0..n_rows {
+        let a = col_start_bytes(&ranges[0]);
+        assert_eq!(
+            &reassembled[row * row_bytes + a..row * row_bytes + a + piece_row_bytes],
+            &full[row * row_bytes + a..row * row_bytes + a + piece_row_bytes],
+            "row {row} range 0 mismatch"
+        );
+        let b = col_start_bytes(&ranges[1]);
+        assert_eq!(
+            &reassembled[row * row_bytes + b..row * row_bytes + b + piece_row_bytes],
+            &full[row * row_bytes + b..row * row_bytes + b + piece_row_bytes],
+            "row {row} range 1 mismatch"
+        );
+    }
+}
+
+#[test]
 fn vocab_matches_token_type_array() {
     let f = model_or_skip!();
     let tokens = f.str_array("tokenizer.ggml.tokens").unwrap();

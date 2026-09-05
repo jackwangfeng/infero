@@ -656,16 +656,33 @@ impl Weights {
                         // single uniform row-range across the combined
                         // `[q|k|v]` tensor would not land on head
                         // boundaries, so each segment is sharded
-                        // independently by its own head count and the three
-                        // results concatenated (row-range shards are
-                        // contiguous byte runs, so this is a plain
-                        // byte-level concatenation, not an interleave).
+                        // independently by its own head count.
+                        //
+                        // The V segment additionally needs `v_heads_tiled`
+                        // handling: for a real GGUF checkpoint (confirmed on
+                        // `Qwen3.8-27B-Q8_0.gguf`), value heads are stored
+                        // tiled -- `[G0_v0, G1_v0, ..., G0_v1, G1_v1, ...]`,
+                        // value head `h`'s real row is `h % key_heads_full`,
+                        // not `h` -- so a plain contiguous row-range (the
+                        // first version of this code) silently mixed value
+                        // heads belonging to OTHER ranks' key heads into
+                        // this rank's shard while dropping some of its own.
+                        // Confirmed live: this produced coherent-but-not-
+                        // bit-exact TP=2 output on the real 27B checkpoint,
+                        // not a crash -- see `shard_tiled_value_rows`'s own
+                        // doc comment. Q/K rows have no such tiling (key
+                        // heads are the thing being tiled *by*, not the
+                        // thing tiled), so they stay a plain contiguous
+                        // shard.
                         let la = cfg.linear_attn.as_ref().with_context(|| {
                             format!("layer {i}: GDN block but Config has no linear_attn")
                         })?;
                         let kd = la.key_dim();
                         let vd = la.value_dim();
                         let full_kd = kd * tp_size;
+                        let key_heads_full = la.key_heads * tp_size;
+                        let heads_per_key = la.heads_per_key();
+                        let vhd = la.value_head_dim;
 
                         let shard3 = |info: &TensorInfo| -> Result<Vec<u8>> {
                             let mut bytes =
@@ -674,9 +691,9 @@ impl Weights {
                                 info,
                                 (full_kd + tp_rank * kd)..(full_kd + (tp_rank + 1) * kd),
                             )?);
-                            bytes.extend(f.tensor_shard(
-                                info,
-                                (2 * full_kd + tp_rank * vd)..(2 * full_kd + (tp_rank + 1) * vd),
+                            bytes.extend(shard_tiled_value_rows(
+                                f, info, key_heads_full, heads_per_key, vhd, 2 * full_kd,
+                                tp_rank, tp_size,
                             )?);
                             Ok(bytes)
                         };
@@ -697,6 +714,28 @@ impl Weights {
                                 cutlass_weight: Default::default(),
                             })
                         };
+                        let upload_value_rows = |name: &str, row_span: usize, total: &mut usize| -> Result<Matrix> {
+                            let info = f.tensor(name)?.clone();
+                            let ty = WeightType::from_ggml(info.ty).with_context(|| format!("tensor {name}"))?;
+                            // `dims[0]` is ggml's fastest axis == in_features
+                            // (`k`) for any linear-style weight, regardless
+                            // of which axis *we* shard -- unsharded here,
+                            // only the value-head output axis (`n`) is.
+                            let full_k = info.dims[0] as usize;
+                            let bytes = shard_tiled_value_rows(
+                                f, &info, key_heads_full, heads_per_key, row_span, 0, tp_rank, tp_size,
+                            )?;
+                            let n_bytes = bytes.len();
+                            *total += n_bytes;
+                            Ok(Matrix {
+                                ty,
+                                k: full_k,
+                                n: la.value_heads * row_span,
+                                n_bytes,
+                                storage: Storage::Device(dev.stream().clone_htod(&bytes)?),
+                                cutlass_weight: Default::default(),
+                            })
+                        };
 
                         // 0: attn_qkv.weight -- three-segment shard above.
                         let qkv_info = f.tensor(&names[0])?.clone();
@@ -710,29 +749,42 @@ impl Weights {
                             2 * kd + vd,
                             &mut device_bytes,
                         )?);
-                        // 1: attn_gate.weight -- value-shaped, single segment.
-                        m.push(upload_matrix_sharded(
-                            dev, f, &names[1], ShardAxis::Output, tp_rank, tp_size, &mut device_bytes,
-                        )?);
+                        // 1: attn_gate.weight -- value-shaped, single segment,
+                        // `v_heads_tiled`-aware (row_span = value_head_dim).
+                        m.push(upload_value_rows(&names[1], vhd, &mut device_bytes)?);
                         // 2, 3: ssm_alpha.weight / ssm_beta.weight -- one
                         // scalar a head (`n = value_heads`, not `value_dim`),
-                        // so the generic per-tp_size division on the whole
-                        // output width is already exactly a per-head split --
-                        // no `*head_dim` multiplier needed here, unlike the
-                        // gate/qkv tensors above.
-                        m.push(upload_matrix_sharded(
-                            dev, f, &names[2], ShardAxis::Output, tp_rank, tp_size, &mut device_bytes,
-                        )?);
-                        m.push(upload_matrix_sharded(
-                            dev, f, &names[3], ShardAxis::Output, tp_rank, tp_size, &mut device_bytes,
-                        )?);
-                        // 4: ssm_out.weight -- row-parallel (input = value_dim).
-                        m.push(upload_matrix_sharded(
-                            dev, f, &names[4], ShardAxis::Input, tp_rank, tp_size, &mut device_bytes,
-                        )?);
+                        // `v_heads_tiled`-aware (row_span = 1: one row a head,
+                        // not `head_dim` rows, unlike the gate/qkv tensors
+                        // above).
+                        m.push(upload_value_rows(&names[2], 1, &mut device_bytes)?);
+                        m.push(upload_value_rows(&names[3], 1, &mut device_bytes)?);
+                        // 4: ssm_out.weight -- row-parallel (input =
+                        // value_dim), `v_heads_tiled`-aware column sharding.
+                        {
+                            let info = f.tensor(&names[4])?.clone();
+                            let ty = WeightType::from_ggml(info.ty)
+                                .with_context(|| format!("tensor {}", names[4]))?;
+                            let full_n = info.shape()[0] as usize;
+                            let bytes = shard_tiled_value_cols(
+                                &f, &info, key_heads_full, heads_per_key, vhd, tp_rank, tp_size,
+                            )?;
+                            let n_bytes = bytes.len();
+                            device_bytes += n_bytes;
+                            m.push(Matrix {
+                                ty,
+                                k: vd,
+                                n: full_n,
+                                n_bytes,
+                                storage: Storage::Device(dev.stream().clone_htod(&bytes)?),
+                                cutlass_weight: Default::default(),
+                            });
+                        }
                         // 5, 6, 7: dense FFN gate/up/down -- ordinary
                         // Megatron-style sharding, identical to the
-                        // standard-attention branch's own FFN handling.
+                        // standard-attention branch's own FFN handling (no
+                        // value-head tiling concern -- FFN's hidden
+                        // dimension isn't head-shaped at all).
                         for (name, axis) in names[5..8]
                             .iter()
                             .zip([ShardAxis::Output, ShardAxis::Output, ShardAxis::Input])
@@ -851,12 +903,18 @@ impl Weights {
                                 // as `attn_qkv.weight` above (`conv_channels
                                 // == 2*key_dim + value_dim`), just with
                                 // `conv_k` (kernel taps) as the fast/inner
-                                // axis instead of `d_model` -- sharded the
-                                // same way, by row-range per segment.
+                                // axis instead of `d_model`. Q/K rows stay a
+                                // plain contiguous shard; the V segment needs
+                                // the same `v_heads_tiled` tiling as
+                                // `attn_qkv.weight`'s V segment (see
+                                // `shard_tiled_value_rows`'s doc comment --
+                                // this exact bug was live on the real 27B
+                                // checkpoint, found post-hoc, not by review).
                                 let la = cfg.linear_attn.as_ref().unwrap();
                                 let kd = la.key_dim();
-                                let vd = la.value_dim();
                                 let full_kd = kd * tp_size;
+                                let key_heads_full = la.key_heads * tp_size;
+                                let heads_per_key = la.heads_per_key();
                                 let info = f.tensor(&t("ssm_conv1d.weight"))?.clone();
                                 let mut bytes =
                                     f.tensor_shard(&info, (tp_rank * kd)..((tp_rank + 1) * kd))?;
@@ -864,9 +922,9 @@ impl Weights {
                                     &info,
                                     (full_kd + tp_rank * kd)..(full_kd + (tp_rank + 1) * kd),
                                 )?);
-                                bytes.extend(f.tensor_shard(
-                                    &info,
-                                    (2 * full_kd + tp_rank * vd)..(2 * full_kd + (tp_rank + 1) * vd),
+                                bytes.extend(shard_tiled_value_rows(
+                                    f, &info, key_heads_full, heads_per_key, la.value_head_dim,
+                                    2 * full_kd, tp_rank, tp_size,
                                 )?);
                                 let host = to_f32(&bytes, &info)?;
                                 device_bytes += host.len() * 4;
@@ -875,11 +933,14 @@ impl Weights {
                         },
                         a_log: match shard {
                             None => upload_a_log(dev, f, &t("ssm_a"), &mut device_bytes)?,
-                            Some((tp_rank, _tp_size)) => {
-                                let vh = cfg.linear_attn.as_ref().unwrap().value_heads;
+                            Some((tp_rank, tp_size)) => {
+                                let la = cfg.linear_attn.as_ref().unwrap();
+                                let key_heads_full = la.key_heads * tp_size;
+                                let heads_per_key = la.heads_per_key();
                                 let info = f.tensor(&t("ssm_a"))?.clone();
-                                let bytes =
-                                    f.tensor_shard(&info, (tp_rank * vh)..((tp_rank + 1) * vh))?;
+                                let bytes = shard_tiled_value_rows(
+                                    f, &info, key_heads_full, heads_per_key, 1, 0, tp_rank, tp_size,
+                                )?;
                                 let raw = to_f32(&bytes, &info)?;
                                 let host: Vec<f32> = raw
                                     .iter()
@@ -894,11 +955,14 @@ impl Weights {
                         },
                         dt_bias: match shard {
                             None => upload_vector(dev, f, &t("ssm_dt.bias"), &mut device_bytes)?,
-                            Some((tp_rank, _tp_size)) => {
-                                let vh = cfg.linear_attn.as_ref().unwrap().value_heads;
+                            Some((tp_rank, tp_size)) => {
+                                let la = cfg.linear_attn.as_ref().unwrap();
+                                let key_heads_full = la.key_heads * tp_size;
+                                let heads_per_key = la.heads_per_key();
                                 let info = f.tensor(&t("ssm_dt.bias"))?.clone();
-                                let bytes =
-                                    f.tensor_shard(&info, (tp_rank * vh)..((tp_rank + 1) * vh))?;
+                                let bytes = shard_tiled_value_rows(
+                                    f, &info, key_heads_full, heads_per_key, 1, 0, tp_rank, tp_size,
+                                )?;
                                 let host = to_f32(&bytes, &info)?;
                                 device_bytes += host.len() * 4;
                                 dev.stream().clone_htod(&host)?
@@ -2425,6 +2489,96 @@ enum ShardAxis {
     /// `ncclAllReduce` with the other ranks before it's the real answer
     /// (attention/GDN output projections, FFN down).
     Input,
+}
+
+/// Shard a value-head-indexed *row* range, respecting GGUF's real value-head
+/// tiling (`LinearAttnConfig::v_heads_tiled`) rather than assuming a
+/// contiguous grouping.
+///
+/// llama.cpp reorders a checkpoint's value heads to `[G0_v0, G1_v0, ...,
+/// G0_v1, G1_v1, ...]` -- value head `h`'s real row is `h % key_heads_full`,
+/// not `h` itself, whenever one key head serves more than one value head
+/// (`heads_per_key() > 1`, GQA-style). A naive contiguous
+/// `(tp_rank*rank_span)..((tp_rank+1)*rank_span)` shard of the un-permuted
+/// row index silently mixes value heads belonging to OTHER ranks' key heads
+/// into this rank's shard while dropping some of this rank's own -- wrong
+/// data, not a crash, which is exactly why this bug (found live, on the
+/// real `Qwen3.8-27B-Q8_0.gguf` checkpoint under TP=2) produced
+/// coherent-but-not-bit-exact output rather than garbage: the same failure
+/// shape `v_heads_tiled`'s own doc comment already describes for reading
+/// the tiling flag backwards.
+///
+/// `key_heads_full`/`heads_per_key` describe the *pre-shard* checkpoint (the
+/// caller must multiply the already-divided `Config::shard_for_tp` count
+/// back up by `tp_size`); `row_span` is how many raw tensor rows one value
+/// head occupies: `value_head_dim` for a real per-head vector (`attn_qkv`'s
+/// V segment, `attn_gate`, `conv1d`'s V channels), or `1` for a
+/// scalar-a-head tensor (`ssm_alpha`/`ssm_beta`/`ssm_a`/`ssm_dt.bias`).
+///
+/// Returns this rank's `heads_per_key` groups' rows concatenated in tile
+/// order -- exactly what a real, standalone `v_heads_tiled` checkpoint at
+/// this rank's own (smaller) head counts would look like, so nothing
+/// downstream needs to know sharding happened.
+///
+/// `row_offset` is a starting row for the value-head axis when it isn't the
+/// tensor's own row 0 -- the combined `[q|k|v]` tensors (`attn_qkv.weight`,
+/// `ssm_conv1d.weight`) put Q/K first, so V's tiling arithmetic needs
+/// `2*full_kd` added to every row it computes; pass `0` for a standalone
+/// value-shaped tensor (`attn_gate.weight`, `ssm_alpha`/`ssm_beta`/`ssm_a`/
+/// `ssm_dt.bias`).
+fn shard_tiled_value_rows(
+    f: &Gguf,
+    info: &TensorInfo,
+    key_heads_full: usize,
+    heads_per_key: usize,
+    row_span: usize,
+    row_offset: usize,
+    tp_rank: usize,
+    tp_size: usize,
+) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        key_heads_full % tp_size == 0,
+        "key_heads {key_heads_full} does not divide tp_size {tp_size}"
+    );
+    let key_heads_rank = key_heads_full / tp_size;
+    let mut bytes = Vec::new();
+    for tile in 0..heads_per_key {
+        let tile_base = row_offset + tile * key_heads_full * row_span;
+        let start = tile_base + tp_rank * key_heads_rank * row_span;
+        let end = start + key_heads_rank * row_span;
+        bytes.extend(f.tensor_shard(info, start..end)?);
+    }
+    Ok(bytes)
+}
+
+/// Column-range counterpart of [`shard_tiled_value_rows`], for the one
+/// GDN tensor whose value-head axis is the *contraction* dimension
+/// (row-parallel sharding -- `ssm_out.weight`'s input width is
+/// `value_dim`). Same tiling reasoning, via
+/// [`Gguf::tensor_shard_cols_multi`] since the `heads_per_key` column bands
+/// must be interleaved per row, not concatenated end to end.
+fn shard_tiled_value_cols(
+    f: &Gguf,
+    info: &TensorInfo,
+    key_heads_full: usize,
+    heads_per_key: usize,
+    col_span: usize,
+    tp_rank: usize,
+    tp_size: usize,
+) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        key_heads_full % tp_size == 0,
+        "key_heads {key_heads_full} does not divide tp_size {tp_size}"
+    );
+    let key_heads_rank = key_heads_full / tp_size;
+    let ranges: Vec<std::ops::Range<usize>> = (0..heads_per_key)
+        .map(|tile| {
+            let tile_base = tile * key_heads_full * col_span;
+            let start = tile_base + tp_rank * key_heads_rank * col_span;
+            start..(start + key_heads_rank * col_span)
+        })
+        .collect();
+    f.tensor_shard_cols_multi(info, &ranges)
 }
 
 /// Like [`upload_matrix`], but reads only this rank's `1/tp_size` slice of
