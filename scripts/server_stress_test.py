@@ -90,14 +90,18 @@ def t_multiturn(base_url: str, n_turns: int) -> tuple[bool, str]:
         if i < n_turns - 1:
             messages.append({"role": "user", "content": f"Turn {i+2}: say a random short fact."})
     # Final turn: ask for the secret back, a real content-sensibility check.
-    # max_tokens=64, not 40: by turn 10 there's a lot of accumulated fake
-    # history to reference before this checkpoint's verbose reasoning
-    # preamble reaches the actual "42" -- 40 flaked real (2026-09-05, 1/5
-    # passes truncated mid-reasoning, never reached the answer) on an
-    # otherwise-correct, uncontaminated model, same class of false failure
-    # as `t_retire_and_reuse`'s original max_tokens=16.
+    # max_tokens=200, not 64: 64 itself still flaked real at n_turns=2
+    # (2026-09-05, reproduced 6/6 truncated mid-reasoning at max_tokens=64,
+    # `finish_reason=length`, never reaching "42") on an otherwise-correct,
+    # uncontaminated model -- this checkpoint's reasoning preamble length
+    # before a recall answer is highly variable (confirmed to run 150-300+
+    # tokens even at n_turns=2, not proportional to conversation length the
+    # way the original max_tokens=64 fix assumed), same class of false
+    # failure as `t_retire_and_reuse`'s original max_tokens=16. Verified at
+    # max_tokens=300 that the model always resolves correctly to "42" once
+    # given enough room; 200 keeps real margin above that.
     messages.append({"role": "user", "content": "What was the secret number I told you earlier?"})
-    status, resp = chat(base_url, messages, max_tokens=64)
+    status, resp = chat(base_url, messages, max_tokens=200)
     if not ok(status, resp):
         return False, f"final recall turn failed: status={status} body={resp!r}"
     final = content_of(resp)
@@ -219,7 +223,13 @@ def t_vision_multiturn(base_url: str) -> tuple[bool, str]:
         return False, f"turn 1 failed: status={status} body={resp!r}"
     messages.append({"role": "assistant", "content": content_of(resp)})
     messages.append({"role": "user", "content": "What color did I just show you? One word."})
-    status, resp = chat(base_url, messages, max_tokens=60)
+    # max_tokens=200, not 60: same class of false failure as t_multiturn's
+    # recall turn -- reproduced 3/3 truncated at max_tokens=60
+    # (`finish_reason=length`, 2026-09-05) on an otherwise-correct model that
+    # always resolves to "Red" once given enough room (verified at
+    # max_tokens=300); this checkpoint's cross-turn image recall goes through
+    # the same long, variable reasoning preamble as the text case.
+    status, resp = chat(base_url, messages, max_tokens=200)
     passed = ok(status, resp) and "red" in content_of(resp).lower()
     return passed, f"status={status} content={content_of(resp) if isinstance(resp, dict) else resp!r}"
 
