@@ -872,17 +872,82 @@ impl Scheduler {
 
     pub fn step(&mut self) -> Result<()> {
         let step_start = self.profile.then(std::time::Instant::now);
+        // Tensor-parallel: rank 0 (this Scheduler) drives, every other rank
+        // runs `crate::tp::run_follower` instead of a `Scheduler` at all --
+        // see that module's doc comment. `before_ids` is this step's
+        // "who was already here" snapshot, the baseline `admitted` below
+        // diffs against.
+        #[cfg(feature = "nccl")]
+        let tp_active = self.model.tp_rank_info().is_some();
+        #[cfg(not(feature = "nccl"))]
+        #[allow(unused_variables)] // every use of this binding is itself behind `#[cfg(feature = "nccl")]`
+        let tp_active = false;
+        #[cfg(feature = "nccl")]
+        let before_ids: std::collections::HashSet<usize> =
+            if tp_active { self.running.iter().map(|r| r.seq.0).collect() } else { Default::default() };
+
         self.admit();
         self.drop_disconnected();
+
+        // Reject what this pass of tensor-parallel support does not cover --
+        // vision/M-RoPE requests -- rather than silently mishandling them.
+        // Scoped to sequences admitted THIS step (`before_ids` already
+        // excludes anything running before this call), matching the design
+        // doc's explicit scope cut.
+        #[cfg(feature = "nccl")]
+        if tp_active {
+            let mut i = 0;
+            while i < self.running.len() {
+                let carries_unsupported = !before_ids.contains(&self.running[i].seq.0)
+                    && (self.running[i].vision.is_some() || self.running[i].mrope.is_some());
+                if carries_unsupported {
+                    let r = self.running.swap_remove(i);
+                    let _ = r.events.send(Event::Failed(
+                        "this server is running under tensor parallelism, which does not yet \
+                         support vision or M-RoPE requests -- see the tensor-parallel design \
+                         doc's explicit scope cut"
+                            .into(),
+                    ));
+                    self.retire(r);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
         if self.running.is_empty() {
+            // A real step decision (an empty one) still has to reach every
+            // other rank -- their own `run_follower` loop is blocked inside
+            // `tp_broadcast_bytes` waiting for exactly this call, whatever it
+            // says, and would hang forever if rank 0 returned here without
+            // ever making it.
+            #[cfg(feature = "nccl")]
+            if tp_active {
+                self.model.tp_broadcast_bytes(&mut crate::tp::StepPlan::default().to_bytes(), true)?;
+                self.model.tp_broadcast_bytes(&mut crate::tp::StepRetired::default().to_bytes(), true)?;
+            }
             return Ok(());
         }
+        #[cfg(feature = "nccl")]
+        anyhow::ensure!(
+            !(tp_active && self.spec_k > 0),
+            "speculative decoding is not supported under tensor parallelism yet -- \
+             this should have been refused at load time (see engine::Engine::start)"
+        );
         if self.speculative_step()? {
             return Ok(());
         }
 
         let plan = self.plan();
         if plan.is_empty() {
+            // Same reasoning as the `running.is_empty()` broadcast above --
+            // a follower waiting on this step's broadcast must not be left
+            // hanging by an early return.
+            #[cfg(feature = "nccl")]
+            if tp_active {
+                self.model.tp_broadcast_bytes(&mut crate::tp::StepPlan::default().to_bytes(), true)?;
+                self.model.tp_broadcast_bytes(&mut crate::tp::StepRetired::default().to_bytes(), true)?;
+            }
             // Every running sequence is blocked on pool capacity; releasing a
             // finished one is the only thing that can unblock them, and that
             // happens below.
@@ -939,6 +1004,37 @@ impl Scheduler {
                 }
             })
             .collect();
+
+        #[cfg(feature = "nccl")]
+        if tp_active {
+            let admitted: Vec<(usize, Vec<u32>)> = self
+                .running
+                .iter()
+                .filter(|r| !before_ids.contains(&r.seq.0))
+                .map(|r| (r.seq.0, r.prompt.clone()))
+                .collect();
+            let plan_msg: Vec<(usize, crate::tp::WorkMsg)> = plan
+                .iter()
+                .map(|(idx, work)| {
+                    let r = &self.running[*idx];
+                    let msg = match work {
+                        Work::Prefill { from, len, last } => {
+                            crate::tp::WorkMsg::Prefill { from: *from, len: *len, wants_logits: *last }
+                        }
+                        // Same value `items` above just used for this row's
+                        // own `BatchItem::tokens` -- the token this step
+                        // feeds, already sampled by a PREVIOUS step, not
+                        // something a follower could derive on its own.
+                        Work::Decode => {
+                            crate::tp::WorkMsg::Decode { token: *r.next.as_ref().unwrap() }
+                        }
+                    };
+                    (r.seq.0, msg)
+                })
+                .collect();
+            let mut bytes = crate::tp::StepPlan { admitted, plan: plan_msg }.to_bytes();
+            self.model.tp_broadcast_bytes(&mut bytes, true)?;
+        }
 
         let vocab = self.model.config().vocab_size;
         let timed = self.profile;
@@ -1160,6 +1256,16 @@ impl Scheduler {
                     self.window = 0;
                 }
             }
+        }
+
+        // This step's second broadcast -- who finished, so a follower can
+        // free the same pool slots rank 0 is about to. Seq ids captured
+        // before `swap_remove` below invalidates `finished`'s indices.
+        #[cfg(feature = "nccl")]
+        if tp_active {
+            let retired_ids: Vec<usize> = finished.iter().map(|&idx| self.running[idx].seq.0).collect();
+            let mut bytes = crate::tp::StepRetired(retired_ids).to_bytes();
+            self.model.tp_broadcast_bytes(&mut bytes, true)?;
         }
 
         // Retire from the back so the earlier indices stay valid.

@@ -732,6 +732,11 @@ pub struct Model {
     /// path). Set once by [`Model::load_full_tp`], never after.
     #[cfg(feature = "nccl")]
     comm: Option<Arc<infero_kernels::tp::NcclComm>>,
+    /// `(tp_rank, tp_size)`, mirrors `comm`'s `None`-at-`tp_size==1` shape --
+    /// exposed via `tp_rank_info()` for `crates/server` to gate its own
+    /// scheduling logic on.
+    #[cfg(feature = "nccl")]
+    tp_rank_info: Option<(usize, usize)>,
     max_seq: usize,
     /// Per layer, whether it mixes with a recurrence. Cached because the pool
     /// needs it to size the state and the layer loop consults it every block.
@@ -989,6 +994,7 @@ impl Model {
                 rank.tp_size as i32,
             )?;
             model.comm = Some(Arc::new(comm));
+            model.tp_rank_info = Some((rank.tp_rank, rank.tp_size));
         }
         Ok(model)
     }
@@ -1305,6 +1311,8 @@ impl Model {
             // `None`, i.e. today's behavior.
             #[cfg(feature = "nccl")]
             comm: None,
+            #[cfg(feature = "nccl")]
+            tp_rank_info: None,
             max_seq,
             layer_kinds,
             logit_rows: 0,
@@ -1345,6 +1353,81 @@ impl Model {
     /// `INFERO_ATTN_BACKEND`.
     pub fn attn_backend_name(&self) -> &'static str {
         self.attn_backend_name
+    }
+
+    /// This rank's `(tp_rank, tp_size)`, `None` at `tp_size == 1` (no real TP
+    /// group) or on a build without the `nccl` feature -- exactly the same
+    /// condition `tp_active()` checks, exposed for `crates/server` to gate
+    /// its own scheduling behavior on without needing raw NCCL access.
+    pub fn tp_rank_info(&self) -> Option<(usize, usize)> {
+        #[cfg(feature = "nccl")]
+        {
+            self.tp_rank_info
+        }
+        #[cfg(not(feature = "nccl"))]
+        {
+            None
+        }
+    }
+
+    /// Broadcasts `payload`'s bytes from `root_is_me` (`true` on exactly one
+    /// rank in the group, `false` on every other) to every other rank's
+    /// `payload`, in place -- a no-op if this rank isn't in a real TP group.
+    /// NCCL's own collectives operate on device memory, not host memory, so
+    /// this does the host<->device round trip itself: a fixed-size length
+    /// prefix first (so a follower knows how many bytes to expect), then the
+    /// payload proper. Used by `crates/server`'s scheduler to keep every
+    /// rank's forward-pass calls in lockstep -- see the design doc's
+    /// "Server/scheduler: rank 0 drives, others follow" section.
+    #[cfg(feature = "nccl")]
+    pub fn tp_broadcast_bytes(&self, payload: &mut Vec<u8>, root_is_me: bool) -> Result<()> {
+        let Some(comm) = &self.comm else { return Ok(()) };
+        let stream = self.dev.stream();
+        let root = 0i32; // rank 0 always drives; see the design doc.
+
+        // A fixed 8-byte length prefix, broadcast first: a follower's own
+        // `payload` starts empty and has to know how many bytes to size
+        // itself to before the real broadcast below can target a same-sized
+        // buffer on every rank (ncclBroadcast needs identical counts).
+        let len_host: [u8; 8] = if root_is_me {
+            (payload.len() as u64).to_le_bytes()
+        } else {
+            [0u8; 8]
+        };
+        let mut len_buf = stream.clone_htod(&len_host)?;
+        comm.broadcast_bytes(&mut len_buf.as_view_mut(), 8, root, stream)?;
+        let len_host = stream.clone_dtoh(&len_buf.as_view())?;
+        let len = u64::from_le_bytes(len_host.try_into().expect("8 bytes")) as usize;
+
+        if !root_is_me {
+            payload.clear();
+            payload.resize(len, 0);
+        }
+        anyhow::ensure!(
+            payload.len() == len,
+            "tp_broadcast_bytes: root's payload is {len} bytes but this call's local payload is {} -- \
+             every rank must reach this call with a payload of the length the root actually sent",
+            payload.len()
+        );
+        if len > 0 {
+            let mut buf = if root_is_me {
+                stream.clone_htod(payload)?
+            } else {
+                stream.alloc_zeros::<u8>(len)?
+            };
+            comm.broadcast_bytes(&mut buf.as_view_mut(), len, root, stream)?;
+            if !root_is_me {
+                let host = stream.clone_dtoh(&buf.as_view())?;
+                payload.copy_from_slice(&host);
+            }
+        }
+        stream.synchronize()?;
+        Ok(())
+    }
+
+    #[cfg(not(feature = "nccl"))]
+    pub fn tp_broadcast_bytes(&self, _payload: &mut Vec<u8>, _root_is_me: bool) -> Result<()> {
+        Ok(())
     }
 
     pub fn max_seq(&self) -> usize {

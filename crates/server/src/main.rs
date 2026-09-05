@@ -23,9 +23,23 @@ struct Args {
     #[arg(long, default_value_t = 4096)]
     ctx: usize,
 
-    /// CUDA device ordinal.
+    /// CUDA device ordinal. Ignored under tensor parallelism (`--tensor-
+    /// parallel-size` > 1) -- `CUDA_VISIBLE_DEVICES` pins each rank's
+    /// process to its own physical GPU there instead, matching
+    /// `tp_generate.rs`'s own launch convention (one process a rank, one
+    /// GPU a process).
     #[arg(long, default_value_t = 0)]
     device: usize,
+
+    /// How many GPUs to shard this model across. `1` (the default) is
+    /// today's exact single-GPU behavior. At `> 1`, launch one process a
+    /// rank with `TP_RANK`/`RUN_ID` set and `CUDA_VISIBLE_DEVICES` pinned to
+    /// a distinct physical GPU each -- see `docs/superpowers/specs/
+    /// 2026-09-05-tensor-parallel-design.md`. Vision/video requests,
+    /// M-RoPE, and speculative decoding are not supported yet at `> 1` (the
+    /// server refuses them, rather than silently mishandling them).
+    #[arg(long, default_value_t = 1)]
+    tensor_parallel_size: usize,
 
     /// KV cache encoding: `f16`, or TurboQuant at `tq4` / `tq2`.
     #[arg(long, default_value = "f16")]
@@ -99,6 +113,51 @@ async fn main() -> Result<()> {
         .init();
 
     let kv_quant = infero_model::KvCacheQuant::parse(&args.kv_quant)?;
+
+    let tp_rank: usize = std::env::var("TP_RANK").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    if args.tensor_parallel_size > 1 && tp_rank != 0 {
+        // A follower rank: no HTTP, no `Scheduler` -- just a `Model` and a
+        // `KvPool` driven by rank 0's broadcasts. Returns only when the
+        // group shuts down (rank 0 exits) or on a real error; never reaches
+        // the HTTP-serving code below.
+        #[cfg(feature = "nccl")]
+        {
+            let run_id = std::env::var("RUN_ID")
+                .context("TP_RANK is set but RUN_ID is not -- both are required under --tensor-parallel-size > 1")?;
+            let gguf = infero_gguf::Gguf::open(&args.model).with_context(|| format!("opening {}", args.model))?;
+            let dev = infero_gpu::Device::new(0) // CUDA_VISIBLE_DEVICES remaps this
+                .context("opening this rank's GPU")?;
+            let rank = infero_model::tp::RankId {
+                pp_rank: 0,
+                pp_size: 1,
+                tp_rank,
+                tp_size: args.tensor_parallel_size,
+            };
+            let model = infero_model::Model::load_full_tp(
+                dev,
+                &gguf,
+                args.ctx,
+                kv_quant,
+                args.gpu_layers.unwrap_or(usize::MAX),
+                args.max_seqs,
+                &rank,
+                &run_id,
+            )
+            .context("loading this rank's shard")?;
+            let pool = infero_server::scheduler::make_pool(&model, args.max_seqs, args.kv_slots)
+                .context("sizing this rank's kv pool")?;
+            tracing::info!(tp_rank, tp_size = args.tensor_parallel_size, "follower rank ready");
+            infero_server::tp::run_follower(model, pool).context("follower loop")?;
+            return Ok(());
+        }
+        #[cfg(not(feature = "nccl"))]
+        anyhow::bail!("--tensor-parallel-size > 1 needs the `nccl` feature; this build doesn't have it");
+    }
+    let tp = (args.tensor_parallel_size > 1).then(|| {
+        let run_id = std::env::var("RUN_ID").unwrap_or_else(|_| "infero_tp_default".to_string());
+        (tp_rank, args.tensor_parallel_size, run_id)
+    });
+
     let engine = engine::Engine::start(
         &args.model,
         args.ctx,
@@ -111,6 +170,7 @@ async fn main() -> Result<()> {
         args.video_max_frames,
         args.video_target_fps,
         args.video_dedup_threshold,
+        tp,
     )
     .context("starting the inference engine")?;
 

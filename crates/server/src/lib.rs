@@ -12,5 +12,7 @@ pub mod tool_call;
 pub mod vision;
 pub mod video;
 pub mod stop;
+#[cfg(feature = "nccl")]
+pub mod tp;
 
 pub use engine::{Engine, ModelInfo};

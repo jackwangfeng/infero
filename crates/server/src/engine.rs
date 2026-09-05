@@ -156,7 +156,21 @@ impl Engine {
         video_max_frames: usize,
         video_target_fps: f64,
         video_dedup_threshold: f64,
+        // `Some((tp_rank, tp_size, run_id))` for a real tensor-parallel
+        // group, `None` (every existing caller) for today's exact
+        // single-GPU behavior. `device_ordinal` is ignored when this is
+        // `Some` -- `CUDA_VISIBLE_DEVICES` is what actually pins a rank to
+        // a physical GPU under TP (see `tp_generate.rs`'s own doc comment
+        // for why), matching `Model::load_full_tp`'s own `Device::new(0)`
+        // convention. `Some` on a build without the `nccl` feature is a
+        // load-time error, not a silently-ignored request.
+        tp: Option<(usize, usize, String)>,
     ) -> Result<Arc<Self>> {
+        #[cfg(not(feature = "nccl"))]
+        anyhow::ensure!(
+            tp.is_none(),
+            "tensor-parallel support needs the `nccl` feature; this build doesn't have it"
+        );
         // A directory is a Hugging Face checkpoint, a file is a GGUF.
         let awq = std::path::Path::new(path).is_dir();
         let gguf = if awq {
@@ -181,10 +195,18 @@ impl Engine {
         // make the second row nearly free the way CUDA's MMA does (see
         // `dcbcdf4`, `f9fdd31`) — there, k=1 is break-even to negative, so it
         // defaults off instead.
-        let spec_k: usize = std::env::var("INFERO_SPEC_K")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(if cfg!(feature = "metal") { 0 } else { 1 });
+        // Speculative decoding is not supported under tensor parallelism yet
+        // (`Scheduler::step`'s own TP branch asserts this never fires) --
+        // forced off here rather than left to that assertion, so a TP run
+        // never even tries to load an MTP head for it.
+        let spec_k: usize = if tp.is_some() {
+            0
+        } else {
+            std::env::var("INFERO_SPEC_K")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(if cfg!(feature = "metal") { 0 } else { 1 })
+        };
         // A verification pass is `k + 1` rows wide and every row needs logits,
         // so speculation raises the floor under the logits buffer. It used to be
         // `max_seqs` alone, which meant `--max-seqs 1` -- the sensible setting
@@ -196,13 +218,41 @@ impl Engine {
         let logit_rows = max_seqs.max(spec_k + 1);
         // `mut`: the vision tower is loaded onto this binding below, once the
         // text model exists.
-        let mut model = match &gguf {
-            Some(f) => Model::load_full(dev, f, max_seq, kv_quant, n_gpu_layers, logit_rows)?,
-            None => {
+        // The `(Some(_), Some(_))` arm below is unreachable when `nccl` is
+        // on (the arm above it already covers every such case) and the only
+        // way to reach that combination when `nccl` is off (that arm
+        // doesn't exist in that build) -- intentional, not dead code.
+        #[allow(unreachable_patterns)]
+        let mut model = match (&gguf, &tp) {
+            #[cfg(feature = "nccl")]
+            (Some(f), Some((tp_rank, tp_size, run_id))) => {
+                let rank = infero_model::tp::RankId {
+                    pp_rank: 0,
+                    pp_size: 1,
+                    tp_rank: *tp_rank,
+                    tp_size: *tp_size,
+                };
+                Model::load_full_tp(dev, f, max_seq, kv_quant, n_gpu_layers, logit_rows, &rank, run_id)?
+            }
+            (Some(_), Some(_)) => {
+                // Only reachable on a build without `nccl` (the ensure! above
+                // already refused `tp.is_some()` there) or with an AWQ
+                // checkpoint (handled below) -- kept as an explicit arm
+                // rather than falling through to the plain branches, which
+                // would silently ignore a real TP request.
+                anyhow::bail!(
+                    "tensor-parallel support needs the `nccl` feature and a GGUF checkpoint \
+                     (AWQ sharded loading is not implemented -- see Weights::load_sharded's own \
+                     scope note)"
+                );
+            }
+            (Some(f), None) => Model::load_full(dev, f, max_seq, kv_quant, n_gpu_layers, logit_rows)?,
+            (None, _) => {
                 anyhow::ensure!(
                     n_gpu_layers == usize::MAX,
                     "an AWQ checkpoint has no offload path; drop --gpu-layers"
                 );
+                anyhow::ensure!(tp.is_none(), "AWQ checkpoints do not support tensor parallelism yet");
                 Model::load_awq(dev, path, max_seq, kv_quant, logit_rows)?
             }
         };
