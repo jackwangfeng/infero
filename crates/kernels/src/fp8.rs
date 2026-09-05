@@ -485,6 +485,16 @@ pub fn repack_rows(quants: &[u8], k: usize, n: usize) -> Result<Vec<u8>> {
 /// feature's unified-format weight path, where nothing reads the
 /// interleave and `[n,k]` row-major is what CUTLASS wants natively too —
 /// see `cutlass/fp8_bw_gemm.cu`'s header.
+///
+/// Copies in parallel, the same `available_parallelism().min(16)` split
+/// [`repack_rows`] uses. This looked like it should need no such thing —
+/// it is only a `copy_from_slice`, not a permutation — but a single-thread
+/// copy is *slower* than `repack_rows`'s sixteen-way permute on the real
+/// 27B checkpoint (measured: unified load `repack_ms` 13.3-13.5s against
+/// non-unified's 1.8-2.0s, stable across repeated runs, not noise) precisely
+/// because it was single-threaded: less work per byte lost to sixteen times
+/// less parallelism. There is no permutation to make this harder than
+/// `repack_rows`'s own split, so it gets the same one.
 pub fn pad_rows(quants: &[u8], k: usize, n: usize) -> Result<Vec<u8>> {
     anyhow::ensure!(
         quants.len() == n * k,
@@ -493,7 +503,20 @@ pub fn pad_rows(quants: &[u8], k: usize, n: usize) -> Result<Vec<u8>> {
     );
     let padded = n.next_multiple_of(ROW_GROUP);
     let mut out = vec![0u8; padded * k];
-    out[..quants.len()].copy_from_slice(quants);
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(16))
+        .unwrap_or(1);
+    let real_len = quants.len();
+    let per_thread = real_len.div_ceil(threads.max(1)).max(1);
+    std::thread::scope(|scope| {
+        for (t, dst_chunk) in out[..real_len].chunks_mut(per_thread).enumerate() {
+            let quants = &quants;
+            let start = t * per_thread;
+            scope.spawn(move || {
+                dst_chunk.copy_from_slice(&quants[start..start + dst_chunk.len()]);
+            });
+        }
+    });
     Ok(out)
 }
 
@@ -1232,5 +1255,44 @@ impl Kernels {
                 Ok(())
             })?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod pad_rows_tests {
+    use super::*;
+
+    /// The identity-permutation serial definition `pad_rows` used to be —
+    /// kept here, not in the function, as the reference the parallel version
+    /// is checked against.
+    fn pad_rows_serial(quants: &[u8], k: usize, n: usize) -> Vec<u8> {
+        let padded = n.next_multiple_of(ROW_GROUP);
+        let mut out = vec![0u8; padded * k];
+        out[..quants.len()].copy_from_slice(quants);
+        out
+    }
+
+    #[test]
+    fn pad_rows_matches_the_serial_reference_at_a_real_ish_shape() {
+        // n not a multiple of ROW_GROUP, so the padding tail is exercised;
+        // k large enough that the parallel split crosses several row
+        // boundaries on any real thread count.
+        let (k, n) = (5120usize, 4098usize);
+        let quants: Vec<u8> = (0..(k * n)).map(|i| (i % 251) as u8).collect();
+        let want = pad_rows_serial(&quants, k, n);
+        let got = super::pad_rows(&quants, k, n).expect("pad_rows");
+        assert_eq!(got.len(), want.len());
+        assert_eq!(got, want, "parallel pad_rows must byte-for-byte match the serial reference");
+    }
+
+    #[test]
+    fn pad_rows_handles_single_row_and_already_aligned_n() {
+        for &n in &[1usize, ROW_GROUP, ROW_GROUP * 3] {
+            let k = 8;
+            let quants: Vec<u8> = (0..(k * n)).map(|i| (i * 7 + 3) as u8).collect();
+            let want = pad_rows_serial(&quants, k, n);
+            let got = super::pad_rows(&quants, k, n).expect("pad_rows");
+            assert_eq!(got, want, "n={n}");
+        }
     }
 }
