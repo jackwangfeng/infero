@@ -749,14 +749,31 @@ impl Weights {
                         wk: matrices.next().unwrap(),
                         wv: matrices.next().unwrap(),
                         wo: matrices.next().unwrap(),
-                        // Qwen2 carries QKV biases; Llama does not.
-                        bq: upload_optional_vector(dev, f, &t("attn_q.bias"), &mut device_bytes)?,
-                        bk: upload_optional_vector(dev, f, &t("attn_k.bias"), &mut device_bytes)?,
-                        bv: upload_optional_vector(dev, f, &t("attn_v.bias"), &mut device_bytes)?,
+                        // Qwen2 carries QKV biases; Llama does not. Q/K/V's
+                        // biases belong to their own column-parallel
+                        // (Output-axis) matrices and must be sharded the
+                        // same way -- see `upload_optional_vector_sharded`'s
+                        // own doc comment for the real bug this was found
+                        // fixing (shapes checked out, values were silently
+                        // wrong on every rank but rank 0).
+                        bq: upload_optional_vector_sharded(dev, f, &t("attn_q.bias"), shard, &mut device_bytes)?,
+                        bk: upload_optional_vector_sharded(dev, f, &t("attn_k.bias"), shard, &mut device_bytes)?,
+                        bv: upload_optional_vector_sharded(dev, f, &t("attn_v.bias"), shard, &mut device_bytes)?,
+                        // Row-parallel (attn_output's own bias) -- NOT
+                        // sharded, applies to the full-width, already-
+                        // all-reduced output; see the sharded fn's doc
+                        // comment for why these two cases differ.
                         bo: upload_optional_vector(
                             dev, f, &t("attn_output.bias"), &mut device_bytes)?,
                         // Qwen3's per-head q/k norms; llama.cpp names them this
-                        // way.
+                        // way. `d_head`-wide (one shared gain applied
+                        // identically to every head), not `n_heads*d_head`,
+                        // so unlike the biases above these are correctly
+                        // replicated in full on every rank as-is -- no
+                        // sharding needed (verified: absent on the real
+                        // validation checkpoint, but confirmed from the
+                        // shape this normalization actually needs, not left
+                        // unchecked).
                         q_norm: upload_optional_vector(
                             dev, f, &t("attn_q_norm.weight"), &mut device_bytes)?,
                         k_norm: upload_optional_vector(
@@ -2256,6 +2273,53 @@ fn upload_optional_vector(
         Some(_) => Ok(Some(upload_vector(dev, f, name, total)?)),
         None => Ok(None),
     }
+}
+
+/// Like [`upload_optional_vector`], but for a bias that belongs to a
+/// column-parallel (Output-axis-sharded) matrix -- Q/K/V's own biases,
+/// `attn_q.bias`/`attn_k.bias`/`attn_v.bias` on a checkpoint that carries
+/// them (Qwen2 does; confirmed present on the real validation checkpoint:
+/// `attn_q.bias` 896 elements, `attn_k.bias`/`attn_v.bias` 128 each).
+///
+/// Found the hard way: `check_shapes` only validates the *matrices* -- a
+/// bias vector's length is never checked against anything, so loading one
+/// unsharded (this function's non-sharded sibling, used unconditionally
+/// before this fix) compiles, loads, and passes every shape check while
+/// silently adding the WRONG slice of the full bias to a sharded matmul's
+/// output on every rank but the one whose shard happens to start at offset
+/// 0 -- real, deterministic, values-only-wrong output, exactly the kind of
+/// bug this file's own `check_shapes` cannot catch by construction. A
+/// row-parallel matrix's bias (`attn_output.bias`, absent on this
+/// checkpoint but real on others) is the opposite case and must NOT be
+/// sharded here -- it applies to the row-parallel projection's OUTPUT,
+/// which is full-width and only correct after the all-reduce sums every
+/// rank's partial contribution, so it stays on `upload_optional_vector`.
+fn upload_optional_vector_sharded(
+    dev: &Device,
+    f: &Gguf,
+    name: &str,
+    shard: Option<(usize, usize)>,
+    total: &mut usize,
+) -> Result<Option<Vector>> {
+    let Some((tp_rank, tp_size)) = shard else {
+        return upload_optional_vector(dev, f, name, total);
+    };
+    let Some(info) = f.get_tensor(name) else {
+        return Ok(None);
+    };
+    let info = info.clone();
+    anyhow::ensure!(info.dims.len() == 1, "{name}: expected a 1-D bias, got {:?}", info.dims);
+    let full_n = info.dims[0] as usize;
+    anyhow::ensure!(
+        full_n % tp_size == 0,
+        "{name}: length {full_n} does not divide tp_size {tp_size}"
+    );
+    let shard_n = full_n / tp_size;
+    let host = to_f32(f.data(&info), &info).with_context(|| format!("decoding {name} ({})", info.ty))?;
+    let start = tp_rank * shard_n;
+    let host_shard = &host[start..start + shard_n];
+    *total += host_shard.len() * 4;
+    Ok(Some(dev.stream().clone_htod(host_shard)?))
 }
 
 /// Norm gains and biases are tiny, so they are converted on the host and kept
