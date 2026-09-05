@@ -11,6 +11,8 @@
 
 pub mod attn_backend;
 pub mod awq;
+#[cfg(feature = "nccl")]
+mod cu_vendor;
 #[cfg(feature = "cutlass")]
 pub mod cutlass_fp8;
 #[cfg(feature = "cutlass")]
@@ -18,6 +20,8 @@ pub use cutlass_fp8::CutlassWeight;
 #[cfg(feature = "flash_attn2")]
 pub mod flash_attn2;
 pub mod fp8;
+#[cfg(feature = "nccl")]
+pub mod tp;
 pub mod gdn;
 pub mod turboquant;
 pub mod vision;

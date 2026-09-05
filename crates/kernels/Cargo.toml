@@ -45,6 +45,12 @@ cutlass = ["cuda"]
 # own tuned kernels -- see `attn_backend.rs` and the design doc at
 # docs/superpowers/specs/2026-09-05-pluggable-attention-backend-design.md.
 flash_attn2 = ["cuda"]
+# Links NCCL (`libnccl.so`, a prebuilt vendor shared library -- no AOT
+# compile step of our own, unlike `cutlass`/`flash_attn2`) for cross-GPU
+# tensor-parallel communication. Needs INFERO_NCCL_DIR pointing at an install
+# with `include/nccl.h` and `lib/libnccl.so` (e.g. `/usr` after
+# `apt install libnccl2 libnccl-dev`); see build.rs.
+nccl = ["cuda"]
 
 [[example]]
 name = "cutlass_vs_block"

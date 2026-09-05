@@ -14,6 +14,18 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     let have_cutlass = std::env::var_os("CARGO_FEATURE_CUTLASS").is_some();
     let have_flash_attn2 = std::env::var_os("CARGO_FEATURE_FLASH_ATTN2").is_some();
+    let have_nccl = std::env::var_os("CARGO_FEATURE_NCCL").is_some();
+    if have_nccl {
+        // NCCL ships its own prebuilt `.so` -- no AOT compile of our own
+        // source, just a link-search/link-lib, so this doesn't need `nvcc`
+        // and runs regardless of whether cutlass/flash_attn2 are enabled.
+        println!("cargo:rerun-if-env-changed=INFERO_NCCL_DIR");
+        let nccl_dir = resolve_nccl_dir();
+        let nccl_lib = nccl_dir.join("lib/x86_64-linux-gnu");
+        let nccl_lib = if nccl_lib.is_dir() { nccl_lib } else { nccl_dir.join("lib") };
+        println!("cargo:rustc-link-search=native={}", nccl_lib.display());
+        println!("cargo:rustc-link-lib=dylib=nccl");
+    }
     if !have_cutlass && !have_flash_attn2 {
         return;
     }
@@ -190,6 +202,17 @@ fn resolve_cutlass_dir() -> PathBuf {
         "the `cutlass`/`flash_attn2` feature needs a NVIDIA/cutlass checkout -- set \
          INFERO_CUTLASS_DIR (a sparse checkout of just `include/` and `tools/util/` is enough, \
          see crates/kernels/src/cutlass/fp8_bw_gemm.cu's header for which example it tracks)"
+    );
+}
+
+fn resolve_nccl_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("INFERO_NCCL_DIR") {
+        return PathBuf::from(p);
+    }
+    panic!(
+        "the `nccl` feature needs INFERO_NCCL_DIR set to a prefix containing \
+         include/nccl.h and lib/libnccl.so (e.g. /usr after \
+         `apt install libnccl2 libnccl-dev`)"
     );
 }
 
