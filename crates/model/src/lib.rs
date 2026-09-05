@@ -115,6 +115,37 @@ fn attn_partial_bound(max_logit_rows: usize) -> usize {
     max_logit_rows + MIN_PREFILL_RUN
 }
 
+/// Refuse a launch that would index `attn_partial` past what was allocated.
+///
+/// `attn_partial` is split-K scratch, indexed *run-relative* by every kernel
+/// that takes it (`attn_decode`, `attn_prefill_ws4`, `attn_flash`,
+/// `attn_output` — see `Kernels::attn_partial_floats` and
+/// `attn_prefill_mma_ws4_f32`'s `partial + ((c * run_tokens + local_token) *
+/// n_heads + head) * d_head` addressing), so a call needs room for its own
+/// run's token count. Whether the split-K path fires at all is the kernel's
+/// own internal `decode_chunks`/`prefill_chunks` decision, which the host
+/// cannot see from here, so this check is deliberately conservative: it asks
+/// for the room the *worst case* would use.
+///
+/// With `INFERO_SPLIT_MIXED_BATCH` off this can never fire — `attn_partial`
+/// is allocated at the full `batch_tokens` and a pass carries at most that
+/// many tokens — which is why it is unconditional rather than gated, and why
+/// it changes nothing about the default path. With the flag on it is the
+/// difference between a loud, actionable error and a silent write past the
+/// end of the shrunk buffer: exactly the class of bug that surfaces several
+/// kernels later as corrupted, plausible-looking output.
+fn ensure_partial_fits(run_tokens: usize, partial_tokens: usize, who: &str) -> Result<()> {
+    anyhow::ensure!(
+        run_tokens <= partial_tokens,
+        "{who} would index attention partials for {run_tokens} tokens but attn_partial \
+         holds only {partial_tokens}. This shape needs a kernel that does not use the \
+         split-K scratch (`attn_prefill_decoupled6_f16acc` at d_head=256, or the \
+         flash_attn2 backend) to serve its wide prefill runs; unset \
+         INFERO_SPLIT_MIXED_BATCH to restore the full-width buffer"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod attn_partial_bound_tests {
     use super::*;
@@ -150,6 +181,279 @@ mod attn_partial_bound_tests {
         // pushing past `max_seqs`) must raise the bound by exactly as much --
         // the headroom is a flat additive constant, not a multiplier.
         assert_eq!(attn_partial_bound(9), 9 + MIN_PREFILL_RUN);
+    }
+}
+
+/// One contiguous run of *one* sequence's tokens, dispatched as its own
+/// attention-kernel call.
+///
+/// `base` is the run's first token's index into this pass's flat per-token
+/// buffers (`act.q`, `act.attn`, `act.seq_of`, `act.positions`); `tokens` is
+/// its width; `kv_len` is **that item's own** KV extent — its sequence's
+/// length once this run's tokens are appended — and deliberately *not* the
+/// batch-wide maximum `forward_batch_rows` computes for `attn_decode`'s
+/// shared use.
+///
+/// The distinction is load-bearing, not cosmetic. The two numbers differ the
+/// moment a batch mixes sequences at different lengths, which under
+/// continuous batching is the ordinary case (`scheduler.rs::plan()` pairs a
+/// long-running sequence's decode token with another sequence's fresh
+/// prefill chunk every step), and the batch-wide maximum is the wrong number
+/// for a per-item call in more than one way:
+///   - `flash_attn2`'s prefill takes `kv_len` as the *real* key-sequence
+///     length and aligns its causal mask against it
+///     (`crates/kernels/src/flash_attn2.rs`), so a 64-token fresh prefill
+///     handed `kv_len = 5001` from an unrelated concurrent decode would
+///     attend an entirely wrong key range with no mask to save it — silent
+///     wrong output, not a crash.
+///   - `FlashAttn2Ffi::kv_run_is_contiguous` reads `slot_table[0..kv_len]`
+///     for *this* sequence, so an over-long `kv_len` inspects slots past the
+///     sequence's real end.
+///   - `attn_decode`/`attn_prefill_ws4` both derive their split-K chunk count
+///     from `kv_len` (`decode_chunks`/`prefill_chunks`), so an over-large
+///     value spends real launches on ranges every key of which is masked
+///     away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AttnRun {
+    base: usize,
+    tokens: usize,
+    kv_len: usize,
+}
+
+/// How one forward pass's standard-attention work is cut into kernel calls
+/// when `INFERO_SPLIT_MIXED_BATCH` is on — see the
+/// mixed-batch-attn-dispatch-split design doc.
+///
+/// `[0, decode_tokens)` is the batch's contiguous *decode* prefix, answered by
+/// one `attn_decode` call exactly as today (that kernel is per-token and has
+/// never had a single-sequence constraint, which is why several concurrently
+/// decoding sequences can share one launch). Everything after it is one
+/// `AttnRun` per item, each dispatched through the same per-item eligibility
+/// chain a single-item batch already uses today.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttnDispatch {
+    /// Tokens in the batched-decode prefix; 0 when there is no decode group.
+    decode_tokens: usize,
+    /// The prefix's shared `kv_len` — the max over just those items, which is
+    /// the correct value for one `attn_decode` spanning all of them.
+    decode_kv_len: usize,
+    /// One run per item after the decode prefix, in batch order.
+    runs: Vec<AttnRun>,
+}
+
+/// Cut `items` into the batched-decode prefix plus one run per remaining item.
+///
+/// `item_kv_len[i]` is item `i`'s own KV extent, built alongside `starts` in
+/// `forward_batch_rows` (see [`AttnRun`] for why the batch-wide max will not
+/// do here).
+///
+/// Two properties this deliberately guarantees:
+///
+///   - **A single-item batch is left exactly as it is today.** One item is
+///     one run over the whole pass, so the eligibility chain sees the same
+///     `run_base = 0`, `run_tokens = n`, `kv_len` it sees today and picks the
+///     same kernel. That covers ordinary single-sequence prefill *and* a
+///     speculative verification pass (one `Decode` item of `k + 1` tokens,
+///     `spec.rs:628`/`:726`), which today reaches the tile kernels through
+///     `prefill_run` and must keep doing so.
+///   - **Correctness does not depend on the scheduler-ordering invariant.**
+///     The decode prefix is `take_while`, not a filter, so a `Decode` item
+///     appearing *after* a `Prefill` one simply becomes its own single-item
+///     run — which the eligibility chain answers with a per-item
+///     `attn_decode`, the same math. The `debug_assert!` below therefore
+///     reports a real scheduler change loudly in a debug build without
+///     release builds silently misrouting data if it is ever violated.
+fn plan_attn_dispatch(items: &[BatchItem<'_>], item_kv_len: &[usize]) -> AttnDispatch {
+    debug_assert_eq!(
+        items.len(),
+        item_kv_len.len(),
+        "one kv extent per batch item"
+    );
+    if items.len() == 1 {
+        return AttnDispatch {
+            decode_tokens: 0,
+            decode_kv_len: 0,
+            runs: vec![AttnRun {
+                base: 0,
+                tokens: items[0].tokens.len(),
+                kv_len: item_kv_len[0],
+            }],
+        };
+    }
+    let decode_count = items
+        .iter()
+        .take_while(|i| i.kind == BatchItemKind::Decode)
+        .count();
+    debug_assert!(
+        items[decode_count..]
+            .iter()
+            .all(|i| i.kind == BatchItemKind::Prefill),
+        "scheduler ordering invariant violated: decode items must precede prefill items \
+         (see crates/server/src/scheduler.rs::plan(), which fills every Work::Decode \
+         before any Work::Prefill). Dispatch stays correct either way, but a batch \
+         shaped like this means the invariant this split was designed around has changed"
+    );
+    let decode_tokens: usize = items[..decode_count].iter().map(|i| i.tokens.len()).sum();
+    let decode_kv_len = item_kv_len[..decode_count].iter().copied().max().unwrap_or(0);
+    let mut runs = Vec::with_capacity(items.len() - decode_count);
+    let mut base = decode_tokens;
+    for (i, item) in items.iter().enumerate().skip(decode_count) {
+        runs.push(AttnRun {
+            base,
+            tokens: item.tokens.len(),
+            kv_len: item_kv_len[i],
+        });
+        base += item.tokens.len();
+    }
+    AttnDispatch {
+        decode_tokens,
+        decode_kv_len,
+        runs,
+    }
+}
+
+#[cfg(test)]
+mod attn_dispatch_tests {
+    use super::*;
+
+    /// `item_kv_len` exactly as `forward_batch_rows` builds it: the sequence's
+    /// length *before* this item's tokens, plus this item's tokens.
+    fn kv_lens(prior_len: &[usize], items: &[BatchItem<'_>]) -> Vec<usize> {
+        prior_len
+            .iter()
+            .zip(items)
+            .map(|(p, i)| p + i.tokens.len())
+            .collect()
+    }
+
+    /// The real hazard this whole change turns on, in its smallest form: one
+    /// sequence 500 tokens into generation decodes its next token in the same
+    /// batch as a *different*, freshly admitted sequence's first 64-token
+    /// prefill chunk. The batch-wide `kv_len` is 501; the prefill item's own
+    /// is 64. Reusing 501 for the prefill item's dedicated call is the bug
+    /// this test exists to catch — see `AttnRun`'s doc comment for the three
+    /// distinct ways that goes wrong downstream.
+    #[test]
+    fn prefill_run_carries_its_own_kv_len_not_the_batch_max() {
+        let decode_tok = [7u32];
+        let prefill_tok = [3u32; 64];
+        let items = [
+            BatchItem::new(SeqId(0), &decode_tok, BatchItemKind::Decode),
+            BatchItem::new(SeqId(1), &prefill_tok, BatchItemKind::Prefill),
+        ];
+        // Sequence 0 has already generated 500 tokens; sequence 1 is brand new.
+        let item_kv_len = kv_lens(&[500, 0], &items);
+        assert_eq!(item_kv_len, vec![501, 64]);
+        let batch_wide_max = *item_kv_len.iter().max().unwrap();
+        assert_eq!(batch_wide_max, 501);
+
+        let plan = plan_attn_dispatch(&items, &item_kv_len);
+        assert_eq!(plan.decode_tokens, 1, "the one decode item is the prefix");
+        assert_eq!(plan.decode_kv_len, 501, "the decode item's own extent");
+        assert_eq!(plan.runs.len(), 1, "one run for the one prefill item");
+        assert_eq!(plan.runs[0].base, 1, "prefill starts after the decode token");
+        assert_eq!(plan.runs[0].tokens, 64);
+        assert_eq!(
+            plan.runs[0].kv_len, 64,
+            "the prefill item must carry ITS OWN kv extent (64), never the \
+             batch-wide max ({batch_wide_max}) that an unrelated concurrent \
+             decode sequence's position pushed up"
+        );
+        assert_ne!(
+            plan.runs[0].kv_len, batch_wide_max,
+            "reusing the shared batch-wide kv_len here is exactly the bug"
+        );
+    }
+
+    /// The mirror image: the *decode* group must not inherit a long prefill
+    /// item's extent either. Its `kv_len` is the max over the decode items
+    /// alone, because that is the only thing the one shared `attn_decode`
+    /// launch actually spans.
+    #[test]
+    fn decode_group_kv_len_ignores_prefill_items() {
+        let a = [1u32];
+        let b = [2u32];
+        let long = [3u32; 1024];
+        let items = [
+            BatchItem::new(SeqId(0), &a, BatchItemKind::Decode),
+            BatchItem::new(SeqId(1), &b, BatchItemKind::Decode),
+            BatchItem::new(SeqId(2), &long, BatchItemKind::Prefill),
+        ];
+        let item_kv_len = kv_lens(&[40, 12, 3000], &items);
+        assert_eq!(item_kv_len, vec![41, 13, 4024]);
+
+        let plan = plan_attn_dispatch(&items, &item_kv_len);
+        assert_eq!(plan.decode_tokens, 2);
+        assert_eq!(
+            plan.decode_kv_len, 41,
+            "max over the decode items only, not the 4024 the prefill item reaches"
+        );
+        assert_eq!(
+            plan.runs,
+            vec![AttnRun { base: 2, tokens: 1024, kv_len: 4024 }]
+        );
+    }
+
+    /// Two simultaneous prefill items and no decode at all — the other
+    /// ordinary mixed shape (`plan()` fills prefill chunks from several
+    /// admitted prompts in one step). Each gets its own run at its own offset
+    /// with its own extent; no decode call is made.
+    #[test]
+    fn two_prefills_get_one_run_each() {
+        let x = [1u32; 100];
+        let y = [2u32; 30];
+        let items = [
+            BatchItem::new(SeqId(0), &x, BatchItemKind::Prefill),
+            BatchItem::new(SeqId(1), &y, BatchItemKind::Prefill),
+        ];
+        let item_kv_len = kv_lens(&[0, 900], &items);
+        let plan = plan_attn_dispatch(&items, &item_kv_len);
+        assert_eq!(plan.decode_tokens, 0);
+        assert_eq!(
+            plan.runs,
+            vec![
+                AttnRun { base: 0, tokens: 100, kv_len: 100 },
+                AttnRun { base: 100, tokens: 30, kv_len: 930 },
+            ]
+        );
+    }
+
+    /// A single-item batch — of either kind — must stay exactly one whole-pass
+    /// run, so the eligibility chain reproduces today's dispatch bit for bit.
+    /// The `Decode` case is speculative verification's `k + 1` candidates,
+    /// which today reach the tile kernels through `prefill_run` and must keep
+    /// doing so rather than being demoted into the decode group.
+    #[test]
+    fn single_item_batch_is_one_whole_pass_run() {
+        let spec = [1u32; 4];
+        let items = [BatchItem::new(SeqId(0), &spec, BatchItemKind::Decode)];
+        let plan = plan_attn_dispatch(&items, &kv_lens(&[77], &items));
+        assert_eq!(plan.decode_tokens, 0, "no separate decode group at one item");
+        assert_eq!(plan.runs, vec![AttnRun { base: 0, tokens: 4, kv_len: 81 }]);
+
+        let prompt = [1u32; 512];
+        let items = [BatchItem::new(SeqId(0), &prompt, BatchItemKind::Prefill)];
+        let plan = plan_attn_dispatch(&items, &kv_lens(&[0], &items));
+        assert_eq!(plan.decode_tokens, 0);
+        assert_eq!(plan.runs, vec![AttnRun { base: 0, tokens: 512, kv_len: 512 }]);
+    }
+
+    /// An all-decode batch is one `attn_decode` over the whole pass — byte for
+    /// byte the call today's code already makes for this shape.
+    #[test]
+    fn all_decode_batch_is_one_call() {
+        let a = [1u32];
+        let b = [2u32];
+        let c = [3u32];
+        let items = [
+            BatchItem::new(SeqId(0), &a, BatchItemKind::Decode),
+            BatchItem::new(SeqId(1), &b, BatchItemKind::Decode),
+            BatchItem::new(SeqId(2), &c, BatchItemKind::Decode),
+        ];
+        let plan = plan_attn_dispatch(&items, &kv_lens(&[10, 200, 5], &items));
+        assert_eq!(plan.decode_tokens, 3);
+        assert_eq!(plan.decode_kv_len, 201);
+        assert!(plan.runs.is_empty());
     }
 }
 
@@ -807,6 +1111,19 @@ pub struct Model {
     /// `attn_partial_bound` and its allocation site in `Activations::new` for
     /// the full reasoning.
     split_mixed_batch: bool,
+    /// How many tokens `act.attn_partial` was actually allocated for --
+    /// `attn_partial_bound(max_logit_rows)` when `split_mixed_batch` is on,
+    /// the full `batch_tokens` otherwise (see `Activations::new`).
+    ///
+    /// Stored because `attention()` has to *check* it: `attn_partial` is
+    /// split-K scratch indexed run-relative, so every kernel that takes it
+    /// (`attn_decode`, `attn_prefill_ws4`, `attn_flash`, `attn_output`) needs
+    /// room for its own run's token count. With the flag off that check can
+    /// never fire (`partial` is the full `batch_tokens` and a pass carries at
+    /// most that many tokens), which is exactly why it costs nothing to make
+    /// unconditional. With the flag on it is the difference between a loud,
+    /// actionable error and a silent write past the end of the shrunk buffer.
+    attn_partial_tokens: usize,
     /// Which [`AttentionBackend`] serves the `prefill_run` path, resolved
     /// once at load the same way `batch_tokens` is -- see
     /// `docs/superpowers/specs/2026-09-05-pluggable-attention-backend-design.md`.
@@ -1525,6 +1842,7 @@ impl Model {
             max_logit_rows,
             batch_tokens,
             split_mixed_batch,
+            attn_partial_tokens: partial_n_tokens,
             attn_backend_name,
             #[cfg(feature = "flash_attn2")]
             flash_attn2_backend: infero_kernels::flash_attn2::FlashAttn2Ffi::default(),
@@ -1917,6 +2235,16 @@ impl Model {
             Vec::new()
         };
         let mut kv_len = 0usize;
+        // Per *item* real kv extent, alongside the batch-wide `kv_len` just
+        // above. The shared maximum is the right number for one `attn_decode`
+        // spanning several sequences; it is the wrong number the moment an
+        // item is dispatched on its own, which is what
+        // `INFERO_SPLIT_MIXED_BATCH` makes happen -- see [`AttnRun`]'s doc
+        // comment for the three distinct ways reusing the maximum goes wrong.
+        // Built unconditionally (one `usize` per item, no allocation worth
+        // gating) so the plan below reads it without a second pass over
+        // `items`.
+        let mut item_kv_len: Vec<usize> = Vec::with_capacity(items.len());
 
         // Per sequence slot: where its tokens begin in this flat batch, and how
         // long the sequence already was. The recurrence needs the first; the
@@ -1957,6 +2285,7 @@ impl Model {
                 slots.push(slot);
             }
             kv_len = kv_len.max(start + item.tokens.len());
+            item_kv_len.push(start + item.tokens.len());
             // The last `want` of this item's rows, in order, so that a caller
             // reading the logits back finds candidate `j` at row `j`.
             let end = token_ids.len();
@@ -2154,6 +2483,26 @@ impl Model {
         // leaves un-tile-kerneled.
         let prefill_run = single_seq_run.filter(|&t| t >= MIN_PREFILL_RUN);
 
+        // How this pass's standard-attention work is cut into kernel calls,
+        // decided once here rather than 64 times inside the layer loop. `None`
+        // -- the default, `INFERO_SPLIT_MIXED_BATCH` unset -- leaves
+        // `attention()` on exactly the dispatch it has always taken.
+        //
+        // TP is out of scope for this split by design (see the design doc's
+        // Scope section). The partition itself is rank-local and reproducible
+        // (`crates/server/src/tp.rs:108-127` builds each follower's items from
+        // the same plan, in the same order, with the same `kind`), so nothing
+        // here is known to be wrong under TP -- it is simply unvalidated, and
+        // asserts rather than silently claiming coverage it doesn't have.
+        let attn_dispatch = self.split_mixed_batch.then(|| {
+            debug_assert!(
+                !self.tp_active(),
+                "mixed-batch attention dispatch split is not TP-aware yet \
+                 (see the design doc's Scope/Error Handling sections)"
+            );
+            plan_attn_dispatch(items, &item_kv_len)
+        });
+
         let armed = self.gdn_rollback.as_ref().is_some_and(|r| r.is_armed());
         let key = (
             pool.id(),
@@ -2161,8 +2510,30 @@ impl Model {
             kv_len.next_multiple_of(graph_kv_bucket()),
             armed,
         );
-        let graphable =
-            self.use_graph && self.offload.is_none() && key.2 <= self.max_seq && prefill_run.is_none();
+        // A pass whose attention dispatch depends on *this call's item layout*
+        // must not be captured or replayed: a graph is keyed by `(pool,
+        // n_tokens, bucketed kv_len, armed)`, and two batches sharing that key
+        // can still differ in how their tokens are split across items -- the
+        // exact hazard the long comment above already spells out for
+        // `prefill_run`. Today only `prefill_run` (a one-item pass) reads the
+        // item layout; with the split on, so does any pass that issues more
+        // than one attention call, since where each call's `run_base`/
+        // `run_tokens` fall is read off `items` and not off device memory.
+        //
+        // A pass that still issues exactly ONE call is *not* layout-dependent:
+        // its single run covers `[0, n_tokens)` with the batch's own `kv_len`,
+        // both already in the graph key. That is deliberately the common case
+        // -- an ordinary single-sequence decode step, and a multi-sequence
+        // all-decode step -- so graph replay, which only ever fires for decode
+        // shapes anyway, keeps working exactly as it does today.
+        let layout_dependent_dispatch = attn_dispatch.as_ref().is_some_and(|p| {
+            usize::from(p.decode_tokens > 0) + p.runs.len() > 1
+        });
+        let graphable = self.use_graph
+            && self.offload.is_none()
+            && key.2 <= self.max_seq
+            && prefill_run.is_none()
+            && !layout_dependent_dispatch;
 
         match self.graphs.get(&key) {
             Some(GraphSlot::Ready(g)) if graphable => g.0.launch()?,
@@ -2192,7 +2563,16 @@ impl Model {
                         if self.layer_kinds[layer] {
                             self.linear_attention(layer, n_tokens, pool, s, single_seq_slot)?;
                         } else {
-                            self.attention(layer, n_tokens, kv, dims, pool, s, prefill_run)?;
+                            self.attention(
+                                layer,
+                                n_tokens,
+                                kv,
+                                dims,
+                                pool,
+                                s,
+                                prefill_run,
+                                attn_dispatch.as_ref(),
+                            )?;
                         }
                         self.feed_forward(layer, n_tokens, s)?;
                         self.release_layer(s)?;
@@ -3212,6 +3592,11 @@ impl Model {
         pool: &mut KvPool,
         slot: Option<usize>,
         prefill_run: Option<usize>,
+        // `Some` only when `INFERO_SPLIT_MIXED_BATCH` is on: how this pass's
+        // attention work is cut into per-subgroup kernel calls, planned once
+        // per batch by `plan_attn_dispatch`. `None` (the default) takes the
+        // one-call-per-pass dispatch this function has always taken.
+        dispatch: Option<&AttnDispatch>,
     ) -> Result<()> {
         let stage = slot.map(|s| &self.offload.as_ref().unwrap().stage[s]);
         let cfg = &self.cfg;
@@ -3744,13 +4129,6 @@ impl Model {
                 }
 
                 let table = pool.slot_table().as_view();
-                let batch = BatchLayout {
-                    seq_of: &seq_of,
-                    positions: &batch_positions,
-                    slot_table: &table,
-                    table_stride,
-                };
-                let (attn_out, partial) = (&mut self.act.attn, &mut self.act.attn_partial);
                 // Whether the output projection will read its activation as
                 // f16. When it will, the combine writes that copy instead of a
                 // `f32_to_f16` launch reading the f32 back — the other half of
@@ -3767,6 +4145,50 @@ impl Model {
                     )
                     && Kernels::mmq_f16_variant_for_shape(l.attn().wo.ty, l.attn().wo.n).is_some()
                     && Self::mmq_shape_ok(&l.attn().wo);
+
+                // Everything the per-run dispatch below reads, bound out of
+                // `self`/`pool` once so the closure captures plain locals
+                // rather than overlapping field paths.
+                let kern = &self.kern;
+                let dev = &self.dev;
+                let backend_name = self.attn_backend_name;
+                #[cfg(feature = "flash_attn2")]
+                let fa2 = &self.flash_attn2_backend;
+                let partial_tokens = self.attn_partial_tokens;
+                let q_buf = &self.act.q;
+                let seq_of_buf = &self.act.seq_of;
+                let pos_buf = &self.act.positions;
+                let (k_cache, v_cache) = pool.dense(layer);
+                let scores_buf = &mut self.act.scores;
+                let x16_buf = &mut self.scratch.x16;
+                let (attn_out, partial) = (&mut self.act.attn, &mut self.act.attn_partial);
+
+                // One contiguous run of tokens through the attention kernels:
+                // the whole pass today, or one subgroup of it when
+                // `INFERO_SPLIT_MIXED_BATCH` is on.
+                //
+                // This is the single copy of the eligibility chain. Both
+                // dispatch shapes below call it, so a future change to which
+                // kernel wins a given shape cannot drift between them --
+                // called once with `(base = 0, run_tokens = n, run_kv_len =
+                // kv_len, tile_eligible = prefill_run.is_some())` it is
+                // byte-for-byte the dispatch this function has always made.
+                //
+                // `tile_eligible` carries what `prefill_run` used to: this run
+                // is one sequence's contiguous, causal, `MIN_PREFILL_RUN`-wide
+                // token range, which is the tile kernels' own precondition.
+                // Every *item* satisfies the contiguity half by construction
+                // (`forward_batch_rows` lays each item's tokens out in order,
+                // positions increasing by one), so per item the gate is just
+                // the width; for the whole-pass call it additionally needs the
+                // pass to be one item, which is what `prefill_run` already
+                // encodes.
+                //
+                // Returns whether the f16 activation copy was actually
+                // written (only `attn_decode`'s multi-chunk combine writes
+                // one), which the output projection needs to know rather than
+                // assume.
+                //
                 // The fused decode kernel measures *level* with the three it
                 // replaces on a microbenchmark, and wins by 4.7% in the served
                 // engine — 4150 tok/s to 4344 at 32 clients. The difference is
@@ -3779,11 +4201,6 @@ impl Model {
                 // So a kernel is not slow or fast on its own, and neither
                 // number here was wrong. `INFERO_DECODE_ATTN=0` restores the
                 // three.
-                // `prefill_run` is `Some(n)` only when this whole pass is one
-                // item — one sequence, `n` tokens, contiguous, causal — which
-                // `attn_prefill_ws4` requires and the caller
-                // (`forward_batch_rows`) has already checked; see its own doc
-                // comment for why a narrower run is not attempted here.
                 //
                 // `_ws4`, not `_ws`: a real 13.4% win on the isolated 16-layer
                 // x 30552-token benchmark (2277ms -> 2008ms) from dropping Q's
@@ -3803,165 +4220,257 @@ impl Model {
                 // before this backend existed) runs exactly as it always
                 // has.
                 //
-                // `prefill_run` alone is not enough to route here: it only
-                // says this pass is one sequence's contiguous *token range*,
-                // which is `attn_prefill_ws4`'s own precondition (it reads
-                // `batch.slot_table` per token regardless, so it never cared
-                // about physical layout) -- `flash_attn2` additionally needs
-                // that sequence's *physical KV-pool slots* for `0..kv_len` to
-                // be one flat region, which a fresh single-shot prefill
-                // happens to get but a multi-turn request continuing an
-                // existing sequence, or one drawn from a fragmented pool,
-                // is not guaranteed to. Real traffic hits both regularly.
-                // Checking here (once, cheaply -- a small device-to-host
-                // copy of this one sequence's slot range) and falling back
-                // to `InferoHandRolled` below when it fails is what keeps
-                // that a plain, correct, silent fallback instead of a 500.
-                #[cfg(feature = "flash_attn2")]
-                let vendor_backend_run = if self.attn_backend_name != "handrolled" {
-                    prefill_run.filter(|_| {
-                        infero_kernels::flash_attn2::FlashAttn2Ffi::kv_run_is_contiguous(
-                            self.dev.stream(),
-                            &batch,
-                            kv_len,
-                        )
-                        .unwrap_or(false)
-                    })
-                } else {
-                    None
-                };
-                #[cfg(not(feature = "flash_attn2"))]
-                let vendor_backend_run =
-                    if self.attn_backend_name != "handrolled" { prefill_run } else { None };
-                if let Some(run_tokens) = vendor_backend_run {
+                // Tile eligibility alone is not enough to route to the vendor
+                // backend: it only says this run is one sequence's contiguous
+                // *token range*, which is `attn_prefill_ws4`'s own
+                // precondition (it reads `batch.slot_table` per token
+                // regardless, so it never cared about physical layout) --
+                // `flash_attn2` additionally needs that sequence's *physical
+                // KV-pool slots* for `0..kv_len` to be one flat region, which
+                // a fresh single-shot prefill happens to get but a multi-turn
+                // request continuing an existing sequence, or one drawn from a
+                // fragmented pool, is not guaranteed to. Real traffic hits
+                // both regularly. Checking here (once, cheaply -- a small
+                // device-to-host copy of this one sequence's slot range) and
+                // falling back to `InferoHandRolled` below when it fails is
+                // what keeps that a plain, correct, silent fallback instead of
+                // a 500.
+                let mut run_attn = |base: usize,
+                                    run_tokens: usize,
+                                    run_kv_len: usize,
+                                    tile_eligible: bool,
+                                    want_h: bool|
+                 -> Result<bool> {
+                    let lo = base * da;
+                    let hi = (base + run_tokens) * da;
+                    let run_dims = AttnDims { n_tokens: run_tokens, ..dims };
+                    // `slot_table`/`table_stride` are pool-wide constants, not
+                    // batch-specific, so a subgroup layout only reslices the
+                    // two per-token arrays.
+                    let run_seq_of = seq_of_buf.slice(base..base + run_tokens);
+                    let run_positions = pos_buf.slice(base..base + run_tokens);
+                    let batch = BatchLayout {
+                        seq_of: &run_seq_of,
+                        positions: &run_positions,
+                        slot_table: &table,
+                        table_stride,
+                    };
+                    let mut wrote_h16 = false;
                     #[cfg(feature = "flash_attn2")]
-                    {
-                        let mut ctx = AttnCallCtx {
-                            out: &mut attn_out.slice_mut(..n * da),
-                            q: &self.act.q.slice(..n * da),
-                            k_cache: &pool.dense(layer).0.as_view(),
-                            v_cache: &pool.dense(layer).1.as_view(),
-                            batch,
-                            dims,
-                            run_base: 0,
-                            run_tokens,
-                            kv_len,
-                            scale: attn_scale,
-                            partial: &mut partial.as_view_mut(),
-                            stream: self.dev.stream(),
-                            kern: &self.kern,
-                        };
-                        self.flash_attn2_backend.prefill(&mut ctx)?;
-                    }
-                    #[cfg(not(feature = "flash_attn2"))]
-                    {
-                        let _ = run_tokens;
-                        unreachable!(
-                            "attn_backend_name={:?} but the flash_attn2 feature isn't compiled in",
-                            self.attn_backend_name
-                        );
-                    }
-                } else if let Some(run_tokens) = prefill_run.filter(|_| self.kern.prefill_attention(&dims)) {
-                    // T=6 of the decoupled-role attention family: a real,
-                    // register-checked, correctness-tested (against the
-                    // three-kernel reference), memcheck/racecheck-clean
-                    // (0 hazards), and reproduced-twice real end-to-end win
-                    // over `ws4` (1.082x, 1827ms vs 1976ms on the
-                    // 16-layer/30552-token benchmark) -- see
-                    // `attn_prefill_decoupled6_f16acc_regcheck_f32`'s doc
-                    // comment in `ops.cu`. Fixed at `d_head=256`
-                    // (`ATTN_DSPLIT_HALF_NTILES` assumes it), unlike `ws4`
-                    // which `prefill_attention` allows up to 256 but does
-                    // not require exactly -- guarded here explicitly. No
-                    // multi-chunk (`partial`) path of its own yet, unlike
-                    // `ws4`'s `grid.z` chunking for small-`n_tiles`/huge-
-                    // `kv_len` shapes -- fine for this checkpoint's real
-                    // batch sizes (already exercises multi-chunk `ws4`
-                    // internally in the very benchmark that measured this
-                    // win), but not yet generalized. `INFERO_PREFILL_T6=0`
-                    // falls back to `ws4` if this needs to be rolled back.
-                    if dims.d_head == 256 && !std::env::var("INFERO_PREFILL_T6").is_ok_and(|v| v == "0") {
-                        self.kern.attn_prefill_decoupled6_f16acc(
-                            &mut attn_out.slice_mut(..n * da),
-                            &self.act.q.slice(..n * da),
-                            &pool.dense(layer).0.as_view(),
-                            &pool.dense(layer).1.as_view(),
-                            batch,
-                            dims,
-                            0,
-                            run_tokens,
-                            kv_len,
-                            attn_scale,
-                        )?;
+                    let vendor_backend_run = if backend_name != "handrolled" {
+                        tile_eligible.then_some(run_tokens).filter(|_| {
+                            infero_kernels::flash_attn2::FlashAttn2Ffi::kv_run_is_contiguous(
+                                dev.stream(),
+                                &batch,
+                                run_kv_len,
+                            )
+                            .unwrap_or(false)
+                        })
                     } else {
-                        self.kern.attn_prefill_ws4(
-                            &mut attn_out.slice_mut(..n * da),
-                            &self.act.q.slice(..n * da),
-                            &pool.dense(layer).0.as_view(),
-                            &pool.dense(layer).1.as_view(),
+                        None
+                    };
+                    #[cfg(not(feature = "flash_attn2"))]
+                    let vendor_backend_run = if backend_name != "handrolled" {
+                        tile_eligible.then_some(run_tokens)
+                    } else {
+                        None
+                    };
+                    if let Some(run_tokens) = vendor_backend_run {
+                        #[cfg(feature = "flash_attn2")]
+                        {
+                            let mut ctx = AttnCallCtx {
+                                out: &mut attn_out.slice_mut(lo..hi),
+                                q: &q_buf.slice(lo..hi),
+                                k_cache: &k_cache.as_view(),
+                                v_cache: &v_cache.as_view(),
+                                batch,
+                                dims: run_dims,
+                                run_base: 0,
+                                run_tokens,
+                                kv_len: run_kv_len,
+                                scale: attn_scale,
+                                partial: &mut partial.as_view_mut(),
+                                stream: dev.stream(),
+                                kern,
+                            };
+                            fa2.prefill(&mut ctx)?;
+                        }
+                        #[cfg(not(feature = "flash_attn2"))]
+                        {
+                            let _ = run_tokens;
+                            unreachable!(
+                                "attn_backend_name={:?} but the flash_attn2 feature isn't compiled in",
+                                backend_name
+                            );
+                        }
+                    } else if tile_eligible && kern.prefill_attention(&run_dims) {
+                        // T=6 of the decoupled-role attention family: a real,
+                        // register-checked, correctness-tested (against the
+                        // three-kernel reference), memcheck/racecheck-clean
+                        // (0 hazards), and reproduced-twice real end-to-end
+                        // win over `ws4` (1.082x, 1827ms vs 1976ms on the
+                        // 16-layer/30552-token benchmark) -- see
+                        // `attn_prefill_decoupled6_f16acc_regcheck_f32`'s doc
+                        // comment in `ops.cu`. Fixed at `d_head=256`
+                        // (`ATTN_DSPLIT_HALF_NTILES` assumes it), unlike `ws4`
+                        // which `prefill_attention` allows up to 256 but does
+                        // not require exactly -- guarded here explicitly. No
+                        // multi-chunk (`partial`) path of its own yet, unlike
+                        // `ws4`'s `grid.z` chunking for small-`n_tiles`/huge-
+                        // `kv_len` shapes -- fine for this checkpoint's real
+                        // batch sizes (already exercises multi-chunk `ws4`
+                        // internally in the very benchmark that measured this
+                        // win), but not yet generalized. `INFERO_PREFILL_T6=0`
+                        // falls back to `ws4` if this needs to be rolled back.
+                        if run_dims.d_head == 256
+                            && !std::env::var("INFERO_PREFILL_T6").is_ok_and(|v| v == "0")
+                        {
+                            kern.attn_prefill_decoupled6_f16acc(
+                                &mut attn_out.slice_mut(lo..hi),
+                                &q_buf.slice(lo..hi),
+                                &k_cache.as_view(),
+                                &v_cache.as_view(),
+                                batch,
+                                run_dims,
+                                0,
+                                run_tokens,
+                                run_kv_len,
+                                attn_scale,
+                            )?;
+                        } else {
+                            ensure_partial_fits(run_tokens, partial_tokens, "attn_prefill_ws4")?;
+                            kern.attn_prefill_ws4(
+                                &mut attn_out.slice_mut(lo..hi),
+                                &q_buf.slice(lo..hi),
+                                &k_cache.as_view(),
+                                &v_cache.as_view(),
+                                batch,
+                                run_dims,
+                                0,
+                                run_tokens,
+                                run_kv_len,
+                                attn_scale,
+                                &mut partial.as_view_mut(),
+                            )?;
+                        }
+                    } else if !std::env::var("INFERO_DECODE_ATTN").is_ok_and(|v| v == "0")
+                        && kern.decode_attention(&run_dims, run_kv_len)
+                    {
+                        ensure_partial_fits(run_tokens, partial_tokens, "attn_decode")?;
+                        let mut h16 = x16_buf.slice_mut(lo..hi);
+                        wrote_h16 = kern.attn_decode(
+                            &mut attn_out.slice_mut(lo..hi),
+                            want_h.then_some(&mut h16),
+                            &q_buf.slice(lo..hi),
+                            &k_cache.as_view(),
+                            &v_cache.as_view(),
                             batch,
-                            dims,
-                            0,
-                            run_tokens,
-                            kv_len,
+                            run_dims,
+                            run_kv_len,
                             attn_scale,
                             &mut partial.as_view_mut(),
                         )?;
+                    } else if kern.flash_attention(&run_dims, run_kv_len) {
+                        ensure_partial_fits(run_tokens, partial_tokens, "attn_flash")?;
+                        kern.attn_flash(
+                            &mut attn_out.slice_mut(lo..hi),
+                            &q_buf.slice(lo..hi),
+                            &k_cache.as_view(),
+                            &v_cache.as_view(),
+                            batch,
+                            run_dims,
+                            run_kv_len,
+                            attn_scale,
+                            &mut partial.as_view_mut(),
+                        )?;
+                    } else {
+                        ensure_partial_fits(run_tokens, partial_tokens, "attn_output")?;
+                        let run_score_len = n_heads * run_tokens * run_kv_len;
+                        kern.attn_scores(
+                            &mut scores_buf.slice_mut(..run_score_len),
+                            &q_buf.slice(lo..hi),
+                            &k_cache.as_view(),
+                            batch,
+                            run_dims,
+                            run_kv_len,
+                            attn_scale,
+                        )?;
+                        kern.attn_softmax(
+                            &mut scores_buf.slice_mut(..run_score_len),
+                            n_heads,
+                            run_tokens,
+                            run_kv_len,
+                        )?;
+                        kern.attn_output(
+                            &mut attn_out.slice_mut(lo..hi),
+                            &scores_buf.slice(..run_score_len),
+                            &v_cache.as_view(),
+                            batch,
+                            run_dims,
+                            run_kv_len,
+                            Some(&mut partial.as_view_mut()),
+                        )?;
+                        probe(kern, layer, "attn_out", &attn_out.slice(lo..hi));
                     }
-                } else if !std::env::var("INFERO_DECODE_ATTN").is_ok_and(|v| v == "0")
-                    && self.kern.decode_attention(&dims, kv_len)
-                {
-                    let mut h16 = self.scratch.x16.slice_mut(..n * da);
-                    attn_f16 = self.kern.attn_decode(
-                        &mut attn_out.slice_mut(..n * da),
-                        wo_f16.then_some(&mut h16),
-                        &self.act.q.slice(..n * da),
-                        &pool.dense(layer).0.as_view(),
-                        &pool.dense(layer).1.as_view(),
-                        batch,
-                        dims,
-                        kv_len,
-                        attn_scale,
-                        &mut partial.as_view_mut(),
-                    )?;
-                } else if self.kern.flash_attention(&dims, kv_len) {
-                    self.kern.attn_flash(
-                        &mut attn_out.slice_mut(..n * da),
-                        &self.act.q.slice(..n * da),
-                        &pool.dense(layer).0.as_view(),
-                        &pool.dense(layer).1.as_view(),
-                        batch,
-                        dims,
-                        kv_len,
-                        attn_scale,
-                        &mut partial.as_view_mut(),
-                    )?;
-                } else {
-                    self.kern.attn_scores(
-                        &mut self.act.scores.slice_mut(..score_len),
-                        &self.act.q.slice(..n * da),
-                        &pool.dense(layer).0.as_view(),
-                        batch,
-                        dims,
-                        kv_len,
-                        attn_scale,
-                    )?;
-                    self.kern.attn_softmax(
-                        &mut self.act.scores.slice_mut(..score_len),
-                        n_heads,
-                        n,
-                        kv_len,
-                    )?;
-                    self.kern.attn_output(
-                        &mut attn_out.slice_mut(..n * da),
-                        &self.act.scores.slice(..score_len),
-                        &pool.dense(layer).1.as_view(),
-                        batch,
-                        dims,
-                        kv_len,
-                        Some(&mut partial.as_view_mut()),
-                    )?;
-                    probe(&self.kern, layer, "attn_out", &self.act.attn.slice(..n * da));
+                    Ok(wrote_h16)
+                };
+
+                match dispatch {
+                    // `INFERO_SPLIT_MIXED_BATCH` on: the batch's decode prefix
+                    // takes one `attn_decode` (that kernel is per-token and
+                    // has never had a single-sequence constraint, which is why
+                    // several concurrently-decoding sequences have always been
+                    // able to share one launch), and every item after it takes
+                    // its own call through the same eligibility chain -- so a
+                    // wide prefill chunk riding along with a decode step is no
+                    // longer swept into `attn_decode` just because the batch
+                    // isn't exactly one item. See the design doc.
+                    Some(plan) => {
+                        // The f16 activation copy is a whole-`n`-row artifact:
+                        // the output projection reads `[0, n)` of `x16` and
+                        // `attn_f16` is one flag for all of them. Only
+                        // `attn_decode`'s combine writes it, so a pass split
+                        // across several calls would leave the rows the other
+                        // calls answered holding a previous layer's values
+                        // while `attn_f16` claimed they were fresh. Offer it
+                        // exactly when one call covers the whole pass, which
+                        // is every shape that could have had it before the
+                        // split existed anyway (a single-item pass, or an
+                        // all-decode batch).
+                        let one_call =
+                            plan.runs.is_empty() || (plan.decode_tokens == 0 && plan.runs.len() == 1);
+                        let want_h = wo_f16 && one_call;
+                        if plan.decode_tokens > 0 {
+                            attn_f16 = run_attn(
+                                0,
+                                plan.decode_tokens,
+                                plan.decode_kv_len,
+                                // The decode subgroup spans several sequences
+                                // in general; the tile kernels cannot take it
+                                // at any width. A one-item pass never reaches
+                                // here (`plan_attn_dispatch` makes it a single
+                                // run instead), so nothing that used a tile
+                                // kernel before loses it.
+                                false,
+                                want_h,
+                            )?;
+                        }
+                        for run in &plan.runs {
+                            let wrote = run_attn(
+                                run.base,
+                                run.tokens,
+                                run.kv_len,
+                                run.tokens >= MIN_PREFILL_RUN,
+                                want_h,
+                            )?;
+                            attn_f16 = attn_f16 || wrote;
+                        }
+                    }
+                    // Flag off (the default): one call for the whole pass,
+                    // exactly as before this split existed.
+                    None => {
+                        attn_f16 = run_attn(0, n, kv_len, prefill_run.is_some(), wo_f16)?;
+                    }
                 }
             }
             Some(tq) => {
@@ -4048,6 +4557,16 @@ impl Model {
                 // rather than bytes. `INFERO_TQ_DECODE_ATTN=0` restores the
                 // three-kernel path this replaces.
                 if self.kern.tq_decode_attention(&dims) {
+                    // The TurboQuant path is deliberately NOT split by
+                    // `INFERO_SPLIT_MIXED_BATCH` -- it keeps its one
+                    // whole-batch call -- but it reads the same `attn_partial`
+                    // buffer the flag shrinks, at the full `n`. So it needs
+                    // the same bounds check the dense path's kernels get, or
+                    // enabling the flag on a TurboQuant-quantized KV cache
+                    // would write past the end of the shrunk buffer with
+                    // nothing to notice. With the flag off this cannot fire
+                    // (`partial` is the full `batch_tokens` wide).
+                    ensure_partial_fits(n, self.attn_partial_tokens, "tq_attn_decode")?;
                     let (kcodes, ksigns, kscale, kgamma) = pool.tq_key(layer);
                     let (vcodes, vscale) = pool.tq_value(layer);
                     self.kern.tq_attn_decode(
