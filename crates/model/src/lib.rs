@@ -799,10 +799,13 @@ pub struct Model {
     /// context length. See [`batch_tokens_for`].
     batch_tokens: usize,
     /// Whether the mixed-batch-attn-dispatch-split path is enabled, resolved
-    /// once at load from `INFERO_SPLIT_MIXED_BATCH` (default on; `="0"`
-    /// reverts to today's single-call-per-batch `attn_decode` fallback and
-    /// the full-`batch_tokens`-wide `attn_partial`). See `attn_partial_bound`
-    /// and its allocation site in `Activations::new`.
+    /// once at load from `INFERO_SPLIT_MIXED_BATCH` (default OFF; `="1"` opts
+    /// in to the smaller `attn_partial_bound`-sized `attn_partial`). Defaults
+    /// OFF -- not on -- because enabling it before Task 5's dispatch-split
+    /// lands shrinks `attn_partial` while the *dispatch* logic that makes that
+    /// safe under a real multi-item batch doesn't exist yet; see
+    /// `attn_partial_bound` and its allocation site in `Activations::new` for
+    /// the full reasoning.
     split_mixed_batch: bool,
     /// Which [`AttentionBackend`] serves the `prefill_run` path, resolved
     /// once at load the same way `batch_tokens` is -- see
@@ -1359,16 +1362,23 @@ impl Model {
         // those two always-on unconditional readers, which would have written
         // past an undersized buffer.
         //
-        // `INFERO_SPLIT_MIXED_BATCH` (default on) resolved once here, the
-        // same "resolved once at load" pattern as `batch_tokens`/
-        // `attn_backend_name` above -- Task 4/5 read this field when deciding
-        // whether a batch's decode/prefill items get dispatched separately.
-        // `="0"` reproduces today's exact behavior: `attn_partial` allocated
-        // at the full `batch_tokens` width, same as before this plan. This
-        // resolution only decides `attn_partial`'s size here in Task 3 --
-        // the dispatch split itself that makes the smaller size safe under a
-        // real multi-item batch is Task 5's job, not implemented yet.
-        let split_mixed_batch = !std::env::var("INFERO_SPLIT_MIXED_BATCH").is_ok_and(|v| v == "0");
+        // `INFERO_SPLIT_MIXED_BATCH` resolved once here, the same "resolved
+        // once at load" pattern as `batch_tokens`/`attn_backend_name` above --
+        // Task 4/5 read this field when deciding whether a batch's
+        // decode/prefill items get dispatched separately.
+        //
+        // Defaults OFF -- flipping this before Task 5's dispatch-split lands
+        // is unsafe (see this function's own comment just above, `attn_decode`
+        // and `InferoHandRolled`'s prefill path both read/write `attn_partial`
+        // at up to the full chunk width, unconditionally, today -- exactly
+        // the documented failure mode a prior conditional-skip attempt hit).
+        // Task 5/7 should flip this default once the dispatch split is
+        // verified. Until then, `="1"` is an explicit, Task-4/5-testing-only
+        // opt-in into the smaller `attn_partial_bound`-sized buffer; leaving
+        // it unset (the default for any real deploy) reproduces today's exact
+        // behavior: `attn_partial` allocated at the full `batch_tokens` width,
+        // same as before this plan.
+        let split_mixed_batch = std::env::var("INFERO_SPLIT_MIXED_BATCH").is_ok_and(|v| v == "1");
         let partial_n_tokens = if split_mixed_batch {
             attn_partial_bound(max_logit_rows)
         } else {
@@ -1561,7 +1571,8 @@ impl Model {
     }
 
     /// Whether the mixed-batch-attn-dispatch-split path is enabled
-    /// (`INFERO_SPLIT_MIXED_BATCH`, default on), resolved once at load. See
+    /// (`INFERO_SPLIT_MIXED_BATCH`, default OFF -- unsafe to flip before
+    /// Task 5's dispatch-split lands), resolved once at load. See
     /// `attn_partial_bound`.
     pub fn split_mixed_batch(&self) -> bool {
         self.split_mixed_batch
@@ -5446,10 +5457,10 @@ impl Activations {
             //
             // Task 3: `partial_n_tokens` is the caller's resolved
             // `attn_partial_bound(max_logit_rows)` (== `max_logit_rows +
-            // MIN_PREFILL_RUN`) when `INFERO_SPLIT_MIXED_BATCH` is enabled
-            // (the default), or `chunk` (today's exact behavior) when it's
-            // disabled via `="0"` -- see `from_parts`'s own `split_mixed_batch`
-            // resolution, next to `batch_tokens`/`attn_backend_name`. Passed
+            // MIN_PREFILL_RUN`) when `INFERO_SPLIT_MIXED_BATCH=1` opts in, or
+            // `chunk` (today's exact, safe, default behavior -- the flag
+            // defaults OFF, see `from_parts`'s own `split_mixed_batch`
+            // resolution for why) otherwise. Passed
             // in as its own parameter rather than derived here so this
             // allocation site doesn't need to re-decide the flag itself. Every
             // OTHER buffer in this struct still uses `chunk` unconditionally
