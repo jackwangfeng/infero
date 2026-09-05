@@ -725,6 +725,13 @@ pub struct Model {
     /// field existed, would silently defeat that reuse every single call.
     #[cfg(feature = "flash_attn2")]
     flash_attn2_backend: infero_kernels::flash_attn2::FlashAttn2Ffi,
+    /// This rank's tensor-parallel communicator, `None` at `tp_size == 1`
+    /// (today's exact single-GPU behavior -- every `attention()`/FFN call
+    /// site guards its `ncclAllReduce` on `self.comm.is_some()`, so a build
+    /// or a run with no TP pays nothing extra and takes no different code
+    /// path). Set once by [`Model::load_full_tp`], never after.
+    #[cfg(feature = "nccl")]
+    comm: Option<Arc<infero_kernels::tp::NcclComm>>,
     max_seq: usize,
     /// Per layer, whether it mixes with a recurrence. Cached because the pool
     /// needs it to size the state and the layer loop consults it every block.
@@ -959,6 +966,7 @@ impl Model {
         n_gpu_layers: usize,
         max_logit_rows: usize,
         rank: &crate::tp::RankId,
+        run_id: &str,
     ) -> Result<Self> {
         let max_logit_rows = max_logit_rows.clamp(1, MAX_BATCH_TOKENS);
         let mut cfg = Config::from_gguf(f)?;
@@ -970,7 +978,19 @@ impl Model {
 
         let shard = (rank.tp_size > 1).then_some((rank.tp_rank, rank.tp_size));
         let w = Weights::load_sharded(&dev, f, &cfg, n_gpu_layers, shard)?;
-        Self::from_parts(dev, kern, cfg, w, max_seq, kv_quant, max_logit_rows)
+        let mut model = Self::from_parts(dev, kern, cfg, w, max_seq, kv_quant, max_logit_rows)?;
+        if rank.tp_size > 1 {
+            use crate::tp::{LocalFileBootstrap, RankBootstrap};
+            let bootstrap = LocalFileBootstrap { run_id: run_id.to_string() };
+            let unique_id = bootstrap.broadcast_unique_id(rank)?;
+            let comm = infero_kernels::tp::NcclComm::init_rank(
+                &unique_id,
+                rank.tp_rank as i32,
+                rank.tp_size as i32,
+            )?;
+            model.comm = Some(Arc::new(comm));
+        }
+        Ok(model)
     }
 
     /// An AWQ checkpoint directory, as Hugging Face ships one.
@@ -1279,6 +1299,12 @@ impl Model {
             attn_backend_name,
             #[cfg(feature = "flash_attn2")]
             flash_attn2_backend: infero_kernels::flash_attn2::FlashAttn2Ffi::default(),
+            // Set by `load_full_tp` after construction, at `tp_size > 1` --
+            // `from_parts` itself has no rank/communicator to give it, and
+            // every other caller (the non-TP load paths) wants exactly
+            // `None`, i.e. today's behavior.
+            #[cfg(feature = "nccl")]
+            comm: None,
             max_seq,
             layer_kinds,
             logit_rows: 0,
@@ -2786,6 +2812,13 @@ impl Model {
             None,
             false,
         )?;
+        // `out_proj` is row-parallel (contracts over `val_dim`, this rank's
+        // own head shard) -- `proj` is only this rank's partial sum until
+        // every rank's slice is summed in.
+        #[cfg(feature = "nccl")]
+        if let Some(comm) = self.comm.clone() {
+            comm.all_reduce_sum_f32(&mut proj.slice_mut(..n * d), n * d, self.dev.stream())?;
+        }
 
         // Same residual protocol as `attention`: leave the block's output in
         // `proj` when the FFN's norm will absorb it, add it here otherwise. A
@@ -2795,6 +2828,27 @@ impl Model {
                 .add_assign(&mut x.slice_mut(..n * d), &proj.slice(..n * d), n * d)?;
         }
         Ok(())
+    }
+
+    /// Whether this rank is part of a real (`tp_size > 1`) tensor-parallel
+    /// group -- `false` on every build without the `nccl` feature and every
+    /// run with no TP. A row-parallel projection's fused mat-vec-plus-
+    /// residual-add path (`mmvq_add`, used by both `attention` and
+    /// `feed_forward` when the shape qualifies) adds straight into the
+    /// residual buffer with no intermediate buffer to run an all-reduce on
+    /// before the add happens -- rather than teach that fused kernel about
+    /// NCCL, this forces the already-existing separate (`matmul_pre` then
+    /// `add_assign`) path when TP is active, trading the fusion's small
+    /// perf win for a real all-reduce point between the matmul and the add.
+    fn tp_active(&self) -> bool {
+        #[cfg(feature = "nccl")]
+        {
+            self.comm.is_some()
+        }
+        #[cfg(not(feature = "nccl"))]
+        {
+            false
+        }
     }
 
     fn attention(
@@ -3718,7 +3772,7 @@ impl Model {
         // erroring. Moving the gate above this branch instead of excluding
         // gated layers from it keeps the fused mat-vec-plus-residual-add for
         // them too, rather than paying for a separate `add_assign` a layer.
-        if l.attn().bo.is_none() && Self::residual_fusable(&l.attn().wo, n, self.use_mmvq) {
+        if l.attn().bo.is_none() && !self.tp_active() && Self::residual_fusable(&l.attn().wo, n, self.use_mmvq) {
             // `da`, not `d`: this projection contracts over the attention
             // interior and produces the residual width. The two are equal on
             // every model that reached this branch before Qwen3-30B-A3B, whose
@@ -3759,6 +3813,16 @@ impl Model {
             None,
             attn_f16,
         )?;
+        // `wo` is row-parallel (contracts over `da`, this rank's own head
+        // shard) -- `self.act.proj` is only this rank's partial sum until
+        // every rank's slice is summed in. Before any bias/residual add
+        // reads it: a bias is a per-output-feature constant, identical on
+        // every rank, and must be added exactly once to the real (summed)
+        // total, not once per rank before the sum.
+        #[cfg(feature = "nccl")]
+        if let Some(comm) = self.comm.clone() {
+            comm.all_reduce_sum_f32(&mut self.act.proj.slice_mut(..n * d), n * d, self.dev.stream())?;
+        }
         if let Some(b) = &l.attn().bo {
             self.kern
                 .add_bias(&mut self.act.proj.slice_mut(..n * d), &b.as_view(), d, n)?;
@@ -3831,7 +3895,9 @@ impl Model {
         // combine writes to `proj` unconditionally — so the producer side holds
         // and the question is only whether the consumer wants f16.
         match &prev.dense {
-            Some(f) => consumer && !Self::residual_fusable(&f.w_down, n, self.use_mmvq),
+            Some(f) => {
+                consumer && !(!self.tp_active() && Self::residual_fusable(&f.w_down, n, self.use_mmvq))
+            }
             None => consumer,
         }
     }
@@ -4048,7 +4114,7 @@ impl Model {
             )?;
         }
         // As with the output projection, straight into the residual stream.
-        if Self::residual_fusable(&l.dense().w_down, n, self.use_mmvq) {
+        if !self.tp_active() && Self::residual_fusable(&l.dense().w_down, n, self.use_mmvq) {
             let bytes = Kernels::q8_1_bytes(d_ff);
             self.kern.quantize_q8_1(
                 &mut self.scratch.q8_1.slice_mut(..bytes),
@@ -4079,6 +4145,13 @@ impl Model {
             None,
             ffn_f16,
         )?;
+        // `w_down` is row-parallel (contracts over `d_ff`, this rank's own
+        // shard of the FFN hidden width) -- same reasoning as `wo`/GDN's
+        // `out_proj` above.
+        #[cfg(feature = "nccl")]
+        if let Some(comm) = self.comm.clone() {
+            comm.all_reduce_sum_f32(&mut self.act.proj.slice_mut(..n * d), n * d, self.dev.stream())?;
+        }
         if !self.attn_norm_takes_residual(layer + 1, n) {
             self.kern.add_assign(
                 &mut self.act.x.slice_mut(..n * d),
