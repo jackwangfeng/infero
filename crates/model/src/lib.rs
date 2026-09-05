@@ -1264,7 +1264,24 @@ impl Model {
             partial_mib = (Kernels::attn_partial_floats(cfg.n_heads, cfg.d_head, batch_tokens) * 4) >> 20,
             "tokens a pass carries"
         );
-        let act = Activations::new(&dev, &cfg, max_seq, max_logit_rows, needs_scores, batch_tokens)?;
+        // Whether any layer's FFN actually got the fused `w_gate_up` matrix
+        // (`INFERO_FUSE_FFN`, decided once at load time in `weights.rs` and
+        // uniform across layers outside TP) -- `gate`'s buffer only needs to
+        // be `2*d_ff` wide when a real fused matmul will land both halves in
+        // one row; the unfused path never writes past `d_ff` into it.
+        let ffn_fused = w
+            .layers
+            .iter()
+            .any(|l| l.dense.as_ref().is_some_and(|d| d.w_gate_up.is_some()));
+        let act = Activations::new(
+            &dev,
+            &cfg,
+            max_seq,
+            max_logit_rows,
+            needs_scores,
+            batch_tokens,
+            ffn_fused,
+        )?;
         let scratch = Scratch {
             w16: dev
                 .stream()
@@ -5164,6 +5181,7 @@ impl Activations {
         max_logit_rows: usize,
         needs_score_buffer: bool,
         chunk: usize,
+        ffn_fused: bool,
     ) -> Result<Self> {
         let stream = dev.stream();
         let d = cfg.d_model;
@@ -5188,9 +5206,12 @@ impl Activations {
             v: alloc_f32(chunk * kv_dim, "values")?,
             attn: alloc_f32(chunk * d_attn, "attention output")?,
             proj: alloc_f32(chunk * d.max(1), "projection")?,
-            // Twice `d_ff`: under `INFERO_FUSE_FFN` one matmul writes `gate` and
+            // Twice `d_ff` only when `ffn_fused`: one matmul writes `gate` and
             // `up` into a single row of this, and `silu_mul_split` reads the
-            // two halves. The unfused path uses the first half only.
+            // two halves. The unfused path (`ffn_fused == false`, the whole
+            // point of `INFERO_FUSE_FFN=0`) never writes past the first half,
+            // so it only needs that much space -- see the caller's own
+            // `w_gate_up.is_some()` check.
             //
             // It doubles as the packed `[q | k | v]` staging row, which is
             // `d_attn + 2·d_kv` wide. That has always been the smaller of the
@@ -5198,7 +5219,7 @@ impl Activations {
             // obviously so once `d_attn` came loose from `d_model` — so take
             // the max rather than relying on it.
             gate: alloc_f32(
-                chunk * (cfg.d_ff * 2).max(d_attn + 2 * kv_dim),
+                chunk * (cfg.d_ff * if ffn_fused { 2 } else { 1 }).max(d_attn + 2 * kv_dim),
                 "ffn gate / packed qkv",
             )?,
             up: alloc_f32(chunk * cfg.d_ff, "ffn up")?,
