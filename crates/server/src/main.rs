@@ -136,7 +136,6 @@ async fn main() -> Result<()> {
         {
             let run_id = std::env::var("RUN_ID")
                 .context("TP_RANK is set but RUN_ID is not -- both are required under --tensor-parallel-size > 1")?;
-            let gguf = infero_gguf::Gguf::open(&args.model).with_context(|| format!("opening {}", args.model))?;
             let dev = infero_gpu::Device::new(0) // CUDA_VISIBLE_DEVICES remaps this
                 .context("opening this rank's GPU")?;
             let rank = infero_model::tp::RankId {
@@ -145,17 +144,36 @@ async fn main() -> Result<()> {
                 tp_rank,
                 tp_size: args.tensor_parallel_size,
             };
-            let model = infero_model::Model::load_full_tp(
-                dev,
-                &gguf,
-                args.ctx,
-                kv_quant,
-                args.gpu_layers.unwrap_or(usize::MAX),
-                args.max_seqs,
-                &rank,
-                &run_id,
-            )
-            .context("loading this rank's shard")?;
+            // A safetensors/AWQ checkpoint is a directory; GGUF is a single
+            // file. Rank 0's own dispatch (`engine::Engine::start`) already
+            // makes this same distinction -- mirrored here since a follower
+            // rank never goes through `Engine::start` at all.
+            let model = if std::path::Path::new(&args.model).is_dir() {
+                infero_model::Model::load_awq_tp(
+                    dev,
+                    &args.model,
+                    args.ctx,
+                    kv_quant,
+                    args.max_seqs,
+                    &rank,
+                    &run_id,
+                )
+                .context("loading this rank's shard")?
+            } else {
+                let gguf = infero_gguf::Gguf::open(&args.model)
+                    .with_context(|| format!("opening {}", args.model))?;
+                infero_model::Model::load_full_tp(
+                    dev,
+                    &gguf,
+                    args.ctx,
+                    kv_quant,
+                    args.gpu_layers.unwrap_or(usize::MAX),
+                    args.max_seqs,
+                    &rank,
+                    &run_id,
+                )
+                .context("loading this rank's shard")?
+            };
             let pool = infero_server::scheduler::make_pool(&model, args.max_seqs, args.kv_slots)
                 .context("sizing this rank's kv pool")?;
             tracing::info!(tp_rank, tp_size = args.tensor_parallel_size, "follower rank ready");

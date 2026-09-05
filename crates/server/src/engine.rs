@@ -254,12 +254,35 @@ impl Engine {
                 );
             }
             (Some(f), None) => Model::load_full(dev, f, max_seq, kv_quant, n_gpu_layers, logit_rows)?,
+            #[cfg(feature = "nccl")]
+            (None, Some((tp_rank, tp_size, run_id))) => {
+                anyhow::ensure!(
+                    n_gpu_layers == usize::MAX,
+                    "an AWQ checkpoint has no offload path; drop --gpu-layers"
+                );
+                let rank = infero_model::tp::RankId {
+                    pp_rank: 0,
+                    pp_size: 1,
+                    tp_rank: *tp_rank,
+                    tp_size: *tp_size,
+                };
+                // Sharded loading here covers plain-float and FP8 dense
+                // attention/GDN/FFN projections (verified this session on
+                // the real `qwen38-27b-fp8` checkpoint) -- an AWQ-int4
+                // (qweight/qzeros/scales) or MoE-expert checkpoint under
+                // sharding still fails loudly inside `weights::load_awq`
+                // itself, not silently here.
+                Model::load_awq_tp(dev, path, max_seq, kv_quant, logit_rows, &rank, run_id)?
+            }
             (None, _) => {
                 anyhow::ensure!(
                     n_gpu_layers == usize::MAX,
                     "an AWQ checkpoint has no offload path; drop --gpu-layers"
                 );
-                anyhow::ensure!(tp.is_none(), "AWQ checkpoints do not support tensor parallelism yet");
+                anyhow::ensure!(
+                    tp.is_none(),
+                    "tensor-parallel support for a safetensors/AWQ checkpoint needs the `nccl` feature"
+                );
                 Model::load_awq(dev, path, max_seq, kv_quant, logit_rows)?
             }
         };

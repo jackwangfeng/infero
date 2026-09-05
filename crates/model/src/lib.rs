@@ -995,6 +995,18 @@ impl Model {
             )?;
             model.comm = Some(Arc::new(comm));
             model.tp_rank_info = Some((rank.tp_rank, rank.tp_size));
+            // CUDA graph capture and this rank's `ncclAllReduce` calls in the
+            // decode loop don't compose: captured once, replay corrupts state
+            // from the second decode step on (confirmed live -- a garbage,
+            // `inf`-valued embedding lookup and a subsequent
+            // `CUDA_ERROR_STREAM_CAPTURE_INVALIDATED`, while `INFERO_NO_GRAPH=1`
+            // makes the identical request bit-exact against TP=1). Same
+            // precedent as `spec_k`'s `tp.is_some() => 0` a few lines up in the
+            // engine -- force the safe, already-existing escape hatch off
+            // rather than leave TP silently relying on the operator setting
+            // `INFERO_NO_GRAPH=1` by hand. Making NCCL collectives graph-
+            // capturable is real, separate follow-up work, not attempted here.
+            model.use_graph = false;
         }
         Ok(model)
     }
@@ -1026,8 +1038,62 @@ impl Model {
         kern.warm_up()?;
 
         let freqs = cfg.rope_freq_factors(&json);
-        let w = weights::load_awq(&dev, &shards, &cfg, &freqs)?;
+        let w = weights::load_awq(&dev, &shards, &cfg, &freqs, None)?;
         Self::from_parts(dev, kern, cfg, w, max_seq, kv_quant, max_logit_rows)
+    }
+
+    /// [`Self::load_awq`], sharded across a tensor-parallel group -- the
+    /// safetensors/AWQ-format counterpart to [`Self::load_full_tp`]. Same
+    /// contract: every rank in the group loads the same checkpoint with the
+    /// same `rank.tp_size` and a distinct `rank.tp_rank`, and `tp_size == 1`
+    /// is byte-for-byte [`Self::load_awq`].
+    #[cfg(feature = "nccl")]
+    pub fn load_awq_tp(
+        dev: Device,
+        dir: impl AsRef<std::path::Path>,
+        max_seq: usize,
+        kv_quant: KvQuant,
+        max_logit_rows: usize,
+        rank: &crate::tp::RankId,
+        run_id: &str,
+    ) -> Result<Self> {
+        let max_logit_rows = max_logit_rows.clamp(1, MAX_BATCH_TOKENS);
+        let dir = dir.as_ref();
+        let shards = infero_safetensors::Shards::open_dir(dir)?;
+        let json = shards.json("config.json")?;
+        let name = dir
+            .file_name()
+            .map_or("unnamed", |s| s.to_str().unwrap_or("unnamed"));
+        let mut cfg = Config::from_hf(&json, name)?;
+        cfg.shard_for_tp(rank);
+        tracing::info!("{cfg}");
+
+        let kern = Kernels::new(dev.clone());
+        kern.warm_up()?;
+
+        let freqs = cfg.rope_freq_factors(&json);
+        let shard = (rank.tp_size > 1).then_some((rank.tp_rank, rank.tp_size));
+        let w = weights::load_awq(&dev, &shards, &cfg, &freqs, shard)?;
+        let mut model = Self::from_parts(dev, kern, cfg, w, max_seq, kv_quant, max_logit_rows)?;
+        if rank.tp_size > 1 {
+            use crate::tp::{LocalFileBootstrap, RankBootstrap};
+            let bootstrap = LocalFileBootstrap { run_id: run_id.to_string() };
+            let unique_id = bootstrap.broadcast_unique_id(rank)?;
+            let comm = infero_kernels::tp::NcclComm::init_rank(
+                &unique_id,
+                rank.tp_rank as i32,
+                rank.tp_size as i32,
+            )?;
+            model.comm = Some(Arc::new(comm));
+            model.tp_rank_info = Some((rank.tp_rank, rank.tp_size));
+            // See the identical guard in `load_full_tp` -- graph capture and
+            // this rank's all-reduce calls don't compose under TP, confirmed
+            // live on this exact checkpoint (garbage embeddings + a stream-
+            // capture error from the second decode step on, gone entirely
+            // under `INFERO_NO_GRAPH=1`).
+            model.use_graph = false;
+        }
+        Ok(model)
     }
 
     /// Assemble a model from weights that are already on the device.

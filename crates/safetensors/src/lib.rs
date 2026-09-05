@@ -76,9 +76,62 @@ pub struct Tensor<'a> {
     pub data: &'a [u8],
 }
 
-impl Tensor<'_> {
+impl<'a> Tensor<'a> {
     pub fn n_elements(&self) -> usize {
         self.shape.iter().product()
+    }
+
+    /// A contiguous row range's raw bytes, for a row-major `[n, ...]`
+    /// tensor. Unlike GGUF's quantized formats, nothing here packs multiple
+    /// rows into a sub-byte block -- every dtype this crate reads is a
+    /// whole number of bytes an element, so a row boundary is always a byte
+    /// boundary and a borrow (no copy) suffices.
+    pub fn shard_rows(&self, rows: std::ops::Range<usize>) -> Result<&'a [u8]> {
+        anyhow::ensure!(!self.shape.is_empty(), "{}: cannot row-shard a scalar", self.name);
+        let n_rows = self.shape[0];
+        anyhow::ensure!(
+            rows.end <= n_rows,
+            "{}: row range {rows:?} out of bounds for {n_rows} rows",
+            self.name
+        );
+        anyhow::ensure!(
+            self.data.len() % n_rows == 0,
+            "{}: {} bytes does not divide evenly into {n_rows} rows",
+            self.name,
+            self.data.len()
+        );
+        let row_bytes = self.data.len() / n_rows;
+        Ok(&self.data[rows.start * row_bytes..rows.end * row_bytes])
+    }
+
+    /// A contiguous column range's raw bytes, for a row-major `[n, k]`
+    /// tensor -- one strided read a row, concatenated into a real, new
+    /// buffer (columns are not contiguous in the source, unlike rows).
+    pub fn shard_cols(&self, cols: std::ops::Range<usize>) -> Result<Vec<u8>> {
+        anyhow::ensure!(self.shape.len() >= 2, "{}: cannot col-shard a <2D tensor", self.name);
+        let n_rows = self.shape[0];
+        let n_cols = self.shape[1];
+        anyhow::ensure!(
+            cols.end <= n_cols,
+            "{}: col range {cols:?} out of bounds for {n_cols} columns",
+            self.name
+        );
+        let elem = self.dtype.size();
+        let row_bytes = n_cols * elem;
+        anyhow::ensure!(
+            row_bytes * n_rows == self.data.len(),
+            "{}: {} bytes doesn't match [{n_rows}, {n_cols}] at {elem} bytes/elem",
+            self.name,
+            self.data.len()
+        );
+        let start = cols.start * elem;
+        let width = (cols.end - cols.start) * elem;
+        let mut out = Vec::with_capacity(width * n_rows);
+        for r in 0..n_rows {
+            let base = r * row_bytes + start;
+            out.extend_from_slice(&self.data[base..base + width]);
+        }
+        Ok(out)
     }
 
     /// The payload as `f16` bits, for a tensor that is stored as one.

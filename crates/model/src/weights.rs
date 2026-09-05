@@ -1647,6 +1647,7 @@ pub fn load_awq(
     w: &infero_safetensors::Shards,
     cfg: &Config,
     freq_factors: &[f32],
+    shard: Option<(usize, usize)>,
 ) -> Result<Weights> {
     use infero_kernels::awq::{AwqTensor, quantize_f16_to_q8_0};
 
@@ -1705,11 +1706,48 @@ pub fn load_awq(
             Err(_) => Ok(None),
         }
     };
+    // Same, sharded on its (only) axis -- for a per-output-head bias
+    // (q_proj.bias/k_proj.bias/v_proj.bias), which is column-parallel
+    // exactly like its own weight matrix and must be sharded the same way:
+    // shapes checking out with a full-width bias silently applies the
+    // wrong slice on every rank but rank 0 (this is the exact class of bug
+    // the GGUF loader's own `bq`/`bk`/`bv` fix found and fixed).
+    let optional_vector_sharded =
+        |name: &str, tp_rank: usize, tp_size: usize, total: &mut usize| -> Result<Option<Vector>> {
+            match w.tensor(name) {
+                Ok(t) => {
+                    let mut v = t.to_f32()?;
+                    let off = norm_offset(name);
+                    if off != 0.0 {
+                        for x in v.iter_mut() {
+                            *x += off;
+                        }
+                    }
+                    anyhow::ensure!(
+                        v.len() % tp_size == 0,
+                        "{name}: {} entries does not divide tp_size {tp_size}",
+                        v.len()
+                    );
+                    let shard_n = v.len() / tp_size;
+                    let sv = &v[tp_rank * shard_n..(tp_rank + 1) * shard_n];
+                    *total += sv.len() * 4;
+                    Ok(Some(dev.stream().clone_htod(sv)?))
+                }
+                Err(_) => Ok(None),
+            }
+        };
     // A quantized projection's bytes, before they reach the device: AWQ's three
     // tensors in, one packed matrix out. Split from the upload so that
     // projections which are stacked into one matrix — see `fuse_ffn` below —
     // can be concatenated in the layout they will be read in.
-    let projection_bytes = |prefix: &str| -> Result<(Vec<u8>, WeightType, usize, usize)> {
+    // A tensor-parallel shard request for `projection_bytes`: which axis of
+    // the on-disk `[n, k]` matrix this rank owns, plus `(tp_rank, tp_size)`.
+    // `Output` shards `n` (a column-parallel projection: q/k/v, gate/up);
+    // `Input` shards `k` (row-parallel: o, down -- the all-reduce input).
+    // `None` is today's exact unsharded behavior.
+    let projection_bytes = |prefix: &str,
+                            shard: Option<(ShardAxis, usize, usize)>|
+     -> Result<(Vec<u8>, WeightType, usize, usize)> {
         // FP8 and plain-float exports name the matrix `{prefix}.weight`; AWQ
         // splits it into qweight/qzeros/scales. Check for the single tensor
         // first, because its absence is the cheap question.
@@ -1720,7 +1758,27 @@ pub fn load_awq(
         // dimension 1. Reading one with the other's convention gives a matrix of
         // plausible size and wrong meaning.
         if let Some(t) = w.get(&format!("{prefix}.weight")) {
-            let (n, k) = (t.shape[0], t.shape[1]);
+            let (full_n, full_k) = (t.shape[0], t.shape[1]);
+            // `(n, k)` is this rank's own (post-shard) width; `full_n`/`full_k`
+            // is the on-disk width. `None` makes them equal, today's exact
+            // unsharded behavior.
+            let (n, k) = match shard {
+                None => (full_n, full_k),
+                Some((ShardAxis::Output, _, tp_size)) => {
+                    anyhow::ensure!(
+                        full_n % tp_size == 0,
+                        "{prefix}: output width {full_n} does not divide tp_size {tp_size}"
+                    );
+                    (full_n / tp_size, full_k)
+                }
+                Some((ShardAxis::Input, _, tp_size)) => {
+                    anyhow::ensure!(
+                        full_k % tp_size == 0,
+                        "{prefix}: input width {full_k} does not divide tp_size {tp_size}"
+                    );
+                    (full_n, full_k / tp_size)
+                }
+            };
             if t.dtype == infero_safetensors::Dtype::F8E4M3 {
                 // Keep the FP8 bytes and carry the scale grid with them, rather
                 // than expanding here. Expanding is correct and was the first
@@ -1734,15 +1792,71 @@ pub fn load_awq(
                 let scales_t = w
                     .tensor(&format!("{prefix}.weight_scale_inv"))
                     .with_context(|| format!("{prefix} is FP8 but has no scale grid"))?;
-                let scales = scales_t.to_f32()?;
-                let want = infero_kernels::fp8::scale_grid(k, n);
+                let full_scales = scales_t.to_f32()?;
+                let full_want = infero_kernels::fp8::scale_grid(full_k, full_n);
                 anyhow::ensure!(
-                    scales.len() == want,
-                    "{prefix}'s scale grid has {} entries; an [{n}, {k}] matrix \
-                     at block {} wants {want}",
-                    scales.len(),
+                    full_scales.len() == full_want,
+                    "{prefix}'s scale grid has {} entries; an [{full_n}, {full_k}] matrix \
+                     at block {} wants {full_want}",
+                    full_scales.len(),
                     infero_kernels::fp8::FP8_BLOCK,
                 );
+                // Sharding happens on the raw pre-repack quant bytes and the
+                // matching block-range of the scale grid, THEN `repack_rows`/
+                // `pad_rows` runs on the already-narrowed `(k, n)` -- both are
+                // row-group-local (a group's output depends only on its own
+                // input rows), so this produces bytes identical to the
+                // corresponding slice of a full repack. `FP8_BLOCK=128`
+                // alignment on the sharded axis is required for the scale
+                // grid to slice cleanly; real projection widths divided by a
+                // real `tp_size` (2, 4, ...) stay multiples of 128 in
+                // practice, so this is a real requirement being checked, not
+                // a theoretical one.
+                let (quant_bytes, scales): (std::borrow::Cow<'_, [u8]>, Vec<f32>) = match shard {
+                    None => (std::borrow::Cow::Borrowed(t.data), full_scales),
+                    Some((ShardAxis::Output, tp_rank, tp_size)) => {
+                        anyhow::ensure!(
+                            n % infero_kernels::fp8::FP8_BLOCK == 0,
+                            "{prefix}: sharded output width {n} is not a multiple of {}",
+                            infero_kernels::fp8::FP8_BLOCK
+                        );
+                        let range = (tp_rank * n)..((tp_rank + 1) * n);
+                        let n_blocks_full = full_n.div_ceil(infero_kernels::fp8::FP8_BLOCK);
+                        let k_blocks = full_k.div_ceil(infero_kernels::fp8::FP8_BLOCK);
+                        anyhow::ensure!(
+                            n_blocks_full % tp_size == 0,
+                            "{prefix}: {n_blocks_full} scale-grid row blocks does not divide tp_size {tp_size}"
+                        );
+                        let blocks_per_rank = n_blocks_full / tp_size;
+                        let brange = (tp_rank * blocks_per_rank)..((tp_rank + 1) * blocks_per_rank);
+                        (
+                            std::borrow::Cow::Borrowed(t.shard_rows(range)?),
+                            full_scales[brange.start * k_blocks..brange.end * k_blocks].to_vec(),
+                        )
+                    }
+                    Some((ShardAxis::Input, tp_rank, tp_size)) => {
+                        anyhow::ensure!(
+                            k % infero_kernels::fp8::FP8_BLOCK == 0,
+                            "{prefix}: sharded input width {k} is not a multiple of {}",
+                            infero_kernels::fp8::FP8_BLOCK
+                        );
+                        let range = (tp_rank * k)..((tp_rank + 1) * k);
+                        let n_blocks = full_n.div_ceil(infero_kernels::fp8::FP8_BLOCK);
+                        let k_blocks_full = full_k.div_ceil(infero_kernels::fp8::FP8_BLOCK);
+                        anyhow::ensure!(
+                            k_blocks_full % tp_size == 0,
+                            "{prefix}: {k_blocks_full} scale-grid col blocks does not divide tp_size {tp_size}"
+                        );
+                        let blocks_per_rank = k_blocks_full / tp_size;
+                        let bstart = tp_rank * blocks_per_rank;
+                        let mut sh_scales = Vec::with_capacity(n_blocks * blocks_per_rank);
+                        for r in 0..n_blocks {
+                            let base = r * k_blocks_full + bstart;
+                            sh_scales.extend_from_slice(&full_scales[base..base + blocks_per_rank]);
+                        }
+                        (std::borrow::Cow::Owned(t.shard_cols(range)?), sh_scales)
+                    }
+                };
                 // Permuted, not copied: every FP8 kernel reads four interleaved
                 // rows as one 16-byte load, which is what took the batched
                 // mat-vec off a request-per-row-per-token. The permutation lives
@@ -1754,24 +1868,11 @@ pub fn load_awq(
                 // permutation, which is both `Kernels::mmv_f8_plain`'s and
                 // CUTLASS's native layout. See that function's doc comment
                 // for why this is safe to prefer now.
-                //
-                // `repack_rows`/`pad_rows` already hand back a `padded *
-                // k`-byte `Vec`, filled in parallel — appending it into a
-                // second, freshly `with_capacity`'d buffer instead of just
-                // using it looked harmless but wasn't: that second buffer's
-                // pages are unmapped until this exact `extend_from_slice`
-                // first touches them, so the copy pays for every one of the
-                // 43 GB checkpoint's page faults on a single thread.
-                // `repack_rows`'s own allocation pays the same fault cost
-                // already, just spread over sixteen threads — 3.6 s measured
-                // against this copy's 25.7 s of the 27B's ~60 s load. Reusing
-                // it and only growing it for the scale tail turns that
-                // second full pass into nothing.
                 let __t0 = std::time::Instant::now();
                 let mut bytes = if fp8_unified_layout() {
-                    infero_kernels::fp8::pad_rows(t.data, k, n)?
+                    infero_kernels::fp8::pad_rows(&quant_bytes, k, n)?
                 } else {
-                    infero_kernels::fp8::repack_rows(t.data, k, n)?
+                    infero_kernels::fp8::repack_rows(&quant_bytes, k, n)?
                 };
                 REPACK_NS.fetch_add(__t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 bytes.reserve_exact(scales.len() * 4);
@@ -1781,6 +1882,11 @@ pub fn load_awq(
                 debug_assert_eq!(bytes.len(), infero_kernels::fp8::fp8_bytes(k, n));
                 return Ok((bytes, WeightType::F8E4M3, k, n));
             }
+            // A plain-float (F16/BF16/F32) tensor -- no repack, no scale
+            // grid, so sharding here is just a byte-range extraction (rows
+            // for Output, a strided per-row read for Input) applied to the
+            // already-widened f16 buffer below, at the same `(n, k)` this
+            // rank owns as computed above.
             let halves: Vec<half::f16> = if false {
                 // Block-scaled FP8. The scale grid is 128x128 and
                 // `dequant_f8_to_f16` validates that the grid matches the
@@ -1801,10 +1907,45 @@ pub fn load_awq(
             // little-endian halves the device wants.
             let bytes = unsafe {
                 std::slice::from_raw_parts(halves.as_ptr() as *const u8, halves.len() * 2)
-            }
-            .to_vec();
-            return Ok((bytes, WeightType::F16, k, n));
+            };
+            let sharded = match shard {
+                None => bytes.to_vec(),
+                Some((ShardAxis::Output, tp_rank, tp_size)) => {
+                    anyhow::ensure!(
+                        full_n % tp_size == 0,
+                        "{prefix}: {full_n} rows does not divide tp_size {tp_size}"
+                    );
+                    let shard_n = full_n / tp_size;
+                    let row_bytes = bytes.len() / full_n;
+                    let start = tp_rank * shard_n * row_bytes;
+                    let end = (tp_rank + 1) * shard_n * row_bytes;
+                    bytes[start..end].to_vec()
+                }
+                Some((ShardAxis::Input, tp_rank, tp_size)) => {
+                    anyhow::ensure!(
+                        full_k % tp_size == 0,
+                        "{prefix}: {full_k} cols does not divide tp_size {tp_size}"
+                    );
+                    let shard_k = full_k / tp_size;
+                    let elem = 2usize; // f16
+                    let row_bytes = full_k * elem;
+                    let cstart = tp_rank * shard_k * elem;
+                    let width = shard_k * elem;
+                    let mut out = Vec::with_capacity(width * full_n);
+                    for r in 0..full_n {
+                        let base = r * row_bytes + cstart;
+                        out.extend_from_slice(&bytes[base..base + width]);
+                    }
+                    out
+                }
+            };
+            return Ok((sharded, WeightType::F16, k, n));
         }
+        anyhow::ensure!(
+            shard.is_none(),
+            "{prefix}: tensor-parallel sharding for an AWQ-int4-packed weight is not \
+             implemented -- this checkpoint format isn't FP8/plain-float here"
+        );
         let qw = w.tensor(&format!("{prefix}.qweight"))?;
         let (k, n) = (qw.shape[0], qw.shape[1] * 8);
         // The scales are BF16 in Qwen3's AWQ export, not F16 — bound to a local
@@ -1837,9 +1978,14 @@ pub fn load_awq(
         Ok((packed, WeightType::Q4G128, k, n))
     };
     let projection = |prefix: &str, total: &mut usize| -> Result<Matrix> {
-        let (bytes, ty, k, n) = projection_bytes(prefix)?;
+        let (bytes, ty, k, n) = projection_bytes(prefix, None)?;
         upload(&bytes, ty, k, n, total)
     };
+    let projection_sharded =
+        |prefix: &str, axis: ShardAxis, tp_rank: usize, tp_size: usize, total: &mut usize| -> Result<Matrix> {
+            let (bytes, ty, k, n) = projection_bytes(prefix, Some((axis, tp_rank, tp_size)))?;
+            upload(&bytes, ty, k, n, total)
+        };
     // Same as `projection`, but also hands back the pre-upload bytes and their
     // shape/type -- for a caller that is about to fuse this projection with a
     // sibling one (`stacked`/`stacked_fp8_2`/`stacked2`/`stacked3`) and would
@@ -1850,10 +1996,113 @@ pub fn load_awq(
     // `stacked_fp8_2`, every one of 64 layers.
     let projection_with_bytes =
         |prefix: &str, total: &mut usize| -> Result<(Matrix, Vec<u8>, WeightType, usize, usize)> {
-            let (bytes, ty, k, n) = projection_bytes(prefix)?;
+            let (bytes, ty, k, n) = projection_bytes(prefix, None)?;
             let m = upload(&bytes, ty, k, n, total)?;
             Ok((m, bytes, ty, k, n))
         };
+    // A combined multi-segment row-parallel tensor (`in_proj_qkv`: Q, K, V
+    // back to back, each its own head-count-based row range, since Q/K use
+    // `key_heads` and V uses `value_heads` -- a single uniform division of
+    // the whole row count would not land on any segment's head boundary).
+    // `segments` is `[(full_segment_n, this_rank's_segment_n), ...]` in file
+    // order; returns the concatenated per-rank bytes, `k`, and the summed
+    // per-rank `n`. This checkpoint's own `Config` sets `v_heads_tiled:
+    // false` (confirmed in `config.rs`'s HF-JSON constructor) -- value heads
+    // are grouped by key head (`h / heads_per_key`), not interleaved, so
+    // every segment here is a plain contiguous range, unlike the GGUF
+    // loader's tiled equivalent.
+    let multi_segment_bytes = |prefix: &str,
+                               segments: &[(usize, usize)],
+                               tp_rank: usize|
+     -> Result<(Vec<u8>, WeightType, usize, usize)> {
+        let t = w
+            .get(&format!("{prefix}.weight"))
+            .with_context(|| format!("{prefix}.weight missing"))?;
+        anyhow::ensure!(
+            t.dtype == infero_safetensors::Dtype::F8E4M3,
+            "{prefix}: multi-segment sharding is only implemented for FP8 here"
+        );
+        let (full_n, k) = (t.shape[0], t.shape[1]);
+        let scales_t = w
+            .tensor(&format!("{prefix}.weight_scale_inv"))
+            .with_context(|| format!("{prefix} is FP8 but has no scale grid"))?;
+        let full_scales = scales_t.to_f32()?;
+        let k_blocks = k.div_ceil(infero_kernels::fp8::FP8_BLOCK);
+        let full_want = infero_kernels::fp8::scale_grid(k, full_n);
+        anyhow::ensure!(
+            full_scales.len() == full_want,
+            "{prefix}'s scale grid has {} entries, expected {full_want}",
+            full_scales.len()
+        );
+        let mut quant_bytes = Vec::new();
+        let mut scales = Vec::new();
+        let mut seg_start = 0usize;
+        let mut shard_n_total = 0usize;
+        for &(seg_full_n, seg_rank_n) in segments {
+            anyhow::ensure!(
+                seg_rank_n % infero_kernels::fp8::FP8_BLOCK == 0,
+                "{prefix}: segment shard width {seg_rank_n} is not a multiple of {}",
+                infero_kernels::fp8::FP8_BLOCK
+            );
+            let rstart = seg_start + tp_rank * seg_rank_n;
+            let range = rstart..(rstart + seg_rank_n);
+            anyhow::ensure!(
+                range.end <= seg_start + seg_full_n,
+                "{prefix}: segment shard range {range:?} exceeds its own {seg_full_n}-row segment"
+            );
+            quant_bytes.extend_from_slice(t.shard_rows(range.clone())?);
+            let brange = (range.start / infero_kernels::fp8::FP8_BLOCK)
+                ..(range.end / infero_kernels::fp8::FP8_BLOCK);
+            scales.extend_from_slice(&full_scales[brange.start * k_blocks..brange.end * k_blocks]);
+            seg_start += seg_full_n;
+            shard_n_total += seg_rank_n;
+        }
+        anyhow::ensure!(
+            seg_start == full_n,
+            "{prefix}: segments summed to {seg_start} rows, tensor has {full_n}"
+        );
+        let __t0 = std::time::Instant::now();
+        let mut bytes = if fp8_unified_layout() {
+            infero_kernels::fp8::pad_rows(&quant_bytes, k, shard_n_total)?
+        } else {
+            infero_kernels::fp8::repack_rows(&quant_bytes, k, shard_n_total)?
+        };
+        REPACK_NS.fetch_add(__t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        bytes.reserve_exact(scales.len() * 4);
+        for v in &scales {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        Ok((bytes, WeightType::F8E4M3, k, shard_n_total))
+    };
+    // A single-segment, value-head-count-wide vector (`in_proj_a`/
+    // `in_proj_b`: one scalar a head, `n = value_heads`) or a value-dim-wide
+    // one (`in_proj_z`: `n = value_heads * value_head_dim`) -- both are a
+    // plain `Output`-axis shard of the whole tensor, no multi-segment
+    // concern, so `projection_bytes` already does the right thing directly.
+    // A plain (unquantized) vector's own multi-segment shard -- `conv1d.weight`
+    // (channels = 2*key_dim + value_dim on the row axis, `kernel_size` trailing
+    // elements a channel) and `A_log`/`dt_bias` (a single `value_heads`-wide
+    // segment, one scalar a head). `segments` is `[(full_rows, this_rank's
+    // rows), ...]` in file order, same convention as `multi_segment_bytes`.
+    let sharded_vector_segments = |name: &str, segments: &[(usize, usize)], tp_rank: usize| -> Result<Vec<f32>> {
+        let t = w.tensor(name)?;
+        let full_rows: usize = segments.iter().map(|(f, _)| f).sum();
+        anyhow::ensure!(
+            t.n_elements() % full_rows == 0,
+            "{name}: {} elements does not divide evenly into {full_rows} rows",
+            t.n_elements()
+        );
+        let elem_per_row = t.n_elements() / full_rows;
+        let full = t.to_f32()?;
+        let mut out = Vec::new();
+        let mut seg_start = 0usize;
+        for &(seg_full, seg_rank) in segments {
+            let rstart = seg_start + tp_rank * seg_rank;
+            out.extend_from_slice(&full[rstart * elem_per_row..(rstart + seg_rank) * elem_per_row]);
+            seg_start += seg_full;
+        }
+        Ok(out)
+    };
 
     // `gate` and `up` as one matrix, and `q`/`k`/`v` as another, which is what
     // vLLM's `MergedColumnParallelLinear` and `QKVParallelLinear` amount to. A
@@ -1879,7 +2128,13 @@ pub fn load_awq(
     // card that cannot spare that would rather have the KV cache. Whatever the
     // decision, it is logged — a throughput number that moved by 4% because the
     // loader quietly declined is the kind of thing that costs a day.
-    let fuse_ffn = match std::env::var("INFERO_FUSE_FFN").as_deref() {
+    // Disabled outright under sharding, same precedent as the GGUF loader's
+    // `w_kv`/`in_proj_ba` fix: every `stacked*` helper below reads its inputs'
+    // full, unsharded bytes a second time rather than the already-sharded
+    // bytes this rank actually holds, so fusing under TP would silently
+    // build a doubled-width matrix against buffers sized for the correctly
+    // sharded projections.
+    let fuse_ffn = shard.is_none() && match std::env::var("INFERO_FUSE_FFN").as_deref() {
         Ok("0") => false,
         Ok(_) => true,
         Err(_) => {
@@ -2176,6 +2431,13 @@ pub fn load_awq(
         let w_down = projection(&format!("{p}.mlp.down_proj"), total)?;
         Ok(DenseFfn { w_gate, w_up, w_gate_up, w_down })
     };
+    let dense_ffn_sharded = |p: &str, tp_rank: usize, tp_size: usize, total: &mut usize| -> Result<DenseFfn> {
+        use ShardAxis::{Input, Output};
+        let w_gate = projection_sharded(&format!("{p}.mlp.gate_proj"), Output, tp_rank, tp_size, total)?;
+        let w_up = projection_sharded(&format!("{p}.mlp.up_proj"), Output, tp_rank, tp_size, total)?;
+        let w_down = projection_sharded(&format!("{p}.mlp.down_proj"), Input, tp_rank, tp_size, total)?;
+        Ok(DenseFfn { w_gate, w_up, w_gate_up: None, w_down })
+    };
 
     // One projection of every expert, concatenated in expert order.
     //
@@ -2188,7 +2450,7 @@ pub fn load_awq(
         let mut bytes: Vec<u8> = Vec::new();
         let mut shape: Option<(WeightType, usize, usize, usize)> = None;
         for e in 0..n_experts {
-            let (b, ty, k, n) = projection_bytes(&format!("{p}.mlp.experts.{e}.{leaf}"))?;
+            let (b, ty, k, n) = projection_bytes(&format!("{p}.mlp.experts.{e}.{leaf}"), None)?;
             match shape {
                 None => {
                     bytes.reserve(b.len() * n_experts);
@@ -2293,6 +2555,40 @@ pub fn load_awq(
         let __t_attn = std::time::Instant::now();
         let attn = if is_linear {
             None
+        } else if let Some((tp_rank, tp_size)) = shard {
+            use ShardAxis::{Input, Output};
+            let wq = projection_sharded(&format!("{p}.self_attn.q_proj"), Output, tp_rank, tp_size, &mut device_bytes)?;
+            let output_gate = wq.n == 2 * cfg.d_attn();
+            anyhow::ensure!(
+                wq.n == cfg.d_attn() || output_gate,
+                "layer {i} q_proj has {} columns; expected {} for a plain query \
+                 or {} for a query and its gate",
+                wq.n,
+                cfg.d_attn(),
+                2 * cfg.d_attn(),
+            );
+            let wk = projection_sharded(&format!("{p}.self_attn.k_proj"), Output, tp_rank, tp_size, &mut device_bytes)?;
+            let wv = projection_sharded(&format!("{p}.self_attn.v_proj"), Output, tp_rank, tp_size, &mut device_bytes)?;
+            Some(AttnWeights {
+                wq,
+                wk,
+                wv,
+                wo: projection_sharded(&format!("{p}.self_attn.o_proj"), Input, tp_rank, tp_size, &mut device_bytes)?,
+                bq: optional_vector_sharded(&format!("{p}.self_attn.q_proj.bias"), tp_rank, tp_size, &mut device_bytes)?,
+                bk: optional_vector_sharded(&format!("{p}.self_attn.k_proj.bias"), tp_rank, tp_size, &mut device_bytes)?,
+                bv: optional_vector_sharded(&format!("{p}.self_attn.v_proj.bias"), tp_rank, tp_size, &mut device_bytes)?,
+                // Row-parallel (attn_output's own bias) -- NOT sharded,
+                // applies to the full-width, already-all-reduced output.
+                bo: optional_vector(&format!("{p}.self_attn.o_proj.bias"), &mut device_bytes)?,
+                // `d_head`-wide (one shared gain applied identically to
+                // every head), not per-head -- correctly replicated in full
+                // on every rank as-is, same as the GGUF loader's finding.
+                q_norm: optional_vector(&format!("{p}.self_attn.q_norm.weight"), &mut device_bytes)?,
+                k_norm: optional_vector(&format!("{p}.self_attn.k_norm.weight"), &mut device_bytes)?,
+                w_qkv: None,
+                w_kv: None,
+                output_gate,
+            })
         } else {
             let (wq, q_bytes, q_ty, q_k, q_n) =
                 projection_with_bytes(&format!("{p}.self_attn.q_proj"), &mut device_bytes)?;
@@ -2353,7 +2649,65 @@ pub fn load_awq(
         ATTN_BLOCK_NS.fetch_add(__t_attn.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 
         let __t_gdn = std::time::Instant::now();
-        let gdn = if is_linear {
+        let gdn = if is_linear && shard.is_some() {
+            let (tp_rank, tp_size) = shard.unwrap();
+            let l = format!("{p}.linear_attn");
+            let la = cfg.linear_attn.as_ref().with_context(|| {
+                format!("layer {i}: GDN block but Config has no linear_attn")
+            })?;
+            anyhow::ensure!(
+                !la.v_heads_tiled,
+                "layer {i}: this checkpoint's Config sets v_heads_tiled=true for a \
+                 safetensors/HF-format load -- the tiling-aware shard this loader \
+                 implements is GGUF-specific and would silently mis-shard here"
+            );
+            let kd = la.key_dim();
+            let vd = la.value_dim();
+            let full_kd = kd * tp_size;
+            let full_vd = vd * tp_size;
+            let full_vh = la.value_heads * tp_size;
+            let vh = la.value_heads;
+            let (in_proj_qkv, qkv_ty, qkv_k, qkv_n) = multi_segment_bytes(
+                &format!("{l}.in_proj_qkv"),
+                &[(full_kd, kd), (full_kd, kd), (full_vd, vd)],
+                tp_rank,
+            )?;
+            let in_proj_qkv = upload(&in_proj_qkv, qkv_ty, qkv_k, qkv_n, &mut device_bytes)?;
+            let in_proj_z = projection_sharded(
+                &format!("{l}.in_proj_z"), ShardAxis::Output, tp_rank, tp_size, &mut device_bytes,
+            )?;
+            let in_proj_a = projection_sharded(
+                &format!("{l}.in_proj_a"), ShardAxis::Output, tp_rank, tp_size, &mut device_bytes,
+            )?;
+            let in_proj_b = projection_sharded(
+                &format!("{l}.in_proj_b"), ShardAxis::Output, tp_rank, tp_size, &mut device_bytes,
+            )?;
+            let conv1d = sharded_vector_segments(
+                &format!("{l}.conv1d.weight"),
+                &[(full_kd, kd), (full_kd, kd), (full_vd, vd)],
+                tp_rank,
+            )?;
+            let a_log = sharded_vector_segments(&format!("{l}.A_log"), &[(full_vh, vh)], tp_rank)?;
+            let dt_bias = sharded_vector_segments(&format!("{l}.dt_bias"), &[(full_vh, vh)], tp_rank)?;
+            device_bytes += (conv1d.len() + a_log.len() + dt_bias.len()) * 4;
+            Some(GdnWeights {
+                in_proj_qkv,
+                in_proj_z,
+                in_proj_a,
+                in_proj_b,
+                in_proj_ba: None,
+                in_proj_qz: None,
+                conv1d: dev.stream().clone_htod(&conv1d)?,
+                a_log: dev.stream().clone_htod(&a_log)?,
+                dt_bias: dev.stream().clone_htod(&dt_bias)?,
+                // `value_head_dim`-wide, head-count-independent -- correctly
+                // replicated in full on every rank, same as GGUF's finding.
+                norm: vector(&format!("{l}.norm.weight"), &mut device_bytes)?,
+                out_proj: projection_sharded(
+                    &format!("{l}.out_proj"), ShardAxis::Input, tp_rank, tp_size, &mut device_bytes,
+                )?,
+            })
+        } else if is_linear {
             let l = format!("{p}.linear_attn");
             let (in_proj_qkv, qkv_bytes, qkv_ty, qkv_k, qkv_n) =
                 projection_with_bytes(&format!("{l}.in_proj_qkv"), &mut device_bytes)?;
@@ -2392,7 +2746,17 @@ pub fn load_awq(
         GDN_BLOCK_NS.fetch_add(__t_gdn.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 
         let __t_ffn = std::time::Instant::now();
-        let dense_val = if sparse { None } else { Some(dense_ffn(&p, &mut device_bytes)?) };
+        let dense_val = if sparse {
+            None
+        } else {
+            match shard {
+                None => Some(dense_ffn(&p, &mut device_bytes)?),
+                Some((tp_rank, tp_size)) => {
+                    anyhow::ensure!(!sparse, "layer {i}: MoE sharding is not implemented");
+                    Some(dense_ffn_sharded(&p, tp_rank, tp_size, &mut device_bytes)?)
+                }
+            }
+        };
         FFN_BLOCK_NS.fetch_add(__t_ffn.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 
         layers.push(Layer {
