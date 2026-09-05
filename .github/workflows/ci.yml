@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # Runs on a plain hosted runner: no GPU needed. Covers the three crates
+  # that have zero CUDA dependency (infero-gguf, infero-safetensors,
+  # infero-tokenizer) with real clippy + test execution.
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+      - name: clippy (host-only crates)
+        run: cargo clippy -p infero-gguf -p infero-safetensors -p infero-tokenizer --no-default-features --all-targets
+      - name: test (host-only crates)
+        run: cargo test -p infero-gguf -p infero-safetensors -p infero-tokenizer --no-default-features
+
+  # Compile-only check of the full default-feature workspace (CUDA-gated
+  # crates included). No physical GPU on this runner -- the CUDA userspace
+  # (headers + stub .so files cudarc dlopens at runtime) is vendored from
+  # pip wheels the same way scripts/setup-cuda.sh already does for local dev
+  # boxes with no system CUDA install. This validates the code compiles
+  # against real CUDA headers/bindings; it cannot run anything that launches
+  # a kernel or opens a device -- see docs/CI.md for the exact boundary.
+  cuda-build-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+      - name: install python (for the pip CUDA wheels)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: fetch CUDA userspace via pip wheels
+        run: |
+          pip install --quiet \
+            "nvidia-cuda-runtime-cu13" \
+            "nvidia-cuda-nvrtc-cu13" \
+            "nvidia-cublas-cu13"
+      - name: vendor CUDA userspace
+        run: |
+          SITE=$(python -c "import nvidia, os; print(os.path.dirname(nvidia.__file__))")
+          mkdir -p vendor/cuda
+          rm -f vendor/cuda/include vendor/cuda/lib
+          ln -s "$SITE/cuda_runtime/include" vendor/cuda/include || ln -s "$SITE/cu13/include" vendor/cuda/include
+          ln -s "$SITE/cuda_nvrtc/lib" vendor/cuda/lib || ln -s "$SITE/cu13/lib" vendor/cuda/lib
+          test -f vendor/cuda/include/cuda_fp16.h
+          test -f vendor/cuda/lib/libnvrtc.so* 2>/dev/null || ls vendor/cuda/lib
+      - name: cargo build (default features, compile-only)
+        run: cargo build --workspace
