@@ -90,8 +90,14 @@ def t_multiturn(base_url: str, n_turns: int) -> tuple[bool, str]:
         if i < n_turns - 1:
             messages.append({"role": "user", "content": f"Turn {i+2}: say a random short fact."})
     # Final turn: ask for the secret back, a real content-sensibility check.
+    # max_tokens=64, not 40: by turn 10 there's a lot of accumulated fake
+    # history to reference before this checkpoint's verbose reasoning
+    # preamble reaches the actual "42" -- 40 flaked real (2026-09-05, 1/5
+    # passes truncated mid-reasoning, never reached the answer) on an
+    # otherwise-correct, uncontaminated model, same class of false failure
+    # as `t_retire_and_reuse`'s original max_tokens=16.
     messages.append({"role": "user", "content": "What was the secret number I told you earlier?"})
-    status, resp = chat(base_url, messages, max_tokens=40)
+    status, resp = chat(base_url, messages, max_tokens=64)
     if not ok(status, resp):
         return False, f"final recall turn failed: status={status} body={resp!r}"
     final = content_of(resp)
@@ -116,10 +122,19 @@ def t_retire_and_reuse(base_url: str) -> tuple[bool, str]:
     # Finish a short conversation, then start a fresh one -- exercises the
     # pool's free-slot reuse path (the same class of state the contiguity bug
     # lived in) via real HTTP traffic, not the tp_generate.rs bypass tool.
+    #
+    # max_tokens=32, not 16: this checkpoint's chat template always emits a
+    # reasoning preamble ("User asks: ... Need answer concise. Final: X.
+    # </think>\n\n<answer>") before the real answer -- confirmed by manual
+    # reproduction (2026-09-05) that 16 tokens routinely truncates mid-preamble,
+    # never reaching "Tokyo" at all, on an otherwise perfectly correct,
+    # uncontaminated response (verified separately with 80 tokens). That was
+    # a false failure in this harness, not a real pool-corruption bug -- don't
+    # reintroduce it by shrinking this back down.
     status1, resp1 = chat(base_url, [{"role": "user", "content": "Say 'first conversation done'."}], max_tokens=16)
     if not ok(status1, resp1):
         return False, f"first conversation failed: status={status1} body={resp1!r}"
-    status2, resp2 = chat(base_url, [{"role": "user", "content": "What is the capital of Japan?"}], max_tokens=16)
+    status2, resp2 = chat(base_url, [{"role": "user", "content": "What is the capital of Japan?"}], max_tokens=32)
     if not ok(status2, resp2):
         return False, f"second (post-retire) conversation failed: status={status2} body={resp2!r}"
     return "Tokyo" in content_of(resp2) or "tokyo" in content_of(resp2).lower(), (

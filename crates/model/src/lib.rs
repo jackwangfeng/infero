@@ -3599,6 +3599,35 @@ impl Model {
                 // it, this is `None` and the branch below it (unchanged from
                 // before this backend existed) runs exactly as it always
                 // has.
+                //
+                // `prefill_run` alone is not enough to route here: it only
+                // says this pass is one sequence's contiguous *token range*,
+                // which is `attn_prefill_ws4`'s own precondition (it reads
+                // `batch.slot_table` per token regardless, so it never cared
+                // about physical layout) -- `flash_attn2` additionally needs
+                // that sequence's *physical KV-pool slots* for `0..kv_len` to
+                // be one flat region, which a fresh single-shot prefill
+                // happens to get but a multi-turn request continuing an
+                // existing sequence, or one drawn from a fragmented pool,
+                // is not guaranteed to. Real traffic hits both regularly.
+                // Checking here (once, cheaply -- a small device-to-host
+                // copy of this one sequence's slot range) and falling back
+                // to `InferoHandRolled` below when it fails is what keeps
+                // that a plain, correct, silent fallback instead of a 500.
+                #[cfg(feature = "flash_attn2")]
+                let vendor_backend_run = if self.attn_backend_name != "handrolled" {
+                    prefill_run.filter(|_| {
+                        infero_kernels::flash_attn2::FlashAttn2Ffi::kv_run_is_contiguous(
+                            self.dev.stream(),
+                            &batch,
+                            kv_len,
+                        )
+                        .unwrap_or(false)
+                    })
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "flash_attn2"))]
                 let vendor_backend_run =
                     if self.attn_backend_name != "handrolled" { prefill_run } else { None };
                 if let Some(run_tokens) = vendor_backend_run {

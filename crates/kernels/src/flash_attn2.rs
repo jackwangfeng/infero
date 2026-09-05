@@ -96,6 +96,36 @@ impl Scratch {
     }
 }
 
+impl FlashAttn2Ffi {
+    /// Whether the physical KV-cache slots for positions `0..kv_len` of the
+    /// run's one sequence are contiguous starting at some base slot.
+    ///
+    /// infero's pool is a general per-token (sequence, logical position) ->
+    /// physical slot table (see `crates/model/src/cache.rs`'s own doc
+    /// comment), which FA2's own kernel has no concept of at all -- it
+    /// expects a flat `[n_kv_heads, n_slots, d_head]` region starting at
+    /// logical position 0. A single, freshly-prefilled sequence's slots are
+    /// contiguous in practice, but a run continuing an existing multi-turn
+    /// sequence, or one drawn from a pool with prior fragmentation, is not
+    /// guaranteed to be -- real production traffic hits both. The caller
+    /// (`Model::attention()`'s dispatch) uses this to decide whether to
+    /// route the run through this backend at all, rather than this backend
+    /// discovering the violation mid-launch.
+    pub fn kv_run_is_contiguous(
+        stream: &std::sync::Arc<infero_gpu::Stream>,
+        batch: &crate::BatchLayout<'_>,
+        kv_len: usize,
+    ) -> Result<bool> {
+        let sid = stream.clone_dtoh(&batch.seq_of.slice(0..1))?[0];
+        let table_offset = sid as usize * batch.table_stride;
+        let slots = stream.clone_dtoh(&batch.slot_table.slice(table_offset..table_offset + kv_len))?;
+        let Some(&base_slot) = slots.first() else {
+            return Ok(true); // kv_len == 0: nothing to be discontiguous about.
+        };
+        Ok(slots.iter().enumerate().all(|(i, &s)| s == base_slot + i as i32))
+    }
+}
+
 impl AttentionBackend for FlashAttn2Ffi {
     fn name(&self) -> &'static str {
         "flash_attn2"
@@ -141,33 +171,27 @@ impl AttentionBackend for FlashAttn2Ffi {
             ctx.dims.d_head
         );
 
-        // Resolve the physical KV-cache base slot for this run and verify
-        // it is contiguous. infero's pool is a general per-token
-        // (sequence, logical position) -> physical slot table (see
-        // `crates/model/src/cache.rs`'s own doc comment: "one pool ...
-        // keeps a table mapping its logical positions onto physical
-        // slots"), which FA2's own kernel has no concept of at all -- it
-        // expects a flat `[n_kv_heads, n_slots, d_head]` region starting at
-        // logical position 0. This pass's scope (a single freshly-prefilled
-        // sequence, `Model::attention()`'s own `prefill_run` precondition)
-        // means the physical slots for positions `0..kv_len` SHOULD already
-        // be contiguous in practice, but that is this call's own
-        // assumption to verify, not something to assume silently -- a
-        // violation fails loudly here rather than producing silently wrong
-        // attention output.
+        // Contiguity is checked by the caller (`Model::attention()`'s
+        // dispatch) BEFORE choosing to call this backend at all -- a
+        // non-contiguous run falls back to `InferoHandRolled` there instead
+        // of reaching this function. This `ensure!` stays as a defensive
+        // double-check for any call site that bypasses that pre-check
+        // (there should be none in the real dispatch path); if it ever
+        // fires, that is a real bug in the caller's pre-check, not an
+        // expected traffic pattern.
+        ensure!(
+            Self::kv_run_is_contiguous(ctx.stream, &ctx.batch, ctx.kv_len)?,
+            "flash_attn2 backend: KV slots for this run are not physically contiguous -- \
+             the caller should have already routed this to InferoHandRolled instead of \
+             reaching this function"
+        );
+        // The physical KV-cache base slot this contiguous run starts at --
+        // a real launch parameter (the shim's flat `[n_kv_heads, n_slots,
+        // d_head]` view needs to know where in that region this
+        // sequence's slots begin), not just a check.
         let sid = ctx.stream.clone_dtoh(&ctx.batch.seq_of.slice(0..1))?[0];
         let table_offset = sid as usize * ctx.batch.table_stride;
-        let slots = ctx.stream.clone_dtoh(&ctx.batch.slot_table.slice(table_offset..table_offset + ctx.kv_len))?;
-        let base_slot = slots[0];
-        for (i, &s) in slots.iter().enumerate() {
-            ensure!(
-                s == base_slot + i as i32,
-                "flash_attn2 backend: KV slots for this run are not physically contiguous \
-                 (slot[{i}]={s}, expected {}) -- this backend only supports a single, freshly \
-                 prefilled sequence in this pass",
-                base_slot + i as i32
-            );
-        }
+        let base_slot = ctx.stream.clone_dtoh(&ctx.batch.slot_table.slice(table_offset..table_offset + 1))?[0];
 
         let d_head = ctx.dims.d_head;
         // `ctx.q` is infero's real activation dtype, f32 -- every hand-rolled
