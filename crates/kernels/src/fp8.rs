@@ -435,6 +435,17 @@ pub fn repack_rows(quants: &[u8], k: usize, n: usize) -> Result<Vec<u8>> {
     );
     let padded = n.next_multiple_of(ROW_GROUP);
     let mut out = vec![0u8; padded * k];
+    repack_rows_fill(&mut out, quants, k, n);
+    Ok(out)
+}
+
+/// [`repack_rows`]'s actual threaded permutation, factored out so both the
+/// `Vec`-returning path above and [`repack_rows_pinned`] (which needs to
+/// fill a `PinnedHostSlice` in place rather than allocate a fresh `Vec`) run
+/// the identical, already-verified split rather than two copies of it.
+fn repack_rows_fill(out: &mut [u8], quants: &[u8], k: usize, n: usize) {
+    let padded = n.next_multiple_of(ROW_GROUP);
+    debug_assert_eq!(out.len(), padded * k);
     let chunks = k / 4;
     // Groups are independent — each writes one `ROW_GROUP * k` window and reads
     // four source rows — so this runs across threads. On one core it is 28
@@ -476,7 +487,6 @@ pub fn repack_rows(quants: &[u8], k: usize, n: usize) -> Result<Vec<u8>> {
             });
         }
     });
-    Ok(out)
 }
 
 /// [`repack_rows`], with the identity permutation: `[n,k]` row-major in,
@@ -503,6 +513,14 @@ pub fn pad_rows(quants: &[u8], k: usize, n: usize) -> Result<Vec<u8>> {
     );
     let padded = n.next_multiple_of(ROW_GROUP);
     let mut out = vec![0u8; padded * k];
+    pad_rows_fill(&mut out, quants);
+    Ok(out)
+}
+
+/// [`pad_rows`]'s copy, factored out for reuse by [`pad_rows_pinned`] the
+/// same way [`repack_rows_fill`] is shared — `out` must already be exactly
+/// `n.next_multiple_of(ROW_GROUP) * k` bytes, zeroed for the padding tail.
+fn pad_rows_fill(out: &mut [u8], quants: &[u8]) {
     let threads = std::thread::available_parallelism()
         .map(|n| n.get().min(16))
         .unwrap_or(1);
@@ -517,7 +535,6 @@ pub fn pad_rows(quants: &[u8], k: usize, n: usize) -> Result<Vec<u8>> {
             });
         }
     });
-    Ok(out)
 }
 
 /// How many scales an `[n, k]` matrix's grid holds.
@@ -550,6 +567,128 @@ pub fn concat2(a: &[u8], n_a: usize, b: &[u8], n_b: usize, k: usize) -> Vec<u8> 
     concat(&[(a, n_a), (b, n_b)], k)
 }
 
+/// Pinned-host-memory variants of [`repack_rows`]/[`pad_rows`]/[`concat2`]/
+/// [`concat3`], for the H2D upload's own sake, not the CPU-side transform.
+///
+/// Real, measured wall after the load-time work in this file's own recent
+/// history (parallelizing [`repack_rows_fill`]/[`pad_rows_fill`]/
+/// [`concat_fill`]'s own copies): the remaining warm-cache cost is now led
+/// by the host-to-device upload itself, measured at ≈9.8 GB/s on the real
+/// 27B checkpoint — squarely *pageable*-host-memory DMA territory (a
+/// regular `Vec<u8>` staged through an internal driver-side copy), not
+/// *pinned* (page-locked) memory DMA, which typically reaches several times
+/// that on the same PCIe link because the DMA engine can transfer directly
+/// with no staging copy.
+///
+/// infero already has a real, working pinned-allocation path — `pack_layer`
+/// in `crates/model/src/weights.rs` uses `dev.context().alloc_pinned` for
+/// layer-offload staging — this reuses that exact primitive for the
+/// repack/pad/concat output buffers instead. Every function here writes
+/// into the pinned buffer via the SAME threaded fill routine the plain
+/// `Vec`-returning functions above use (`repack_rows_fill`/`pad_rows_fill`/
+/// `concat_fill`), not a second copy of the logic — the only change is
+/// where the bytes land, never how they're computed.
+#[cfg(feature = "cuda")]
+pub mod pinned {
+    use super::*;
+    use infero_gpu::{Device, PinnedHostSlice};
+
+    /// [`super::repack_rows`], writing into pinned host memory.
+    ///
+    /// # Safety
+    /// Matches `pack_layer`'s own `alloc_pinned` use: the allocation is
+    /// fully written (including its padding tail) before this returns, and
+    /// the returned handle owns the memory for as long as the caller holds
+    /// it.
+    pub fn repack_rows_pinned(
+        dev: &Device,
+        quants: &[u8],
+        k: usize,
+        n: usize,
+    ) -> Result<PinnedHostSlice<u8>> {
+        anyhow::ensure!(
+            k.is_multiple_of(4),
+            "the repack moves four bytes at a time; k is {k}"
+        );
+        anyhow::ensure!(
+            quants.len() == n * k,
+            "{} quant bytes for an [{n}, {k}] matrix",
+            quants.len()
+        );
+        let padded = n.next_multiple_of(ROW_GROUP);
+        let mut out = unsafe { dev.context().alloc_pinned::<u8>(padded * k) }
+            .context("allocating pinned host memory for repack_rows")?;
+        let dst = out.as_mut_slice()?;
+        dst.fill(0);
+        repack_rows_fill(dst, quants, k, n);
+        Ok(out)
+    }
+
+    /// [`super::pad_rows`], writing into pinned host memory.
+    ///
+    /// # Safety
+    /// Same as [`repack_rows_pinned`].
+    pub fn pad_rows_pinned(
+        dev: &Device,
+        quants: &[u8],
+        k: usize,
+        n: usize,
+    ) -> Result<PinnedHostSlice<u8>> {
+        anyhow::ensure!(
+            quants.len() == n * k,
+            "{} quant bytes for an [{n}, {k}] matrix",
+            quants.len()
+        );
+        let padded = n.next_multiple_of(ROW_GROUP);
+        let mut out = unsafe { dev.context().alloc_pinned::<u8>(padded * k) }
+            .context("allocating pinned host memory for pad_rows")?;
+        let dst = out.as_mut_slice()?;
+        dst.fill(0);
+        pad_rows_fill(dst, quants);
+        Ok(out)
+    }
+
+    /// [`super::concat3`], writing into pinned host memory.
+    ///
+    /// # Safety
+    /// Same as [`repack_rows_pinned`].
+    pub fn concat3_pinned(
+        dev: &Device,
+        a: &[u8],
+        n_a: usize,
+        b: &[u8],
+        n_b: usize,
+        c: &[u8],
+        n_c: usize,
+        k: usize,
+    ) -> Result<PinnedHostSlice<u8>> {
+        let parts = [(a, n_a), (b, n_b), (c, n_c)];
+        let mut out = unsafe { dev.context().alloc_pinned::<u8>(concat_len(&parts, k)) }
+            .context("allocating pinned host memory for concat3")?;
+        concat_fill(out.as_mut_slice()?, &parts, k);
+        Ok(out)
+    }
+
+    /// [`super::concat2`], writing into pinned host memory.
+    ///
+    /// # Safety
+    /// Same as [`repack_rows_pinned`].
+    pub fn concat2_pinned(
+        dev: &Device,
+        a: &[u8],
+        n_a: usize,
+        b: &[u8],
+        n_b: usize,
+        k: usize,
+    ) -> Result<PinnedHostSlice<u8>> {
+        let parts = [(a, n_a), (b, n_b)];
+        let mut out = unsafe { dev.context().alloc_pinned::<u8>(concat_len(&parts, k)) }
+            .context("allocating pinned host memory for concat2")?;
+        concat_fill(out.as_mut_slice()?, &parts, k);
+        Ok(out)
+    }
+}
+
 /// Was a single-thread `extend_from_slice` chain -- correct, but the same
 /// mistake [`pad_rows`]'s own doc comment already found once: a `Vec` this
 /// size (gate+up's quants alone run ~170 MiB a layer on the 27B, 64 layers)
@@ -560,7 +699,27 @@ pub fn concat2(a: &[u8], n_a: usize, b: &[u8], n_b: usize, k: usize) -> Vec<u8> 
 /// scale grid is a few KB even for the widest real matrix (`scale_grid`'s own
 /// `n/128 * k/128` shape), so only the quant region is worth splitting across
 /// threads; the scale region stays a plain sequential copy.
+/// The `(total_quant + total_scale)` byte size [`concat`]/[`concat_fill`]
+/// need for `parts` — callers allocating their own destination (e.g.
+/// [`concat2_pinned`]/[`concat3_pinned`]) size against this rather than
+/// duplicating the arithmetic.
+fn concat_len(parts: &[(&[u8], usize)], k: usize) -> usize {
+    let scale_cols = k.div_ceil(FP8_BLOCK);
+    let quant_len = |n: usize| n * k;
+    let scale_len = |n: usize| (n / FP8_BLOCK) * scale_cols;
+    parts.iter().map(|&(_, n)| quant_len(n) + scale_len(n) * 4).sum()
+}
+
 fn concat(parts: &[(&[u8], usize)], k: usize) -> Vec<u8> {
+    let mut out = vec![0u8; concat_len(parts, k)];
+    concat_fill(&mut out, parts, k);
+    out
+}
+
+/// [`concat`]'s actual threaded copy, factored out so [`concat2_pinned`]/
+/// [`concat3_pinned`] can fill a `PinnedHostSlice` in place with the
+/// identical, already-verified split rather than a second copy of it.
+fn concat_fill(out: &mut [u8], parts: &[(&[u8], usize)], k: usize) {
     let scale_cols = k.div_ceil(FP8_BLOCK);
     let quant_len = |n: usize| n * k;
     let scale_len = |n: usize| (n / FP8_BLOCK) * scale_cols;
@@ -569,8 +728,7 @@ fn concat(parts: &[(&[u8], usize)], k: usize) -> Vec<u8> {
         debug_assert_eq!(bytes.len(), quant_len(n) + scale_len(n) * 4);
     }
     let total_quant: usize = parts.iter().map(|&(_, n)| quant_len(n)).sum();
-    let total_scale: usize = parts.iter().map(|&(_, n)| scale_len(n) * 4).sum();
-    let mut out = vec![0u8; total_quant + total_scale];
+    debug_assert_eq!(out.len(), concat_len(parts, k));
     let (quant_region, scale_region) = out.split_at_mut(total_quant);
 
     // Split the quant region into one disjoint sub-slice a part first (no
@@ -606,7 +764,6 @@ fn concat(parts: &[(&[u8], usize)], k: usize) -> Vec<u8> {
         debug_assert_eq!(bytes.len() - ql, sl);
         off += sl;
     }
-    out
 }
 
 /// The activation quantizer's group width — must match `QUANT_GROUP` in
@@ -1404,5 +1561,98 @@ mod concat_tests {
         let want = concat_serial(&[(&a, n_a), (&b, n_b)], k);
         let got = super::concat2(&a, n_a, &b, n_b, k);
         assert_eq!(got, want);
+    }
+}
+
+/// Real-GPU tests for [`pinned`]: each pinned variant must produce bytes
+/// identical to its plain, already-verified `Vec`-returning counterpart —
+/// they share the same fill routine, so this is really a check that the
+/// pinned-allocation plumbing (sizing, zero-fill, `as_mut_slice`) didn't
+/// introduce an off-by-one or leave the padding tail uninitialized, not a
+/// re-check of the copy/permute logic itself.
+#[cfg(all(test, feature = "cuda"))]
+mod pinned_tests {
+    use super::pinned::*;
+    use super::*;
+    use infero_gpu::Device;
+
+    fn dev() -> Device {
+        Device::new(0).expect("a CUDA device is required for this test")
+    }
+
+    #[test]
+    fn repack_rows_pinned_matches_repack_rows() {
+        let (k, n) = (5120usize, 4098usize);
+        let quants: Vec<u8> = (0..(k * n)).map(|i| (i % 251) as u8).collect();
+        let want = super::repack_rows(&quants, k, n).expect("repack_rows");
+        let dev = dev();
+        let mut got = repack_rows_pinned(&dev, &quants, k, n).expect("repack_rows_pinned");
+        assert_eq!(
+            got.as_mut_slice().expect("as_mut_slice"),
+            want.as_slice(),
+            "pinned repack_rows must byte-for-byte match the Vec-returning version"
+        );
+    }
+
+    #[test]
+    fn pad_rows_pinned_matches_pad_rows() {
+        let (k, n) = (5120usize, 4098usize);
+        let quants: Vec<u8> = (0..(k * n)).map(|i| (i % 251) as u8).collect();
+        let want = super::pad_rows(&quants, k, n).expect("pad_rows");
+        let dev = dev();
+        let mut got = pad_rows_pinned(&dev, &quants, k, n).expect("pad_rows_pinned");
+        assert_eq!(
+            got.as_mut_slice().expect("as_mut_slice"),
+            want.as_slice(),
+            "pinned pad_rows must byte-for-byte match the Vec-returning version"
+        );
+    }
+
+    #[test]
+    fn concat2_pinned_matches_concat2() {
+        let k = 5120usize;
+        let (n_a, n_b) = (17408usize, 17408usize + FP8_BLOCK);
+        let fake_part = |n: usize, seed: u8| -> Vec<u8> {
+            let quant_len = n * k;
+            let scale_len = scale_grid(k, n) * 4;
+            (0..(quant_len + scale_len))
+                .map(|i| ((i as u64).wrapping_mul(31).wrapping_add(seed as u64) % 251) as u8)
+                .collect()
+        };
+        let a = fake_part(n_a, 7);
+        let b = fake_part(n_b, 41);
+        let want = super::concat2(&a, n_a, &b, n_b, k);
+        let dev = dev();
+        let mut got = concat2_pinned(&dev, &a, n_a, &b, n_b, k).expect("concat2_pinned");
+        assert_eq!(
+            got.as_mut_slice().expect("as_mut_slice"),
+            want.as_slice(),
+            "pinned concat2 must byte-for-byte match the Vec-returning version"
+        );
+    }
+
+    #[test]
+    fn concat3_pinned_matches_concat3() {
+        let k = 128usize;
+        let (n_a, n_b, n_c) = (FP8_BLOCK, FP8_BLOCK * 5, FP8_BLOCK * 2);
+        let fake_part = |n: usize, seed: u8| -> Vec<u8> {
+            let quant_len = n * k;
+            let scale_len = scale_grid(k, n) * 4;
+            (0..(quant_len + scale_len))
+                .map(|i| ((i as u64).wrapping_mul(31).wrapping_add(seed as u64) % 251) as u8)
+                .collect()
+        };
+        let a = fake_part(n_a, 1);
+        let b = fake_part(n_b, 2);
+        let c = fake_part(n_c, 3);
+        let want = super::concat3(&a, n_a, &b, n_b, &c, n_c, k);
+        let dev = dev();
+        let mut got =
+            concat3_pinned(&dev, &a, n_a, &b, n_b, &c, n_c, k).expect("concat3_pinned");
+        assert_eq!(
+            got.as_mut_slice().expect("as_mut_slice"),
+            want.as_slice(),
+            "pinned concat3 must byte-for-byte match the Vec-returning version"
+        );
     }
 }
