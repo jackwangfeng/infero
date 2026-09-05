@@ -779,9 +779,43 @@ impl Weights {
                         k_norm: upload_optional_vector(
                             dev, f, &t("attn_k_norm.weight"), &mut device_bytes)?,
                         w_qkv: None,
-                        w_kv: stacked2_gguf(
-                            dev, f, &t("attn_k.weight"), &t("attn_v.weight"),
-                            &mut device_bytes)?,
+                        // `stacked2_gguf` reads `attn_k.weight`/`attn_v.weight`
+                        // straight out of the GGUF file, at their full,
+                        // unsharded width -- it has no `shard` parameter and
+                        // does not go through `upload_matrix_sharded`. Under
+                        // TP that is a real, load-bearing mismatch, not just a
+                        // missed optimization: whenever a layer's K and V
+                        // happen to share type and `k` (true for every layer
+                        // on most checkpoints, and true here whenever a
+                        // Q4_K_M file's mixed-precision layout gives a layer
+                        // uniform-type K/V), this builds a
+                        // `w.n = full_kv_dim_k + full_kv_dim_v`-wide matrix --
+                        // double the per-rank `kv_dim` every other sharded
+                        // tensor in this layer uses -- and the caller
+                        // (`attention`'s fused-`w_kv` branch) writes/splits it
+                        // against buffers sized for the correctly-sharded
+                        // `kv_dim`. The resulting garbage K/V is silent: no
+                        // shape assertion catches it because `matmul_pre`
+                        // writes `n_tokens * w.n` elements into a scratch
+                        // buffer that is usually oversized enough to absorb
+                        // the overrun without tripping memcheck. This is what
+                        // made llama-3.1-8b-instruct-q4_k_m produce coherent
+                        // output through its Q6_K-V layers and degenerate
+                        // repeated-token garbage from the first Q4_K-V layer
+                        // on -- Q4_K/Q6_K mixing is exactly what usually keeps
+                        // this condition false. Disabled outright under
+                        // sharding rather than reimplemented against
+                        // pre-sharded bytes: it is a decode-step launch-count
+                        // optimization (see its own doc comment above), and
+                        // the per-matrix fallback below is already correct
+                        // and already TP-sharded.
+                        w_kv: if shard.is_some() {
+                            None
+                        } else {
+                            stacked2_gguf(
+                                dev, f, &t("attn_k.weight"), &t("attn_v.weight"),
+                                &mut device_bytes)?
+                        },
                         output_gate: cfg.attn_output_gate,
                     }),
                     None,

@@ -32,13 +32,14 @@ use infero_cuda::Device;
 use infero_gguf::Gguf;
 use infero_model::tp::RankId;
 use infero_model::{KvCacheQuant, Model, Sampler, SamplingParams};
-use infero_tokenizer::Tokenizer;
+use infero_tokenizer::{ChatMessage, Tokenizer};
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let path = args.next().context("usage: tp_generate <model.gguf> [prompt] [-n N]")?;
+    let path = args.next().context("usage: tp_generate <model.gguf> [prompt] [-n N] [--raw]")?;
     let mut prompt = String::new();
     let mut max_new = 32usize;
+    let mut raw = false;
     let rest: Vec<String> = args.collect();
     let mut i = 0;
     while i < rest.len() {
@@ -47,6 +48,7 @@ fn main() -> Result<()> {
                 i += 1;
                 max_new = rest.get(i).and_then(|v| v.parse().ok()).unwrap_or(max_new);
             }
+            "--raw" => raw = true,
             other => {
                 if !prompt.is_empty() {
                     prompt.push(' ');
@@ -70,7 +72,17 @@ fn main() -> Result<()> {
     let dev = Device::new(0)?; // CUDA_VISIBLE_DEVICES remaps this to the right physical GPU per rank
     let mut model = Model::load_full_tp(dev, &gguf, 2048, KvCacheQuant::F16, usize::MAX, 32, &rank, &run_id)?;
 
-    let tokens = tokenizer.encode(&prompt, None, true);
+    // Match `generate.rs`'s real usage: an instruct-tuned checkpoint's raw-
+    // text continuation is not a meaningful correctness baseline for it, so
+    // apply the model's own chat template unless `--raw` asks to skip it.
+    let text = if raw {
+        prompt.clone()
+    } else if let Some(template) = tokenizer.chat_template() {
+        template.render(&[ChatMessage::user(&prompt)], true)?
+    } else {
+        prompt.clone()
+    };
+    let tokens = tokenizer.encode(&text, None, true);
     anyhow::ensure!(!tokens.is_empty(), "prompt tokenized to nothing");
 
     let mut session = model.new_session()?;

@@ -57,6 +57,49 @@ fn loads_both_ranks_of_a_tp2_shard_without_shape_mismatch() {
 }
 
 #[test]
+fn w_kv_fusion_is_disabled_under_sharding() {
+    // Regression test for a real bug: `stacked2_gguf` (which builds the
+    // fused K+V matrix `w_kv` as a decode-step launch-count optimization,
+    // taken by `attention()` whenever a layer's K and V share a GGUF type)
+    // reads `attn_k.weight`/`attn_v.weight` directly out of the file at
+    // their full, unsharded width -- it has no `shard` parameter and does
+    // not go through `upload_matrix_sharded`. Under sharding this silently
+    // built a `w.n` twice the per-rank `kv_dim` every other tensor in the
+    // layer uses, and `attention`'s fused-`w_kv` branch wrote/split it
+    // against buffers sized for the correctly-sharded `kv_dim` -- garbage
+    // K/V from that layer on, with no shape assertion catching it. Real
+    // checkpoints that mix quantization types per layer (a Q4_K_M file's
+    // Q6_K/Q4_K attn_v mixing, say) mask this whenever K and V happen to
+    // differ in type at a given layer, which is why this was found only on
+    // one of two validation checkpoints -- so this test does not rely on
+    // the fixture actually containing a K/V-type-matched layer; it simply
+    // asserts the fused path is never built at all under sharding,
+    // regardless of what the checkpoint's own per-layer types happen to be.
+    let Some(path) = model_path() else {
+        eprintln!("skipping: set INFERO_TEST_TP_GGUF to a real GGUF checkpoint");
+        return;
+    };
+    let gguf = Gguf::open(&path).expect("opening checkpoint");
+    let rank = RankId { pp_rank: 0, pp_size: 1, tp_rank: 0, tp_size: 2 };
+    let mut cfg = Config::from_gguf(&gguf).expect("parsing config");
+    cfg.shard_for_tp(&rank);
+    let dev = Device::new(0).expect("device");
+    let w = Weights::load_sharded(&dev, &gguf, &cfg, usize::MAX, Some((0, 2)))
+        .expect("rank 0 failed to load");
+    for (i, l) in w.layers.iter().enumerate() {
+        if l.is_linear() {
+            continue;
+        }
+        assert!(
+            l.attn().w_kv.is_none(),
+            "layer {i}: w_kv must be None under sharding -- built from unsharded \
+             GGUF bytes at the wrong width, this is the real bug that produced \
+             degenerate garbage output on llama-3.1-8b-instruct-q4_k_m TP=2"
+        );
+    }
+}
+
+#[test]
 fn tp1_is_unaffected() {
     let Some(path) = model_path() else {
         eprintln!("skipping: set INFERO_TEST_TP_GGUF to a real GGUF checkpoint");
