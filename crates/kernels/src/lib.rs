@@ -1174,6 +1174,22 @@ impl Kernels {
         self.to_f16_inner(out, x, n, true)
     }
 
+    /// The inverse of [`Self::to_f16`] -- for a caller holding real f16 data
+    /// from outside this crate's own kernels (a vendor FFI kernel's own
+    /// output, e.g.) that needs it back in f32 without a host round-trip.
+    pub fn from_f16(&self, out: &mut ViewMut<'_, f32>, x: &View<'_, f16>, n: usize) -> Result<()> {
+        let f = self.dev.kernels().get("infero_ops", ops_src(), "f16_to_f32")?;
+        let n_i = n as i32;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(x).arg(&n_i);
+        let threads = (n as u32).div_ceil(4);
+        self.dev.profile().time("from_f16", self.dev.stream(), || {
+            unsafe { b.launch(elementwise(threads)) }.context("from_f16")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     fn to_f16_inner(
         &self,
         out: &mut ViewMut<'_, f16>,

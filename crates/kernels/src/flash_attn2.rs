@@ -120,15 +120,20 @@ impl AttentionBackend for FlashAttn2Ffi {
         // infero's real f32 activation buffer, same class of dtype mismatch
         // as Q above, just on the write side: pointing the kernel at
         // `ctx.out`'s raw f32 memory directly (as this backend did before
-        // this fix) makes it write 2-byte fp16 elements into a buffer whose
-        // real element stride is 4 bytes, so every read-back element is
-        // built from two half-overlapping fp16 writes -- explains the
-        // otherwise-mysterious ~2^-13-scale, deterministic-but-wrong values
-        // this test was seeing even after the acc_o register value was
-        // confirmed correct via `print_tensor`. Write to a real f16 buffer
-        // and convert on the host afterward -- correctness-only for this
-        // pass (see the design doc's non-goals: this backend does not need
-        // to be fast), not a device-side kernel.
+        // the correctness fix landed) makes it write 2-byte fp16 elements
+        // into a buffer whose real element stride is 4 bytes, so every
+        // read-back element is built from two half-overlapping fp16 writes
+        // -- explains the otherwise-mysterious ~2^-13-scale,
+        // deterministic-but-wrong values this test was seeing even after
+        // the acc_o register value was confirmed correct via
+        // `print_tensor`. Write to a real f16 buffer, convert back with
+        // `Kernels::from_f16` (a device-side kernel, same shape as the Q
+        // conversion above) -- the first version of this fix went through
+        // the host (`clone_dtoh`, a CPU-side `f32::from` loop,
+        // `memcpy_htod_sync`) for every one of a real prefill's 64
+        // layer*chunk calls, which measured as ~14.4s of a real 18.6s
+        // 30552-token run -- the actual dominant cost of this backend, far
+        // larger than the FFI call or the kernel itself. Fixed here.
         let n_out_elems = ctx.run_tokens * ctx.dims.n_heads * d_head;
         let mut out16 = ctx.stream.alloc_zeros::<half::f16>(n_out_elems)?;
         let mut out16_view = out16.as_view_mut();
@@ -174,13 +179,7 @@ impl AttentionBackend for FlashAttn2Ffi {
         // for a `Drop` type) so `out16` is free to read back below.
         drop(_g2);
         ensure!(rc == 0, "flash_attn2 fwd failed, code {rc}");
-        let out16_host = ctx.stream.clone_dtoh(&out16)?;
-        let out32_host: Vec<f32> = out16_host.iter().map(|v| f32::from(*v)).collect();
-        let (ctx_out_ptr, _g6) = ctx.out.device_ptr_mut(ctx.stream);
-        unsafe {
-            cudarc::driver::result::memcpy_htod_sync(ctx_out_ptr, &out32_host)
-                .map_err(|e| anyhow::anyhow!("flash_attn2: writing converted output failed: {e}"))?;
-        }
+        ctx.kern.from_f16(ctx.out, &out16.as_view(), n_out_elems)?;
         Ok(())
     }
 }

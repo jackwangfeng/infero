@@ -249,6 +249,32 @@ extern "C" __global__ void f32_to_f16(__half* __restrict__ out,
     for (int j = base; j < base + 4 && j < n; ++j) out[j] = __float2half(in[j]);
 }
 
+// The inverse of `f32_to_f16` -- same four-elements-a-thread reasoning (a
+// single-convert kernel is latency-bound, not bandwidth-bound, at one
+// element a thread). Exists for callers that receive real f16 output from
+// somewhere outside this crate's own kernels (a vendor FFI kernel's
+// `Element = half_t` output, e.g.) and need it back in f32 without a
+// host round-trip -- see `flash_attn2.rs`'s own doc comment for why that
+// round-trip was there in the first place and what it cost.
+extern "C" __global__ void f16_to_f32(float* __restrict__ out,
+                                      const __half* __restrict__ in, int n) {
+    const int base = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (base >= n) return;
+    const bool aligned = ((unsigned long long)in % 8 == 0)
+                         && ((unsigned long long)out % 16 == 0);
+    if (aligned && base + 3 < n) {
+        const uint2 v = *(const uint2*)(const void*)(in + base);
+        const __half2 h0 = *(const __half2*)(const void*)&v.x;
+        const __half2 h1 = *(const __half2*)(const void*)&v.y;
+        const float2 f0 = __half22float2(h0);
+        const float2 f1 = __half22float2(h1);
+        const float4 f = make_float4(f0.x, f0.y, f1.x, f1.y);
+        *(float4*)(void*)(out + base) = f;
+        return;
+    }
+    for (int j = base; j < base + 4 && j < n; ++j) out[j] = __half2float(in[j]);
+}
+
 // The same conversion, writing k in the order an `m16n8k16` A fragment wants
 // when the B fragment comes straight out of an AWQ pack.
 //
