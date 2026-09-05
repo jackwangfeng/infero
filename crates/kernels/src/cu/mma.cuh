@@ -379,3 +379,110 @@ extern "C" __global__ void ldmatrix_b_probe(const int8_t* __restrict__ B,
     out[lane * 4 + 2] = want[0];
     out[lane * 4 + 3] = want[1];
 }
+
+// ---- GDN kernel-2 register<->MMA-fragment bridge, validated in isolation --
+//
+// `gdn_chunk_state_f32` (see `gdn.cu`) keeps its per-chunk state `sc[64]`
+// resident in registers across ~955 sequential chunk iterations, in a
+// 256-thread layout unrelated to any MMA fragment: thread `lane` owns
+// `S[i0+r][j]` for a fixed `(j, part)` pair (`j = lane/2`, `part = lane%2`,
+// `i0 = part*64`), i.e. one thread per (row-half, column). Giving this state's
+// own matmul-shaped steps (`pred = W @ S`, `S += Kd^T @ delta`) tensor cores
+// needs it to serve as an MMA operand and receive an MMA accumulator's output
+// -- neither of which uses this per-thread distribution -- so both directions
+// have to round-trip through a shared-memory staging tile instead. This probe
+// tests exactly that bridge, both directions, before the real kernel commits
+// to it: is the layout choice below (staging `S` *transposed*, `st[j][d]`, so
+// it lands in the "column-major" shape `ldmatrix`'s own B-operand convention
+// already documented above expects for a `(k=d, n=j)` contraction) actually
+// correct, and does an MMA accumulator's own natural per-lane output position
+// write back into the same tile at the cell the ORIGINAL per-thread layout
+// expects to read next?
+//
+// Uses a plain scalar gather from shared memory (mirroring `mma_f16_probe`'s
+// existing style, sourced from `st` instead of a global tile) rather than
+// `ldmatrix`, since what this probe exists to answer is whether the *data
+// layout* bridge is correct, not which load instruction reads it fastest --
+// that is a real, separate follow-up optimization for whichever kernel
+// actually adopts this, not a question this probe needs to settle.
+extern "C" __global__ __launch_bounds__(256) void gdn_state_bridge_probe(
+        const float* __restrict__ s_in,      // [128][128], row d, col j
+        const half* __restrict__ w_in,       // [16][16], row-major
+        float* __restrict__ pred_out,        // [16][8], the mma_f16 result
+        float* __restrict__ roundtrip_out) { // [128][128], s_in through the full bridge
+    const int lane = threadIdx.x;   // 0..255, matches gdn_chunk_state_f32
+    const int j = lane / 2;         // 0..127
+    const int part = lane % 2;      // 0 or 1
+    const int i0 = part * 64;       // 0 or 64
+
+    __shared__ half st[128 * 128];  // st[j][d] -- see the comment above for why transposed
+
+    float sc[64];
+#pragma unroll
+    for (int r = 0; r < 64; ++r) {
+        sc[r] = s_in[(size_t)(i0 + r) * 128 + j];
+        st[(size_t)j * 128 + (i0 + r)] = __float2half(sc[r]);
+    }
+    __syncthreads();
+
+    if (lane < 32) {
+        mma_a_f16 a;
+        mma_b_f16 b;
+        mma_c_f32 d = {{0.0f, 0.0f, 0.0f, 0.0f}};
+
+        const int ar = mma_a_row(lane);
+        const int bc = mma_b_col(lane);
+        const int k0 = mma_k0_f16(lane);
+
+        const half* a_lo = w_in + ar * 16 + k0;
+        const half* a_hi = w_in + (ar + 8) * 16 + k0;
+        a.x[0] = *(const unsigned*)(const void*)a_lo;
+        a.x[1] = *(const unsigned*)(const void*)a_hi;
+        a.x[2] = *(const unsigned*)(const void*)(a_lo + 8);
+        a.x[3] = *(const unsigned*)(const void*)(a_hi + 8);
+
+        const half* bp = st + bc * 128 + k0;
+        b.x[0] = *(const unsigned*)(const void*)bp;
+        b.x[1] = *(const unsigned*)(const void*)(bp + 8);
+
+        // Independent thread scheduling (Volta+) does not guarantee this
+        // warp's 32 lanes finish the reads above before any lane starts the
+        // write-back below, even though both are straight-line code with no
+        // branch between them -- `racecheck` caught exactly this the first
+        // time this kernel ran (2 real hazards, passing correctness check
+        // notwithstanding: a race that happens not to reorder on one run is
+        // still a race). `__syncwarp()` is the fix, not a wider
+        // `__syncthreads()` -- every lane touching `st` here is in this same
+        // warp.
+        __syncwarp();
+
+        mma_f16(d, a, b);
+
+        const int cr = mma_c_row(lane);
+        const int cc = mma_c_col(lane);
+        pred_out[cr * 8 + cc + 0] = d.x[0];
+        pred_out[cr * 8 + cc + 1] = d.x[1];
+        pred_out[(cr + 8) * 8 + cc + 0] = d.x[2];
+        pred_out[(cr + 8) * 8 + cc + 1] = d.x[3];
+
+        // The other direction: the accumulator's own natural per-lane output
+        // cell, written back into `st` at the corresponding (j=n, d=m)
+        // position -- exactly what a real state-advance step needs every
+        // chunk (fold this MMA's result into the running state, in place, so
+        // the same per-thread registers can read it back next chunk).
+        st[(size_t)cc * 128 + cr] = __float2half(d.x[0]);
+        st[(size_t)(cc + 1) * 128 + cr] = __float2half(d.x[1]);
+        st[(size_t)cc * 128 + (cr + 8)] = __float2half(d.x[2]);
+        st[(size_t)(cc + 1) * 128 + (cr + 8)] = __float2half(d.x[3]);
+    }
+    __syncthreads();
+
+    // Every thread reads its own (i0+r, j) cell back out of `st`, exactly as
+    // the real kernel's next chunk iteration would. Cells with d<16 && j<8
+    // prove the MMA-output round trip; the rest prove step 1's write-then-
+    // read survives undisturbed.
+#pragma unroll
+    for (int r = 0; r < 64; ++r) {
+        roundtrip_out[(size_t)(i0 + r) * 128 + j] = __half2float(st[(size_t)j * 128 + (i0 + r)]);
+    }
+}

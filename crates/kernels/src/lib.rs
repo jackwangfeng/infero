@@ -6752,6 +6752,33 @@ impl Kernels {
         Ok(())
     }
 
+    /// Validates the register<->MMA-fragment bridge a tensor-core version of
+    /// `gdn_chunk_state_f32`'s state-advance would need, before any real
+    /// kernel commits to it -- see `gdn_state_bridge_probe`'s own doc comment
+    /// in `mma.cuh` for exactly what this proves.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_state_bridge_probe(
+        &self,
+        pred_out: &mut ViewMut<'_, f32>,
+        roundtrip_out: &mut ViewMut<'_, f32>,
+        s_in: &View<'_, f32>,
+        w_in: &View<'_, half::f16>,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_mmq", mmq_src(), "gdn_state_bridge_probe")?;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(s_in).arg(w_in).arg(pred_out).arg(roundtrip_out);
+        unsafe { b.launch(cfg) }.context("gdn_state_bridge_probe")?;
+        Ok(())
+    }
+
     /// One `mma.m16n8k32.e4m3` on a 16x32 by 8x32 pair of e4m3 tiles.
     ///
     /// The e4m3 counterpart of [`Self::mma_s8_probe`]: same fragment layout,

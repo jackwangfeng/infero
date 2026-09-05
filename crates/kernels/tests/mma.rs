@@ -215,3 +215,115 @@ fn ldmatrix_loads_an_f16_a_fragment_too() -> Result<()> {
     }
     Ok(())
 }
+
+// ---- GDN kernel-2's register<->MMA-fragment bridge (a toy validation) ----
+//
+// Not a claim that a tensor-core `gdn_chunk_state_f32` exists -- it derisks
+// the one open design question a real attempt would have to answer first:
+// can the state's own 256-thread register layout round-trip through a
+// shared-memory staging tile as an MMA B-operand, and can an MMA
+// accumulator's output land back in the exact cells that layout expects to
+// read next. See `gdn_state_bridge_probe`'s doc comment in `mma.cuh`.
+
+/// `w` row-major (16x16) times `s`'s top-left 16x16 corner, contracted over
+/// `s`'s row index (`d`), giving `pred[m][n] = sum_d w[m][d] * s[d][n]`.
+fn reference_state_bridge(w: &[half::f16], s: &[f32]) -> Vec<f32> {
+    let mut pred = vec![0.0f32; 16 * 8];
+    for m in 0..16 {
+        for n in 0..8 {
+            let mut acc = 0.0f32;
+            for d in 0..16 {
+                acc += w[m * 16 + d].to_f32() * s[d * 128 + n];
+            }
+            pred[m * 8 + n] = acc;
+        }
+    }
+    pred
+}
+
+#[test]
+fn gdn_state_survives_the_register_to_mma_fragment_bridge() -> Result<()> {
+    let dev = match Device::new(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skipping: no cuda device ({e})");
+            return Ok(());
+        }
+    };
+    if dev.arch() < 80 {
+        eprintln!("skipping: sm_{} predates this mma", dev.arch());
+        return Ok(());
+    }
+    let kern = Kernels::new(dev.clone());
+    let stream = dev.stream();
+
+    // Multiples of 1/4 in [-8, 8), same scheme `the_f16_mma_fragment_layout_...`
+    // test uses -- exact in f16, so both directions of the bridge (register
+    // -> f16 shared tile -> f32 back out) can be checked by equality, not a
+    // tolerance that could hide a swapped index.
+    let s_in: Vec<f32> = (0..128 * 128)
+        .map(|i| (((i * 7 + 3) % 64) as f32 / 4.0 - 8.0))
+        .collect();
+    let w_in: Vec<half::f16> = (0..16 * 16)
+        .map(|i| half::f16::from_f32(((i * 13 + 5) % 64) as f32 / 4.0 - 8.0))
+        .collect();
+
+    let d_s = stream.clone_htod(&s_in)?;
+    let d_w = stream.clone_htod(&w_in)?;
+    let mut d_pred = stream.alloc_zeros::<f32>(16 * 8)?;
+    let mut d_roundtrip = stream.alloc_zeros::<f32>(128 * 128)?;
+    kern.gdn_state_bridge_probe(
+        &mut d_pred.slice_mut(..),
+        &mut d_roundtrip.slice_mut(..),
+        &d_s.slice(..),
+        &d_w.slice(..),
+    )?;
+    let pred = stream.clone_dtoh(&d_pred)?;
+    let roundtrip = stream.clone_dtoh(&d_roundtrip)?;
+    dev.synchronize()?;
+
+    // Direction 1: staged-through-shared-memory `s_in` used as an MMA
+    // B-operand produces the same matmul a host reference does.
+    let want_pred = reference_state_bridge(&w_in, &s_in);
+    for m in 0..16 {
+        for n in 0..8 {
+            assert_eq!(
+                pred[m * 8 + n],
+                want_pred[m * 8 + n],
+                "cell ({m}, {n}): state-as-B-operand bridge is wrong"
+            );
+        }
+    }
+
+    // Direction 2: the MMA accumulator's own output lands back in the exact
+    // cells the original per-thread (d, j) layout reads -- `pred[m][n]` and
+    // `roundtrip[m][n]` (for d=m<16, j=n<8) must be the same values.
+    for d in 0..16 {
+        for j in 0..8 {
+            assert_eq!(
+                roundtrip[d * 128 + j],
+                pred[d * 8 + j],
+                "cell (d={d}, j={j}): mma-output-to-register bridge is wrong"
+            );
+        }
+    }
+
+    // Untouched cells (outside the 16x8 tile the MMA above wrote) must
+    // survive the plain write-then-read through the shared tile unchanged.
+    let mut untouched_checked = 0;
+    for d in 0..128 {
+        for j in 0..128 {
+            if d < 16 && j < 8 {
+                continue;
+            }
+            assert_eq!(
+                roundtrip[d * 128 + j],
+                s_in[d * 128 + j],
+                "cell (d={d}, j={j}): untouched state corrupted by the staging round trip"
+            );
+            untouched_checked += 1;
+        }
+    }
+    assert_eq!(untouched_checked, 128 * 128 - 16 * 8);
+    Ok(())
+}
