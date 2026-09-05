@@ -20,6 +20,8 @@
 
 mod cache;
 pub mod config;
+#[cfg(feature = "nccl")]
+pub mod tp;
 pub mod gdn_state;
 pub mod mtp;
 pub mod qwen35;
@@ -1009,63 +1011,6 @@ impl Model {
                 "the block stack is not homogeneous"
             );
         }
-        // Which `AttentionBackend` serves `attention()`'s `prefill_run`
-        // path -- resolved once here (mirrors `needs_scores`/`batch_tokens`
-        // below), not per call. `InferoHandRolled` always supports every
-        // shape `prefill_attention` already covers (priority 0), so it wins
-        // by default; a vendor backend only wins when forced via
-        // `INFERO_ATTN_BACKEND` or when it's the only one that supports a
-        // shape this crate has no tuned kernel for -- neither condition
-        // exists yet on `flash_attn2`'s fixed `d_head=256`-only scope on
-        // real hardware infero already has a tuned kernel for. Runtime
-        // selection has no second required env var to "activate" a
-        // compiled-in backend -- once `flash_attn2` is compiled in,
-        // `supports()` alone decides eligibility (see the design doc's
-        // "one footgun this design must not repeat").
-        let attn_backend_name = {
-            let hw_caps = HardwareCaps::probe(&dev);
-            #[allow(unused_mut)] // only mutated when the `flash_attn2` feature adds a second backend
-            let mut backends: Vec<Box<dyn AttentionBackend + '_>> =
-                vec![Box::new(InferoHandRolled::new(&kern))];
-            #[cfg(feature = "flash_attn2")]
-            backends.push(Box::new(infero_kernels::flash_attn2::FlashAttn2Ffi));
-            let dims = AttnDims {
-                n_heads: cfg.n_heads,
-                n_kv_heads: cfg.n_kv_heads,
-                d_head: cfg.d_head,
-                n_slots: 0,
-                n_tokens: 0,
-            };
-            let forced = std::env::var("INFERO_ATTN_BACKEND").ok();
-            let name = match select_backend(&backends, &hw_caps, &dims, kv_quant, forced.as_deref()) {
-                Ok(chosen) => chosen.name(),
-                // `InferoHandRolled::supports()` only covers the shapes
-                // `prefill_attention()` itself gates (e.g. it's off unless
-                // `INFERO_ATTN_MMA=1`, or the GQA/`d_head` shape doesn't
-                // qualify) -- narrower than what `attention()`'s real
-                // dispatch handles, since that cascade has its own further
-                // fallback chain (`decode_attention`, `flash_attention`, the
-                // 3-kernel path) beyond the one sub-case this trait models.
-                // "No backend's narrow `supports()` matches" is therefore
-                // NOT "this model can't run attention" -- it means the
-                // existing cascade's own fallback covers it, which is
-                // exactly what `attn_backend_name == "handrolled"` already
-                // defers to. Only an explicit `INFERO_ATTN_BACKEND` request
-                // should fail loudly here -- an unforced non-match is this
-                // backend's normal, expected case for most shapes.
-                Err(e) if forced.is_none() => {
-                    tracing::debug!(
-                        reason = %e,
-                        "no attention backend's narrow `supports()` matched this shape; \
-                         falling back to `handrolled`, whose own cascade covers it"
-                    );
-                    "handrolled"
-                }
-                Err(e) => return Err(e),
-            };
-            tracing::info!(backend = name, "attention backend selected");
-            name
-        };
         // Resolved here and stored, not recomputed: the buffers below are sized
         // from it and `forward` splits its input by it, and those two disagreeing
         // is the kind of mismatch `add_assign` already cost a day of.
@@ -1100,6 +1045,74 @@ impl Model {
         };
         let batch_tokens =
             batch_tokens_for(cfg.n_heads, max_seq, max_logit_rows, needs_scores, fp8_ceiling);
+        // Which `AttentionBackend` serves `attention()`'s `prefill_run`
+        // path -- resolved once here (mirrors `needs_scores`/`batch_tokens`
+        // above, computed just before this specifically so the real,
+        // configured `batch_tokens` -- not a placeholder -- is available for
+        // `supports()` to gate on), not per call. `InferoHandRolled` always
+        // supports every shape `prefill_attention` already covers (priority
+        // 0), so it wins by default; a vendor backend only wins when forced
+        // via `INFERO_ATTN_BACKEND` or when its own `supports()` prefers this
+        // shape outright (see `FlashAttn2Ffi::supports()`'s own
+        // `batch_tokens` threshold -- real per-call-shape benchmarking this
+        // session found the direction between infero's tuned kernels and FA2
+        // flips with query-row count, small runs favoring infero, this
+        // model's real 8192-row production chunk favoring FA2, so backend
+        // selection needs the real configured chunk size, not a
+        // shape-agnostic guess). Runtime selection has no second required env
+        // var to "activate" a compiled-in backend -- once `flash_attn2` is
+        // compiled in, `supports()` alone decides eligibility (see the design
+        // doc's "one footgun this design must not repeat").
+        let attn_backend_name = {
+            let hw_caps = HardwareCaps::probe(&dev);
+            #[allow(unused_mut)] // only mutated when the `flash_attn2` feature adds a second backend
+            let mut backends: Vec<Box<dyn AttentionBackend + '_>> =
+                vec![Box::new(InferoHandRolled::new(&kern))];
+            #[cfg(feature = "flash_attn2")]
+            backends.push(Box::new(infero_kernels::flash_attn2::FlashAttn2Ffi::default()));
+            let dims = AttnDims {
+                n_heads: cfg.n_heads,
+                n_kv_heads: cfg.n_kv_heads,
+                d_head: cfg.d_head,
+                n_slots: 0,
+                // The model's real, configured prefill chunk size -- not a
+                // placeholder. This is the only call shape `prefill_run`
+                // ever actually uses (see `Model::attention()`'s own
+                // precondition: one sequence, contiguous, causal, capped at
+                // `batch_tokens()`), so it is the real, representative row
+                // count for this decision, not an approximation of one.
+                n_tokens: batch_tokens,
+            };
+            let forced = std::env::var("INFERO_ATTN_BACKEND").ok();
+            let name = match select_backend(&backends, &hw_caps, &dims, kv_quant, forced.as_deref()) {
+                Ok(chosen) => chosen.name(),
+                // `InferoHandRolled::supports()` only covers the shapes
+                // `prefill_attention()` itself gates (e.g. it's off unless
+                // `INFERO_ATTN_MMA=1`, or the GQA/`d_head` shape doesn't
+                // qualify) -- narrower than what `attention()`'s real
+                // dispatch handles, since that cascade has its own further
+                // fallback chain (`decode_attention`, `flash_attention`, the
+                // 3-kernel path) beyond the one sub-case this trait models.
+                // "No backend's narrow `supports()` matches" is therefore
+                // NOT "this model can't run attention" -- it means the
+                // existing cascade's own fallback covers it, which is
+                // exactly what `attn_backend_name == "handrolled"` already
+                // defers to. Only an explicit `INFERO_ATTN_BACKEND` request
+                // should fail loudly here -- an unforced non-match is this
+                // backend's normal, expected case for most shapes.
+                Err(e) if forced.is_none() => {
+                    tracing::debug!(
+                        reason = %e,
+                        "no attention backend's narrow `supports()` matched this shape; \
+                         falling back to `handrolled`, whose own cascade covers it"
+                    );
+                    "handrolled"
+                }
+                Err(e) => return Err(e),
+            };
+            tracing::info!(backend = name, "attention backend selected");
+            name
+        };
         tracing::info!(
             batch_tokens,
             score_mib = cfg.n_heads * batch_tokens * (if needs_scores { max_seq } else { 1 }) * 4 >> 20,
