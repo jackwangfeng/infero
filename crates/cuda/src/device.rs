@@ -123,7 +123,19 @@ impl Device {
     }
 
     /// Free and total device memory in bytes.
+    ///
+    /// `cuMemGetInfo` (like most of the driver API) operates on whatever
+    /// context is current on the *calling OS thread* -- there is no
+    /// context argument to pass it. `Device` clones share one
+    /// `Arc<CudaContext>`, but a context is only current on the specific
+    /// thread that pushed/bound it (typically wherever `Device::new` ran),
+    /// so calling this from an unrelated thread (an HTTP handler on a tokio
+    /// worker thread, say) fails with `CUDA_ERROR_INVALID_CONTEXT` without
+    /// this bind first -- found by actually calling `/metrics` from a real
+    /// running server, not assumed.
     pub fn mem_info(&self) -> Result<(usize, usize)> {
+        unsafe { cudarc::driver::result::ctx::set_current(self.ctx.cu_ctx()) }
+            .context("binding this device's context to the calling thread")?;
         Ok(cudarc::driver::result::mem_get_info()?)
     }
 }
