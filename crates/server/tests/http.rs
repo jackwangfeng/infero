@@ -40,7 +40,7 @@ fn server() -> Option<SocketAddr> {
             0.0,
         )
         .expect("starting engine");
-        let app = routes::router(engine).layer(
+        let app = routes::router(engine, infero_server::auth::AuthConfig::new(None, None)).layer(
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)

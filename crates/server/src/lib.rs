@@ -4,7 +4,9 @@
 //! tests against a real model.
 
 pub mod api;
+pub mod auth;
 pub mod engine;
+pub mod metrics;
 pub mod routes;
 pub mod prefix;
 pub mod scheduler;

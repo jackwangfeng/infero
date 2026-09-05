@@ -9,6 +9,7 @@ use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::middleware;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -20,6 +21,7 @@ use infero_tokenizer::{
 };
 
 use crate::api::*;
+use crate::auth::AuthConfig;
 use crate::engine::{self, Engine, Event, FinishReason, PendingImage, PendingVideo, Request};
 use crate::tool_call;
 
@@ -30,12 +32,41 @@ use crate::tool_call;
 /// same default silently capped any image over ~1.5 MiB too.
 const MAX_BODY_BYTES: usize = 80 * 1024 * 1024;
 
-pub fn router(engine: Arc<Engine>) -> Router {
-    Router::new()
-        .route("/health", get(health))
+/// `/health` is deliberately outside `auth`'s reach entirely -- an
+/// orchestrator's liveness/readiness probe shouldn't need an API key or
+/// spend a client's rate-limit budget. Everything else gets both checks,
+/// each only actually installed in the middleware stack when `auth` has it
+/// configured (see `AuthConfig`) -- a server started without `--api-keys`/
+/// `--rate-limit-per-minute` runs with neither layer present at all, not a
+/// pair of no-op checks on every request.
+pub fn router(engine: Arc<Engine>, auth: AuthConfig) -> Router {
+    let mut protected = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/completions", post(completions))
+        .route("/v1/completions", post(completions));
+
+    // Added in the order that puts rate-limiting outermost (it runs first,
+    // rejecting a flood before an invalid key is even checked) and API-key
+    // auth innermost.
+    if auth.auth_enabled() {
+        protected = protected.layer(middleware::from_fn_with_state(
+            auth.clone(),
+            crate::auth::require_api_key,
+        ));
+    }
+    if auth.rate_limit_enabled() {
+        protected = protected.layer(middleware::from_fn_with_state(
+            auth.clone(),
+            crate::auth::rate_limit,
+        ));
+    }
+
+    Router::new()
+        .route("/health", get(health))
+        .route("/health/live", get(health_live))
+        .route("/health/ready", get(health_ready))
+        .route("/metrics", get(metrics))
+        .merge(protected)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(engine)
 }
@@ -120,6 +151,42 @@ async fn health(State(engine): State<Arc<Engine>>) -> impl IntoResponse {
         "queue_depth": engine.queue_depth(),
         "requests_served": engine.requests_served(),
     }))
+}
+
+/// Liveness: is the process's inference worker thread's main loop still
+/// running? By construction (`Engine::start` fully loads the model and
+/// spawns the worker before `main` ever binds the HTTP listener -- see
+/// `main.rs`), the server never accepts a connection before the model is
+/// ready, so there is no separate "starting up" state to report here; the
+/// one real failure mode this catches is the worker thread having stopped
+/// after startup.
+async fn health_live(State(engine): State<Arc<Engine>>) -> impl IntoResponse {
+    if engine.worker_alive() {
+        (StatusCode::OK, Json(serde_json::json!({"status": "alive"})))
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"status": "worker stopped"})),
+        )
+    }
+}
+
+/// Readiness: identical check to liveness today, for the reason explained on
+/// `health_live` -- kept as a distinct endpoint (rather than aliasing it)
+/// because an orchestrator's readiness and liveness probes are conventionally
+/// configured with different intervals/failure thresholds, and this gives it
+/// somewhere to diverge later (e.g. once there's a real "draining before
+/// shutdown" state) without a breaking route change.
+async fn health_ready(State(engine): State<Arc<Engine>>) -> impl IntoResponse {
+    health_live(State(engine)).await
+}
+
+async fn metrics(State(engine): State<Arc<Engine>>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        crate::metrics::render(&engine),
+    )
 }
 
 async fn models(State(engine): State<Arc<Engine>>) -> impl IntoResponse {
@@ -334,6 +401,8 @@ async fn chat_completions(
         .clamp(1, engine.info.max_seq);
     let stop = req.stop.map(StopField::into_vec).unwrap_or_default();
 
+    let rid = request_id("req");
+    let prompt_token_count = tokens.len();
     let rx = engine.submit(Request {
         prompt: tokens,
         pending_image,
@@ -343,6 +412,8 @@ async fn chat_completions(
         stop,
         events: dummy_sender(),
     })?;
+    engine.metrics.record_received();
+    tracing::info!(request_id = %rid, endpoint = "chat_completions", prompt_tokens = prompt_token_count, stream = req.stream, "request admitted");
 
     let model = engine.info.id.clone();
     if req.stream {
@@ -350,12 +421,25 @@ async fn chat_completions(
             Some(serde_json::Value::Array(tools)) => Some(tools.clone()),
             _ => None,
         };
-        Ok(Sse::new(chat_stream(rx, model, tools_for_stream))
+        Ok(Sse::new(chat_stream(rx, model, tools_for_stream, engine.clone(), rid))
             .keep_alive(KeepAlive::default())
             .into_response())
     } else {
-        let (text, reason, prompt_tokens, completion_tokens) =
-            engine::collect(rx).await.map_err(ApiError::from)?;
+        let started = std::time::Instant::now();
+        let (text, reason, prompt_tokens, completion_tokens) = match engine::collect(rx).await {
+            Ok(v) => v,
+            Err(e) => {
+                engine.metrics.record_error();
+                tracing::warn!(request_id = %rid, error = %format!("{e:#}"), "request failed");
+                return Err(ApiError::from(e));
+            }
+        };
+        engine.metrics.record_ok(prompt_tokens, completion_tokens);
+        tracing::info!(
+            request_id = %rid, prompt_tokens, completion_tokens,
+            latency_ms = started.elapsed().as_millis() as u64, finish_reason = reason.as_str(),
+            "request completed"
+        );
         // Only scan when tools were actually advertised this turn — a model
         // that was never told about them has no reason to write
         // `<tool_call>`, and scanning anyway would risk mistaking a user
@@ -442,6 +526,8 @@ async fn completions(
     let max_tokens = req.max_tokens.unwrap_or(256).clamp(1, engine.info.max_seq);
     let stop = req.stop.map(StopField::into_vec).unwrap_or_default();
 
+    let rid = request_id("req");
+    let prompt_token_count = tokens.len();
     let rx = engine.submit(Request {
         prompt: tokens,
         pending_image: None,
@@ -451,15 +537,30 @@ async fn completions(
         stop,
         events: dummy_sender(),
     })?;
+    engine.metrics.record_received();
+    tracing::info!(request_id = %rid, endpoint = "completions", prompt_tokens = prompt_token_count, stream = req.stream, "request admitted");
 
     let model = engine.info.id.clone();
     if req.stream {
-        Ok(Sse::new(completion_stream(rx, model))
+        Ok(Sse::new(completion_stream(rx, model, engine.clone(), rid))
             .keep_alive(KeepAlive::default())
             .into_response())
     } else {
-        let (text, reason, prompt_tokens, completion_tokens) =
-            engine::collect(rx).await.map_err(ApiError::from)?;
+        let started = std::time::Instant::now();
+        let (text, reason, prompt_tokens, completion_tokens) = match engine::collect(rx).await {
+            Ok(v) => v,
+            Err(e) => {
+                engine.metrics.record_error();
+                tracing::warn!(request_id = %rid, error = %format!("{e:#}"), "request failed");
+                return Err(ApiError::from(e));
+            }
+        };
+        engine.metrics.record_ok(prompt_tokens, completion_tokens);
+        tracing::info!(
+            request_id = %rid, prompt_tokens, completion_tokens,
+            latency_ms = started.elapsed().as_millis() as u64, finish_reason = reason.as_str(),
+            "request completed"
+        );
         Ok(Json(CompletionResponse {
             id: request_id("cmpl"),
             object: "text_completion",
@@ -489,8 +590,11 @@ fn chat_stream(
     mut rx: mpsc::UnboundedReceiver<Event>,
     model: String,
     tools: Option<Vec<serde_json::Value>>,
+    engine: Arc<Engine>,
+    rid: String,
 ) -> impl Stream<Item = Result<SseEvent, Infallible>> {
     let id = request_id("chatcmpl");
+    let started = std::time::Instant::now();
     async_stream(move |yielder| async move {
         // OpenAI's first chunk carries the role and no content.
         yielder
@@ -548,11 +652,19 @@ fn chat_stream(
                             .await;
                     }
                 }
-                Event::Done { reason: r, .. } => {
+                Event::Done { reason: r, prompt_tokens, completion_tokens } => {
                     reason = r;
+                    engine.metrics.record_ok(prompt_tokens, completion_tokens);
+                    tracing::info!(
+                        request_id = %rid, prompt_tokens, completion_tokens,
+                        latency_ms = started.elapsed().as_millis() as u64, finish_reason = r.as_str(),
+                        "request completed"
+                    );
                     break;
                 }
                 Event::Failed(message) => {
+                    engine.metrics.record_error();
+                    tracing::warn!(request_id = %rid, error = %message, "request failed");
                     yielder.send(error_event(&message)).await;
                     yielder.send(done_event()).await;
                     return;
@@ -628,8 +740,11 @@ fn chat_stream(
 fn completion_stream(
     mut rx: mpsc::UnboundedReceiver<Event>,
     model: String,
+    engine: Arc<Engine>,
+    rid: String,
 ) -> impl Stream<Item = Result<SseEvent, Infallible>> {
     let id = request_id("cmpl");
+    let started = std::time::Instant::now();
     async_stream(move |yielder| async move {
         let mut reason = FinishReason::Stop;
         while let Some(ev) = rx.recv().await {
@@ -649,11 +764,19 @@ fn completion_stream(
                     };
                     yielder.send(json_event(&chunk)).await;
                 }
-                Event::Done { reason: r, .. } => {
+                Event::Done { reason: r, prompt_tokens, completion_tokens } => {
                     reason = r;
+                    engine.metrics.record_ok(prompt_tokens, completion_tokens);
+                    tracing::info!(
+                        request_id = %rid, prompt_tokens, completion_tokens,
+                        latency_ms = started.elapsed().as_millis() as u64, finish_reason = r.as_str(),
+                        "request completed"
+                    );
                     break;
                 }
                 Event::Failed(message) => {
+                    engine.metrics.record_error();
+                    tracing::warn!(request_id = %rid, error = %message, "request failed");
                     yielder.send(error_event(&message)).await;
                     yielder.send(done_event()).await;
                     return;

@@ -98,6 +98,18 @@ struct Args {
     /// `notes/video-encoding-optimizations.md`, item 5.
     #[arg(long, default_value_t = 0.0)]
     video_dedup_threshold: f64,
+
+    /// Comma-separated API keys required via `Authorization: Bearer <key>`
+    /// on every endpoint except `/health`. Unset (the default, checked
+    /// against `INFERO_API_KEYS` too) disables auth entirely -- today's
+    /// exact, unauthenticated behavior.
+    #[arg(long)]
+    api_keys: Option<String>,
+
+    /// Requests allowed a rolling 60s window, per API key (or per source IP
+    /// when no key is presented). Unset disables rate limiting entirely.
+    #[arg(long)]
+    rate_limit_per_minute: Option<u32>,
 }
 
 #[tokio::main]
@@ -174,7 +186,16 @@ async fn main() -> Result<()> {
     )
     .context("starting the inference engine")?;
 
-    let app = routes::router(engine.clone())
+    let api_keys = args.api_keys.or_else(|| std::env::var("INFERO_API_KEYS").ok());
+    if api_keys.is_some() {
+        tracing::info!("API key authentication enabled");
+    }
+    if let Some(rpm) = args.rate_limit_per_minute {
+        tracing::info!(requests_per_minute = rpm, "rate limiting enabled");
+    }
+    let auth = infero_server::auth::AuthConfig::new(api_keys.as_deref(), args.rate_limit_per_minute);
+
+    let app = routes::router(engine.clone(), auth)
         .layer(TraceLayer::new_for_http())
         // Permissive CORS so browser playgrounds can talk to a local server.
         .layer(
@@ -213,10 +234,13 @@ async fn main() -> Result<()> {
     );
     println!();
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("serving")?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("serving")?;
     Ok(())
 }
 

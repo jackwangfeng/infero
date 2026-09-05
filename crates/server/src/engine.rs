@@ -18,6 +18,7 @@ use infero_gpu::Device;
 use infero_gguf::Gguf;
 use infero_model::{KvCacheQuant, Model, SamplingParams};
 
+use crate::metrics::Metrics;
 use crate::scheduler::{Scheduler, make_pool};
 use infero_tokenizer::Tokenizer;
 
@@ -116,6 +117,12 @@ pub struct Engine {
     /// otherwise the cumulative (lookups, hits, tokens served from cache) as of
     /// the last completed step.
     prefix_stats: Option<[Arc<AtomicU64>; 3]>,
+    /// A handle to the same CUDA context/stream the model runs on, cloned
+    /// (cheap -- `Device` is `Arc`-backed) before `model` moves into the
+    /// `Scheduler`/worker thread. Its only use here is `mem_info()` for
+    /// `/metrics`; the worker thread's own copy does the real work.
+    device: Device,
+    pub metrics: Arc<Metrics>,
 }
 
 #[derive(Debug, Clone)]
@@ -261,6 +268,11 @@ impl Engine {
         // so this is the same `awq` test the loader above used, not a new
         // condition. Returns `false` for a checkpoint that simply has no
         // tower, which is most of them and not an error.
+        // Cheap: `Device` clones share the same `Arc`-backed context/stream,
+        // not a new CUDA context -- this is purely so `/metrics` has a handle
+        // to query `mem_info()` from after `model` moves into the scheduler
+        // below.
+        let device = model.device().clone();
         let has_vision = awq && model.load_vision_tower(path, vision_max_patches)?;
         if has_vision {
             tracing::info!(vision_max_patches, "vision tower loaded");
@@ -360,11 +372,14 @@ impl Engine {
             ]
         });
 
+        let metrics = crate::metrics::new_metrics();
+
         let worker = Worker {
             scheduler,
             in_flight: in_flight.clone(),
             served: served.clone(),
             prefix_stats: prefix_stats.clone(),
+            metrics: metrics.clone(),
         };
         // A dedicated OS thread, not a tokio task: the forward pass blocks on
         // CUDA and would otherwise stall the runtime.
@@ -382,6 +397,8 @@ impl Engine {
             in_flight,
             served,
             prefix_stats,
+            device,
+            metrics,
         }))
     }
 
@@ -395,6 +412,18 @@ impl Engine {
 
     pub fn requests_served(&self) -> u64 {
         self.served.load(Ordering::Relaxed)
+    }
+
+    /// (free, total) device memory in bytes, on the same GPU the model runs
+    /// on -- a real `cuMemGetInfo` call, not a cached figure.
+    pub fn mem_info(&self) -> Result<(usize, usize)> {
+        self.device.mem_info()
+    }
+
+    /// Whether the inference worker thread's main loop is still running --
+    /// what `/health/live` actually checks.
+    pub fn worker_alive(&self) -> bool {
+        !self.metrics.worker_stopped.load(Ordering::Relaxed)
     }
 
     /// (lookups, hits, tokens served from cache) as of the last completed
@@ -448,10 +477,21 @@ struct Worker {
     in_flight: Arc<AtomicU64>,
     served: Arc<AtomicU64>,
     prefix_stats: Option<[Arc<AtomicU64>; 3]>,
+    metrics: Arc<Metrics>,
 }
 
 impl Worker {
-    fn run(mut self, mut jobs: mpsc::UnboundedReceiver<Request>) {
+    fn run(mut self, jobs: mpsc::UnboundedReceiver<Request>) {
+        // `worker_stopped` flips exactly once, whichever way `run_inner`
+        // returns (normal shutdown or a panic unwind past this point would
+        // both leave it `false` -- a panic already aborts the process in
+        // this workspace's usual build, so the gap is theoretical, not one
+        // this scope needs to close).
+        self.run_inner(jobs);
+        self.metrics.worker_stopped.store(true, Ordering::Relaxed);
+    }
+
+    fn run_inner(&mut self, mut jobs: mpsc::UnboundedReceiver<Request>) {
         loop {
             // With nothing in flight there is no reason to spin; block until a
             // request shows up.
