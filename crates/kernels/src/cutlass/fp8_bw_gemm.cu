@@ -200,6 +200,100 @@ using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 using StrideD = typename Gemm::GemmKernel::StrideD;
 }  // namespace f32out
 
+// Genuine per-architecture kernel bodies for Hopper (SM90) and Blackwell
+// datacenter (SM100) -- NOT the same device code as the SM120 kernel above
+// recompiled with a different `-gencode`. CUTLASS's collective builders pick
+// materially different mainloop implementations per `cutlass::arch::SmXX`
+// tag (Hopper's `wgmma`+TMA warp-specialized path vs. SM120's own MMA atoms),
+// so each of these is its own real `GemmKernel` C++ type / device function,
+// not a recompilation of the SM120 one. Selecting which to actually call is
+// a runtime dispatch on the host side (see `infero_cutlass_fp8_bw_gemm_f32out`
+// below), keyed on the detected GPU's real compute capability -- this file
+// still produces one fat object with `-gencode` entries for every target
+// architecture; nvcc compiles each `SmXX`-tagged kernel's device code only
+// for the `-gencode` targets it's actually valid for (CUTLASS's own
+// `__CUDA_ARCH__`-gated kernel bodies make the other targets in the same
+// translation unit safe no-ops rather than compile failures -- this is the
+// same "one source, several `-gencode`s, runtime-select the real one" shape
+// CUTLASS's own multi-arch examples use).
+//
+// Execution-verified: SM120 only (the only hardware this box has). SM90/SM100
+// are verified by real compile against the vendored CUTLASS headers plus
+// matching CUTLASS's own real per-architecture type names
+// (`Sm90BlockwiseScaleConfig`, `MainloopSm90TmaGmmaWarpSpecializedBlockwiseFP8`
+// via `KernelTmaWarpSpecializedCooperativeFP8Blockwise`;
+// `Sm100BlockwiseScaleConfig`, `KernelScheduleSm100Blockwise`) -- NOT
+// execution-tested. Say so explicitly wherever this is reported.
+namespace sm90 {
+namespace f32out {
+using ElementC = float;
+using LayoutC = cutlass::layout::RowMajor;
+constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+using ElementD = ElementC;
+using AlignmentD = std::integral_constant<int, AlignmentC>;
+
+using ScaleConfig = cutlass::detail::Sm90BlockwiseScaleConfig<ScaleGranularityM, ScaleGranularityN, ScaleGranularityK>;
+using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+
+using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, CooperativeMmaTileShape_MNK, ClusterShape_MNK,
+    cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementCompute, ElementC, LayoutC,
+    AlignmentC, ElementD, LayoutC, AlignmentD::value,
+    cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+
+using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, ElementA, cute::tuple<LayoutA, LayoutSFA>, AlignmentA,
+    ElementB, cute::tuple<LayoutB, LayoutSFB>, AlignmentB, ElementAccumulator, CooperativeMmaTileShape_MNK,
+    ClusterShape_MNK,
+    cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+    cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8Blockwise>::CollectiveOp;
+
+using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop,
+                                                         CollectiveEpilogue, void>;
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+using StrideA = typename Gemm::GemmKernel::StrideA;
+using StrideB = typename Gemm::GemmKernel::StrideB;
+using StrideD = typename Gemm::GemmKernel::StrideD;
+}  // namespace f32out
+}  // namespace sm90
+
+namespace sm100 {
+namespace f32out {
+using ElementC = float;
+using LayoutC = cutlass::layout::RowMajor;
+constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+using ElementD = ElementC;
+using AlignmentD = std::integral_constant<int, AlignmentC>;
+
+using ScaleConfig = cutlass::detail::Sm100BlockwiseScaleConfig<ScaleGranularityM, ScaleGranularityN, ScaleGranularityK>;
+using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+
+using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, CooperativeMmaTileShape_MNK, ClusterShape_MNK,
+    cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementCompute, ElementC, LayoutC,
+    AlignmentC, ElementD, LayoutC, AlignmentD::value,
+    cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+
+using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, ElementA, cute::tuple<LayoutA, LayoutSFA>, AlignmentA,
+    ElementB, cute::tuple<LayoutB, LayoutSFB>, AlignmentB, ElementAccumulator, CooperativeMmaTileShape_MNK,
+    ClusterShape_MNK,
+    cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+    cutlass::gemm::KernelScheduleSm100Blockwise>::CollectiveOp;
+
+using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop,
+                                                         CollectiveEpilogue, void>;
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+using StrideA = typename Gemm::GemmKernel::StrideA;
+using StrideB = typename Gemm::GemmKernel::StrideB;
+using StrideD = typename Gemm::GemmKernel::StrideD;
+}  // namespace f32out
+}  // namespace sm100
+
 extern "C" size_t infero_cutlass_fp8_bw_gemm_f32out_workspace(int m, int n, int k) {
   auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
   auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
@@ -236,6 +330,97 @@ extern "C" int32_t infero_cutlass_fp8_bw_gemm_f32out(const void* a, const void* 
   arguments.epilogue.thread.beta = accum ? 1.0f : 0.0f;
 
   f32out::Gemm gemm;
+  auto status = gemm.can_implement(arguments);
+  if (status != cutlass::Status::kSuccess) return static_cast<int32_t>(status);
+  status = gemm.initialize(arguments, workspace, stream);
+  if (status != cutlass::Status::kSuccess) return static_cast<int32_t>(status);
+  status = gemm.run(arguments, workspace, stream);
+  return static_cast<int32_t>(status);
+}
+
+// Hopper (SM90) and Blackwell-datacenter (SM100) f32out variants -- real,
+// distinctly-typed `GemmKernel`s (see the `namespace sm90`/`sm100` comment
+// above), not the SM120 kernel above recompiled. The caller (Rust side)
+// picks which of these three `_sm90`/`_sm100`/plain-SM120 entry points to
+// call based on the real detected GPU compute capability -- no C-level
+// dispatch here, kept as three plain, separately-named functions so the
+// existing SM120 entry points above are completely unchanged (zero
+// behavior/ABI change on the one architecture this can actually be tested
+// on).
+extern "C" size_t infero_cutlass_fp8_bw_gemm_f32out_workspace_sm90(int m, int n, int k) {
+  auto stride_A = cutlass::make_cute_packed_stride(sm90::f32out::StrideA{}, cute::make_shape(m, k, 1));
+  auto stride_B = cutlass::make_cute_packed_stride(sm90::f32out::StrideB{}, cute::make_shape(n, k, 1));
+  auto stride_D = cutlass::make_cute_packed_stride(sm90::f32out::StrideD{}, cute::make_shape(m, n, 1));
+  auto layout_SFA = sm90::f32out::ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(m, n, k, 1));
+  auto layout_SFB = sm90::f32out::ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, 1));
+  typename sm90::f32out::Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {m, n, k, 1},
+      {nullptr, stride_A, nullptr, stride_B, nullptr, layout_SFA, nullptr, layout_SFB},
+      {{}, nullptr, stride_D, nullptr, stride_D}};
+  return sm90::f32out::Gemm::get_workspace_size(arguments);
+}
+
+extern "C" int32_t infero_cutlass_fp8_bw_gemm_f32out_sm90(const void* a, const void* b, const float* sfa,
+                                                           const float* sfb, float* d, void* workspace, int m, int n,
+                                                           int k, int accum, cudaStream_t stream) {
+  auto stride_A = cutlass::make_cute_packed_stride(sm90::f32out::StrideA{}, cute::make_shape(m, k, 1));
+  auto stride_B = cutlass::make_cute_packed_stride(sm90::f32out::StrideB{}, cute::make_shape(n, k, 1));
+  auto stride_D = cutlass::make_cute_packed_stride(sm90::f32out::StrideD{}, cute::make_shape(m, n, 1));
+  auto layout_SFA = sm90::f32out::ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(m, n, k, 1));
+  auto layout_SFB = sm90::f32out::ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, 1));
+
+  typename sm90::f32out::Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {m, n, k, 1},
+      {static_cast<const ElementA*>(a), stride_A, static_cast<const ElementB*>(b), stride_B, sfa, layout_SFA, sfb,
+       layout_SFB},
+      {{}, d, stride_D, d, stride_D}};
+  arguments.epilogue.thread.alpha = 1.0f;
+  arguments.epilogue.thread.beta = accum ? 1.0f : 0.0f;
+
+  sm90::f32out::Gemm gemm;
+  auto status = gemm.can_implement(arguments);
+  if (status != cutlass::Status::kSuccess) return static_cast<int32_t>(status);
+  status = gemm.initialize(arguments, workspace, stream);
+  if (status != cutlass::Status::kSuccess) return static_cast<int32_t>(status);
+  status = gemm.run(arguments, workspace, stream);
+  return static_cast<int32_t>(status);
+}
+
+extern "C" size_t infero_cutlass_fp8_bw_gemm_f32out_workspace_sm100(int m, int n, int k) {
+  auto stride_A = cutlass::make_cute_packed_stride(sm100::f32out::StrideA{}, cute::make_shape(m, k, 1));
+  auto stride_B = cutlass::make_cute_packed_stride(sm100::f32out::StrideB{}, cute::make_shape(n, k, 1));
+  auto stride_D = cutlass::make_cute_packed_stride(sm100::f32out::StrideD{}, cute::make_shape(m, n, 1));
+  auto layout_SFA = sm100::f32out::ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(m, n, k, 1));
+  auto layout_SFB = sm100::f32out::ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, 1));
+  typename sm100::f32out::Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {m, n, k, 1},
+      {nullptr, stride_A, nullptr, stride_B, nullptr, layout_SFA, nullptr, layout_SFB},
+      {{}, nullptr, stride_D, nullptr, stride_D}};
+  return sm100::f32out::Gemm::get_workspace_size(arguments);
+}
+
+extern "C" int32_t infero_cutlass_fp8_bw_gemm_f32out_sm100(const void* a, const void* b, const float* sfa,
+                                                            const float* sfb, float* d, void* workspace, int m, int n,
+                                                            int k, int accum, cudaStream_t stream) {
+  auto stride_A = cutlass::make_cute_packed_stride(sm100::f32out::StrideA{}, cute::make_shape(m, k, 1));
+  auto stride_B = cutlass::make_cute_packed_stride(sm100::f32out::StrideB{}, cute::make_shape(n, k, 1));
+  auto stride_D = cutlass::make_cute_packed_stride(sm100::f32out::StrideD{}, cute::make_shape(m, n, 1));
+  auto layout_SFA = sm100::f32out::ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(m, n, k, 1));
+  auto layout_SFB = sm100::f32out::ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, 1));
+
+  typename sm100::f32out::Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {m, n, k, 1},
+      {static_cast<const ElementA*>(a), stride_A, static_cast<const ElementB*>(b), stride_B, sfa, layout_SFA, sfb,
+       layout_SFB},
+      {{}, d, stride_D, d, stride_D}};
+  arguments.epilogue.thread.alpha = 1.0f;
+  arguments.epilogue.thread.beta = accum ? 1.0f : 0.0f;
+
+  sm100::f32out::Gemm gemm;
   auto status = gemm.can_implement(arguments);
   if (status != cutlass::Status::kSuccess) return static_cast<int32_t>(status);
   status = gemm.initialize(arguments, workspace, stream);

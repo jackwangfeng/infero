@@ -52,11 +52,24 @@ fn main() {
         }
         let src = manifest.join("src/cutlass/fp8_bw_gemm.cu");
         let obj = out_dir.join("fp8_bw_gemm.o");
+        // Real per-architecture CUTLASS kernel bodies (SM90/SM100 in
+        // addition to this box's own SM120) live in the same translation
+        // unit, each behind its own `cutlass::arch::SmXX` tag -- CUTLASS's
+        // own `__CUDA_ARCH__`-gated kernel implementations make it safe to
+        // list several `-gencode` targets against one source file (each
+        // architecture-tagged kernel only produces real device code for the
+        // target(s) it's actually valid for). Only sm_120a is
+        // execution-verified on this box; sm_90a/sm_100a are compile-verified
+        // against the real vendored CUTLASS headers, not run.
         aot_compile(
             &nvcc,
             &src,
             &obj,
-            &["arch=compute_120a,code=sm_120a"],
+            &[
+                "arch=compute_90a,code=sm_90a",
+                "arch=compute_100a,code=sm_100a",
+                "arch=compute_120a,code=sm_120a",
+            ],
             &[],
             &[&cutlass_include, &cutlass_util],
         );
