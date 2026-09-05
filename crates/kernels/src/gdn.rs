@@ -1114,6 +1114,87 @@ impl Kernels {
         Ok(())
     }
 
+    /// Tensor-core version of [`Self::gdn_chunk_state_only`] -- see
+    /// `gdn_chunk_state_mma_f32`'s own doc comment in `gdn.cu` for the real
+    /// tiling scheme and what `gdn_state_bridge_probe` (`mma.cuh`) derisked
+    /// before this kernel was written.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_chunk_state_mma_only(
+        &self,
+        delta: &mut ViewMut<'_, f32>,
+        s_before: &mut ViewMut<'_, f32>,
+        state: &mut ViewMut<'_, f32>,
+        w: &View<'_, f32>,
+        u: &View<'_, f32>,
+        qkv: &View<'_, f32>,
+        g: &View<'_, f32>,
+        seqs: &SeqLayout<'_>,
+        heads: usize,
+        key_heads: usize,
+        dk: usize,
+        dv: usize,
+        offsets: (usize, usize, usize, usize),
+        v_tiled: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(seqs.n_seqs == 1, "gdn_chunk_state_mma_only: single sequence only");
+        anyhow::ensure!(
+            dk == 128 && dv == 128,
+            "gdn_chunk_state_mma_only is instantiated for dk = dv = 128, got {dk}x{dv}"
+        );
+        let (stride, _q_off, k_off, _v_off) = offsets;
+        const GDN_CHUNK: usize = 32;
+        const GDN_DK: usize = 128;
+        const GDN_DV: usize = 128;
+        let n_chunks = seqs.total_tokens.div_ceil(GDN_CHUNK).max(1);
+        let f32_size = std::mem::size_of::<f32>();
+        let f16_size = std::mem::size_of::<u16>();
+
+        let f = self.dev.kernels().get("infero_gdn", gdn_src(), "gdn_chunk_state_mma_f32")?;
+        // sS[128][128] + sW[GDN_CHUNK][128] + sKT[128][GDN_CHUNK] + sDT[128][GDN_CHUNK], all f16,
+        // plus sgc[GDN_CHUNK] f32 -- see gdn_chunk_state_mma_f32's own shared-memory layout comment.
+        let shared = (GDN_DK * GDN_DV + GDN_CHUNK * GDN_DK + GDN_DK * GDN_CHUNK + GDN_DV * GDN_CHUNK)
+            * f16_size
+            + GDN_CHUNK * f32_size;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared as u32)?;
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (heads as u32, 1, 1),
+            block_dim: (2 * dv as u32, 1, 1),
+            shared_mem_bytes: shared as u32,
+        };
+        let (h, kh) = (heads as i32, key_heads as i32);
+        let (dka, dva) = (dk as i32, dv as i32);
+        let (st, ko) = (stride as i32, k_off as i32);
+        let vt = i32::from(v_tiled);
+        let nc = n_chunks as i32;
+        let mut bl = self.dev.stream().launch_builder(&f);
+        bl.arg(&mut *delta)
+            .arg(&mut *s_before)
+            .arg(&mut *state)
+            .arg(w)
+            .arg(u)
+            .arg(qkv)
+            .arg(g)
+            .arg(seqs.first_token)
+            .arg(seqs.n_tokens)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dka)
+            .arg(&dva)
+            .arg(&st)
+            .arg(&ko)
+            .arg(&vt)
+            .arg(&nc);
+        self.dev
+            .profile()
+            .time("gdn_chunk_state_mma_only", self.dev.stream(), || {
+                unsafe { bl.launch(cfg) }.context("gdn_chunk_state_mma_only")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     /// Three-kernel split of the chunked delta rule -- see the doc comment
     /// on `gdn_chunk_uw_f32` in `gdn.cu` for the full architecture and why
     /// it's a real, independent re-derivation of SGLang's own real
