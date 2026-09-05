@@ -1480,6 +1480,15 @@ impl Scheduler {
     }
 
     fn admit(&mut self) {
+        // `free_slots()` reflects slots actually taken via `KvPool::extend()`,
+        // which only happens later when a batch is built -- `pool.alloc()`
+        // below only claims a `SeqState` row, it never decrements this. Two
+        // large requests admitted in the same pass would otherwise each
+        // check `need` against the same stale snapshot and both pass even
+        // when their combined need exceeds what's really free. Track what
+        // this pass has already promised so the next candidate is checked
+        // against what would *actually* remain.
+        let mut committed_this_pass = 0usize;
         while !self.waiting.is_empty() {
             if self.pool.active_sequences() >= self.pool.max_seqs() {
                 break;
@@ -1540,21 +1549,26 @@ impl Scheduler {
             // generate; a sequence admitted into a pool it cannot finish in
             // would deadlock against itself.
             let need = req.prompt.len() + 1;
+            // What's really left once this pass's earlier admissions -- not
+            // yet reflected in `free_slots()` itself, since that only moves
+            // on a real `KvPool::extend()` -- are accounted for.
+            let available = self.pool.free_slots().saturating_sub(committed_this_pass);
             // Cached blocks hold slots a waiting request could use, and a cold
             // block is worth less than an admission. Evict before deciding the
             // prompt does not fit; only unreferenced blocks go.
-            if need > self.pool.free_slots()
+            if need > available
                 && let Some(c) = self.prefix.as_mut()
             {
-                c.evict_for(&mut self.pool, need);
+                c.evict_for(&mut self.pool, need + committed_this_pass);
             }
-            if need > self.pool.free_slots() || need > self.pool.max_seq() {
-                if self.running.is_empty() {
+            let available = self.pool.free_slots().saturating_sub(committed_this_pass);
+            if need > available || need > self.pool.max_seq() {
+                if self.running.is_empty() && committed_this_pass == 0 {
                     // Nothing will ever free up: reject rather than spin.
                     let _ = req.events.send(Event::Failed(format!(
                         "prompt of {} tokens does not fit: {} slots free, {} per sequence",
                         req.prompt.len(),
-                        self.pool.free_slots(),
+                        available,
                         self.pool.max_seq()
                     )));
                     continue;
@@ -1567,6 +1581,7 @@ impl Scheduler {
                 self.waiting.push_front(req);
                 break;
             };
+            committed_this_pass += need;
 
             // Whatever of this prompt is already computed. Capped one token
             // short of the whole prompt: a sequence with nothing left to run
@@ -1662,16 +1677,29 @@ impl Scheduler {
     fn plan(&self) -> Vec<(usize, Work)> {
         let mut plan = Vec::with_capacity(self.running.len());
         let mut budget = self.model.batch_tokens();
+        // `batch_tokens` bounds how much a single forward pass can carry
+        // through the model; it says nothing about how many of those tokens
+        // the KV pool can actually back with a real slot. Scheduling more new
+        // tokens across this step's items than `pool.free_slots()` would
+        // have `forward_batch_rows`'s `pool.extend()` fail partway through
+        // building the batch -- which fails the *whole* step, not just the
+        // one sequence that ran short (see `engine.rs`'s `fail_all()` on any
+        // step error). Track the same real ceiling here so a step never asks
+        // for more than the pool can give: cap or split prefill chunks, same
+        // as `batch_tokens` already does, rather than let it reach `extend`
+        // as flat exhaustion.
+        let mut pool_budget = self.pool.free_slots();
 
         // Decodes first: one token each, and a running sequence starved by a
         // prefill is a stall the client feels.
         for (i, r) in self.running.iter().enumerate() {
-            if budget == 0 {
+            if budget == 0 || pool_budget == 0 {
                 break;
             }
             if r.prompt_complete() && r.next.is_some() {
                 plan.push((i, Work::Decode));
                 budget -= 1;
+                pool_budget -= 1;
             }
         }
 
@@ -1681,14 +1709,17 @@ impl Scheduler {
         // ::vision_row_offset` is what a chunk boundary landing inside it
         // needs), so it is just an ordinary prompt here, same as plain text.
         for (i, r) in self.running.iter().enumerate() {
-            if budget == 0 {
+            if budget == 0 || pool_budget == 0 {
                 break;
             }
             if r.prompt_complete() {
                 continue;
             }
             let remaining = r.prompt.len() - r.prefilled;
-            let len = remaining.min(budget);
+            let len = remaining.min(budget).min(pool_budget);
+            if len == 0 {
+                continue;
+            }
             plan.push((
                 i,
                 Work::Prefill {
@@ -1698,6 +1729,7 @@ impl Scheduler {
                 },
             ));
             budget -= len;
+            pool_budget -= len;
         }
         plan
     }
