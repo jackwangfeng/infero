@@ -761,6 +761,25 @@ fn an_interleaved_batch_dispatches_every_item_to_its_own_rows() -> Result<()> {
 /// agrees), 0.981 (seed 2, argmax agrees). Seed 2 is used below so this test
 /// asserts next-token agreement as well as a cosine floor, rather than only
 /// the weaker "it moved at all" check the near-tie seeds would be limited to.
+///
+/// **What the 0.95 floor does and does not prove.** Unlike
+/// `an_interleaved_batch_dispatches_every_item_to_its_own_rows`'s identical
+/// 0.95 floor, which is anchored between a measured good-path baseline *and*
+/// a measured bad-path number from a real injected bug, this floor is
+/// anchored only against the good-path noise measured above (0.889-0.981
+/// across seeds) -- there is no equivalent bad-path measurement here for a
+/// boundary-specific bug (e.g. a partial-tile-handling regression specific to
+/// "one token past a full tile," which `TQ_DEQUANT_THRESHOLD`'s tile-size-
+/// adjacent value of 128 makes a plausible failure mode, distinct from the
+/// `>`/`>=` dispatch bug this test's paired bound with the `n == threshold`
+/// case already catches). So this floor reliably proves the long path ran
+/// and produced a non-garbage, plausible result -- paired with the
+/// `< 0.99999` check, that it is not byte-identical to the short path
+/// either -- and it reliably catches the dispatch off-by-one via that pairing
+/// with the `n == threshold` case. It would *not* necessarily catch a subtle
+/// dequant-kernel regression that only manifests at exactly
+/// `threshold + 1`-length runs specifically; that is Task 3/3.5's own
+/// dequant-kernel-correctness tests' job, exercised at other shapes.
 #[test]
 fn threshold_boundary_both_sides_agree_with_reference() -> Result<()> {
     let _gpu = gpu_lock();
