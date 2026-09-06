@@ -736,6 +736,50 @@ fn plan_tq_dispatch(
     plan
 }
 
+/// Which dense attention kernel serves one long TurboQuant dequant run.
+///
+/// The long path unpacks a sequence's whole cached span into a dense f16
+/// scratch buffer and then attends it with an ordinary dense kernel, so by
+/// this point there are three real candidates -- the same three the F16 dense
+/// path's own `run_attn` cascade picks between -- not just `attn_prefill_ws4`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TqLongRunKernel {
+    FlashAttn2,
+    Decoupled6,
+    Ws4,
+}
+
+/// The long-run kernel choice, factored out of [`Model::attention`] so it is
+/// testable without a GPU (the inputs it *cannot* decide -- FA2's
+/// hardware/shape eligibility and its physical-contiguity precondition -- are
+/// resolved by the caller and arrive here already folded into `fa2_ok`).
+///
+/// Mirrors the F16 dense path's own order: FlashAttention-2 first when it
+/// claims the shape, then `decoupled6` (fixed at `d_head == 256`, with the
+/// same `INFERO_PREFILL_T6=0` rollback escape hatch the dense path has), then
+/// `attn_prefill_ws4`, which is what this dispatch called unconditionally
+/// before this cascade existed and is still the only candidate for every
+/// shape the other two decline (`d_head != 256` -- both are hard-gated at
+/// 256 -- and, for FA2, any run below its own row threshold).
+///
+/// Note that `fa2_ok` here is necessarily a *per-run* answer, unlike the F16
+/// dense path where the same question is settled once at load time into
+/// `attn_backend_name`. That is not a re-litigation of the dense path's own
+/// measured "don't gate FA2 per run" finding: on a TurboQuant model the
+/// load-time selection cannot be reused at all, because it was resolved
+/// against the pool's real (quantized) `KvQuant` and therefore always says
+/// `"handrolled"`, while the buffer this run hands the kernel has already
+/// been dequantized to plain f16.
+fn tq_long_run_kernel(fa2_ok: bool, d_head: usize, t6_enabled: bool) -> TqLongRunKernel {
+    if fa2_ok {
+        TqLongRunKernel::FlashAttn2
+    } else if d_head == 256 && t6_enabled {
+        TqLongRunKernel::Decoupled6
+    } else {
+        TqLongRunKernel::Ws4
+    }
+}
+
 #[cfg(test)]
 mod tq_dispatch_tests {
     use super::*;
@@ -970,6 +1014,67 @@ mod tq_dispatch_tests {
         assert_eq!(plan, TqDispatch::whole_pass(300, 300));
         // ...and so it stays graphable exactly as it was before this path existed.
         assert!(!plan.is_layout_dependent());
+    }
+
+    /// The long path's own kernel cascade, host-side. Every combination here
+    /// is a shape this dispatch really can be handed; none of it needs a GPU,
+    /// which matters because the only checkpoint this repo can run locally is
+    /// `d_head = 64` and therefore can never reach the two `d_head == 256`
+    /// branches at all (see this function's doc comment).
+    #[test]
+    fn the_long_run_cascade_picks_the_right_kernel() {
+        // The local test checkpoint's shape. Neither `decoupled6` nor FA2 is
+        // compiled for `d_head != 256`, and FA2's own `supports()` says so
+        // too (the test below), so `fa2_ok` is necessarily false here and
+        // `ws4` serves every run whatever its width -- which is what makes
+        // this whole change behavior-neutral for the existing GPU tests.
+        assert_eq!(tq_long_run_kernel(false, 64, true), TqLongRunKernel::Ws4);
+        assert_eq!(tq_long_run_kernel(false, 64, false), TqLongRunKernel::Ws4);
+        // The production 27B checkpoint's shape, FA2 declining (short run, or
+        // not compiled in, or non-contiguous KV): `decoupled6` takes it.
+        assert_eq!(tq_long_run_kernel(false, 256, true), TqLongRunKernel::Decoupled6);
+        // ...unless it is rolled back with `INFERO_PREFILL_T6=0`, which lands
+        // back on the pre-existing behavior rather than on FA2.
+        assert_eq!(tq_long_run_kernel(false, 256, false), TqLongRunKernel::Ws4);
+        // FA2 winning is unconditional on the other two once it claims the
+        // shape -- its own `supports()` already established `d_head == 256`
+        // and the row count, so there is nothing left for this to re-check.
+        assert_eq!(tq_long_run_kernel(true, 256, true), TqLongRunKernel::FlashAttn2);
+        assert_eq!(tq_long_run_kernel(true, 256, false), TqLongRunKernel::FlashAttn2);
+    }
+
+    /// The other half of that decision, which lives in `FlashAttn2Ffi` rather
+    /// than here: what `supports()` actually answers for the shapes this
+    /// dispatch feeds it, and specifically that passing `KvCacheQuant::F16`
+    /// (which is what the dequantized scratch buffer really is) is the thing
+    /// that lets a TurboQuant-quantized *pool* reach FA2 at all.
+    #[cfg(feature = "flash_attn2")]
+    #[test]
+    fn fa2_supports_answers_the_dequantized_buffers_shape_not_the_pools() {
+        let fa2 = infero_kernels::flash_attn2::FlashAttn2Ffi::default();
+        // Ampere and up, matching FA2's own `>= (8, 0)` floor. No device is
+        // touched -- `HardwareCaps` is two plain numbers.
+        let caps = HardwareCaps { arch: 86, sm_count: 48 };
+        let dims = |d_head: usize, n_tokens: usize| AttnDims {
+            n_heads: 24,
+            n_kv_heads: 4,
+            d_head,
+            n_slots: n_tokens,
+            n_tokens,
+        };
+        // The whole point of the local `supports()` call: same caps, same
+        // dims, same backend -- only the `KvQuant` differs, and it is the
+        // difference between this dispatch reaching FA2 and never reaching it.
+        assert!(fa2.supports(&caps, &dims(256, 8192), KvCacheQuant::F16));
+        assert!(!fa2.supports(&caps, &dims(256, 8192), KvCacheQuant::Tq4));
+        // Below FA2's own row threshold: declines, and the cascade falls to
+        // `decoupled6`. Most long runs land here (`TQ_DEQUANT_THRESHOLD` is 8).
+        assert!(!fa2.supports(&caps, &dims(256, 300), KvCacheQuant::F16));
+        // The local test checkpoint: declines on `d_head` however wide the run.
+        assert!(!fa2.supports(&caps, &dims(64, 8192), KvCacheQuant::F16));
+        // Pre-Ampere: declines regardless.
+        let volta = HardwareCaps { arch: 70, sm_count: 80 };
+        assert!(!fa2.supports(&volta, &dims(256, 8192), KvCacheQuant::F16));
     }
 }
 
@@ -1879,6 +1984,28 @@ pub struct Model {
     /// `AttnDims`/`KvQuant` -- this field existing does not by itself change
     /// `attention()`'s default behavior.
     attn_backend_name: &'static str,
+    /// This device's compute capability / SM count, probed once at load
+    /// (`HardwareCaps::probe`) and kept, the same "resolved once, reused
+    /// everywhere" way `batch_tokens`/`split_mixed_batch`/`tq_prefill_dequant`
+    /// are.
+    ///
+    /// The one-time backend selection above consumes it too, but this field
+    /// exists for a second reader that selection cannot serve: the TurboQuant
+    /// long-prefill dequant dispatch in `attention()`. That call site has to
+    /// re-ask `FlashAttn2Ffi::supports()` locally, per run, because the
+    /// model-wide `attn_backend_name` was resolved against the *pool's* real
+    /// `KvQuant` -- which on a TurboQuant model is quantized, so FA2 declines
+    /// and the whole model resolves to `"handrolled"` -- while the buffer that
+    /// dispatch actually hands a dense kernel has already been dequantized
+    /// into plain f16. See `tq_long_run_kernel` and its call site.
+    ///
+    /// That reader is the only one, and it is behind `flash_attn2` -- hence
+    /// the conditional `allow`. The field itself is unconditional so `Model`'s
+    /// shape doesn't depend on the feature (`from_parts` probes once either
+    /// way, and the probe is two already-resolved `Device` numbers, not a
+    /// driver query).
+    #[cfg_attr(not(feature = "flash_attn2"), allow(dead_code))]
+    hw_caps: HardwareCaps,
     /// The actual, persistent instance `attention()`'s dispatch calls
     /// `prefill()` on when `attn_backend_name != "handrolled"` -- kept
     /// separate from the transient `Box<dyn AttentionBackend>` list built
@@ -2366,8 +2493,15 @@ impl Model {
         // var to "activate" a compiled-in backend -- once `flash_attn2` is
         // compiled in, `supports()` alone decides eligibility (see the design
         // doc's "one footgun this design must not repeat").
+        //
+        // Probed once here and kept on `Model` (the `hw_caps` field below),
+        // not just consumed by the one-time selection block: the TurboQuant
+        // long-prefill dispatch re-asks `FlashAttn2Ffi::supports()` per run
+        // (see `attention()`'s long-run branch for why the model-wide
+        // `attn_backend_name` answers the wrong question there), and it needs
+        // these caps at call time. Same probe, one call, no re-probe.
+        let hw_caps = HardwareCaps::probe(&dev);
         let attn_backend_name = {
-            let hw_caps = HardwareCaps::probe(&dev);
             #[allow(unused_mut)] // only mutated when the `flash_attn2` feature adds a second backend
             let mut backends: Vec<Box<dyn AttentionBackend + '_>> =
                 vec![Box::new(InferoHandRolled::new(&kern))];
@@ -2623,6 +2757,7 @@ impl Model {
             tq_prefill_dequant,
             attn_partial_tokens: partial_n_tokens,
             attn_backend_name,
+            hw_caps,
             #[cfg(feature = "flash_attn2")]
             flash_attn2_backend: infero_kernels::flash_attn2::FlashAttn2Ffi::default(),
             // Set by `load_full_tp` after construction, at `tp_size > 1` --
@@ -5821,27 +5956,124 @@ impl Model {
                         ..dims
                     };
                     let (lo, hi) = (base * da, (base + tokens) * da);
-                    // Deliberately always `attn_prefill_ws4`, never
-                    // `decoupled6`/flash_attn2: `ws4` alone is eligible across
-                    // every shape this plan's tests exercise, and it is the one
-                    // whose `prefill_attention` gate `plan_tq_dispatch` already
-                    // consulted before classifying this item as long. Adding
-                    // the other two kernels' own eligibility branches is
-                    // separable follow-up work.
-                    ensure_partial_fits(tokens, self.attn_partial_tokens, "attn_prefill_ws4")?;
-                    self.kern.attn_prefill_ws4(
-                        &mut tq.acc_rot.slice_mut(lo..hi),
-                        &tq.q_rot.slice(lo..hi),
-                        &tq.dequant_k.slice(..dq_len),
-                        &tq.dequant_v.slice(..dq_len),
-                        synth_batch,
-                        run_dims,
-                        0,
-                        tokens,
+                    // The same three-way cascade the F16 dense path's own
+                    // `run_attn` closure makes, for the same reason: by this
+                    // point the KV this run is about to attend is a dense f16
+                    // buffer (`tq.dequant_k`/`dequant_v`, just written by
+                    // `tq_dequant_kv`), physically indistinguishable from the
+                    // dense pool's own cache, so every kernel that can serve a
+                    // dense prefill run can serve this one.
+                    //
+                    // This deliberately does NOT consult `attn_backend_name`
+                    // the way the dense path's own vendor branch does. That
+                    // field is resolved once at load against the *pool's* real
+                    // `KvQuant`, and `FlashAttn2Ffi::supports()` declines any
+                    // quantized one -- so on a TurboQuant model it is always
+                    // `"handrolled"`, and gating on it here would answer a
+                    // question about the pool's storage format when the actual
+                    // question is about *this buffer*, which is not quantized
+                    // at all. Hence the local, per-run `supports()` call below,
+                    // passing `KvCacheQuant::F16` explicitly: not a fork of
+                    // that function's logic, the same function called with the
+                    // parameter that is true for this call's real data.
+                    #[cfg(feature = "flash_attn2")]
+                    let fa2_ok = self.flash_attn2_backend.supports(
+                        &self.hw_caps,
+                        &run_dims,
+                        KvCacheQuant::F16,
+                    ) && infero_kernels::flash_attn2::FlashAttn2Ffi::kv_run_is_contiguous(
+                        self.dev.stream(),
+                        &synth_batch,
                         seq_kv,
-                        attn_scale,
-                        &mut self.act.attn_partial.as_view_mut(),
-                    )?;
+                    )
+                    .unwrap_or(false);
+                    #[cfg(not(feature = "flash_attn2"))]
+                    let fa2_ok = false;
+                    // `supports()` carries FA2's own row threshold (4096), so
+                    // most long runs -- anything above `TQ_DEQUANT_THRESHOLD`
+                    // qualifies as long, which starts at 9 tokens -- fall
+                    // straight past it. That is the intent: this cascade
+                    // targets the genuinely huge prefill chunk this whole
+                    // dequant path exists for, not every long run.
+                    //
+                    // The contiguity check is redundant by construction here
+                    // (`synth_batch`'s slot table is the identity ramp
+                    // `tq.identity_slots`), and is called anyway -- same
+                    // pre-check the dense path makes, and a real guard if that
+                    // synthetic layout is ever changed.
+                    let t6_enabled = !std::env::var("INFERO_PREFILL_T6").is_ok_and(|v| v == "0");
+                    match tq_long_run_kernel(fa2_ok, run_dims.d_head, t6_enabled) {
+                        TqLongRunKernel::FlashAttn2 => {
+                            #[cfg(feature = "flash_attn2")]
+                            {
+                                let mut ctx = AttnCallCtx {
+                                    out: &mut tq.acc_rot.slice_mut(lo..hi),
+                                    q: &tq.q_rot.slice(lo..hi),
+                                    k_cache: &tq.dequant_k.slice(..dq_len),
+                                    v_cache: &tq.dequant_v.slice(..dq_len),
+                                    batch: synth_batch,
+                                    dims: run_dims,
+                                    run_base: 0,
+                                    run_tokens: tokens,
+                                    kv_len: seq_kv,
+                                    scale: attn_scale,
+                                    partial: &mut self.act.attn_partial.as_view_mut(),
+                                    stream: self.dev.stream(),
+                                    kern: &self.kern,
+                                };
+                                self.flash_attn2_backend.prefill(&mut ctx)?;
+                            }
+                            #[cfg(not(feature = "flash_attn2"))]
+                            unreachable!(
+                                "tq_long_run_kernel picked flash_attn2 but the feature \
+                                 isn't compiled in -- `fa2_ok` is a hard `false` there"
+                            );
+                        }
+                        // T=6 of the decoupled-role attention family, fixed at
+                        // `d_head == 256` (`ATTN_DSPLIT_HALF_NTILES` assumes
+                        // it) and with no multi-chunk `partial` path of its
+                        // own, exactly as on the dense path -- see that
+                        // branch's own comment for the measurement behind
+                        // preferring it over `ws4`.
+                        TqLongRunKernel::Decoupled6 => {
+                            self.kern.attn_prefill_decoupled6_f16acc(
+                                &mut tq.acc_rot.slice_mut(lo..hi),
+                                &tq.q_rot.slice(lo..hi),
+                                &tq.dequant_k.slice(..dq_len),
+                                &tq.dequant_v.slice(..dq_len),
+                                synth_batch,
+                                run_dims,
+                                0,
+                                tokens,
+                                seq_kv,
+                                attn_scale,
+                            )?;
+                        }
+                        // Unchanged: what this dispatch has always called, and
+                        // still the only candidate for `d_head != 256` (which
+                        // is every shape this plan's own tests exercise -- the
+                        // local test checkpoint is `d_head = 64`).
+                        TqLongRunKernel::Ws4 => {
+                            ensure_partial_fits(
+                                tokens,
+                                self.attn_partial_tokens,
+                                "attn_prefill_ws4",
+                            )?;
+                            self.kern.attn_prefill_ws4(
+                                &mut tq.acc_rot.slice_mut(lo..hi),
+                                &tq.q_rot.slice(lo..hi),
+                                &tq.dequant_k.slice(..dq_len),
+                                &tq.dequant_v.slice(..dq_len),
+                                synth_batch,
+                                run_dims,
+                                0,
+                                tokens,
+                                seq_kv,
+                                attn_scale,
+                                &mut self.act.attn_partial.as_view_mut(),
+                            )?;
+                        }
+                    }
                 }
                 // Back out of the rotated basis, once, on the output.
                 self.kern.tq_matvec(
