@@ -479,6 +479,88 @@ impl TqDispatch {
     }
 }
 
+/// The token width past which a prefill item takes the dequantize-and-dispatch
+/// path, or `usize::MAX` when that path cannot serve this load at all.
+///
+/// Every reason the long path is unavailable is folded into this one number, so
+/// that "unavailable" always means the same thing downstream:
+/// [`plan_tq_dispatch`] classifies nothing as long, the plan collapses to the
+/// single whole-batch call the TurboQuant branch has always made, and the pass
+/// is bit-for-bit what it was before this path existed. There is deliberately
+/// no per-item error path and no second, later gate — an unsupported load is
+/// *slower*, never broken.
+///
+/// The three reasons:
+///
+///   - **`enabled`** — `INFERO_TQ_PREFILL_DEQUANT=0`, resolved once at load.
+///
+///   - **`tile_kernel_eligible`** — `Kernels::prefill_attention`. This is where
+///     the long path's one hard shape requirement lives: `attn_prefill_ws4`
+///     *errors* on a shape it cannot serve (`ensure!(self.prefill_attention(
+///     &dims))`), and it is off entirely unless `INFERO_ATTN_MMA=1` is set.
+///     Deciding it here means an ineligible shape quietly keeps every item on
+///     `tq_attn_decode` instead of failing the pass.
+///
+///   - **the quantization itself**, on two counts:
+///
+///     `uses_qjl` is a *correctness* gate, not a shape one — MEASURED, and it
+///     is why this path cannot serve `tq4` today. `tq_attn_decode` evaluates
+///     TurboQuant's two-stage score estimator:
+///
+///         est = scale·⟨q_rot, cb[code]⟩
+///             + qjl_scale·(√(π/2)/d)·γ·⟨q_qjl, s⟩       (s = ±1 sign sketch)
+///
+///     and `tq_dequant_kv` materializes only the first term, because a
+///     dequantized key has no per-element value for the second (see its own
+///     doc comment in `turboquant.cu`). That is not a rounding difference. On
+///     this repo's own 0.5B test model at a 401-token prompt, against an f16
+///     cache: `tq4` scores cosine 0.675, and the same cache scored *without*
+///     its QJL term scores 0.330 — the two disagree with each other at cosine
+///     0.289 and pick different next tokens. So a QJL-enabled cache keeps
+///     taking `tq_attn_decode` until the dequantizer can carry the term,
+///     rather than silently running a materially worse estimator.
+///
+///     It *is* carryable, and cheaply — the term is linear in `q_rot`:
+///
+///         ⟨q_qjl, s⟩ = ⟨Q·q_rot, s⟩ = ⟨q_rot, Qᵀ·s⟩
+///
+///     (`q_qjl` is `tables.qjl · q_rot`, one `tq_matvec` inside the branch), so
+///
+///         k_eff = scale·cb[code] + qjl_scale·(√(π/2)/d)·γ·(Qᵀ·s)
+///
+///     is a per-element dequantized key that reproduces the full estimator
+///     exactly. It costs `tq_dequant_kv` a d×d sign-matvec per cached key —
+///     O(H·L·d²) against attention's own O(H·L²·d), i.e. noise at any `L` this
+///     path is used for. Doing it needs `k_signs`, `k_gamma` and `tables.qjl`
+///     handed back to that kernel (they were dropped from its signature on the
+///     — correct in itself, but incomplete — finding that the sign term is not
+///     a *per-element correction to the codebook value*), plus its own
+///     kernel-level correctness test. Kernel work, deliberately left to a
+///     follow-up rather than smuggled into the dispatch change.
+///
+///     The bit-width check is the narrower one: `tq_dequant_kv` has only been
+///     validated against a host reference at `k_bits=4`/`v_bits=4` (see
+///     `crates/kernels/tests/turboquant.rs`), and running unverified
+///     dequantization math is not something to do silently. It is a *gate*
+///     rather than an error for the same reason as the other two, and the
+///     reason bites here specifically: with `uses_qjl` already excluded, the
+///     loads that reach this point are exactly the QJL-free ones, and of those
+///     only `k4v4` passes. `k8v4` — this repo's own quality sweep's
+///     recommended allocation, and a preset two tests in
+///     `crates/model/tests/turboquant.rs` use — is QJL-free, and as an error
+///     it made every >`TQ_DEQUANT_THRESHOLD` prefill fail outright under
+///     `INFERO_ATTN_MMA=1` (measured, on a configuration that works at any
+///     length today). Widening `tq_dequant_kv`'s own test coverage is what
+///     lifts this, not deleting the check.
+fn tq_dequant_threshold(quant: KvCacheQuant, enabled: bool, tile_kernel_eligible: bool) -> usize {
+    let usable = enabled
+        && tile_kernel_eligible
+        && !quant.uses_qjl()
+        && quant.k_mse_bits() == 4
+        && quant.v_bits() == 4;
+    if usable { TQ_DEQUANT_THRESHOLD } else { usize::MAX }
+}
+
 /// Coalesce `items` into short/decode runs plus individually-listed long
 /// prefill items.
 ///
@@ -715,6 +797,66 @@ mod tq_dispatch_tests {
         assert!(plan.is_single_whole_pass_call());
         assert!(!plan.is_layout_dependent());
         assert_eq!(plan, TqDispatch::whole_pass(304, 900));
+    }
+
+    /// Every reason the long path is unavailable resolves to the same
+    /// `usize::MAX`, so that "unavailable" is always the same thing: a collapse
+    /// to one whole-batch `tq_attn_decode` call, never an error.
+    #[test]
+    fn an_unavailable_long_path_is_always_an_infinite_threshold() {
+        // The one combination that is actually served today.
+        assert_eq!(
+            tq_dequant_threshold(KvCacheQuant::Tq4Mse, true, true),
+            TQ_DEQUANT_THRESHOLD
+        );
+        for (why, quant, enabled, tile) in [
+            ("INFERO_TQ_PREFILL_DEQUANT=0", KvCacheQuant::Tq4Mse, false, true),
+            ("no eligible tile kernel", KvCacheQuant::Tq4Mse, true, false),
+            // `tq4` itself: QJL-enabled, so a dequantized key cannot carry the
+            // estimator's second term. See `tq_dequant_threshold`'s own doc.
+            ("qjl", KvCacheQuant::Tq4, true, true),
+            ("qjl", KvCacheQuant::Tq2, true, true),
+            // ...and the bit widths `tq_dequant_kv` has no host-reference
+            // coverage for. `k8v4` is the case that matters: QJL-free, and a
+            // preset this repo's own tests use, so it reaches the bit-width
+            // check and must come out of it slower rather than broken.
+            ("k8v4 bit width", KvCacheQuant::new(8, 4, false).unwrap(), true, true),
+            ("k8v2 bit width", KvCacheQuant::new(8, 2, false).unwrap(), true, true),
+            ("k2v8 bit width", KvCacheQuant::new(2, 8, false).unwrap(), true, true),
+            ("k4v2 bit width", KvCacheQuant::new(4, 2, false).unwrap(), true, true),
+            ("tq2-mse bit width", KvCacheQuant::Tq2Mse, true, true),
+        ] {
+            assert_eq!(
+                tq_dequant_threshold(quant, enabled, tile),
+                usize::MAX,
+                "{why}: {} should have no long path at all",
+                quant.name()
+            );
+        }
+    }
+
+    /// The point of that collapse, end to end: a `k8v4` pool's 300-token
+    /// prefill — well past `TQ_DEQUANT_THRESHOLD`, and which an earlier draft
+    /// of this dispatch failed outright with a hard error — plans zero long
+    /// runs and one ordinary whole-batch call.
+    #[test]
+    fn an_unvalidated_bit_width_falls_back_instead_of_failing() {
+        let k8v4 = KvCacheQuant::new(8, 4, false).unwrap();
+        assert!(
+            !k8v4.uses_qjl(),
+            "k8v4 must reach the bit-width check for this to test it"
+        );
+        let toks = vec![1u32; 300];
+        let items = [item(0, &toks, BatchItemKind::Prefill)];
+        let threshold = tq_dequant_threshold(k8v4, true, true);
+        let plan = plan_tq_dispatch(&items, &[300], threshold);
+        assert!(
+            plan.long_runs.is_empty(),
+            "a k8v4 prefill must stay on tq_attn_decode, not reach tq_dequant_kv"
+        );
+        assert_eq!(plan, TqDispatch::whole_pass(300, 300));
+        // ...and so it stays graphable exactly as it was before this path existed.
+        assert!(!plan.is_layout_dependent());
     }
 }
 
@@ -3099,61 +3241,12 @@ impl Model {
         // quantized -- with the long path unavailable this collapses to the
         // single whole-batch call that branch has always made, so it is not
         // gated on the feature flag, only fed by it.
-        //
-        // `prefill_attention` is part of the threshold rather than a
-        // fallback inside `attention()` because it is where the long path's
-        // one hard requirement lives: `attn_prefill_ws4` *errors* on a shape
-        // it cannot serve (`ensure!(self.prefill_attention(&dims))`), and it
-        // is off entirely unless `INFERO_ATTN_MMA=1` is set. Deciding here
-        // means an ineligible shape quietly keeps every item on
-        // `tq_attn_decode` instead of failing the pass.
-        //
-        // `uses_qjl` is the other, and it is a *correctness* gate, not a
-        // shape one -- MEASURED, and it is why this path cannot serve `tq4`
-        // today. `tq_attn_decode` evaluates TurboQuant's two-stage score
-        // estimator:
-        //
-        //     est = scale·⟨q_rot, cb[code]⟩
-        //         + qjl_scale·(√(π/2)/d)·γ·⟨q_qjl, s⟩       (s = ±1 sign sketch)
-        //
-        // and `tq_dequant_kv` materializes only the first term, because a
-        // dequantized key has no per-element value for the second (see its
-        // own doc comment in `turboquant.cu`). That is not a rounding
-        // difference. On this repo's own 0.5B test model at a 401-token
-        // prompt, against an f16 cache: `tq4` scores cosine 0.675, and the
-        // same cache scored *without* its QJL term scores 0.330 -- the two
-        // disagree with each other at cosine 0.289 and pick different next
-        // tokens. So a QJL-enabled cache must keep taking `tq_attn_decode`
-        // until the dequantizer can carry the term, rather than silently
-        // running a materially worse estimator.
-        //
-        // It *is* carryable, and cheaply -- the term is linear in `q_rot`:
-        //
-        //     ⟨q_qjl, s⟩ = ⟨Q·q_rot, s⟩ = ⟨q_rot, Qᵀ·s⟩
-        //
-        // (`q_qjl` is `tables.qjl · q_rot`, one `tq_matvec` above), so
-        //
-        //     k_eff = scale·cb[code] + qjl_scale·(√(π/2)/d)·γ·(Qᵀ·s)
-        //
-        // is a per-element dequantized key that reproduces the full
-        // estimator exactly. It costs `tq_dequant_kv` a d×d sign-matvec per
-        // cached key -- O(H·L·d²) against attention's own O(H·L²·d), i.e.
-        // noise at any `L` this path is used for. Doing it needs `k_signs`,
-        // `k_gamma` and `tables.qjl` handed back to that kernel (they were
-        // dropped from its signature on the -- correct in itself, but
-        // incomplete -- finding that the sign term is not a *per-element
-        // correction to the codebook value*), plus its own kernel-level
-        // correctness test. That is kernel work, deliberately left to a
-        // follow-up rather than smuggled into this dispatch change.
         let tq_dispatch = self.tq.is_some().then(|| {
-            let threshold = if self.tq_prefill_dequant
-                && !pool.quant().uses_qjl()
-                && self.kern.prefill_attention(&dims)
-            {
-                TQ_DEQUANT_THRESHOLD
-            } else {
-                usize::MAX
-            };
+            let threshold = tq_dequant_threshold(
+                pool.quant(),
+                self.tq_prefill_dequant,
+                self.kern.prefill_attention(&dims),
+            );
             plan_tq_dispatch(items, &item_kv_len, threshold)
         });
 
@@ -5303,23 +5396,26 @@ impl Model {
                 // own per-run extents are both correct and required.
                 let one_call = plan.is_single_whole_pass_call();
 
-                // This task's own tests, and Task 2's kernel-level check of
-                // `tq_dequant_kv` against a host reference, only cover
-                // `KvCacheQuant::Tq4`. An untested bit-width must fail loud
-                // rather than quietly run unverified dequantization math. Only
-                // the long path is affected: a short/decode-only batch takes
-                // the same `tq_attn_decode` it always has, at every bit width.
-                if !plan.long_runs.is_empty() {
-                    anyhow::ensure!(
-                        k_bits == 4 && v_bits == 4,
-                        "tq_dequant_kv: only k_bits=4/v_bits=4 has been validated against a \
-                         host reference (see crates/kernels/tests/turboquant.rs); this load's \
-                         KvCacheQuant is k_bits={k_bits}/v_bits={v_bits}. Set \
-                         INFERO_TQ_PREFILL_DEQUANT=0 to use the (slower, but validated for \
-                         every bit width) tq_attn_decode path instead, or extend Task 2's \
-                         test coverage to this combination before removing this guard."
-                    );
-                }
+                // `tq_dequant_kv` has only been validated against a host
+                // reference at `k_bits=4`/`v_bits=4` (see
+                // `crates/kernels/tests/turboquant.rs`), so nothing else may
+                // reach it. That is enforced where every other reason the long
+                // path is unavailable is enforced -- in `tq_dequant_threshold`,
+                // which collapses the plan to one whole-batch `tq_attn_decode`
+                // call rather than failing the pass, so an unvalidated
+                // bit-width comes out slower and never broken.
+                //
+                // Which makes this unreachable, and it is asserted rather than
+                // returned for exactly that reason: it is the invariant tying
+                // the two places together, and a future edit that plans a long
+                // run without consulting the threshold should trip it in a
+                // debug build rather than quietly dequantize with untested math
+                // in release.
+                debug_assert!(
+                    plan.long_runs.is_empty() || (k_bits == 4 && v_bits == 4),
+                    "long dequant runs planned for k_bits={k_bits}/v_bits={v_bits}, which \
+                     `tq_dequant_threshold` should have excluded -- the two have drifted"
+                );
 
                 // Short and decode items: unchanged kernels, unchanged math,
                 // just scoped to one contiguous run of the batch instead of

@@ -443,45 +443,34 @@ fn the_qjl_estimator_keeps_long_runs_off_the_dequant_path() -> Result<()> {
 /// The flag is read once at load (`Model::from_parts`), so it has to be set
 /// around `load_quantized` rather than around `forward`.
 fn both_paths(quant: KvCacheQuant) -> Result<Option<(Vec<f32>, Vec<f32>)>> {
-    let Some(path) = model_path() else {
-        return Ok(None);
-    };
-    let gguf = Gguf::open(&path)?;
-    let tok = Tokenizer::from_gguf(&gguf)?;
-
-    // Long enough to clear even a generously large `TQ_DEQUANT_THRESHOLD`.
-    let prompt = "The quick brown fox jumps over the lazy dog. ".repeat(40);
-    let ids = tok.encode(&prompt, Some(false), false);
-    assert!(
-        ids.len() > 256,
-        "prompt too short to exercise the long-run path: {} tokens",
-        ids.len()
-    );
-
-    let off = {
-        unsafe { std::env::set_var("INFERO_TQ_PREFILL_DEQUANT", "0") };
-        let mut model = Model::load_quantized(Device::new(0)?, &gguf, 1024, quant)?;
-        unsafe { std::env::remove_var("INFERO_TQ_PREFILL_DEQUANT") };
-        assert!(!model.tq_prefill_dequant(), "=0 should switch the path off");
+    let mut out = Vec::new();
+    for dequant in [false, true] {
+        // `load_tq` owns the environment variable, including on a failed load.
+        let Some((mut model, tok)) = load_tq(quant, dequant)? else {
+            return Ok(None);
+        };
+        // Long enough to clear even a generously large `TQ_DEQUANT_THRESHOLD`.
+        let prompt = "The quick brown fox jumps over the lazy dog. ".repeat(40);
+        let ids = tok.encode(&prompt, Some(false), false);
+        assert!(
+            ids.len() > 256,
+            "prompt too short to exercise the long-run path: {} tokens",
+            ids.len()
+        );
         assert!(
             model.batch_tokens() >= ids.len(),
             "this prompt would be split across {} passes; the test wants one long item",
             ids.len().div_ceil(model.batch_tokens())
         );
         let mut session = model.new_session()?;
-        model
-            .forward(&ids, BatchItemKind::Prefill, &mut session)?
-            .to_vec()
-    };
-
-    let on = {
-        let mut model = Model::load_quantized(Device::new(0)?, &gguf, 1024, quant)?;
-        assert!(model.tq_prefill_dequant(), "dequant-dispatch should default on");
-        let mut session = model.new_session()?;
-        model
-            .forward(&ids, BatchItemKind::Prefill, &mut session)?
-            .to_vec()
-    };
+        out.push(
+            model
+                .forward(&ids, BatchItemKind::Prefill, &mut session)?
+                .to_vec(),
+        );
+    }
+    let on = out.pop().expect("both paths ran");
+    let off = out.pop().expect("both paths ran");
     Ok(Some((off, on)))
 }
 
@@ -679,3 +668,4 @@ fn an_interleaved_batch_dispatches_every_item_to_its_own_rows() -> Result<()> {
     );
     Ok(())
 }
+
