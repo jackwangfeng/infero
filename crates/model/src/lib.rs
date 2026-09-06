@@ -146,13 +146,19 @@ const MIN_PREFILL_RUN: usize = 8;
 /// (`crates/model/tests/turboquant.rs`) requires the dequant path's argmax
 /// to agree with `tq_attn_decode`'s at `TQ_DEQUANT_THRESHOLD + 1` tokens --
 /// both are the same TurboQuant estimator, but they reach it through
-/// different floating-point paths (see `tq_dequant_kv`'s own doc comment),
-/// and at a handful of cached keys that difference is large relative to
-/// the estimator's own noise floor. Measured directly: with the constant
-/// temporarily set to 2 and 3, that test's `n = threshold + 1` case (3 and
-/// 4 tokens respectively) failed outright -- cosine 0.985 and 0.863, with
-/// the argmax disagreeing both times (this is non-monotonic in `n`, not a
-/// smooth noise decay: 3 tokens disagreed, 5 tokens agreed, 4 tokens
+/// different floating-point paths: `tq_dequant_kv` rounds the combined
+/// MSE-codebook + QJL term to `f16` once per cached key, while
+/// `tq_attn_decode`/`tq_attn_scores` keep the two terms as separate `f32`
+/// accumulators and combine them only at the score. The reassociation
+/// itself is exact (see `tq_dequant_kv`'s own doc comment for the algebra),
+/// but the extra `f16` rounding step it adds is not, and at a near-degenerate
+/// few-key softmax that one rounding step is large relative to the
+/// estimator's own noise floor; it dilutes away as `kv_len` grows, which is
+/// exactly why long runs are unaffected. Measured directly: with the
+/// constant temporarily set to 2 and 3, that test's `n = threshold + 1` case
+/// (3 and 4 tokens respectively) failed outright -- cosine 0.985 and 0.863,
+/// with the argmax disagreeing both times (this is non-monotonic in `n`, not
+/// a smooth noise decay: 3 tokens disagreed, 5 tokens agreed, 4 tokens
 /// disagreed again -- each length is genuinely different cached content,
 /// not a point on a decreasing-noise curve). The same test passed cleanly
 /// at 4 (n=5 cosine 0.980) and at 8 (n=9 cosine 0.988, reproduced twice,
@@ -165,6 +171,21 @@ const MIN_PREFILL_RUN: usize = 8;
 /// real 3.79x faster than `tq_attn_decode` (see the table above), so this
 /// is a large win over the 128 placeholder, just not the largest one the
 /// raw timing numbers alone would suggest.
+///
+/// **Shape caveat.** The timing table above was measured at production's
+/// real shape (`N_HEADS=24`/`N_KV_HEADS=4`/`D_HEAD=256`). The correctness
+/// re-verification above (the `threshold_boundary` test at candidate values
+/// 2/3/4/8) ran against the only GGUF checkpoint available on this machine,
+/// `qwen2.5-0.5b-instruct-q8_0.gguf` -- `head_count=14`, `head_count_kv=2`,
+/// `embedding_length=896`, i.e. `d_head=64`, not 256. `tq_dequant_kv`'s
+/// `S'ᵀ·s` sum runs over `d_head` terms, so the f16-rounding error this
+/// threshold is guarding against is plausibly shape-dependent (a wider
+/// `d_head` sums more terms into that one rounding step before it hits
+/// `f16`) and this has **not** been independently re-verified at
+/// production's real `d_head=256` -- only assumed to transfer, for lack of
+/// a locally-available checkpoint at that shape. If it does not transfer,
+/// Task 6's end-to-end validation (run against the real checkpoint) is the
+/// place that would surface it.
 pub const TQ_DEQUANT_THRESHOLD: usize = 8;
 
 /// The real ceiling on how many tokens the decode-only dispatch path (see the

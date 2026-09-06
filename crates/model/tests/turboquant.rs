@@ -672,16 +672,29 @@ fn a_continuation_chunk_attends_its_own_history_through_the_dequant_path() -> Re
 /// is only ~0.977 on this model *before* this change, so such a comparison has
 /// no headroom left to detect anything.
 ///
-/// On the tolerance. The measured numbers here are 0.983 / 0.970 / 0.997, and
-/// they are not the long path's doing — only item 1 is long. Splitting a batch
-/// into per-run calls changes each call's `n_tokens`, and `tq_attn_decode`
-/// derives its split-K chunk count from that (`decode_chunks`), so the same
-/// token's keys get summed in a different order. That is the same pre-existing
-/// sensitivity that makes a solo run and a batched run differ by ~0.977 on this
-/// path already. 0.95 is set below it and well above what a real bug does:
-/// giving every short run the *first* run's base — precisely the mistake a
-/// two-flat-lists partition makes on this interleaved shape — drops item 0 to
-/// 0.694, which this catches with room to spare.
+/// On the tolerance. The measured numbers here (at the current
+/// `TQ_DEQUANT_THRESHOLD = 8`) are 0.983 / 0.970 / 0.981 for items 0/1/2.
+/// Item 0 (the decode item) never takes the long path regardless of the
+/// threshold (`plan_tq_dispatch` excludes `Decode` items outright), so its
+/// deviation is entirely the reordering effect described below. Items 1
+/// (200 tokens) and 2 (40 tokens) both now exceed `TQ_DEQUANT_THRESHOLD = 8`
+/// and both take the real dequant path -- at the 128-era threshold this
+/// used to read "only item 1 is long," measuring 0.983 / 0.970 / 0.997, with
+/// item 2 near 1.0 because it stayed on the short path back then. Splitting
+/// a batch into per-run calls changes each call's `n_tokens`, and
+/// `tq_attn_decode` derives its split-K chunk count from that
+/// (`decode_chunks`), so the same token's keys get summed in a different
+/// order. That is the same pre-existing sensitivity that makes a solo run
+/// and a batched run differ by ~0.977 on this path already, and it is what
+/// item 0's and item 1's numbers are still measuring; item 2's now also
+/// carries the dequant path's own extra rounding step on top of it (see
+/// `TQ_DEQUANT_THRESHOLD`'s doc comment in `crates/model/src/lib.rs` for
+/// why that step exists), which is why item 2 moved off ~0.997 to 0.981
+/// once its 40 tokens started clearing the lower threshold. 0.95 is set
+/// below all of these and well above what a real bug does: giving every
+/// short run the *first* run's base — precisely the mistake a
+/// two-flat-lists partition makes on this interleaved shape — drops item 0
+/// to 0.694, which this catches with room to spare.
 #[test]
 fn an_interleaved_batch_dispatches_every_item_to_its_own_rows() -> Result<()> {
     let _gpu = gpu_lock();
@@ -729,7 +742,10 @@ fn an_interleaved_batch_dispatches_every_item_to_its_own_rows() -> Result<()> {
         assert!(cos > 0.95, "item {i} cosine {cos:.9}");
         any_moved |= cos < 0.99999;
     }
-    // Item 1 is the only long one, so it is the only one that may move at all;
+    // Items 1 (200 tokens) and 2 (40 tokens) both clear the current
+    // `TQ_DEQUANT_THRESHOLD = 8` and take the long dequant path (at the
+    // 128-era threshold only item 1 did); item 0 is a `Decode` item and never
+    // takes the long path regardless. So any of items 1/2 moving is enough;
     // if nothing moved, the long path never ran and this proved nothing.
     assert!(
         any_moved,
@@ -752,25 +768,32 @@ fn an_interleaved_batch_dispatches_every_item_to_its_own_rows() -> Result<()> {
 /// `threshold + 1` stops moving instead, which the upper assertion in the
 /// other branch catches.
 ///
-/// **On the seed and the tolerance at `threshold + 1`.** Measured, sweeping
-/// all three `prompt_tokens` passages at this exact length: cosine 0.975
-/// (seed 0, and its argmax actually flips -- a real near-tie, not a bug: the
-/// single dequant call here covers only ~129 tokens' worth of averaging
-/// across 24 layers, far less than the 256+-token prompts the other tests in
-/// this file use, so the noise floor is wider), 0.889 (seed 1, argmax still
-/// agrees), 0.981 (seed 2, argmax agrees). Seed 2 is used below so this test
-/// asserts next-token agreement as well as a cosine floor, rather than only
-/// the weaker "it moved at all" check the near-tie seeds would be limited to.
+/// **On the seed and the tolerance at `threshold + 1`.** Re-measured after
+/// Task 5 dropped `TQ_DEQUANT_THRESHOLD` from 128 to 8 (so this now runs at
+/// `n=9`, not the `n=129` this comment used to describe), sweeping all three
+/// `prompt_tokens` passages at the new exact length: cosine 0.994 (seed 0,
+/// and its argmax actually flips, 11 vs 13 -- a real near-tie, not a bug: the
+/// single dequant call here covers only ~9 tokens' worth of averaging across
+/// 24 layers, an order of magnitude less than the 256+-token prompts the
+/// other tests in this file use, so the noise floor is wider still than it
+/// was at the old `n=129`), 0.990 (seed 1, argmax still agrees), 0.988 (seed
+/// 2, argmax agrees). Seed 2 is used below so this test asserts next-token
+/// agreement as well as a cosine floor, rather than only the weaker "it moved
+/// at all" check the near-tie seed would be limited to. The same
+/// near-tie/agree/agree pattern held at the old `n=129` (0.975/0.889/0.981),
+/// just with a narrower gap between the near-tie seed and the two that agree
+/// -- shrinking the run from ~129 to ~9 tokens widened the noise floor as
+/// expected, but did not change which seed is the risky one.
 ///
 /// **What the 0.95 floor does and does not prove.** Unlike
 /// `an_interleaved_batch_dispatches_every_item_to_its_own_rows`'s identical
 /// 0.95 floor, which is anchored between a measured good-path baseline *and*
 /// a measured bad-path number from a real injected bug, this floor is
-/// anchored only against the good-path noise measured above (0.889-0.981
-/// across seeds) -- there is no equivalent bad-path measurement here for a
-/// boundary-specific bug (e.g. a partial-tile-handling regression specific to
-/// "one token past a full tile," which `TQ_DEQUANT_THRESHOLD`'s tile-size-
-/// adjacent value of 128 makes a plausible failure mode, distinct from the
+/// anchored only against the good-path noise measured above (0.988-0.994
+/// across seeds at the current `n=9`) -- there is no equivalent bad-path
+/// measurement here for a boundary-specific bug (e.g. a partial-tile-handling
+/// regression specific to "one token past a full tile," which is a plausible
+/// failure mode at any tile-size-adjacent threshold value, distinct from the
 /// `>`/`>=` dispatch bug this test's paired bound with the `n == threshold`
 /// case already catches). So this floor reliably proves the long path ran
 /// and produced a non-garbage, plausible result -- paired with the
