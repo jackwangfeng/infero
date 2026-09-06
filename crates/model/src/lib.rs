@@ -241,6 +241,40 @@ struct AttnDispatch {
     runs: Vec<AttnRun>,
 }
 
+impl AttnDispatch {
+    /// Whether this plan collapses to exactly ONE attention call covering the
+    /// whole pass — either an all-decode batch (`runs` empty, so the decode
+    /// prefix *is* the batch) or a single item (no decode prefix, one run).
+    ///
+    /// Two separate decisions hang off this, and they must agree, which is why
+    /// it is one predicate asked twice rather than two expressions:
+    ///
+    ///   - **CUDA graph capture** (`forward_batch_rows`). A pass that issues
+    ///     more than one call reads `items` to decide where each call's
+    ///     `run_base`/`run_tokens` fall, and a graph keyed only by
+    ///     `(pool, n_tokens, bucketed kv_len, armed)` cannot see that — so it
+    ///     must not be captured or replayed. A single-call pass covers
+    ///     `[0, n_tokens)` and is safe to capture, which is what keeps
+    ///     ordinary decode steps graphable.
+    ///   - **Which `kv_len` that one call gets.** Precisely *because* a
+    ///     single-call pass may be replayed from a graph, it must take
+    ///     `attention()`'s own `kv_len` parameter — which the caller has
+    ///     already rounded up to `graph_kv_bucket()` when the pass is
+    ///     graphable — and not this plan's real per-item extents. A graph
+    ///     bakes `kv_len` in as a host scalar
+    ///     (`crates/kernels/src/lib.rs`'s `attn_decode` launch), so capturing
+    ///     one at a real `kv_len` and replaying it for every later step in the
+    ///     same bucket would silently stop attending to the tokens generated
+    ///     since. In the single-call shapes the two values are the same number
+    ///     anyway before bucketing (`decode_kv_len` is the max over every item
+    ///     when every item is a decode; `runs[0].kv_len` is the batch max when
+    ///     there is one item), so taking the parameter is exact parity with
+    ///     the flag-off path rather than an approximation.
+    fn is_single_whole_pass_call(&self) -> bool {
+        usize::from(self.decode_tokens > 0) + self.runs.len() <= 1
+    }
+}
+
 /// Cut `items` into the batched-decode prefix plus one run per remaining item.
 ///
 /// `item_kv_len[i]` is item `i`'s own KV extent, built alongside `starts` in
@@ -436,6 +470,46 @@ mod attn_dispatch_tests {
         let plan = plan_attn_dispatch(&items, &kv_lens(&[0], &items));
         assert_eq!(plan.decode_tokens, 0);
         assert_eq!(plan.runs, vec![AttnRun { base: 0, tokens: 512, kv_len: 512 }]);
+    }
+
+    /// `is_single_whole_pass_call` decides two things that must agree: whether
+    /// the pass may be captured as a CUDA graph, and whether its one call
+    /// takes `attention()`'s (possibly bucketed) `kv_len` parameter instead of
+    /// the plan's own real extents. Getting the second wrong while the first
+    /// says "graphable" is a silent-wrong-output bug, so the predicate is
+    /// pinned here rather than left to two hand-written expressions.
+    #[test]
+    fn only_a_one_call_plan_is_a_single_whole_pass_call() {
+        let a = [1u32];
+        let b = [2u32];
+        let long = [3u32; 64];
+
+        // All-decode: one `attn_decode` over the whole pass.
+        let items = [
+            BatchItem::new(SeqId(0), &a, BatchItemKind::Decode),
+            BatchItem::new(SeqId(1), &b, BatchItemKind::Decode),
+        ];
+        assert!(plan_attn_dispatch(&items, &kv_lens(&[9, 9], &items)).is_single_whole_pass_call());
+
+        // One item, either kind: one run over the whole pass.
+        let items = [BatchItem::new(SeqId(0), &long, BatchItemKind::Prefill)];
+        assert!(plan_attn_dispatch(&items, &kv_lens(&[0], &items)).is_single_whole_pass_call());
+        let items = [BatchItem::new(SeqId(0), &a, BatchItemKind::Decode)];
+        assert!(plan_attn_dispatch(&items, &kv_lens(&[500], &items)).is_single_whole_pass_call());
+
+        // Decode prefix + a prefill item: two calls.
+        let items = [
+            BatchItem::new(SeqId(0), &a, BatchItemKind::Decode),
+            BatchItem::new(SeqId(1), &long, BatchItemKind::Prefill),
+        ];
+        assert!(!plan_attn_dispatch(&items, &kv_lens(&[500, 0], &items)).is_single_whole_pass_call());
+
+        // Two prefill items, no decode prefix: two calls.
+        let items = [
+            BatchItem::new(SeqId(0), &long, BatchItemKind::Prefill),
+            BatchItem::new(SeqId(1), &long, BatchItemKind::Prefill),
+        ];
+        assert!(!plan_attn_dispatch(&items, &kv_lens(&[0, 0], &items)).is_single_whole_pass_call());
     }
 
     /// An all-decode batch is one `attn_decode` over the whole pass — byte for
@@ -2526,9 +2600,14 @@ impl Model {
         // -- an ordinary single-sequence decode step, and a multi-sequence
         // all-decode step -- so graph replay, which only ever fires for decode
         // shapes anyway, keeps working exactly as it does today.
-        let layout_dependent_dispatch = attn_dispatch.as_ref().is_some_and(|p| {
-            usize::from(p.decode_tokens > 0) + p.runs.len() > 1
-        });
+        //
+        // The same predicate decides which `kv_len` that one call is given
+        // (see `AttnDispatch::is_single_whole_pass_call`): a pass that may be
+        // replayed from a graph must take the bucketed `kv` this function
+        // hands `attention()` below, not the plan's own real extents.
+        let layout_dependent_dispatch = attn_dispatch
+            .as_ref()
+            .is_some_and(|p| !p.is_single_whole_pass_call());
         let graphable = self.use_graph
             && self.offload.is_none()
             && key.2 <= self.max_seq
@@ -4437,14 +4516,32 @@ impl Model {
                         // is every shape that could have had it before the
                         // split existed anyway (a single-item pass, or an
                         // all-decode batch).
-                        let one_call =
-                            plan.runs.is_empty() || (plan.decode_tokens == 0 && plan.runs.len() == 1);
+                        let one_call = plan.is_single_whole_pass_call();
                         let want_h = wo_f16 && one_call;
+                        // Which `kv_len` a call gets. A pass that issues one
+                        // whole-pass call is exactly the pass the caller may
+                        // capture and replay a CUDA graph for, and it has
+                        // already rounded `kv_len` up to `graph_kv_bucket()`
+                        // for precisely that reason -- a graph bakes `kv_len`
+                        // in as a host scalar, so a graph captured at a real
+                        // `kv_len` and replayed for the next 60-odd decode
+                        // steps in the same bucket would silently stop
+                        // attending to everything generated since. So the
+                        // single-call shapes take the *parameter*, which is
+                        // the same number the plan holds whenever the pass is
+                        // not graphable, and the bucketed one when it is --
+                        // exact parity with the flag-off path either way.
+                        //
+                        // A multi-call pass is never graphable (see
+                        // `is_single_whole_pass_call`), so `kv_len` is the raw
+                        // batch-wide max there and the plan's own real
+                        // per-item extents are both correct and required.
+                        let kv_for = |plan_kv: usize| if one_call { kv_len } else { plan_kv };
                         if plan.decode_tokens > 0 {
                             attn_f16 = run_attn(
                                 0,
                                 plan.decode_tokens,
-                                plan.decode_kv_len,
+                                kv_for(plan.decode_kv_len),
                                 // The decode subgroup spans several sequences
                                 // in general; the tile kernels cannot take it
                                 // at any width. A one-item pass never reaches
@@ -4459,7 +4556,7 @@ impl Model {
                             let wrote = run_attn(
                                 run.base,
                                 run.tokens,
-                                run.kv_len,
+                                kv_for(run.kv_len),
                                 run.tokens >= MIN_PREFILL_RUN,
                                 want_h,
                             )?;

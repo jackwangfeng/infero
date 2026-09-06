@@ -261,6 +261,105 @@ fn two_simultaneous_prefills_each_match_their_solo_run() -> Result<()> {
     Ok(())
 }
 
+/// A CUDA graph captured for a decode step must not bake in that step's *real*
+/// `kv_len`, because it is replayed for every later step in the same 64-token
+/// bucket.
+///
+/// `forward_batch_rows` hands `attention()` the **bucketed** `kv_len`
+/// (`kv_len.next_multiple_of(graph_kv_bucket())`) whenever the pass is
+/// graphable, exactly so the one set of launch parameters a graph freezes
+/// stays valid for the whole bucket. A split-path dispatch that reached past
+/// that parameter for the plan's own real per-item extents would capture a
+/// graph at, say, `kv_len = 66` and then replay it for real `kv_len` 67
+/// through 128 — the model silently attending only to its first 66 keys and
+/// never seeing the ~60 tokens it just generated. That produces fluent,
+/// plausible text, which is why no amount of "the output looked coherent"
+/// smoke testing finds it and why this test exists.
+///
+/// Shape of the check: prime a sequence to exactly 64 tokens, then run 80
+/// decode steps on a *forced* token stream (identical inputs both sides, so
+/// nothing compounds), under `INFERO_SPLIT_MIXED_BATCH=1` and `=0`. Both
+/// bucket identically, so the two must agree at every single step. Steps 3
+/// onward are the replayed ones: real `kv_len` 65 runs eagerly and marks the
+/// key warm, 66 captures, 67..128 replay, 129 opens the next bucket.
+#[test]
+fn a_replayed_decode_graph_still_sees_every_real_token() -> Result<()> {
+    let _gpu = gpu_lock();
+    if model_path().is_none() {
+        return Ok(());
+    }
+
+    /// Prime to 64 tokens, then decode 80 forced steps, returning each step's
+    /// logits. Graphs are left ON (the default) — that is the whole point.
+    fn forced_decode_run(model: &mut Model) -> Result<Vec<Vec<f32>>> {
+        let vocab = model.config().vocab_size;
+        // 64 exactly, so the first decode step lands at real kv_len 65 and the
+        // bucket boundary at 128 falls in the middle of the run.
+        let prompt = tokens(vocab, 13, 64);
+        // Forced rather than sampled: both sides must see byte-identical
+        // inputs, or a first divergence would compound and the test would be
+        // measuring drift instead of attention.
+        let forced = tokens(vocab, 77, 80);
+
+        let mut pool = model.new_pool(4096, 4)?;
+        let seq = pool.alloc().expect("fresh pool had no rows");
+        prime(model, &mut pool, seq, &prompt)?;
+        assert_eq!(pool.len(seq), 64, "priming must land exactly on the bucket");
+
+        let mut out = Vec::with_capacity(forced.len());
+        for t in &forced {
+            let item = BatchItem::new(seq, std::slice::from_ref(t), BatchItemKind::Decode);
+            out.push(model.forward_batch(std::slice::from_ref(&item), &mut pool)?[..vocab].to_vec());
+        }
+        Ok(out)
+    }
+
+    let on = {
+        let (mut model, _t) = load("1")?.expect("model path already checked");
+        forced_decode_run(&mut model)?
+    };
+    let off = {
+        let (mut model, _t) = load("0")?.expect("model path already checked");
+        forced_decode_run(&mut model)?
+    };
+    assert_eq!(on.len(), off.len());
+
+    let mut worst = (0usize, 1.0f64);
+    for (step, (a, b)) in on.iter().zip(&off).enumerate() {
+        let cos = cosine(a, b);
+        if cos < worst.1 {
+            worst = (step, cos);
+        }
+        assert_eq!(
+            argmax(a),
+            argmax(b),
+            "decode step {step} (real kv_len {}) disagrees between \
+             INFERO_SPLIT_MIXED_BATCH=1 and =0 -- a replayed graph is almost \
+             certainly attending to a stale key range",
+            65 + step
+        );
+    }
+    eprintln!(
+        "  worst of {} forced decode steps: step {} (kv_len {}), cosine {:.12}",
+        on.len(),
+        worst.0,
+        65 + worst.0,
+        worst.1
+    );
+    // Both sides run the identical kernels with the identical bucketed
+    // `kv_len`, so this is parity, not tolerance. Measured at
+    // 1.000000000000 across all 80 steps once the fix is in; the bug drives
+    // the replayed steps far below any plausible threshold.
+    assert!(
+        worst.1 > 0.999999,
+        "decode step {} (kv_len {}) moved to cosine {:.12} under the split path",
+        worst.0,
+        65 + worst.0,
+        worst.1
+    );
+    Ok(())
+}
+
 /// A run too wide for the shrunk `attn_partial` must be refused, loudly.
 ///
 /// This is the one real limitation of turning the flag on: `attn_partial` is
