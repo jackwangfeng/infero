@@ -5,6 +5,25 @@
 //! for a *particular* model is a separate question, and this file measures it
 //! rather than assuming the paper's Llama-3.1-8B numbers carry over to a
 //! 0.5B model with 64-wide heads.
+//!
+//! **`INFERO_ATTN_MMA=1` is required for the dequant-dispatch coverage.**
+//! `Kernels::prefill_attention` caches that variable in a `OnceLock`, so it has
+//! to be set before the test binary starts, not from inside a test. Without it
+//! no tile kernel is eligible, `tq_dequant_threshold` keeps every run on
+//! `tq_attn_decode`, and the five tests covering the long path
+//! (`long_prefill_dequant_dispatch_agrees_with_tq_attn_decode`,
+//! `a_qjl_enabled_long_prefill_now_agrees_via_the_dequant_path`,
+//! `a_continuation_chunk_attends_its_own_history_through_the_dequant_path`,
+//! `an_interleaved_batch_dispatches_every_item_to_its_own_rows`,
+//! `threshold_boundary_both_sides_agree_with_reference`) each print a skip
+//! notice and return `Ok(())`. A plain `cargo test -p infero-model` is
+//! therefore green with *zero* coverage of the dispatch, and the notice is
+//! invisible without `--nocapture`. The real command is:
+//!
+//! ```text
+//! INFERO_ATTN_MMA=1 cargo test --release -p infero-model --test turboquant \
+//!     -- --test-threads=1 --nocapture
+//! ```
 
 use std::path::PathBuf;
 
@@ -15,6 +34,18 @@ use infero_model::{
     BatchItem, BatchItemKind, KvCacheQuant, Model, Sampler, SamplingParams, TQ_DEQUANT_THRESHOLD,
 };
 use infero_tokenizer::Tokenizer;
+
+/// The single long prompt the dequant-dispatch comparisons prefill.
+///
+/// `both_paths` runs it through both kernel routes and
+/// `a_qjl_enabled_long_prefill_now_agrees_via_the_dequant_path` runs the same
+/// text through an f16 cache to compare all three. Written once, deliberately:
+/// as two literals, a drift in either would have those tests comparing logits
+/// from *different prompts* -- loudly wrong, but with a message pointing at the
+/// dispatch rather than at the prompt.
+fn long_prompt() -> String {
+    "The quick brown fox jumps over the lazy dog. ".repeat(40)
+}
 
 /// Enough prompts, and varied enough, that a two-point difference between
 /// settings is not just which token happened to be near a tie.
@@ -459,8 +490,7 @@ fn a_qjl_enabled_long_prefill_now_agrees_via_the_dequant_path() -> Result<()> {
     let Some((mut model, tok)) = load(KvCacheQuant::F16)? else {
         return Ok(());
     };
-    let prompt = "The quick brown fox jumps over the lazy dog. ".repeat(40);
-    let ids = tok.encode(&prompt, Some(false), false);
+    let ids = tok.encode(&long_prompt(), Some(false), false);
     let mut session = model.new_session()?;
     let dense = model
         .forward(&ids, BatchItemKind::Prefill, &mut session)?
@@ -519,8 +549,7 @@ fn both_paths(quant: KvCacheQuant) -> Result<Option<(Vec<f32>, Vec<f32>)>> {
             return Ok(None);
         };
         // Long enough to clear even a generously large `TQ_DEQUANT_THRESHOLD`.
-        let prompt = "The quick brown fox jumps over the lazy dog. ".repeat(40);
-        let ids = tok.encode(&prompt, Some(false), false);
+        let ids = tok.encode(&long_prompt(), Some(false), false);
         assert!(
             ids.len() > 256,
             "prompt too short to exercise the long-run path: {} tokens",
