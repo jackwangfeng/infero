@@ -700,6 +700,245 @@ INFERO_TQ_PREFILL_DEQUANT (default on) and TQ_DEQUANT_THRESHOLD."
 
 ---
 
+### Task 3.5: QJL-aware `tq_dequant_kv` (inserted during execution — see ledger)
+
+**Why this task exists.** Task 3's implementer found, and measured, a real problem Task 2's own review did not catch because it wasn't the question asked: `tq_attn_decode` evaluates TurboQuant's real score estimator as **two separate terms**, not one —
+
+```
+est = scale·⟨q_rot, cb_k[code]⟩  +  qjl_scale·(√(π/2)/d)·γ·⟨q_qjl, s⟩
+```
+
+(`turboquant.cu:387`) — and `tq_dequant_kv` (Task 2) only materializes the first (MSE-codebook) term. Task 2's own finding, "`k_signs`/`k_gamma` are not a per-element correction to the codebook value," is correct — but the QJL term isn't a per-element key correction at all, it's a **second, independent score-level dot product** (`⟨q_qjl, s⟩`), and dropping it changes the answer for any QJL-enabled config, including `Tq4` — the config this whole plan exists to speed up. Measured end to end (Task 3's report, §2): `tq4` vs `tq4`-without-QJL cosine **0.289**, a different next token, not a rounding difference.
+
+Task 3 shipped a safe stopgap — `uses_qjl()` keeps any QJL config on the existing, slower, correct `tq_attn_decode` path, pinned by a bit-exact-equality test — and correctly declined to force a fix under its own scope. **Ruling (user, verbatim: "1" / "哪能怂啊" / "补上QJL修正项，把Tq4真正跑通加速"): do the full fix. `Tq4` must actually get the speedup, not just the QJL-free configs.** A second ruling (controller): the bit-width guard `ensure!` Task 3 added per the original brief should become a graceful per-item fallback to `tq_attn_decode` (same pattern as the QJL gate), not a hard error — `k8v4` is a real, previously-recommended preset in this codebase's own tests and must not start 500ing on a long prompt. Verify Task 3's review addressed this before starting this task; if not, this task's Step 1 covers it too.
+
+**The fix is known and cheap, not a research problem.** The QJL term is linear in `q_rot`. `q_qjl = tables.qjl · q_rot` (`Kernels::tq_matvec`, a `d×d` mat-vec), so for any real matrix `Q` and vectors `x, y`: `⟨Q·x, y⟩ = ⟨x, Qᵀ·y⟩`. Substituting `Q = tables.qjl`, `x = q_rot`, `y = s` (the sign sketch a cached key decodes to):
+
+```
+⟨q_qjl, s⟩ = ⟨Q·q_rot, s⟩ = ⟨q_rot, Qᵀ·s⟩
+```
+
+so
+
+```
+k_eff = scale·cb_k[code]  +  qjl_scale·(√(π/2)/d)·γ·(Qᵀ·s)
+```
+
+is a per-key vector — independent of the query — that reproduces the *exact* two-term estimator when dotted against `q_rot` by a standard dense kernel. Cost: one `d×d` mat-vec against the sign sketch per cached key, `O(H·L·d²)` against attention's own `O(H·L²·d)` — noise at any `L` this path serves.
+
+**Files:**
+- Modify: `crates/kernels/src/turboquant.rs` — `Tables`/`DeviceTables` gain a `qjl_t: Vec<f32>`/`Buf<f32>` field. `Tables::new` (~line 81-99) already computes `rotation_t = transpose(&rotation, d)` for exactly this "need both directions" reason (see its own doc comment, "`Πᵀ`, for mapping the attention output back"); add `qjl_t = transpose(&qjl, d)` immediately beside it, uploaded in `DeviceTables::new` the same way `rotation_t` is (`stream.clone_htod(&tables.qjl_t)?`). This is the same one-time, load-time cost `rotation_t` already pays — not a per-call cost.
+- Modify: `crates/kernels/src/cu/turboquant.cu` — extend `tq_dequant_kv` (added in Task 2) to add the QJL correction term to its **key** output only (values are unaffected — `tq_attn_output`'s value unpack has no sign/gamma term at all, confirmed in Task 2's review, and this fix doesn't change that).
+- Modify: `crates/kernels/src/lib.rs` — `Kernels::tq_dequant_kv`'s wrapper re-gains `k_signs: &View<'_, u8>` and `k_gamma: &View<'_, f16>` (removed in Task 2 because the *old*, incomplete kernel didn't need them — it does now), plus new `qjl_t: &View<'_, f32>` and `qjl_scale: f32` parameters.
+- Modify: `crates/model/src/lib.rs` — Task 3's call site passes the new arguments; the `uses_qjl()` gate is **deleted**, not just loosened — once this lands, a QJL-enabled long-prefill run is exactly as eligible for the dequant path as any other. Also apply the bit-width-guard ruling above if Task 3's review didn't already.
+- Test: `crates/kernels/tests/turboquant.rs` — extend with a QJL-aware correctness test.
+- Test: `crates/model/tests/turboquant.rs` — Task 3 added `the_qjl_estimator_keeps_long_runs_off_the_dequant_path`, pinning the *old* (correct, for its own scope) behavior that QJL configs stay off the dequant path. That test's premise is now wrong on purpose — replace it with the mirror image: a `Tq4`-quantized long prefill run now agrees with `tq_attn_decode` (same cosine bar Task 3's non-QJL tests already clear, `> 0.999`), proving the fold actually closes the gap Task 3's report measured at 0.289.
+
+**Interfaces:**
+- Consumes: `Kernels::tq_matvec` (existing, for reference/comparison only — not called by the new kernel path itself, which does its own in-kernel mat-vec), `tq_sign_of` (existing `__device__` helper in `turboquant.cu`, decodes one sign bit to ±1 — reuse it, don't re-derive the bit-unpack), `TQ_SQRT_HALF_PI` (existing `#define`, `turboquant.cu:25`), `KvQuant::uses_qjl()`/`qjl_scale()` (existing, `crates/kernels/src/turboquant.rs:718-726`).
+- Produces: `Tables::qjl_t: Vec<f32>` / `DeviceTables::qjl_t: Buf<f32>`; `Kernels::tq_dequant_kv`'s updated signature (adds `k_signs`, `k_gamma`, `qjl_t`, `qjl_scale`); the deleted `uses_qjl()` gate at the call site.
+
+**The one thing this task must resolve empirically, not by hand-derivation (the way Task 2 resolved its own open question): the exact index/stride convention for reading `qjl_t` inside the new kernel code.** `Tables`' matrices are stored column-major (`m[j*d+i]` is row `i`, column `j` — see the struct's own doc comment) specifically so a mat-vec's inner loop reads consecutive addresses across threads; get the transpose direction backwards and the kernel will silently compute the wrong per-key vector rather than crash. **Do not guess the indexing from this description — derive it by writing a host-side reference first** (mirroring `crates/kernels/tests/turboquant.rs`'s existing `host_decode`/`host_dequant_no_rotation` pattern: independently reconstruct `k_eff` on the host from downloaded `qjl_t`, `k_signs`, `k_gamma`, `k_codes`, `k_scale`, using the formula above verbatim), then match the kernel to that reference until the test passes — the same TDD discipline this whole plan has used throughout, not an exception for this task.
+
+- [ ] **Step 1: Confirm/fix the bit-width guard from Task 3, if not already done**
+
+Check `crates/model/src/lib.rs` for the `ensure!(k_bits == 4 && v_bits == 4, ...)` guard Task 3 added. If Task 3's own review already changed this to a graceful per-item fallback (check the ledger / Task 3's final commits before starting), skip this step. Otherwise: change it from a hard `anyhow::ensure!` into an eligibility condition — an item whose bit widths don't match falls through to the short/decode `tq_attn_decode` path for that one item, the same way a QJL-enabled item currently does, rather than erroring the whole forward pass.
+
+- [ ] **Step 2: Write the failing kernel-level test**
+
+In `crates/kernels/tests/turboquant.rs`, add a host-side reference that reconstructs the *full* two-term estimator's effective key vector — not just the MSE term `host_dequant_no_rotation` (Task 2) already covers:
+
+```rust
+/// The full per-key effective vector the QJL-aware `tq_dequant_kv` must
+/// produce: `k_eff = scale·cb[code] + qjl_scale·(sqrt(pi/2)/d)·gamma·(Qt·s)`,
+/// where `Qt` is `tables.qjl`'s transpose and `s` is this key's sign sketch
+/// decoded to +-1. Reproduces `tq_attn_decode_f32`'s two-term estimator
+/// exactly when dotted against a real `q_rot` -- see turboquant.cu:387.
+fn host_qjl_aware_key_eff(
+    codes: &[u8],
+    scale: f32,
+    signs: &[u8],
+    gamma: f32,
+    cb: &Codebook,
+    qjl_t: &[f32],       // column-major, D*D
+    qjl_scale: f32,
+    d: usize,
+) -> Vec<f32> {
+    let mse = host_dequant_no_rotation(codes, scale, cb); // Task 2's existing helper
+    let sign = |i: usize| -> f32 {
+        let byte = signs[i / 8];
+        if (byte >> (i % 8)) & 1 == 0 { 1.0 } else { -1.0 } // match tq_sign_of's real bit convention -- verify against the CUDA source, don't assume 0=+1
+    };
+    let c = qjl_scale * (std::f32::consts::PI / 2.0).sqrt() / d as f32;
+    (0..d)
+        .map(|i| {
+            let qt_s: f32 = (0..d).map(|j| qjl_t[j * d + i] * sign(j)).sum(); // column-major: qjl_t[j*d+i] is row i, column j -- this is the (Qt * s)[i] convention to verify against the kernel, per this task's own "resolve empirically" instruction
+            mse[i] + c * gamma * qt_s
+        })
+        .collect()
+}
+
+#[test]
+fn tq_dequant_kv_reproduces_the_full_qjl_estimator() -> Result<()> {
+    let k = kernels()?;
+    let tables = DeviceTables::new(k.device(), D, KvQuant::Tq4)?; // Tq4 uses QJL -- KvQuant::Tq4.uses_qjl() must be true
+    assert!(tables.quant.uses_qjl(), "test setup: Tq4 must use QJL");
+    let n = 5usize;
+    let k_bits = tables.quant.k_mse_bits();
+    let v_bits = tables.quant.v_bits();
+
+    let keys = unit_vectors(n, 21);
+    let values = unit_vectors(n, 22);
+    let k_cache = store_keys(&k, &tables, &keys, n)?; // Task 2's existing helper -- unchanged
+    let v_cache = store_values(&k, &tables, &values, n)?;
+
+    let stream = k.device().stream().clone();
+    let slots: Vec<i32> = (0..n as i32).collect();
+    let d_slots = stream.clone_htod(&slots)?;
+    let mut d_dequant_k = stream.alloc_zeros::<half::f16>(n * D)?;
+    let mut d_dequant_v = stream.alloc_zeros::<half::f16>(n * D)?;
+
+    k.tq_dequant_kv(
+        &mut d_dequant_k.as_view_mut(),
+        &mut d_dequant_v.as_view_mut(),
+        &k_cache.codes.as_view(),
+        &k_cache.signs.as_view(),   // re-added this task
+        &k_cache.scale.as_view(),
+        &k_cache.gamma.as_view(),   // re-added this task
+        &v_cache.codes.as_view(),
+        &v_cache.scale.as_view(),
+        &d_slots.as_view(),
+        &tables.k_levels.as_view(),
+        k_bits,
+        &tables.v_levels.as_view(),
+        v_bits,
+        &tables.qjl_t.as_view(),   // new
+        tables.quant.qjl_scale(),  // new
+        1,
+        D,
+        n,
+        n,
+    )?;
+    k.device().synchronize()?;
+
+    let got_k = stream.clone_dtoh(&d_dequant_k)?;
+    let host_k_scale = stream.clone_dtoh(&k_cache.scale)?;
+    let host_k_codes = stream.clone_dtoh(&k_cache.codes)?;
+    let host_k_signs = stream.clone_dtoh(&k_cache.signs)?;
+    let host_k_gamma = stream.clone_dtoh(&k_cache.gamma)?;
+    let host_qjl_t = stream.clone_dtoh(&tables.qjl_t)?; // downloading a device buffer back to host for the reference -- check the real accessor pattern this file already uses elsewhere (e.g. how `rotation_is_an_isometry_on_the_device` downloads `Tables` fields) rather than assuming `clone_dtoh` is the exact right call here
+    let bytes_per_vec = D * k_bits as usize / 8;
+    let sign_bytes_per_vec = D / 8;
+    for v in 0..n {
+        let expect = host_qjl_aware_key_eff(
+            &host_k_codes[v * bytes_per_vec..(v + 1) * bytes_per_vec],
+            host_k_scale[v].to_f32(),
+            &host_k_signs[v * sign_bytes_per_vec..(v + 1) * sign_bytes_per_vec],
+            host_k_gamma[v].to_f32(),
+            &tables.k_codebook,
+            &host_qjl_t,
+            tables.quant.qjl_scale(),
+            D,
+        );
+        let got: Vec<f32> = got_k[v * D..(v + 1) * D].iter().map(|x| x.to_f32()).collect();
+        for (g, e) in got.iter().zip(&expect) {
+            assert!((g - e).abs() < 1e-2, "key {v} mismatch: {g} vs {e}"); // looser tolerance than Task 2's MSE-only test -- two summed terms compound more f16/f32 rounding; tighten if the real numbers allow once this passes
+        }
+    }
+    Ok(())
+}
+```
+
+- [ ] **Step 3: Run test to verify it fails**
+
+Run: `cargo test -p infero-kernels --test turboquant tq_dequant_kv_reproduces_the_full_qjl_estimator -- --nocapture`
+Expected: FAIL — compile error (`qjl_t`/`k_signs`/`k_gamma`/`qjl_scale` not yet accepted by `tq_dequant_kv`'s current signature).
+
+- [ ] **Step 4: Add `qjl_t` to `Tables`/`DeviceTables`**
+
+`crates/kernels/src/turboquant.rs`, in `Tables::new` (~line 81-99):
+
+```rust
+let rotation = random_rotation(d, seed);
+let rotation_t = transpose(&rotation, d);
+let s = gaussian_matrix(d, seed ^ 0x5151_5151_5151_5151);
+let qjl = matmul_t(&s, &rotation, d);
+let qjl_t = transpose(&qjl, d);
+
+Ok(Self {
+    d,
+    rotation: to_column_major(&rotation, d),
+    rotation_t: to_column_major(&rotation_t, d),
+    qjl: to_column_major(&qjl, d),
+    qjl_t: to_column_major(&qjl_t, d),
+})
+```
+
+Add the `qjl_t: Vec<f32>` field to the `Tables` struct (beside `qjl`) and `qjl_t: Buf<f32>` to `DeviceTables`, uploaded in `DeviceTables::new` beside the existing `qjl: stream.clone_htod(&tables.qjl)?,` line: `qjl_t: stream.clone_htod(&tables.qjl_t)?,`.
+
+- [ ] **Step 5: Extend the CUDA kernel**
+
+In `crates/kernels/src/cu/turboquant.cu`, extend `tq_dequant_kv` (added in Task 2): after computing each key element's MSE-based value (unchanged), stage this key's decoded sign vector into shared memory once per block (every output thread needs the *whole* d-length sign vector, not just its own index — read `tq_attn_decode_f32`'s own handling of `sign`/`qs`/shared-memory staging around `turboquant.cu:370-390` for the established pattern in this exact file, and follow it rather than inventing a new one), then have each thread accumulate its own output element's `Qᵀ·s` term against `qjl_t` and add the scaled result to the MSE value already computed. Value output (`dequant_v`) is unchanged by this task — no sign/gamma term applies to values.
+
+Do not guess the `qjl_t` indexing — get Step 2's test passing, which is the actual verification that the indexing (and the sign-bit convention: confirm `tq_sign_of`'s real mapping of bit value to +1/-1 against `turboquant.cu`'s own source, don't assume) is correct.
+
+- [ ] **Step 6: Update the Rust wrapper**
+
+`crates/kernels/src/lib.rs`, `Kernels::tq_dequant_kv`: re-add `k_signs: &View<'_, u8>`, `k_gamma: &View<'_, f16>` to the signature (removed in Task 2), add `qjl_t: &View<'_, f32>`, `qjl_scale: f32`. Update the `LaunchConfig`/`b.arg(...)` chain to match, keeping this file's existing FFI-wrapper conventions (`usize` cast to `i32` at the boundary, etc.).
+
+- [ ] **Step 7: Run test to verify it passes**
+
+Run: `cargo test -p infero-kernels --test turboquant tq_dequant_kv_reproduces_the_full_qjl_estimator -- --nocapture`
+Expected: PASS
+
+- [ ] **Step 8: `compute-sanitizer` pass**
+
+Run memcheck and racecheck against the new test, same as Task 2's own precedent. Expected: 0 hazards for both.
+
+- [ ] **Step 9: Update the model-level call site and delete the `uses_qjl()` gate**
+
+In `crates/model/src/lib.rs`, find Task 3's `tq_dequant_kv` call site (the long-runs loop inside the TQ dispatch) and: pass the sequence's real `k_signs`/`k_gamma` (already fetched via `pool.tq_key(layer)`, which Task 3's code already calls — no new pool accessor needed), `tq.tables.qjl_t.as_view()`, and `quant.qjl_scale()`. Delete the `uses_qjl()` eligibility check entirely — a QJL-enabled item is now exactly as eligible for the long path as any other, gated only by run length and (per Step 1) bit width.
+
+- [ ] **Step 10: Replace the now-obsolete model-level pinning test**
+
+In `crates/model/tests/turboquant.rs`, Task 3 added `the_qjl_estimator_keeps_long_runs_off_the_dequant_path`, asserting bit-exact equality specifically *because* the dequant path was closed to QJL configs. That premise is gone. Replace it with a test proving the fold actually works end to end:
+
+```rust
+/// The whole point of this task: a real Tq4 (QJL-enabled) long prefill run
+/// must now agree with tq_attn_decode just as well as the non-QJL configs
+/// already do, closing the 0.289-cosine gap Task 3's report measured.
+#[test]
+fn a_qjl_enabled_long_prefill_now_agrees_via_the_dequant_path() -> Result<()> {
+    // Mirror long_prefill_dequant_dispatch_agrees_with_tq_attn_decode
+    // (Task 3), but load with KvCacheQuant::Tq4 specifically (not a
+    // QJL-free variant) and confirm cosine > 0.999 between
+    // INFERO_TQ_PREFILL_DEQUANT=0 and unset, same bar Task 3's own
+    // non-QJL tests already clear.
+}
+```
+
+Write out the real test body following Task 3's own `long_prefill_dequant_dispatch_agrees_with_tq_attn_decode` structure exactly (same file, same helpers) — don't leave it as the sketch above in the actual commit.
+
+- [ ] **Step 11: Run the full existing TurboQuant and mixed-batch test suites**
+
+Run: `cargo test -p infero-model --test turboquant --test mixed_batch_dispatch -- --test-threads=1`
+Expected: PASS, same failure set as Task 3 left it (pre-existing, unrelated failures only — verify by comparing against Task 3's own documented failure list rather than assuming zero failures means success or new failures mean this task broke something already broken).
+
+- [ ] **Step 12: Commit**
+
+```bash
+git add crates/kernels/src/turboquant.rs crates/kernels/src/cu/turboquant.cu crates/kernels/src/lib.rs crates/kernels/tests/turboquant.rs crates/model/src/lib.rs crates/model/tests/turboquant.rs
+git commit -m "tq4 dequant-dispatch: add the QJL correction term, close the gap for Tq4 itself
+
+tq_dequant_kv now reproduces TurboQuant's full two-term score estimator
+(MSE codebook term + QJL sign-sketch term, linear-algebra fold verified
+against a host reference), not just the MSE term Task 2 shipped. Deletes
+the uses_qjl() eligibility gate Task 3 added as a stopgap -- Tq4 itself
+now gets the long-run speedup this whole plan exists for."
+```
+
+---
+
 ### Task 4: Continuation-prefill, mixed-batch, and threshold-boundary scenarios
 
 **Files:**
