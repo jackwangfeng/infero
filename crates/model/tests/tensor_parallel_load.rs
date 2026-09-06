@@ -22,6 +22,7 @@ use infero_gguf::Gguf;
 use infero_model::config::Config;
 use infero_model::tp::RankId;
 use infero_model::weights::Weights;
+use infero_model::{KvCacheQuant, Model};
 
 fn model_path() -> Option<PathBuf> {
     let p = std::env::var("INFERO_TEST_TP_GGUF").ok().map(PathBuf::from)?;
@@ -97,6 +98,58 @@ fn w_kv_fusion_is_disabled_under_sharding() {
              degenerate garbage output on llama-3.1-8b-instruct-q4_k_m TP=2"
         );
     }
+}
+
+/// Task 6: the mixed-batch attention dispatch split must be forced off under
+/// real TP, regardless of `INFERO_SPLIT_MIXED_BATCH` -- and by a *real* gate,
+/// not merely `attn_dispatch`'s construction-site `debug_assert!` (a no-op in
+/// release builds; see `Model::gate_for_tp`'s doc comment and the design
+/// doc's Error Handling section, "implementation should gate
+/// `split_mixed_batch_enabled` itself on `tp_size <= 1`, not merely assert").
+///
+/// Deliberately does not call `Model::load_full_tp` -- see this file's module
+/// doc for why that would deadlock waiting for a peer rank that never joins
+/// in a single test process. Instead this builds a real, TP-sharded `Model`
+/// via `Model::from_weights` (`load_full_tp` calls the same private
+/// `from_parts` assembly) and then calls `Model::gate_for_tp` directly --
+/// exactly the call `load_full_tp`/`load_awq_tp` make right after
+/// construction, before their own blocking NCCL bootstrap.
+#[test]
+fn split_mixed_batch_disabled_under_tp() {
+    let Some(path) = model_path() else {
+        eprintln!("skipping: set INFERO_TEST_TP_GGUF to a real GGUF checkpoint");
+        return;
+    };
+    let gguf = Gguf::open(&path).expect("opening checkpoint");
+    let rank = RankId { pp_rank: 0, pp_size: 1, tp_rank: 0, tp_size: 2 };
+    let mut cfg = Config::from_gguf(&gguf).expect("parsing config");
+    cfg.shard_for_tp(&rank);
+    let dev = Device::new(0).expect("device");
+    let w = Weights::load_sharded(&dev, &gguf, &cfg, usize::MAX, Some((0, 2)))
+        .expect("rank 0 failed to load");
+
+    // `Model::from_parts` (reached through `from_weights`) resolves
+    // `split_mixed_batch` from this env var at construction time -- forced to
+    // "1" here so the assertion below actually proves the TP gate overrides
+    // an explicit opt-in, not merely that it agrees with an already-off
+    // default.
+    unsafe { std::env::set_var("INFERO_SPLIT_MIXED_BATCH", "1") };
+    let built = Model::from_weights(dev, cfg, w, 512, KvCacheQuant::F16, 8);
+    unsafe { std::env::remove_var("INFERO_SPLIT_MIXED_BATCH") };
+    let mut model = built.expect("model construction");
+    assert!(
+        model.split_mixed_batch(),
+        "test setup broken: INFERO_SPLIT_MIXED_BATCH=1 must resolve true \
+         before any TP gate runs, or the assertion below would prove nothing"
+    );
+
+    model.gate_for_tp(&rank);
+    assert!(
+        !model.split_mixed_batch(),
+        "split_mixed_batch must be forced off once tp_size > 1, even with \
+         INFERO_SPLIT_MIXED_BATCH=1 set -- and this must hold in release \
+         builds too, not just via a debug_assert!"
+    );
 }
 
 #[test]

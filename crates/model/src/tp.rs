@@ -19,6 +19,24 @@ pub struct RankId {
     pub tp_size: usize,
 }
 
+/// Whether the mixed-batch attention dispatch split
+/// (`INFERO_SPLIT_MIXED_BATCH`, see `Model::split_mixed_batch`) may be
+/// enabled for a rank at this `tp_size` -- always `false` once `tp_size > 1`,
+/// regardless of the env var. The split's own dispatch logic and its test
+/// coverage (`crates/model/tests/mixed_batch_dispatch.rs`) were built and
+/// validated single-GPU only; see the design doc's Scope/Error Handling
+/// sections ("v1 is single-GPU only").
+///
+/// Pulled out as its own pure, GPU/NCCL-free function -- rather than inlined
+/// only at `Model::load_full_tp`/`load_awq_tp`'s call sites -- specifically so
+/// this decision is unit-testable without those functions' blocking
+/// `ncclCommInitRank` bootstrap (which needs a second real process to
+/// complete; see `tests/tensor_parallel_load.rs`'s module doc for why the
+/// existing TP tests already avoid calling `load_full_tp` directly).
+pub fn split_mixed_batch_allowed(tp_size: usize) -> bool {
+    tp_size <= 1
+}
+
 /// How ranks in the same tensor-parallel group agree on an NCCL unique id
 /// before any of them can call `ncclCommInitRank`. `tp_rank == 0` (within
 /// its `pp_rank`) generates the id; every other rank blocks until it can
@@ -84,5 +102,21 @@ mod tests {
         let id0 = bootstrap.broadcast_unique_id(&rank0).expect("rank 0 bootstrap");
         let id1 = bootstrap.broadcast_unique_id(&rank1).expect("rank 1 bootstrap");
         assert_eq!(id0.0, id1.0, "both ranks must agree on the same NCCL unique id");
+    }
+
+    #[test]
+    fn split_mixed_batch_disallowed_once_tp_size_exceeds_one() {
+        assert!(
+            !split_mixed_batch_allowed(2),
+            "tp_size=2 must disallow the mixed-batch dispatch split -- v1 is single-GPU only"
+        );
+        assert!(
+            !split_mixed_batch_allowed(8),
+            "no real tp_size > 1 is exempt, not just the common tp_size=2 case"
+        );
+        assert!(
+            split_mixed_batch_allowed(1),
+            "tp_size=1 (no real TP group) must be unaffected"
+        );
     }
 }

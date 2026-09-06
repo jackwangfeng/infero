@@ -1184,6 +1184,13 @@ pub struct Model {
     /// safe under a real multi-item batch doesn't exist yet; see
     /// `attn_partial_bound` and its allocation site in `Activations::new` for
     /// the full reasoning.
+    ///
+    /// Forced back to `false` by [`Self::gate_for_tp`] whenever a real TP
+    /// group is in play (`rank.tp_size > 1`), regardless of the env var --
+    /// see that method's doc comment. That gate runs unconditionally (not
+    /// only in debug builds), which is what actually keeps this off under
+    /// TP; `attn_dispatch`'s construction-site `debug_assert!` is a second,
+    /// debug-only line of defense, not the mechanism itself.
     split_mixed_batch: bool,
     /// How many tokens `act.attn_partial` was actually allocated for --
     /// `attn_partial_bound(max_logit_rows)` when `split_mixed_batch` is on,
@@ -1477,6 +1484,7 @@ impl Model {
         let shard = (rank.tp_size > 1).then_some((rank.tp_rank, rank.tp_size));
         let w = Weights::load_sharded(&dev, f, &cfg, n_gpu_layers, shard)?;
         let mut model = Self::from_parts(dev, kern, cfg, w, max_seq, kv_quant, max_logit_rows)?;
+        model.gate_for_tp(rank);
         if rank.tp_size > 1 {
             use crate::tp::{LocalFileBootstrap, RankBootstrap};
             let bootstrap = LocalFileBootstrap { run_id: run_id.to_string() };
@@ -1568,6 +1576,7 @@ impl Model {
         let shard = (rank.tp_size > 1).then_some((rank.tp_rank, rank.tp_size));
         let w = weights::load_awq(&dev, &shards, &cfg, &freqs, shard)?;
         let mut model = Self::from_parts(dev, kern, cfg, w, max_seq, kv_quant, max_logit_rows)?;
+        model.gate_for_tp(rank);
         if rank.tp_size > 1 {
             use crate::tp::{LocalFileBootstrap, RankBootstrap};
             let bootstrap = LocalFileBootstrap { run_id: run_id.to_string() };
@@ -1990,6 +1999,31 @@ impl Model {
         #[cfg(not(feature = "nccl"))]
         {
             None
+        }
+    }
+
+    /// Applies rank-dependent gates that don't need a live communicator --
+    /// currently only forcing `split_mixed_batch` off under real TP
+    /// (`rank.tp_size > 1`), regardless of `INFERO_SPLIT_MIXED_BATCH`. The
+    /// mixed-batch dispatch split's own dispatch logic and test coverage
+    /// (`crates/model/tests/mixed_batch_dispatch.rs`) were built and
+    /// validated single-GPU only (see the design doc's Scope/Error Handling
+    /// sections, "v1 is single-GPU only") -- this is the *real* gate the
+    /// spec requires in addition to `attn_dispatch`'s construction-site
+    /// `debug_assert!` (a no-op in release builds, and must not be the only
+    /// protection).
+    ///
+    /// Called by [`Self::load_full_tp`]/[`Self::load_awq_tp`] right after
+    /// construction, deliberately *before* those functions' blocking
+    /// `ncclCommInitRank` bootstrap -- kept as its own step precisely so it
+    /// is exercisable in a test without that bootstrap, which needs a second
+    /// real process to complete (see `tests/tensor_parallel_load.rs`'s
+    /// module doc for why the existing TP tests already avoid calling
+    /// `load_full_tp` directly).
+    #[cfg(feature = "nccl")]
+    pub fn gate_for_tp(&mut self, rank: &crate::tp::RankId) {
+        if !crate::tp::split_mixed_batch_allowed(rank.tp_size) {
+            self.split_mixed_batch = false;
         }
     }
 
