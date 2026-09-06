@@ -93,8 +93,12 @@ const SCORE_BUDGET: usize = 1 << 30;
 /// decode-only buffer.
 const MIN_PREFILL_RUN: usize = 8;
 
-/// Below this many query tokens, a TurboQuant prefill run stays on
+/// At or below this many query tokens, a TurboQuant prefill run stays on
 /// `tq_attn_decode` -- not worth a dedicated dequantize-and-dispatch call.
+/// "At or below", not "below": the shipped gate is `tokens >
+/// TQ_DEQUANT_THRESHOLD` (`plan_tq_dispatch`), so a run of *exactly* this many
+/// tokens is short, which is the boundary
+/// `threshold_boundary_both_sides_agree_with_reference` pins from both sides.
 ///
 /// Measured 2026-09-06 on an RTX A4000 (sm_86, 48 SMs), via
 /// `crates/kernels/examples/tq_prefill_dequant_vs_decode_bench.rs`
@@ -186,6 +190,17 @@ const MIN_PREFILL_RUN: usize = 8;
 /// a locally-available checkpoint at that shape. If it does not transfer,
 /// Task 6's end-to-end validation (run against the real checkpoint) is the
 /// place that would surface it.
+///
+/// **What the `dequant+ws4` column does and does not include.** The benchmark
+/// builds its synthetic layout (the identity `seq_of` and slot table) and its
+/// slot list *outside* the timed loop, and so does the engine: the two identity
+/// buffers are load-time constants ([`TqBuffers::identity_seq_of`] /
+/// `identity_slots`) and the per-sequence slot list is uploaded once per
+/// forward pass in `forward_batch_rows`, never once per layer. What the real
+/// path still pays on top of the table is therefore one device allocation and
+/// one `kv_len`-wide host-to-device copy per long item per pass, amortized
+/// across all of the model's layers -- not the per-layer repeat an earlier
+/// version of this code paid, which the table never modelled.
 pub const TQ_DEQUANT_THRESHOLD: usize = 8;
 
 /// The real ceiling on how many tokens the decode-only dispatch path (see the
@@ -563,6 +578,23 @@ impl TqDispatch {
     fn is_layout_dependent(&self) -> bool {
         !self.is_single_whole_pass_call() || !self.long_runs.is_empty()
     }
+}
+
+/// A [`TqDispatch`] plus the device-side data that goes with it for *this*
+/// forward pass.
+///
+/// The plan itself is a pure function of the batch's items; `long_slots` is not
+/// — it is one host-to-device copy per long item, of that sequence's physical
+/// slot list. It lives here, built once in `forward_batch_rows` beside the
+/// plan, because a sequence's slot list is a property of the sequence and not
+/// of the layer attending over it: built inside `attention()` it was allocated
+/// and uploaded again for every one of the model's layers, 24 or 64 identical
+/// copies a pass.
+struct TqPass<'a> {
+    plan: &'a TqDispatch,
+    /// One entry per [`TqDispatch::long_runs`] entry, in the same order: that
+    /// sequence's physical slots, truncated to its own `kv_len`.
+    long_slots: &'a [Buf<i32>],
 }
 
 /// The token width past which a prefill item takes the dequantize-and-dispatch
@@ -1725,6 +1757,22 @@ struct TqBuffers {
     /// batch is longer than `TQ_DEQUANT_THRESHOLD`.
     dequant_k: Buf<f16>,
     dequant_v: Buf<f16>,
+    /// The synthetic layout a long run hands the tile kernel, uploaded once at
+    /// load rather than rebuilt per call.
+    ///
+    /// Both are *constants*, not per-call data: `identity_seq_of` is all zeros
+    /// (a long run is a single synthetic sequence, so every one of its query
+    /// tokens maps to sequence 0) and `identity_slots` is the ramp `0..max_seq`
+    /// (`tq_dequant_kv` writes logical position `i` at row `i` of the compact
+    /// scratch buffer, so its slot table is the identity). A call takes the
+    /// prefix it needs — `..run_tokens` and `..kv_len` — and every long run in
+    /// every layer of every pass reads the same two buffers.
+    ///
+    /// Built per layer before, which meant 2 allocations and 2 host-to-device
+    /// copies of identical bytes per long item per layer: 128 of each on a
+    /// 64-layer pass, for content that never changes.
+    identity_seq_of: Buf<i32>,
+    identity_slots: Buf<i32>,
 }
 
 /// Staging for the cuBLAS path: a dequantized weight matrix and f16 inputs.
@@ -1802,9 +1850,13 @@ pub struct Model {
     /// Whether a long-enough TurboQuant prefill run dequantizes once and
     /// reuses the dense tile kernels, resolved once at load from
     /// `INFERO_TQ_PREFILL_DEQUANT`. `="0"` forces every run through
-    /// `tq_attn_decode` unchanged (`TQ_DEQUANT_THRESHOLD` effectively becomes
-    /// `usize::MAX`); unset or `="1"` leaves the threshold in `lib.rs:94` in
-    /// effect.
+    /// `tq_attn_decode` unchanged (the effective threshold becomes
+    /// `usize::MAX`); unset or `="1"` defers to [`tq_dequant_threshold`],
+    /// which is the single source of truth and may still disable the path for
+    /// reasons of its own -- no eligible tile kernel for this model's shape,
+    /// or a bit-width combination `tq_dequant_kv` has no host-reference
+    /// coverage for. This flag is one of that function's three inputs, not the
+    /// whole gate.
     tq_prefill_dequant: bool,
     /// How many tokens `act.attn_partial` was actually allocated for --
     /// `attn_partial_bound(max_logit_rows)` when `split_mixed_batch` is on,
@@ -2502,6 +2554,14 @@ impl Model {
                 acc_rot: dev.stream().alloc_zeros::<f32>(chunk * d_attn)?,
                 dequant_k: dev.stream().alloc_zeros::<f16>(cfg.n_kv_heads * max_seq * cfg.d_head)?,
                 dequant_v: dev.stream().alloc_zeros::<f16>(cfg.n_kv_heads * max_seq * cfg.d_head)?,
+                // A long run's token count never exceeds its own KV extent,
+                // which `extend` already caps at `max_seq` -- so one `max_seq`
+                // ramp and one `max_seq` of zeros cover every prefix any run
+                // can ask for.
+                identity_seq_of: dev.stream().alloc_zeros::<i32>(max_seq)?,
+                identity_slots: dev
+                    .stream()
+                    .clone_htod(&(0..max_seq as i32).collect::<Vec<i32>>())?,
             })
         } else {
             None
@@ -2624,6 +2684,17 @@ impl Model {
         self.split_mixed_batch
     }
 
+    /// Whether the TurboQuant dequantize-and-dispatch path is *enabled*,
+    /// resolved once at load from `INFERO_TQ_PREFILL_DEQUANT`.
+    ///
+    /// Enabled is not the same as reachable, and this accessor deliberately
+    /// does not restate the difference: [`tq_dequant_threshold`] is the single
+    /// source of truth for whether a given run actually takes the long path,
+    /// and it folds this flag together with the model's tile-kernel
+    /// eligibility and the cache's bit widths into one number. `true` here with
+    /// either of those unmet still means every run stays on `tq_attn_decode`.
+    /// Exposed so a test can assert the env var resolved as it intended before
+    /// concluding anything from what the model then computed.
     pub fn tq_prefill_dequant(&self) -> bool {
         self.tq_prefill_dequant
     }
@@ -3323,6 +3394,20 @@ impl Model {
         // single whole-batch call that branch has always made, so it is not
         // gated on the feature flag, only fed by it.
         let tq_dispatch = self.tq.is_some().then(|| {
+            // The same debug-only TP guard the dense path's plan carries just
+            // above, for the same reason and with the same caveat: the plan is
+            // a deterministic function of `items` alone, and every rank builds
+            // its own from the same plan in the same order with the same
+            // `kind` (`crates/server/src/tp.rs`), so ranks stay in lockstep on
+            // which items take the long path -- nothing here is *known* to be
+            // wrong under TP. It is simply unvalidated (the design doc's Scope
+            // section puts TP out of scope), so it asserts rather than
+            // silently claiming coverage it does not have.
+            debug_assert!(
+                !self.tp_active(),
+                "the TurboQuant dequant-dispatch split is not TP-aware yet \
+                 (see the design doc's Scope section)"
+            );
             let threshold = tq_dequant_threshold(
                 pool.quant(),
                 self.tq_prefill_dequant,
@@ -3330,6 +3415,32 @@ impl Model {
             );
             plan_tq_dispatch(items, &item_kv_len, threshold)
         });
+
+        // This pass's long-run slot lists, uploaded once here rather than once
+        // per layer inside `attention()`. A sequence's physical slot list does
+        // not depend on which layer is attending, so the per-layer version paid
+        // one allocation and one host-to-device copy of identical bytes for
+        // every layer of the model. Empty in the overwhelmingly common case:
+        // only a prefill item wider than `TQ_DEQUANT_THRESHOLD`, on a load
+        // where the long path is available at all, ever puts an entry here.
+        let tq_long_slots: Vec<Buf<i32>> = match tq_dispatch.as_ref() {
+            Some(plan) => plan
+                .long_runs
+                .iter()
+                .map(|long| {
+                    let host = pool.seq_slots(long.seq);
+                    let kv = long.run.kv_len;
+                    anyhow::ensure!(
+                        host.len() >= kv,
+                        "sequence {} holds {} slots but its kv extent is {kv}",
+                        long.seq.0,
+                        host.len()
+                    );
+                    Ok(self.dev.stream().clone_htod(&host[..kv])?)
+                })
+                .collect::<Result<Vec<_>>>()?,
+            None => Vec::new(),
+        };
 
         let armed = self.gdn_rollback.as_ref().is_some_and(|r| r.is_armed());
         let key = (
@@ -3412,7 +3523,10 @@ impl Model {
                                 s,
                                 prefill_run,
                                 attn_dispatch.as_ref(),
-                                tq_dispatch.as_ref(),
+                                tq_dispatch.as_ref().map(|plan| TqPass {
+                                    plan,
+                                    long_slots: &tq_long_slots,
+                                }),
                             )?;
                         }
                         self.feed_forward(layer, n_tokens, s)?;
@@ -4440,9 +4554,10 @@ impl Model {
         dispatch: Option<&AttnDispatch>,
         // `Some` whenever this pool's KV cache is quantized: how the
         // TurboQuant branch's work is cut into kernel calls, planned once per
-        // batch by `plan_tq_dispatch`. `None` (a dense pool, which never
+        // batch by `plan_tq_dispatch`, plus the per-long-item slot lists
+        // uploaded once alongside it. `None` (a dense pool, which never
         // reaches that branch) falls back to the one whole-pass call.
-        tq_dispatch: Option<&TqDispatch>,
+        tq_pass: Option<TqPass<'_>>,
     ) -> Result<()> {
         let stage = slot.map(|s| &self.offload.as_ref().unwrap().stage[s]);
         let cfg = &self.cfg;
@@ -5461,13 +5576,19 @@ impl Model {
                 // before the split existed, and is what any future caller that
                 // does not plan gets.
                 let whole_pass;
-                let plan = match tq_dispatch {
-                    Some(p) => p,
+                let (plan, long_slots) = match &tq_pass {
+                    Some(p) => (p.plan, p.long_slots),
                     None => {
                         whole_pass = TqDispatch::whole_pass(n, kv_len);
-                        &whole_pass
+                        (&whole_pass, &[] as &[Buf<i32>])
                     }
                 };
+                debug_assert_eq!(
+                    plan.long_runs.len(),
+                    long_slots.len(),
+                    "one uploaded slot list per long run -- `forward_batch_rows` \
+                     builds them from the same plan, in the same order"
+                );
                 // Exactly [`AttnDispatch::is_single_whole_pass_call`]'s rule,
                 // for exactly its reason: a pass that issues one call may have
                 // been captured into a CUDA graph, and a graph bakes `kv_len`
@@ -5604,7 +5725,7 @@ impl Model {
                 // once into dense f16, then serve every one of its query tokens
                 // with the ordinary tile kernel, instead of re-unpacking the
                 // entire span once per query token.
-                for long in &plan.long_runs {
+                for (long, d_slots) in plan.long_runs.iter().zip(long_slots) {
                     let AttnRun {
                         base,
                         tokens,
@@ -5618,14 +5739,15 @@ impl Model {
                          and the buffer holds {dq_cap} -- it is sized for the model's own \
                          max_seq, so this pool was built wider than the model was loaded for"
                     );
-                    let host_slots = pool.seq_slots(long.seq);
-                    anyhow::ensure!(
-                        host_slots.len() >= seq_kv,
-                        "sequence {} holds {} slots but its kv extent is {seq_kv}",
-                        long.seq.0,
-                        host_slots.len()
+                    // What the ensure above proves for `seq_kv`, this states for
+                    // `tokens`: both index prefixes of `max_seq`-sized buffers,
+                    // and a run's query tokens are always part of its own KV
+                    // extent (`plan_tq_dispatch` takes `kv_len` from
+                    // `KvPool::len` *after* the write side extended it).
+                    debug_assert!(
+                        tokens <= seq_kv,
+                        "a {tokens}-token run inside a {seq_kv}-position sequence"
                     );
-                    let d_slots = self.dev.stream().clone_htod(&host_slots[..seq_kv])?;
                     {
                         let (kcodes, ksigns, kscale, kgamma) = pool.tq_key(layer);
                         let (vcodes, vscale) = pool.tq_value(layer);
@@ -5672,19 +5794,19 @@ impl Model {
                     // doubly wrong here -- its entries are pool-wide physical
                     // slots and its stride is the pool's `max_seq`.
                     //
+                    // Both halves are prefixes of load-time constants (see
+                    // `TqBuffers::identity_seq_of`), not per-call uploads: all
+                    // zeros and the `0..max_seq` ramp do not depend on this run.
+                    //
                     // `positions` is deliberately NOT the identity: it is this
                     // item's real absolute positions, already on the device,
                     // which is what the tile kernel's causal mask compares each
                     // key index against (`abs_key <= row_last`). A continuation
                     // chunk's first token sits at `seq_kv - tokens`, not at 0,
                     // and handing it 0 would mask away its whole history.
-                    let identity_seq_of = vec![0i32; tokens];
-                    let identity_slots: Vec<i32> = (0..seq_kv as i32).collect();
-                    let d_seq_of = self.dev.stream().clone_htod(&identity_seq_of)?;
-                    let d_slot_table = self.dev.stream().clone_htod(&identity_slots)?;
                     let run_positions = self.act.positions.slice(base..base + tokens);
-                    let d_seq_of_view = d_seq_of.as_view();
-                    let d_slot_table_view = d_slot_table.as_view();
+                    let d_seq_of_view = tq.identity_seq_of.slice(..tokens);
+                    let d_slot_table_view = tq.identity_slots.slice(..seq_kv);
                     let synth_batch = BatchLayout {
                         seq_of: &d_seq_of_view,
                         positions: &run_positions,
