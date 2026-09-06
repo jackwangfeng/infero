@@ -448,6 +448,56 @@ extern "C" __global__ void tq_attn_decode_f32(
     }
 }
 
+// Unpacks one sequence's cached span into dense f16, for prefill runs long
+// enough that re-unpacking through `tq_attn_decode_f32` per query token stops
+// paying for itself.
+//
+// Key dequant is a plain `level * scale` per element -- no per-element
+// sign/gamma correction. `tq_attn_decode_f32` above (and `tq_attn_scores`)
+// settle this: `mse_term` is built entirely from `cb_k[tq_unpack(...)]`, and
+// `qjl_term` is a wholly separate dot product built from the sign bits; the
+// two are only combined *after* both are warp-reduced, scaled by
+// `gamma`/`qjl_scale` at the score level, not folded into any single
+// dequantized key value. So there is no per-element value for `k_signs`/
+// `k_gamma` to correct here, and this kernel does not take them.
+//
+// One block per (kv_head, position); `slots[position]` gives this position's
+// physical slot for the *input* side, but the output is the compact
+// per-item scratch buffer, addressed by logical position directly (no
+// `slots` indirection there).
+extern "C" __global__ void tq_dequant_kv(
+    __half* __restrict__ dequant_k,       // [n_kv_heads, kv_len, d_head]
+    __half* __restrict__ dequant_v,       // [n_kv_heads, kv_len, d_head]
+    const uint8_t* __restrict__ k_codes, const __half* __restrict__ k_scale,
+    const uint8_t* __restrict__ v_codes, const __half* __restrict__ v_scale,
+    const int* __restrict__ slots,        // [kv_len], this sequence's slots in logical order
+    const float* __restrict__ k_levels, int k_bits,
+    const float* __restrict__ v_levels, int v_bits, int n_kv_heads,
+    int d_head, int n_slots, int kv_len) {
+    const int kv_head = blockIdx.x;
+    const int pos = blockIdx.y;
+    if (kv_head >= n_kv_heads || pos >= kv_len) return;
+    const int slot = slots[pos];
+
+    const int per_byte_k = 8 / k_bits;
+    const int bytes_k = d_head / per_byte_k;
+    const uint8_t* k_vec = k_codes + ((size_t)kv_head * n_slots + slot) * bytes_k;
+    const float kscale = __half2float(k_scale[(size_t)kv_head * n_slots + slot]);
+    __half* k_out = dequant_k + ((size_t)kv_head * kv_len + pos) * d_head;
+    for (int i = threadIdx.x; i < d_head; i += blockDim.x) {
+        k_out[i] = __float2half(k_levels[tq_unpack(k_vec, i, k_bits)] * kscale);
+    }
+
+    const int per_byte_v = 8 / v_bits;
+    const int bytes_v = d_head / per_byte_v;
+    const uint8_t* v_vec = v_codes + ((size_t)kv_head * n_slots + slot) * bytes_v;
+    const float vscale = __half2float(v_scale[(size_t)kv_head * n_slots + slot]);
+    __half* v_out = dequant_v + ((size_t)kv_head * kv_len + pos) * d_head;
+    for (int i = threadIdx.x; i < d_head; i += blockDim.x) {
+        v_out[i] = __float2half(v_levels[tq_unpack(v_vec, i, v_bits)] * vscale);
+    }
+}
+
 // out[t, h, :] = sum_j p_j * v~_j, still in the rotated basis. The caller
 // applies Pi^T once afterwards.
 extern "C" __global__ void tq_attn_output(

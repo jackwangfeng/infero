@@ -99,6 +99,57 @@ fn host_decode(codes: &[u8], scale: f32, cb: &Codebook, host: &Tables) -> Vec<f3
         .collect()
 }
 
+/// Rotate `vectors` and quantize them as values.
+fn store_values(k: &Kernels, tables: &DeviceTables, vectors: &[f32], n: usize) -> Result<Cache> {
+    let stream = k.device().stream().clone();
+    let bits = tables.quant.v_bits();
+    let mut cache = alloc_cache(k, n, bits)?;
+
+    let src = stream.clone_htod(vectors)?;
+    let mut rotated = stream.alloc_zeros::<f32>(n * D)?;
+    k.tq_matvec(
+        &mut rotated.as_view_mut(),
+        &src.as_view(),
+        &tables.rotation.as_view(),
+        D,
+        n,
+    )?;
+
+    let positions: Vec<i32> = (0..n as i32).collect();
+    let dpos = stream.clone_htod(&positions)?;
+    k.tq_store_v(
+        &mut cache.codes.as_view_mut(),
+        &mut cache.scale.as_view_mut(),
+        &rotated.as_view(),
+        &dpos.as_view(),
+        &tables.v_levels.as_view(),
+        bits,
+        1,
+        D,
+        n,
+        n,
+    )?;
+    k.device().synchronize()?;
+    Ok(cache)
+}
+
+/// Unpack a cached value vector on the host: uniform dequant, no rotation
+/// undone (values are never rotated back either -- see `TqBuffers`' doc
+/// comment in `crates/model/src/lib.rs`). Independent of the kernel on
+/// purpose, same rationale as `host_decode` above.
+fn host_dequant_no_rotation(codes: &[u8], scale: f32, cb: &Codebook) -> Vec<f32> {
+    let bits = cb.bits as usize;
+    let per_byte = 8 / bits;
+    let mask = (1u8 << bits) - 1;
+    (0..D)
+        .map(|i| {
+            let byte = codes[i / per_byte];
+            let code = (byte >> ((i % per_byte) * bits)) & mask;
+            cb.levels[code as usize] * scale
+        })
+        .collect()
+}
+
 fn unit_vectors(n: usize, seed: u64) -> Vec<f32> {
     let mut v = pseudo_random(n * D, seed);
     for chunk in v.chunks_mut(D) {
@@ -671,6 +722,98 @@ fn averaging_suppresses_quantization_noise() -> Result<()> {
         mean_err < per_vector_err / 50.0,
         "quantization error did not average out: {mean_err} vs {per_vector_err}"
     );
+    Ok(())
+}
+
+/// `tq_dequant_kv` unpacks a cached span straight into dense f16, without any
+/// per-element sign/gamma correction: `tq_attn_decode_f32`'s own key unpack
+/// (`crates/kernels/src/cu/turboquant.cu`) computes `mse_term` from
+/// `cb_k[tq_unpack(...)]` alone and `qjl_term` from the sign bits as a wholly
+/// separate dot product, combining the two only after both are reduced,
+/// scaled by `attn_scale`/`gamma`/`qjl_scale` at the *score* level. A single
+/// dequantized key element is therefore just `level * scale` -- `k_signs`/
+/// `k_gamma` never touch it, so `tq_dequant_kv` does not take them.
+#[test]
+fn tq_dequant_kv_matches_store_then_manual_unpack() -> Result<()> {
+    let k = kernels()?;
+    let tables = DeviceTables::new(k.device(), D, KvQuant::Tq4)?;
+    // `DeviceTables` already carries `k_codebook`/`v_codebook: Codebook` as
+    // plain host-computed fields (`Codebook::solve` runs on the host,
+    // `turboquant.rs:810-811`) -- no separate device->host download needed.
+    let n = 5usize;
+    let k_bits = tables.quant.k_mse_bits();
+    let v_bits = tables.quant.v_bits();
+
+    let keys = unit_vectors(n, 11);
+    let values = unit_vectors(n, 12);
+    let k_cache = store_keys(&k, &tables, &keys, n)?;
+    let v_cache = store_values(&k, &tables, &values, n)?;
+
+    let stream = k.device().stream().clone();
+    let slots: Vec<i32> = (0..n as i32).collect();
+    let d_slots = stream.clone_htod(&slots)?;
+    let mut d_dequant_k = stream.alloc_zeros::<half::f16>(n * D)?;
+    let mut d_dequant_v = stream.alloc_zeros::<half::f16>(n * D)?;
+
+    k.tq_dequant_kv(
+        &mut d_dequant_k.as_view_mut(),
+        &mut d_dequant_v.as_view_mut(),
+        &k_cache.codes.as_view(),
+        &k_cache.scale.as_view(),
+        &v_cache.codes.as_view(),
+        &v_cache.scale.as_view(),
+        &d_slots.as_view(),
+        &tables.k_levels.as_view(),
+        k_bits,
+        &tables.v_levels.as_view(),
+        v_bits,
+        1,
+        D,
+        n,
+        n,
+    )?;
+    k.device().synchronize()?;
+
+    let got_k = stream.clone_dtoh(&d_dequant_k)?;
+    let host_k_scale = stream.clone_dtoh(&k_cache.scale)?;
+    let host_k_codes = stream.clone_dtoh(&k_cache.codes)?;
+    let bytes_per_vec_k = D * k_bits as usize / 8;
+    for v in 0..n {
+        let expect = host_dequant_no_rotation(
+            &host_k_codes[v * bytes_per_vec_k..(v + 1) * bytes_per_vec_k],
+            host_k_scale[v].to_f32(),
+            &tables.k_codebook,
+        );
+        let got: Vec<f32> = got_k[v * D..(v + 1) * D]
+            .iter()
+            .map(|x| x.to_f32())
+            .collect();
+        for (g, e) in got.iter().zip(&expect) {
+            assert!((g - e).abs() < 1e-3, "key vector {v} mismatch: {g} vs {e}");
+        }
+    }
+
+    let got_v = stream.clone_dtoh(&d_dequant_v)?;
+    let host_v_scale = stream.clone_dtoh(&v_cache.scale)?;
+    let host_v_codes = stream.clone_dtoh(&v_cache.codes)?;
+    let bytes_per_vec_v = D * v_bits as usize / 8;
+    for v in 0..n {
+        let expect = host_dequant_no_rotation(
+            &host_v_codes[v * bytes_per_vec_v..(v + 1) * bytes_per_vec_v],
+            host_v_scale[v].to_f32(),
+            &tables.v_codebook,
+        );
+        let got: Vec<f32> = got_v[v * D..(v + 1) * D]
+            .iter()
+            .map(|x| x.to_f32())
+            .collect();
+        for (g, e) in got.iter().zip(&expect) {
+            assert!(
+                (g - e).abs() < 1e-3,
+                "value vector {v} mismatch: {g} vs {e}"
+            );
+        }
+    }
     Ok(())
 }
 

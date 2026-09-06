@@ -7558,6 +7558,80 @@ impl Kernels {
         Ok(())
     }
 
+    /// Unpack one sequence's `0..kv_len` cached span into a dense, rotated-basis
+    /// f16 buffer -- the read-side counterpart to `tq_store_k`/`tq_store_v`,
+    /// used when a prefill run is long enough that re-unpacking through
+    /// `tq_attn_decode` per query token stops paying for itself.
+    /// Does **not** undo the rotation -- the output pairs with the
+    /// already-rotated `q_rot`/`acc_rot` the rest of the TQ pipeline already
+    /// uses, same convention as every other TQ kernel in this file.
+    ///
+    /// Key dequant is a plain `level * scale` per element: `k_signs`/
+    /// `k_gamma` only feed the QJL term of `tq_attn_scores`/
+    /// `tq_attn_decode_f32`'s *score-level* estimator, not any per-element
+    /// correction of a single dequantized key value, so this kernel does not
+    /// take them (see `cu/turboquant.cu`'s `tq_dequant_kv` doc comment).
+    #[allow(clippy::too_many_arguments)]
+    pub fn tq_dequant_kv(
+        &self,
+        dequant_k: &mut ViewMut<'_, f16>,
+        dequant_v: &mut ViewMut<'_, f16>,
+        k_codes: &View<'_, u8>,
+        k_scale: &View<'_, f16>,
+        v_codes: &View<'_, u8>,
+        v_scale: &View<'_, f16>,
+        slots: &View<'_, i32>,
+        k_levels: &View<'_, f32>,
+        k_bits: u8,
+        v_levels: &View<'_, f32>,
+        v_bits: u8,
+        n_kv_heads: usize,
+        d_head: usize,
+        n_slots: usize,
+        kv_len: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_turboquant", tq_src(), "tq_dequant_kv")?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_kv_heads as u32, kv_len as u32, 1),
+            block_dim: (per_vector_block(d_head), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (kb, vb, kh, dh, ns, kl) = (
+            k_bits as i32,
+            v_bits as i32,
+            n_kv_heads as i32,
+            d_head as i32,
+            n_slots as i32,
+            kv_len as i32,
+        );
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(dequant_k)
+            .arg(dequant_v)
+            .arg(k_codes)
+            .arg(k_scale)
+            .arg(v_codes)
+            .arg(v_scale)
+            .arg(slots)
+            .arg(k_levels)
+            .arg(&kb)
+            .arg(v_levels)
+            .arg(&vb)
+            .arg(&kh)
+            .arg(&dh)
+            .arg(&ns)
+            .arg(&kl);
+        self.dev
+            .profile()
+            .time("tq_dequant_kv", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("tq_dequant_kv")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     /// Attention logits from a quantized key cache, using the two-stage
     /// unbiased inner product estimator.
     #[allow(clippy::too_many_arguments)]
