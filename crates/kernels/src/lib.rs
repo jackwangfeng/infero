@@ -7600,8 +7600,15 @@ impl Kernels {
             .dev
             .kernels()
             .get("infero_turboquant", tq_src(), "tq_dequant_kv")?;
+        // `kv_len` on X, `n_kv_heads` on Y -- not the other way round. Grid Y
+        // and Z cap at 65535 blocks on every architecture and only X reaches
+        // 2^31-1, so `kv_len` (the axis that grows with context) has to be the
+        // one on X: with the axes swapped, a `--ctx 65536` load would fail this
+        // launch outright on exactly the long-context workload this path exists
+        // to serve. The kernel reads `pos` from `blockIdx.x` to match; the
+        // addressing itself is unchanged.
         let cfg = LaunchConfig {
-            grid_dim: (n_kv_heads as u32, kv_len as u32, 1),
+            grid_dim: (kv_len as u32, n_kv_heads as u32, 1),
             block_dim: (per_vector_block(d_head), 1, 1),
             shared_mem_bytes: 0,
         };

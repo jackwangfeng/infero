@@ -487,10 +487,14 @@ extern "C" __global__ void tq_attn_decode_f32(
 // Values are untouched by any of this: `tq_attn_output`'s value unpack has no
 // sign/gamma term at all, so a dequantized value stays `level * scale`.
 //
-// One block per (kv_head, position); `slots[position]` gives this position's
-// physical slot for the *input* side, but the output is the compact
-// per-item scratch buffer, addressed by logical position directly (no
-// `slots` indirection there).
+// One block per (position, kv_head) -- position on `blockIdx.x` deliberately,
+// because it is the axis that scales with context: only grid X reaches
+// 2^31-1, while Y and Z cap at 65535 on every architecture, so a `kv_len`
+// on Y would fail the launch outright somewhere past a 64K context. The
+// choice is pure grid shape; the addressing below is identical either way.
+// `slots[position]` gives this position's physical slot for the *input*
+// side, but the output is the compact per-item scratch buffer, addressed by
+// logical position directly (no `slots` indirection there).
 extern "C" __global__ void tq_dequant_kv(
     __half* __restrict__ dequant_k,       // [n_kv_heads, kv_len, d_head]
     __half* __restrict__ dequant_v,       // [n_kv_heads, kv_len, d_head]
@@ -507,10 +511,13 @@ extern "C" __global__ void tq_dequant_kv(
     // needs the whole `d`-long vector, not just its own coordinate.
     __shared__ float s_sign[TQ_MAX_D];
 
-    const int kv_head = blockIdx.x;
-    const int pos = blockIdx.y;
+    const int pos = blockIdx.x;
+    const int kv_head = blockIdx.y;
     if (kv_head >= n_kv_heads || pos >= kv_len) return;
     const int slot = slots[pos];
+    // Same guard `tq_store_k` puts on its own write side: a slot outside the
+    // pool would read another head's cache line rather than fault.
+    if (slot < 0 || slot >= n_slots) return;
     const size_t vec = (size_t)kv_head * n_slots + slot;
 
     const int per_byte_k = 8 / k_bits;
@@ -544,8 +551,8 @@ extern "C" __global__ void tq_dequant_kv(
 
     const int per_byte_v = 8 / v_bits;
     const int bytes_v = d_head / per_byte_v;
-    const uint8_t* v_vec = v_codes + ((size_t)kv_head * n_slots + slot) * bytes_v;
-    const float vscale = __half2float(v_scale[(size_t)kv_head * n_slots + slot]);
+    const uint8_t* v_vec = v_codes + vec * bytes_v;
+    const float vscale = __half2float(v_scale[vec]);
     __half* v_out = dequant_v + ((size_t)kv_head * kv_len + pos) * d_head;
     for (int i = threadIdx.x; i < d_head; i += blockDim.x) {
         v_out[i] = __float2half(v_levels[tq_unpack(v_vec, i, v_bits)] * vscale);
