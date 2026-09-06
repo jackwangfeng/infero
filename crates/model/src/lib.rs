@@ -100,7 +100,7 @@ const MIN_PREFILL_RUN: usize = 8;
 /// `2026-09-06-tq4-prefill-dequant-dispatch` plan measures infero's own
 /// crossover on this codebase's actual kernels and updates this constant
 /// with the real number.
-const TQ_DEQUANT_THRESHOLD: usize = 128;
+pub const TQ_DEQUANT_THRESHOLD: usize = 128;
 
 /// The real ceiling on how many tokens the decode-only dispatch path (see the
 /// mixed-batch-attn-dispatch-split design doc) can be asked to carry in one

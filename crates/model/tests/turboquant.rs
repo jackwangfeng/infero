@@ -11,7 +11,9 @@ use std::path::PathBuf;
 use anyhow::Result;
 use infero_cuda::Device;
 use infero_gguf::Gguf;
-use infero_model::{BatchItem, BatchItemKind, KvCacheQuant, Model, Sampler, SamplingParams};
+use infero_model::{
+    BatchItem, BatchItemKind, KvCacheQuant, Model, Sampler, SamplingParams, TQ_DEQUANT_THRESHOLD,
+};
 use infero_tokenizer::Tokenizer;
 
 /// Enough prompts, and varied enough, that a two-point difference between
@@ -736,3 +738,80 @@ fn an_interleaved_batch_dispatches_every_item_to_its_own_rows() -> Result<()> {
     Ok(())
 }
 
+/// The exact-boundary scenario the other three tests in this file cannot
+/// reach: `plan_tq_dispatch` gates on strict `tokens > dequant_threshold`
+/// (see `crates/model/src/lib.rs`), so a prefill run of *exactly*
+/// `TQ_DEQUANT_THRESHOLD` tokens must stay on the short/decode path -- same
+/// kernel, both settings, bit for bit -- while `TQ_DEQUANT_THRESHOLD + 1`
+/// must take the long dequant path.
+///
+/// This is the test an off-by-one at that comparison would fail: flip `>` to
+/// `>=` and the exactly-at-threshold run starts taking the long path too,
+/// which shows up here as a cosine that moved when it should not have (the
+/// lower assertion in that branch below). Flip it the other way and
+/// `threshold + 1` stops moving instead, which the upper assertion in the
+/// other branch catches.
+///
+/// **On the seed and the tolerance at `threshold + 1`.** Measured, sweeping
+/// all three `prompt_tokens` passages at this exact length: cosine 0.975
+/// (seed 0, and its argmax actually flips -- a real near-tie, not a bug: the
+/// single dequant call here covers only ~129 tokens' worth of averaging
+/// across 24 layers, far less than the 256+-token prompts the other tests in
+/// this file use, so the noise floor is wider), 0.889 (seed 1, argmax still
+/// agrees), 0.981 (seed 2, argmax agrees). Seed 2 is used below so this test
+/// asserts next-token agreement as well as a cosine floor, rather than only
+/// the weaker "it moved at all" check the near-tie seeds would be limited to.
+#[test]
+fn threshold_boundary_both_sides_agree_with_reference() -> Result<()> {
+    let _gpu = gpu_lock();
+    if std::env::var("INFERO_ATTN_MMA").as_deref() != Ok("1") {
+        eprintln!("skipping: needs INFERO_ATTN_MMA=1 set before the test binary starts");
+        return Ok(());
+    }
+    for &n in &[TQ_DEQUANT_THRESHOLD, TQ_DEQUANT_THRESHOLD + 1] {
+        let mut out = Vec::new();
+        for dequant in [false, true] {
+            let Some((mut model, tok)) = load_tq(KvCacheQuant::Tq4Mse, dequant)? else {
+                return Ok(());
+            };
+            let ids = prompt_tokens(&tok, 2, n);
+            let mut session = model.new_session()?;
+            out.push(
+                model
+                    .forward(&ids, BatchItemKind::Prefill, &mut session)?
+                    .to_vec(),
+            );
+        }
+        let cos = cosine(&out[0], &out[1]);
+        eprintln!("  n={n}: dequant off vs on cosine {cos:.9}");
+        assert_eq!(
+            argmax(&out[0]),
+            argmax(&out[1]),
+            "n={n}: dequant off/on disagree on the next token"
+        );
+        if n == TQ_DEQUANT_THRESHOLD {
+            // `tokens > dequant_threshold` is false right at the threshold, so
+            // both settings must take the identical short-path kernel call.
+            assert!(
+                cos > 0.99999,
+                "n={n}: cosine {cos:.9} -- exactly at the threshold both \
+                 settings should take the same (short) path; if this moved, \
+                 the boundary compares `>=` instead of `>`"
+            );
+        } else {
+            // One token over, `tokens > dequant_threshold` is true, so this
+            // run takes the long dequant path. Looser than the other tests'
+            // 0.99 floor -- see the doc comment above for why a run this
+            // short has a wider noise floor -- but still well above chance.
+            assert!(cos > 0.95, "n={n}: cosine {cos:.9}");
+            assert!(
+                cos < 0.99999,
+                "n={n}: cosine {cos:.9} is indistinguishable from 1.0 -- the \
+                 long path never ran, so this proves nothing about the \
+                 boundary (is TQ_DEQUANT_THRESHOLD + 1 still tile-kernel \
+                 eligible?)"
+            );
+        }
+    }
+    Ok(())
+}
