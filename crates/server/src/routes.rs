@@ -365,6 +365,30 @@ async fn chat_completions(
         )
         .map_err(|e| ApiError::bad_request(format!("chat template failed: {e:#}")))?;
 
+    // Off by default (one env var check per request, no cost otherwise).
+    // Set INFERO_PROMPT_DUMP=<dir> to capture every fully-rendered prompt
+    // exactly as the model sees it -- the tool this session used to find
+    // that a conversation with an unanswered tool call (an assistant
+    // `<tool_call>` turn with no following `tool` role reply, immediately
+    // followed by a new user turn) reliably degrades into shorter and
+    // shorter completions each further turn: real evidence showed the
+    // model sampling a genuine early stop mid tool-call, worsening on every
+    // subsequent turn built on that same malformed history. Not caused by
+    // this server's own tool-call parsing (`tool_call.rs` handles the exact
+    // format correctly) -- the malformed turn already existed in the
+    // `messages` this endpoint received, most likely from a client that
+    // persisted an incomplete/rejected tool call as if it were a normal
+    // final answer instead of a `tool` role response.
+    if let Ok(dir) = std::env::var("INFERO_PROMPT_DUMP") {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let path = format!("{dir}/prompt_{ts}.txt");
+        let _ = std::fs::write(&path, &prompt);
+        tracing::info!(path = %path, len = prompt.len(), "dumped rendered prompt");
+    }
+
     // parse_special = true: the template's own markers must become control
     // tokens.
     //
