@@ -140,10 +140,57 @@ fn ensure_partial_fits(run_tokens: usize, partial_tokens: usize, who: &str) -> R
         "{who} would index attention partials for {run_tokens} tokens but attn_partial \
          holds only {partial_tokens}. This shape needs a kernel that does not use the \
          split-K scratch (`attn_prefill_decoupled6_f16acc` at d_head=256, or the \
-         flash_attn2 backend) to serve its wide prefill runs; unset \
-         INFERO_SPLIT_MIXED_BATCH to restore the full-width buffer"
+         flash_attn2 backend) to serve its wide prefill runs; set \
+         INFERO_SPLIT_MIXED_BATCH=0 to restore the full-width buffer"
     );
     Ok(())
+}
+
+/// Whether a prefill run wider than [`attn_partial_bound`] provably resolves
+/// to a kernel that never reads `attn_partial` — the precondition for
+/// shrinking that buffer, and therefore what gates the *default* resolution
+/// of `INFERO_SPLIT_MIXED_BATCH` (Task 7; an explicit `="1"` bypasses it).
+///
+/// Re-derived from `attention()`'s real eligibility chain rather than
+/// asserted, and deliberately conservative — it must be false whenever
+/// `ensure_partial_fits` could fire, and may be false in cases where it
+/// would not:
+///
+///   - `kv_quant != F16` is out. TurboQuant takes an entirely separate
+///     branch in `attention()` whose `tq_attn_decode` indexes `attn_partial`
+///     for the *whole pass*, wide prefill included, with no tile-kernel
+///     alternative to fall through to.
+///   - `prefill_attention(dims)` false is out. That is the gate
+///     (`INFERO_ATTN_MMA=1`, `group <= 8`, `d_head` a multiple of 16 up to
+///     256) on the whole tile-kernel branch; without it a wide run falls
+///     straight through to `attn_decode`, which does read the scratch.
+///   - `d_head != 256` is out, and `INFERO_PREFILL_T6=0` is out. Inside that
+///     branch only `attn_prefill_decoupled6_f16acc` avoids the scratch, and
+///     those two are exactly its own preconditions at the call site; the
+///     `else` arm is `attn_prefill_ws4`, which reads it.
+///
+/// The `flash_attn2` vendor backend also never touches `attn_partial` (its
+/// `prefill()` ignores `AttnCallCtx::partial` entirely — grep the file), but
+/// it is deliberately *not* part of this condition: it only serves runs whose
+/// KV is physically contiguous, and the handrolled cascade below it is what
+/// answers the rest. Requiring the fallback to be safe is what makes the
+/// whole chain safe.
+fn wide_prefill_avoids_attn_partial(kern: &Kernels, cfg: &Config, kv_quant: KvCacheQuant) -> bool {
+    if kv_quant != KvCacheQuant::F16 {
+        return false;
+    }
+    let dims = AttnDims {
+        n_heads: cfg.n_heads,
+        n_kv_heads: cfg.n_kv_heads,
+        d_head: cfg.d_head,
+        // `prefill_attention` reads neither; a prefill run's real width and
+        // the pool's slot count are irrelevant to the shape gate.
+        n_slots: 0,
+        n_tokens: 1,
+    };
+    cfg.d_head == 256
+        && kern.prefill_attention(&dims)
+        && !std::env::var("INFERO_PREFILL_T6").is_ok_and(|v| v == "0")
 }
 
 #[cfg(test)]
@@ -1177,13 +1224,14 @@ pub struct Model {
     /// context length. See [`batch_tokens_for`].
     batch_tokens: usize,
     /// Whether the mixed-batch-attn-dispatch-split path is enabled, resolved
-    /// once at load from `INFERO_SPLIT_MIXED_BATCH` (default OFF; `="1"` opts
-    /// in to the smaller `attn_partial_bound`-sized `attn_partial`). Defaults
-    /// OFF -- not on -- because enabling it before Task 5's dispatch-split
-    /// lands shrinks `attn_partial` while the *dispatch* logic that makes that
-    /// safe under a real multi-item batch doesn't exist yet; see
-    /// `attn_partial_bound` and its allocation site in `Activations::new` for
-    /// the full reasoning.
+    /// once at load from `INFERO_SPLIT_MIXED_BATCH`: `="0"` forces it off
+    /// (the rollback switch), `="1"` forces it on, and **unset -- the default
+    /// since Task 7 -- resolves it from the model's own shape** via
+    /// [`wide_prefill_avoids_attn_partial`], i.e. on wherever shrinking
+    /// `attn_partial` to `attn_partial_bound(max_logit_rows)` cannot make
+    /// `ensure_partial_fits` fire. See `from_parts`' resolution site for the
+    /// three-way match and why the default is shape-gated rather than a flat
+    /// `!= "0"`.
     ///
     /// Forced back to `false` by [`Self::gate_for_tp`] whenever a real TP
     /// group is in play (`rank.tp_size > 1`), regardless of the env var --
@@ -1767,18 +1815,36 @@ impl Model {
         // Task 4/5 read this field when deciding whether a batch's
         // decode/prefill items get dispatched separately.
         //
-        // Defaults OFF -- flipping this before Task 5's dispatch-split lands
-        // is unsafe (see this function's own comment just above, `attn_decode`
-        // and `InferoHandRolled`'s prefill path both read/write `attn_partial`
-        // at up to the full chunk width, unconditionally, today -- exactly
-        // the documented failure mode a prior conditional-skip attempt hit).
-        // Task 5/7 should flip this default once the dispatch split is
-        // verified. Until then, `="1"` is an explicit, Task-4/5-testing-only
-        // opt-in into the smaller `attn_partial_bound`-sized buffer; leaving
-        // it unset (the default for any real deploy) reproduces today's exact
-        // behavior: `attn_partial` allocated at the full `batch_tokens` width,
-        // same as before this plan.
-        let split_mixed_batch = std::env::var("INFERO_SPLIT_MIXED_BATCH").is_ok_and(|v| v == "1");
+        // Task 7 flipped this default from off to on, after full verification
+        // against the real production checkpoint on `bw` -- see
+        // `.superpowers/sdd/2026-09-05-mixed-batch-attention-dispatch-split/
+        // task-7-report.md` for the measured numbers. Three resolutions:
+        //
+        //   `="0"`  force off. The rollback switch; reproduces the pre-plan
+        //           dispatch exactly (`attn_partial` at the full
+        //           `batch_tokens` width, one attention call a pass).
+        //   `="1"`  force on regardless of the shape check below. Kept as the
+        //           explicit opt-in Tasks 4-6 tested through, and the only way
+        //           to exercise the split path on a model whose wide prefill
+        //           runs *do* read `attn_partial` (`tests/mixed_batch_
+        //           dispatch.rs` runs a `d_head = 64` model this way).
+        //   unset   on iff this model's wide prefill runs provably never touch
+        //           the shrunk buffer -- `wide_prefill_avoids_attn_partial`.
+        //
+        // That last condition is the whole reason the default is not a plain
+        // `!= "0"`. Shrinking `attn_partial` is only safe because a prefill
+        // run wider than `attn_partial_bound(max_logit_rows)` resolves to a
+        // kernel that takes no split-K scratch (`flash_attn2`'s prefill, or
+        // `attn_prefill_decoupled6_f16acc`). `ensure_partial_fits` turns a
+        // shape where that stops holding into a loud error rather than a
+        // silent overrun -- correct, but a *500 instead of an answer*, and an
+        // on-by-default flag must not be able to do that to a model nobody
+        // opted in for. So the default only fires where the error cannot.
+        let split_mixed_batch = match std::env::var("INFERO_SPLIT_MIXED_BATCH").ok().as_deref() {
+            Some("0") => false,
+            Some("1") => true,
+            _ => wide_prefill_avoids_attn_partial(&kern, &cfg, kv_quant),
+        };
         let partial_n_tokens = if split_mixed_batch {
             attn_partial_bound(max_logit_rows)
         } else {

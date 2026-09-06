@@ -483,3 +483,62 @@ fn split_off_reproduces_the_old_dispatch() -> Result<()> {
     }
     Ok(())
 }
+
+/// Task 7 flipped `INFERO_SPLIT_MIXED_BATCH`'s default from off to on, but not
+/// to a flat "on unless `=0`": with the variable **unset** the default is
+/// resolved from the model's own shape by `Model::from_parts` /
+/// `wide_prefill_avoids_attn_partial`, and must come out *off* for any model
+/// whose wide prefill runs would read the shrunk `attn_partial` -- otherwise
+/// an on-by-default flag turns those runs into an `ensure_partial_fits` error
+/// (a 500) on a model nobody opted in for.
+///
+/// `qwen2.5-0.5b` is exactly such a model: `d_head = 64`, so
+/// `attn_prefill_decoupled6_f16acc` (256-only) cannot serve it and the
+/// eligibility chain falls through to kernels that do use the scratch --
+/// which is the very reason this file's other tests keep every run under
+/// `MAX_LOGIT_ROWS + MIN_PREFILL_RUN` by hand (see the module note). So the
+/// unset default here must be `false`, while the explicit `="1"` those tests
+/// use stays `true`.
+///
+/// The positive half (a `d_head = 256` model resolving unset -> on) is not
+/// checkable here -- no 256-wide checkpoint is small enough for this suite --
+/// and is covered instead by Task 7's real deployment check: the production
+/// `qwen38-27b-fp8` server, launched with the variable unset, logs
+/// `split_mixed_batch=true partial_mib=7`.
+#[test]
+fn unset_defaults_off_on_a_model_whose_wide_prefills_need_the_scratch() -> Result<()> {
+    let _gpu = gpu_lock();
+    let Some(path) = model_path() else {
+        return Ok(());
+    };
+    let gguf = infero_gguf::Gguf::open(&path)?;
+    // Deliberately *not* `load()`, which always sets the variable. The whole
+    // point is what happens when nothing is set at all.
+    //
+    // Safety: same as `load()` -- `gpu_lock()` serializes this file, and no
+    // other test in this binary reads or writes this variable.
+    unsafe { std::env::remove_var("INFERO_SPLIT_MIXED_BATCH") };
+    let model = Model::load_full(
+        infero_cuda::Device::new(0)?,
+        &gguf,
+        1024,
+        KvCacheQuant::F16,
+        usize::MAX,
+        MAX_LOGIT_ROWS,
+    )?;
+    assert!(
+        !model.split_mixed_batch(),
+        "with INFERO_SPLIT_MIXED_BATCH unset, a d_head=64 model must resolve the \
+         split OFF -- its wide prefill runs read attn_partial, so shrinking that \
+         buffer by default would turn them into ensure_partial_fits errors"
+    );
+
+    // And the explicit opt-in still overrides the shape gate, or every other
+    // test in this file would silently be measuring the flag-off path.
+    let (opted_in, _t) = load("1")?.expect("model path already checked");
+    assert!(
+        opted_in.split_mixed_batch(),
+        "INFERO_SPLIT_MIXED_BATCH=1 must force the split on regardless of shape"
+    );
+    Ok(())
+}
