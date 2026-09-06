@@ -292,6 +292,18 @@ impl KvPool {
         &mut self.slot_table
     }
 
+    /// This sequence's physical slots, in the logical order `extend` assigned
+    /// them -- position `i` in the returned slice is where logical position
+    /// `i` actually lives. `tq_dequant_kv`'s caller uploads this to the device
+    /// as its `slots` argument, the same role `tq_store_k`/`tq_store_v`'s own
+    /// `slots` parameter already plays for the write side.
+    pub(crate) fn seq_slots(&self, id: SeqId) -> &[i32] {
+        &self.seqs[id.0]
+            .as_ref()
+            .expect("seq_slots on a sequence that was never allocated")
+            .slots
+    }
+
     /// Read a sequence's slot table back off the device.
     ///
     /// Not on any hot path; it exists so a test can assert that two sequences

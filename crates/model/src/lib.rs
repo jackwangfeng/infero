@@ -93,6 +93,15 @@ const SCORE_BUDGET: usize = 1 << 30;
 /// decode-only buffer.
 const MIN_PREFILL_RUN: usize = 8;
 
+/// Below this many query tokens, a TurboQuant prefill run stays on
+/// `tq_attn_decode` -- not worth a dedicated dequantize-and-dispatch call.
+/// This starting value mirrors vLLM's own `_CONTINUATION_DECODE_THRESHOLD`
+/// as a conservative placeholder; Task 5 of the
+/// `2026-09-06-tq4-prefill-dequant-dispatch` plan measures infero's own
+/// crossover on this codebase's actual kernels and updates this constant
+/// with the real number.
+const TQ_DEQUANT_THRESHOLD: usize = 128;
+
 /// The real ceiling on how many tokens the decode-only dispatch path (see the
 /// mixed-batch-attn-dispatch-split design doc) can be asked to carry in one
 /// step, plus headroom for a short prefill remainder folded into it.
@@ -1169,6 +1178,14 @@ struct TqBuffers {
     q_qjl: Buf<f32>,
     /// The attention output before `Πᵀ` maps it back.
     acc_rot: Buf<f32>,
+    /// Dense, rotated-basis KV for one sequence's dequantized prefill span.
+    /// `[n_kv_heads, max_seq, d_head]`, sized once at load and reused across
+    /// layers and calls -- the same "resolved once, reused everywhere"
+    /// pattern `Scratch`'s other buffers already use. Only written when
+    /// `Model::tq_prefill_dequant()` is true and at least one item in a
+    /// batch is longer than `TQ_DEQUANT_THRESHOLD`.
+    dequant_k: Buf<f16>,
+    dequant_v: Buf<f16>,
 }
 
 /// Staging for the cuBLAS path: a dequantized weight matrix and f16 inputs.
@@ -1243,6 +1260,13 @@ pub struct Model {
     /// because this field and `attn_partial_tokens` below must never
     /// disagree.
     split_mixed_batch: bool,
+    /// Whether a long-enough TurboQuant prefill run dequantizes once and
+    /// reuses the dense tile kernels, resolved once at load from
+    /// `INFERO_TQ_PREFILL_DEQUANT`. `="0"` forces every run through
+    /// `tq_attn_decode` unchanged (`TQ_DEQUANT_THRESHOLD` effectively becomes
+    /// `usize::MAX`); unset or `="1"` leaves the threshold in `lib.rs:94` in
+    /// effect.
+    tq_prefill_dequant: bool,
     /// How many tokens `act.attn_partial` was actually allocated for --
     /// `attn_partial_bound(max_logit_rows)` when `split_mixed_batch` is on,
     /// the full `batch_tokens` otherwise (see `Activations::new`).
@@ -1848,6 +1872,7 @@ impl Model {
             Some("1") => true,
             _ => wide_prefill_avoids_attn_partial(&kern, &cfg, kv_quant),
         };
+        let tq_prefill_dequant = !std::env::var("INFERO_TQ_PREFILL_DEQUANT").is_ok_and(|v| v == "0");
         let partial_n_tokens = if split_mixed_batch {
             attn_partial_bound(max_logit_rows)
         } else {
@@ -1936,6 +1961,8 @@ impl Model {
                 q_rot: dev.stream().alloc_zeros::<f32>(chunk * d_attn)?,
                 q_qjl: dev.stream().alloc_zeros::<f32>(chunk * d_attn)?,
                 acc_rot: dev.stream().alloc_zeros::<f32>(chunk * d_attn)?,
+                dequant_k: dev.stream().alloc_zeros::<f16>(cfg.n_kv_heads * max_seq * cfg.d_head)?,
+                dequant_v: dev.stream().alloc_zeros::<f16>(cfg.n_kv_heads * max_seq * cfg.d_head)?,
             })
         } else {
             None
@@ -1994,6 +2021,7 @@ impl Model {
             max_logit_rows,
             batch_tokens,
             split_mixed_batch,
+            tq_prefill_dequant,
             attn_partial_tokens: partial_n_tokens,
             attn_backend_name,
             #[cfg(feature = "flash_attn2")]
@@ -2055,6 +2083,10 @@ impl Model {
     /// with this flag.
     pub fn split_mixed_batch(&self) -> bool {
         self.split_mixed_batch
+    }
+
+    pub fn tq_prefill_dequant(&self) -> bool {
+        self.tq_prefill_dequant
     }
 
     /// How many tokens `act.attn_partial` was actually allocated for.
