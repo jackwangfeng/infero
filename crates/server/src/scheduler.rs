@@ -1963,28 +1963,41 @@ pub fn make_pool(model: &Model, max_seqs: usize, slots: Option<usize>) -> Result
     // per-slot tables — so find the largest slot count that fits by bisection
     // on the pool's own accounting rather than by re-deriving it here.
     let budget = free.saturating_sub(free / 8).saturating_sub(512 << 20);
-    let fits = |n: usize| -> bool {
+    // Returns the pool itself, not just whether it fit -- the original
+    // shape here (`fits: |n| -> bool`) threw the trial allocation away and
+    // reconstructed an identical one at the end, which for the common case
+    // (the very first `fits(hi)` check already succeeds) meant every real
+    // startup allocated the whole KV pool twice. Freed memory from the
+    // discarded trial isn't necessarily handed back to the driver
+    // immediately by the allocator, so that redundant pass was a real,
+    // avoidable spike (and possibly retained cost) on top of the pool this
+    // function actually returns, not just wasted time.
+    let fits = |n: usize| -> Option<KvPool> {
         match model.new_pool(n, max_seqs) {
-            Ok(p) => p.bytes() <= budget,
-            Err(_) => false,
+            Ok(p) if p.bytes() <= budget => Some(p),
+            _ => None,
         }
     };
-    if fits(hi) {
-        return model
-            .new_pool(hi, max_seqs)
-            .context("allocating the kv pool");
+    if let Some(pool) = fits(hi) {
+        return Ok(pool);
     }
+    // `lo` (== `max_seq`) is the floor the comment above already assumes
+    // always fits -- one full-context sequence -- so build it once, up
+    // front, and only replace it when bisection finds something bigger,
+    // rather than deferring its construction to a final call that may
+    // duplicate the loop's own last successful trial.
+    let mut best = model.new_pool(lo, max_seqs).context("allocating the kv pool")?;
     while lo + max_seq < hi {
         let mid = (lo + hi) / 2;
-        if fits(mid) {
-            lo = mid;
-        } else {
-            hi = mid;
+        match fits(mid) {
+            Some(p) => {
+                lo = mid;
+                best = p;
+            }
+            None => hi = mid,
         }
     }
-    model
-        .new_pool(lo, max_seqs)
-        .context("allocating the kv pool")
+    Ok(best)
 }
 
 /// Where the MTP head's GGUF tensors live, if anywhere findable without
