@@ -725,18 +725,21 @@ fn averaging_suppresses_quantization_noise() -> Result<()> {
     Ok(())
 }
 
-/// `tq_dequant_kv` unpacks a cached span straight into dense f16, without any
-/// per-element sign/gamma correction: `tq_attn_decode_f32`'s own key unpack
-/// (`crates/kernels/src/cu/turboquant.cu`) computes `mse_term` from
-/// `cb_k[tq_unpack(...)]` alone and `qjl_term` from the sign bits as a wholly
-/// separate dot product, combining the two only after both are reduced,
-/// scaled by `attn_scale`/`gamma`/`qjl_scale` at the *score* level. A single
-/// dequantized key element is therefore just `level * scale` -- `k_signs`/
-/// `k_gamma` never touch it, so `tq_dequant_kv` does not take them.
+/// The MSE-only ablation, `tq4-mse`: with `qjl_scale` zero there is no second
+/// estimator term to fold in, and a dequantized key element is exactly
+/// `level * scale`. `k_signs`/`k_gamma` are still passed (the cache carries
+/// them either way) and must not touch the output.
+///
+/// Values are the same at every setting — `tq_attn_output`'s value unpack has
+/// no sign/gamma term at all — so this is also the value side's only coverage.
 #[test]
 fn tq_dequant_kv_matches_store_then_manual_unpack() -> Result<()> {
     let k = kernels()?;
-    let tables = DeviceTables::new(k.device(), D, KvQuant::Tq4)?;
+    let tables = DeviceTables::new(k.device(), D, KvQuant::Tq4Mse)?;
+    assert!(
+        !tables.quant.uses_qjl() && tables.quant.qjl_scale() == 0.0,
+        "test setup: tq4-mse is the QJL-free ablation"
+    );
     // `DeviceTables` already carries `k_codebook`/`v_codebook: Codebook` as
     // plain host-computed fields (`Codebook::solve` runs on the host,
     // `turboquant.rs:810-811`) -- no separate device->host download needed.
@@ -759,7 +762,9 @@ fn tq_dequant_kv_matches_store_then_manual_unpack() -> Result<()> {
         &mut d_dequant_k.as_view_mut(),
         &mut d_dequant_v.as_view_mut(),
         &k_cache.codes.as_view(),
+        &k_cache.signs.as_view(),
         &k_cache.scale.as_view(),
+        &k_cache.gamma.as_view(),
         &v_cache.codes.as_view(),
         &v_cache.scale.as_view(),
         &d_slots.as_view(),
@@ -767,6 +772,8 @@ fn tq_dequant_kv_matches_store_then_manual_unpack() -> Result<()> {
         k_bits,
         &tables.v_levels.as_view(),
         v_bits,
+        &tables.qjl_t.as_view(),
+        tables.quant.qjl_scale(),
         1,
         D,
         n,
@@ -814,6 +821,341 @@ fn tq_dequant_kv_matches_store_then_manual_unpack() -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// The full per-key effective vector the QJL-aware `tq_dequant_kv` must
+/// produce:
+///
+/// ```text
+/// k_eff = scale·cb[code] + qjl_scale·(sqrt(pi/2)/d)·gamma·(Qᵀ·s)
+/// ```
+///
+/// where `Q` is `tables.qjl`, `Qᵀ` is `tables.qjl_t`, and `s` is this key's
+/// sign sketch decoded to ±1. Dotted against a real `q_rot` this reproduces
+/// `tq_attn_decode_f32`'s two-term estimator exactly, because the QJL term is
+/// linear in the query: `⟨q_qjl, s⟩ = ⟨Q·q_rot, s⟩ = ⟨q_rot, Qᵀ·s⟩`.
+///
+/// Written straight from the documented layouts, independent of the kernel:
+/// the bit unpack is `host_dequant_no_rotation`'s (already independent of
+/// `tq_unpack`), and the sign unpack is spelled out here rather than reused
+/// from the CUDA side. The sign convention is *not* guessed — `tq_sign_of`
+/// (`cu/turboquant.cu`) returns `+1` when the bit is **set**, and `tq_store_k`
+/// sets the bit when the projection is positive, so a set bit is `+1`.
+fn host_qjl_aware_key_eff(
+    codes: &[u8],
+    scale: f32,
+    signs: &[u8],
+    gamma: f32,
+    cb: &Codebook,
+    qjl_t: &[f32],
+    qjl_scale: f32,
+) -> Vec<f32> {
+    let mse = host_dequant_no_rotation(codes, scale, cb);
+    let sign = |i: usize| -> f32 {
+        if (signs[i / 8] >> (i % 8)) & 1 == 1 {
+            1.0
+        } else {
+            -1.0
+        }
+    };
+    let c = qjl_scale * (std::f32::consts::PI / 2.0).sqrt() / D as f32 * gamma;
+    (0..D)
+        .map(|i| {
+            // Column-major, exactly as `tq_matvec`/`tq_store_k` read their own
+            // matrices: `m[j * D + i]` is row `i`, column `j`, so this is
+            // `(Qᵀ·s)[i]`.
+            let qt_s: f32 = (0..D).map(|j| qjl_t[j * D + i] * sign(j)).sum();
+            mse[i] + c * qt_s
+        })
+        .collect()
+}
+
+/// `tq_dequant_kv` must materialize TurboQuant's **whole** score estimator into
+/// the dequantized key, not just its MSE-codebook half. Dropping the QJL term
+/// is not a rounding difference: measured end to end on a 0.5B model, a `tq4`
+/// cache scored with and without it agrees at cosine 0.289 and picks a
+/// different next token.
+///
+/// Elementwise against a host reference that reconstructs `k_eff` from the
+/// downloaded tables; the sibling test below then checks the *consequence* —
+/// that dotting this vector with `q_rot` reproduces the deployed two-term
+/// estimator `tq_attn_scores` computes.
+#[test]
+fn tq_dequant_kv_reproduces_the_full_qjl_estimator() -> Result<()> {
+    let k = kernels()?;
+    let tables = DeviceTables::new(k.device(), D, KvQuant::Tq4)?;
+    assert!(
+        tables.quant.uses_qjl(),
+        "test setup: tq4 must use QJL, or this test proves nothing"
+    );
+    let n = 5usize;
+    let k_bits = tables.quant.k_mse_bits();
+    let v_bits = tables.quant.v_bits();
+
+    let keys = unit_vectors(n, 21);
+    let values = unit_vectors(n, 22);
+    let k_cache = store_keys(&k, &tables, &keys, n)?;
+    let v_cache = store_values(&k, &tables, &values, n)?;
+
+    let stream = k.device().stream().clone();
+    let slots: Vec<i32> = (0..n as i32).collect();
+    let d_slots = stream.clone_htod(&slots)?;
+    let mut d_dequant_k = stream.alloc_zeros::<f16>(n * D)?;
+    let mut d_dequant_v = stream.alloc_zeros::<f16>(n * D)?;
+
+    k.tq_dequant_kv(
+        &mut d_dequant_k.as_view_mut(),
+        &mut d_dequant_v.as_view_mut(),
+        &k_cache.codes.as_view(),
+        &k_cache.signs.as_view(),
+        &k_cache.scale.as_view(),
+        &k_cache.gamma.as_view(),
+        &v_cache.codes.as_view(),
+        &v_cache.scale.as_view(),
+        &d_slots.as_view(),
+        &tables.k_levels.as_view(),
+        k_bits,
+        &tables.v_levels.as_view(),
+        v_bits,
+        &tables.qjl_t.as_view(),
+        tables.quant.qjl_scale(),
+        1,
+        D,
+        n,
+        n,
+    )?;
+    k.device().synchronize()?;
+
+    let got_k = stream.clone_dtoh(&d_dequant_k)?;
+    let host_k_scale = stream.clone_dtoh(&k_cache.scale)?;
+    let host_k_codes = stream.clone_dtoh(&k_cache.codes)?;
+    let host_k_signs = stream.clone_dtoh(&k_cache.signs)?;
+    let host_k_gamma = stream.clone_dtoh(&k_cache.gamma)?;
+    let host_qjl_t = stream.clone_dtoh(&tables.qjl_t)?;
+    k.device().synchronize()?;
+
+    let bytes_per_vec = D * k_bits as usize / 8;
+    let sign_bytes_per_vec = D / 8;
+    let mut worst = 0.0f32;
+    for v in 0..n {
+        let expect = host_qjl_aware_key_eff(
+            &host_k_codes[v * bytes_per_vec..(v + 1) * bytes_per_vec],
+            host_k_scale[v].to_f32(),
+            &host_k_signs[v * sign_bytes_per_vec..(v + 1) * sign_bytes_per_vec],
+            host_k_gamma[v].to_f32(),
+            &tables.k_codebook,
+            &host_qjl_t,
+            tables.quant.qjl_scale(),
+        );
+        // The QJL term has to be a real part of the answer, not a rounding
+        // correction: if it were, the MSE-only reference would pass this test
+        // too and the assertion below would prove nothing.
+        let mse_only = host_dequant_no_rotation(
+            &host_k_codes[v * bytes_per_vec..(v + 1) * bytes_per_vec],
+            host_k_scale[v].to_f32(),
+            &tables.k_codebook,
+        );
+        let (gap, _) = max_abs_diff(&expect, &mse_only);
+        assert!(
+            gap > 1e-2,
+            "key {v}: the QJL term moves the key by only {gap} -- this test \
+             cannot distinguish the two estimators"
+        );
+
+        let got: Vec<f32> = got_k[v * D..(v + 1) * D]
+            .iter()
+            .map(|x| x.to_f32())
+            .collect();
+        let (d, at) = max_abs_diff(&got, &expect);
+        worst = worst.max(d);
+        assert!(
+            d < 1e-3,
+            "key {v} element {at}: kernel {} vs host reference {}",
+            got[at],
+            expect[at]
+        );
+    }
+    eprintln!("  qjl-aware dequant vs host reference: max abs diff {worst:.2e}");
+    Ok(())
+}
+
+/// The property the fold actually has to have, checked against the deployed
+/// estimator rather than against a restatement of its formula: for every
+/// (query, key) pair,
+///
+/// ```text
+/// ⟨q_rot, tq_dequant_kv(key)⟩ == tq_attn_scores(q_rot, q_qjl, key)
+/// ```
+///
+/// `tq_attn_scores` is the kernel the short/decode path runs (and computes the
+/// same two-term estimator as `tq_attn_decode_f32`, `cu/turboquant.cu:270` and
+/// `:388`), so this is an independent oracle: a transposed `qjl_t`, a flipped
+/// sign convention or a missing `gamma` all break it, and none of them can be
+/// hidden by the host reference above sharing an error with the kernel.
+#[test]
+fn a_dequantized_key_dotted_with_the_query_is_the_two_stage_score() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    let tables = DeviceTables::new(k.device(), D, KvQuant::Tq4)?;
+    let k_bits = tables.quant.k_mse_bits();
+    let v_bits = tables.quant.v_bits();
+
+    let n_keys = 64usize;
+    let keys = unit_vectors(n_keys, 31);
+    let values = unit_vectors(n_keys, 32);
+    let k_cache = store_keys(&k, &tables, &keys, n_keys)?;
+    let v_cache = store_values(&k, &tables, &values, n_keys)?;
+
+    // The dequantized keys, through the kernel under test.
+    let slots: Vec<i32> = (0..n_keys as i32).collect();
+    let d_slots = stream.clone_htod(&slots)?;
+    let mut d_dequant_k = stream.alloc_zeros::<f16>(n_keys * D)?;
+    let mut d_dequant_v = stream.alloc_zeros::<f16>(n_keys * D)?;
+    k.tq_dequant_kv(
+        &mut d_dequant_k.as_view_mut(),
+        &mut d_dequant_v.as_view_mut(),
+        &k_cache.codes.as_view(),
+        &k_cache.signs.as_view(),
+        &k_cache.scale.as_view(),
+        &k_cache.gamma.as_view(),
+        &v_cache.codes.as_view(),
+        &v_cache.scale.as_view(),
+        &d_slots.as_view(),
+        &tables.k_levels.as_view(),
+        k_bits,
+        &tables.v_levels.as_view(),
+        v_bits,
+        &tables.qjl_t.as_view(),
+        tables.quant.qjl_scale(),
+        1,
+        D,
+        n_keys,
+        n_keys,
+    )?;
+
+    // The estimator the short/decode path really runs, over the same cache.
+    let n_q = 16usize;
+    let queries = unit_vectors(n_q, 33);
+    let dq = stream.clone_htod(&queries)?;
+    let mut q_rot = stream.alloc_zeros::<f32>(n_q * D)?;
+    let mut q_qjl = stream.alloc_zeros::<f32>(n_q * D)?;
+    k.tq_matvec(
+        &mut q_rot.as_view_mut(),
+        &dq.as_view(),
+        &tables.rotation.as_view(),
+        D,
+        n_q,
+    )?;
+    k.tq_matvec(
+        &mut q_qjl.as_view_mut(),
+        &q_rot.as_view(),
+        &tables.qjl.as_view(),
+        D,
+        n_q,
+    )?;
+
+    let dims = AttnDims {
+        n_heads: 1,
+        n_kv_heads: 1,
+        d_head: D,
+        n_slots: n_keys,
+        n_tokens: n_q,
+    };
+    let positions = vec![n_keys as i32 - 1; n_q];
+    let dpos = stream.clone_htod(&positions)?;
+    let dseq = stream.clone_htod(&vec![0i32; n_q])?;
+    let dtable = stream.clone_htod(&(0..n_keys as i32).collect::<Vec<_>>())?;
+    let (vseq, vpos, vtable) = (dseq.as_view(), dpos.as_view(), dtable.as_view());
+    let batch = BatchLayout {
+        seq_of: &vseq,
+        positions: &vpos,
+        slot_table: &vtable,
+        table_stride: n_keys,
+    };
+    let mut scores = stream.alloc_zeros::<f32>(n_q * n_keys)?;
+    k.tq_attn_scores(
+        &mut scores.as_view_mut(),
+        &q_rot.as_view(),
+        &q_qjl.as_view(),
+        &k_cache.codes.as_view(),
+        &k_cache.signs.as_view(),
+        &k_cache.scale.as_view(),
+        &k_cache.gamma.as_view(),
+        batch,
+        &tables.k_levels.as_view(),
+        k_bits,
+        dims,
+        n_keys,
+        1.0,
+        tables.quant.qjl_scale(),
+    )?;
+
+    let dense_k: Vec<f32> = stream
+        .clone_dtoh(&d_dequant_k)?
+        .iter()
+        .map(|x| x.to_f32())
+        .collect();
+    let q_rot_h = stream.clone_dtoh(&q_rot)?;
+    let want = stream.clone_dtoh(&scores)?;
+    k.device().synchronize()?;
+
+    let mut got = Vec::with_capacity(n_q * n_keys);
+    for t in 0..n_q {
+        for j in 0..n_keys {
+            got.push(dot(
+                &q_rot_h[t * D..(t + 1) * D],
+                &dense_k[j * D..(j + 1) * D],
+            ));
+        }
+    }
+
+    // ...and the MSE-only key, i.e. exactly what this kernel produced before
+    // this test existed, which must *not* clear the same bar.
+    let mut mse_only = Vec::with_capacity(n_q * n_keys);
+    let host_k_scale = stream.clone_dtoh(&k_cache.scale)?;
+    let host_k_codes = stream.clone_dtoh(&k_cache.codes)?;
+    let bytes_per_vec = D * k_bits as usize / 8;
+    for t in 0..n_q {
+        for j in 0..n_keys {
+            let kv = host_dequant_no_rotation(
+                &host_k_codes[j * bytes_per_vec..(j + 1) * bytes_per_vec],
+                host_k_scale[j].to_f32(),
+                &tables.k_codebook,
+            );
+            mse_only.push(dot(&q_rot_h[t * D..(t + 1) * D], &kv));
+        }
+    }
+
+    let rel = |a: &[f32]| -> f64 {
+        let num: f64 = a
+            .iter()
+            .zip(&want)
+            .map(|(x, y)| ((x - y) as f64).powi(2))
+            .sum();
+        let den: f64 = want.iter().map(|y| (*y as f64).powi(2)).sum();
+        (num / den).sqrt()
+    };
+    let (folded, dropped) = (rel(&got), rel(&mse_only));
+    eprintln!(
+        "  vs tq_attn_scores: qjl-aware dequant rel-rmse {folded:.5}, \
+         cosine {:.6}; mse-only dequant rel-rmse {dropped:.5}, cosine {:.6}",
+        cosine(&got, &want),
+        cosine(&mse_only, &want),
+    );
+    // f16 keys against `tq_attn_scores`' f32 codebook reads is the only gap
+    // that should be left.
+    assert!(
+        folded < 0.01,
+        "a dequantized key does not reproduce the two-stage score: rel-rmse {folded:.5}"
+    );
+    // And the term is worth carrying: the MSE-only key is an order of
+    // magnitude further away, which is the gap this task closes.
+    assert!(
+        dropped > folded * 10.0,
+        "the QJL term barely matters here ({dropped:.5} vs {folded:.5}) -- \
+         this test would pass without it"
+    );
     Ok(())
 }
 

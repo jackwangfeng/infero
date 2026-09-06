@@ -76,6 +76,15 @@ pub struct Tables {
     /// `S' = S·Πᵀ`, the QJL projection folded into the rotated basis so that
     /// cached vectors never have to be rotated back.
     pub qjl: Vec<f32>,
+    /// `S'ᵀ`, for pushing the QJL stage off the query and onto the key.
+    ///
+    /// The estimator's second term is `⟨S'·q_rot, s⟩` for a cached key's ±1
+    /// sign sketch `s`, and it is linear in the query, so
+    /// `⟨S'·q_rot, s⟩ = ⟨q_rot, S'ᵀ·s⟩`. That is what lets a *dequantized* key
+    /// carry the term as a per-element vector (`tq_dequant_kv`) instead of it
+    /// only existing at the score level — the same "need both directions"
+    /// reason `rotation_t` exists.
+    pub qjl_t: Vec<f32>,
 }
 
 impl Tables {
@@ -93,12 +102,14 @@ impl Tables {
         // `⟨S'·(Π·q), qjl⟩` with the query rotated only once.
         let s = gaussian_matrix(d, seed ^ 0x5151_5151_5151_5151);
         let qjl = matmul_t(&s, &rotation, d);
+        let qjl_t = transpose(&qjl, d);
 
         Ok(Self {
             d,
             rotation: to_column_major(&rotation, d),
             rotation_t: to_column_major(&rotation_t, d),
             qjl: to_column_major(&qjl, d),
+            qjl_t: to_column_major(&qjl_t, d),
         })
     }
 }
@@ -440,6 +451,25 @@ mod tests {
         }
     }
 
+    /// `qjl_t` is `qjl`'s transpose in the same column-major layout, which is
+    /// what makes `⟨S'·q, s⟩ = ⟨q, S'ᵀ·s⟩` usable by a kernel that reads it the
+    /// way `tq_matvec` reads any other table here.
+    #[test]
+    fn the_qjl_transpose_really_is_the_transpose() {
+        let t = Tables::new(D, DEFAULT_SEED).unwrap();
+        let mut off_diagonal_differs = false;
+        for i in 0..D {
+            for j in 0..D {
+                assert_eq!(t.qjl[j * D + i], t.qjl_t[i * D + j]);
+                off_diagonal_differs |= i != j && t.qjl[j * D + i] != t.qjl[i * D + j];
+            }
+        }
+        // S' is a Gaussian matrix, so it is not symmetric -- which is why
+        // getting the direction backwards is a real, silent bug rather than a
+        // no-op, and why the kernel test that pins it has to exist.
+        assert!(off_diagonal_differs, "S' came out symmetric");
+    }
+
     /// The paper states the optimal centroids for b = 1, 2 in the large-`d`
     /// limit: `{±√(2/π)/√d}` and `{±0.453/√d, ±1.51/√d}`.
     #[test]
@@ -561,6 +591,7 @@ mod tests {
         let b = Tables::new(D, DEFAULT_SEED).unwrap();
         assert_eq!(a.rotation, b.rotation);
         assert_eq!(a.qjl, b.qjl);
+        assert_eq!(a.qjl_t, b.qjl_t);
         let c = Tables::new(D, DEFAULT_SEED + 1).unwrap();
         assert_ne!(a.rotation, c.rotation);
     }
@@ -784,6 +815,7 @@ pub struct DeviceTables {
     pub rotation: Buf<f32>,
     pub rotation_t: Buf<f32>,
     pub qjl: Buf<f32>,
+    pub qjl_t: Buf<f32>,
     pub k_levels: Buf<f32>,
     pub v_levels: Buf<f32>,
     pub k_codebook: Codebook,
@@ -817,6 +849,7 @@ impl DeviceTables {
             rotation: stream.clone_htod(&tables.rotation)?,
             rotation_t: stream.clone_htod(&tables.rotation_t)?,
             qjl: stream.clone_htod(&tables.qjl)?,
+            qjl_t: stream.clone_htod(&tables.qjl_t)?,
             k_levels: stream.clone_htod(&k_codebook.levels)?,
             v_levels: stream.clone_htod(&v_codebook.levels)?,
             k_codebook,

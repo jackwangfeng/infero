@@ -452,14 +452,40 @@ extern "C" __global__ void tq_attn_decode_f32(
 // enough that re-unpacking through `tq_attn_decode_f32` per query token stops
 // paying for itself.
 //
-// Key dequant is a plain `level * scale` per element -- no per-element
-// sign/gamma correction. `tq_attn_decode_f32` above (and `tq_attn_scores`)
-// settle this: `mse_term` is built entirely from `cb_k[tq_unpack(...)]`, and
-// `qjl_term` is a wholly separate dot product built from the sign bits; the
-// two are only combined *after* both are warp-reduced, scaled by
-// `gamma`/`qjl_scale` at the score level, not folded into any single
-// dequantized key value. So there is no per-element value for `k_signs`/
-// `k_gamma` to correct here, and this kernel does not take them.
+// The dequantized key carries TurboQuant's *whole* two-term estimator, not
+// just its MSE-codebook half. `tq_attn_decode_f32` above (and
+// `tq_attn_scores`) score a key as
+//
+//     est = scale * <q_rot, cb_k[code]>
+//         + qjl_scale * (sqrt(pi/2)/d) * gamma * <q_qjl, s>
+//
+// where `s` is the +-1 sign sketch and `q_qjl = S' * q_rot` (one `tq_matvec`
+// against `tables.qjl`). The second term never appears as a per-element
+// correction *there* -- it is a separate dot product against a differently
+// projected query, combined only after both are reduced -- but it is linear in
+// the query, so it can be moved onto the key:
+//
+//     <S'*q_rot, s> = <q_rot, S'^T * s>
+//
+// and therefore
+//
+//     k_eff = scale * cb_k[code] + qjl_scale * (sqrt(pi/2)/d) * gamma * (S'^T * s)
+//
+// *is* a per-element dequantized key, one a plain dense kernel dotted against
+// `q_rot` reproduces the two-term estimator from exactly. `qjl_t` is `S'^T`
+// (`Tables::qjl_t`), read column-major like every other matrix here. Dropping
+// the term instead is not a rounding difference: measured end to end, a `tq4`
+// cache scored with and without it agrees at cosine 0.289 and picks a
+// different next token.
+//
+// The cost is one d x d sign-matvec per cached key, O(H*L*d^2) against
+// attention's own O(H*L^2*d) -- noise at any `L` this path serves. A
+// `qjl_scale` of zero (the MSE-only ablation, `tq4-mse`) skips it entirely
+// rather than multiplying it away; the branch is block-uniform, so the
+// `__syncthreads()` inside it is too.
+//
+// Values are untouched by any of this: `tq_attn_output`'s value unpack has no
+// sign/gamma term at all, so a dequantized value stays `level * scale`.
 //
 // One block per (kv_head, position); `slots[position]` gives this position's
 // physical slot for the *input* side, but the output is the compact
@@ -468,24 +494,52 @@ extern "C" __global__ void tq_attn_decode_f32(
 extern "C" __global__ void tq_dequant_kv(
     __half* __restrict__ dequant_k,       // [n_kv_heads, kv_len, d_head]
     __half* __restrict__ dequant_v,       // [n_kv_heads, kv_len, d_head]
-    const uint8_t* __restrict__ k_codes, const __half* __restrict__ k_scale,
+    const uint8_t* __restrict__ k_codes, const uint8_t* __restrict__ k_signs,
+    const __half* __restrict__ k_scale, const __half* __restrict__ k_gamma,
     const uint8_t* __restrict__ v_codes, const __half* __restrict__ v_scale,
     const int* __restrict__ slots,        // [kv_len], this sequence's slots in logical order
     const float* __restrict__ k_levels, int k_bits,
-    const float* __restrict__ v_levels, int v_bits, int n_kv_heads,
+    const float* __restrict__ v_levels, int v_bits,
+    const float* __restrict__ qjl_t,      // S'^T, column-major [d_head, d_head]
+    float qjl_scale, int n_kv_heads,
     int d_head, int n_slots, int kv_len) {
+    // This key's sign sketch, decoded once per block: every output element
+    // needs the whole `d`-long vector, not just its own coordinate.
+    __shared__ float s_sign[TQ_MAX_D];
+
     const int kv_head = blockIdx.x;
     const int pos = blockIdx.y;
     if (kv_head >= n_kv_heads || pos >= kv_len) return;
     const int slot = slots[pos];
+    const size_t vec = (size_t)kv_head * n_slots + slot;
 
     const int per_byte_k = 8 / k_bits;
     const int bytes_k = d_head / per_byte_k;
-    const uint8_t* k_vec = k_codes + ((size_t)kv_head * n_slots + slot) * bytes_k;
-    const float kscale = __half2float(k_scale[(size_t)kv_head * n_slots + slot]);
+    const uint8_t* k_vec = k_codes + vec * bytes_k;
+    const float kscale = __half2float(k_scale[vec]);
     __half* k_out = dequant_k + ((size_t)kv_head * kv_len + pos) * d_head;
-    for (int i = threadIdx.x; i < d_head; i += blockDim.x) {
-        k_out[i] = __float2half(k_levels[tq_unpack(k_vec, i, k_bits)] * kscale);
+    if (qjl_scale != 0.0f) {
+        const uint8_t* k_sign = k_signs + vec * (d_head / 8);
+        for (int j = threadIdx.x; j < d_head; j += blockDim.x) {
+            s_sign[j] = tq_sign_of(k_sign, j);
+        }
+        __syncthreads();
+        const float c = qjl_scale * (TQ_SQRT_HALF_PI / (float)d_head)
+                      * __half2float(k_gamma[vec]);
+        for (int i = threadIdx.x; i < d_head; i += blockDim.x) {
+            // (S'^T * s)[i], reading `qjl_t` exactly as `tq_matvec` reads a
+            // column-major matrix: `qjl_t[j*d + i]` is row i, column j.
+            float qt_s = 0.0f;
+            for (int j = 0; j < d_head; ++j) {
+                qt_s += qjl_t[(size_t)j * d_head + i] * s_sign[j];
+            }
+            k_out[i] = __float2half(
+                k_levels[tq_unpack(k_vec, i, k_bits)] * kscale + c * qt_s);
+        }
+    } else {
+        for (int i = threadIdx.x; i < d_head; i += blockDim.x) {
+            k_out[i] = __float2half(k_levels[tq_unpack(k_vec, i, k_bits)] * kscale);
+        }
     }
 
     const int per_byte_v = 8 / v_bits;

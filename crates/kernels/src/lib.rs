@@ -7566,18 +7566,22 @@ impl Kernels {
     /// already-rotated `q_rot`/`acc_rot` the rest of the TQ pipeline already
     /// uses, same convention as every other TQ kernel in this file.
     ///
-    /// Key dequant is a plain `level * scale` per element: `k_signs`/
-    /// `k_gamma` only feed the QJL term of `tq_attn_scores`/
-    /// `tq_attn_decode_f32`'s *score-level* estimator, not any per-element
-    /// correction of a single dequantized key value, so this kernel does not
-    /// take them (see `cu/turboquant.cu`'s `tq_dequant_kv` doc comment).
+    /// The dequantized key carries TurboQuant's whole two-term estimator: the
+    /// codebook term plus the QJL sign-sketch one, folded onto the key by
+    /// `⟨S'·q_rot, s⟩ = ⟨q_rot, S'ᵀ·s⟩`. That is what `k_signs`, `k_gamma` and
+    /// `qjl_t` (`DeviceTables::qjl_t`, i.e. `S'ᵀ`) are for; `qjl_scale` is the
+    /// same one-or-zero multiplier `tq_attn_scores` takes, and zero skips the
+    /// term outright. Values carry no such term at any setting. See
+    /// `cu/turboquant.cu`'s `tq_dequant_kv` doc comment for the derivation.
     #[allow(clippy::too_many_arguments)]
     pub fn tq_dequant_kv(
         &self,
         dequant_k: &mut ViewMut<'_, f16>,
         dequant_v: &mut ViewMut<'_, f16>,
         k_codes: &View<'_, u8>,
+        k_signs: &View<'_, u8>,
         k_scale: &View<'_, f16>,
+        k_gamma: &View<'_, f16>,
         v_codes: &View<'_, u8>,
         v_scale: &View<'_, f16>,
         slots: &View<'_, i32>,
@@ -7585,6 +7589,8 @@ impl Kernels {
         k_bits: u8,
         v_levels: &View<'_, f32>,
         v_bits: u8,
+        qjl_t: &View<'_, f32>,
+        qjl_scale: f32,
         n_kv_heads: usize,
         d_head: usize,
         n_slots: usize,
@@ -7611,7 +7617,9 @@ impl Kernels {
         b.arg(dequant_k)
             .arg(dequant_v)
             .arg(k_codes)
+            .arg(k_signs)
             .arg(k_scale)
+            .arg(k_gamma)
             .arg(v_codes)
             .arg(v_scale)
             .arg(slots)
@@ -7619,6 +7627,8 @@ impl Kernels {
             .arg(&kb)
             .arg(v_levels)
             .arg(&vb)
+            .arg(qjl_t)
+            .arg(&qjl_scale)
             .arg(&kh)
             .arg(&dh)
             .arg(&ns)

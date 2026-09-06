@@ -501,63 +501,47 @@ impl TqDispatch {
 ///     Deciding it here means an ineligible shape quietly keeps every item on
 ///     `tq_attn_decode` instead of failing the pass.
 ///
-///   - **the quantization itself**, on two counts:
-///
-///     `uses_qjl` is a *correctness* gate, not a shape one — MEASURED, and it
-///     is why this path cannot serve `tq4` today. `tq_attn_decode` evaluates
-///     TurboQuant's two-stage score estimator:
-///
-///         est = scale·⟨q_rot, cb[code]⟩
-///             + qjl_scale·(√(π/2)/d)·γ·⟨q_qjl, s⟩       (s = ±1 sign sketch)
-///
-///     and `tq_dequant_kv` materializes only the first term, because a
-///     dequantized key has no per-element value for the second (see its own
-///     doc comment in `turboquant.cu`). That is not a rounding difference. On
-///     this repo's own 0.5B test model at a 401-token prompt, against an f16
-///     cache: `tq4` scores cosine 0.675, and the same cache scored *without*
-///     its QJL term scores 0.330 — the two disagree with each other at cosine
-///     0.289 and pick different next tokens. So a QJL-enabled cache keeps
-///     taking `tq_attn_decode` until the dequantizer can carry the term,
-///     rather than silently running a materially worse estimator.
-///
-///     It *is* carryable, and cheaply — the term is linear in `q_rot`:
-///
-///         ⟨q_qjl, s⟩ = ⟨Q·q_rot, s⟩ = ⟨q_rot, Qᵀ·s⟩
-///
-///     (`q_qjl` is `tables.qjl · q_rot`, one `tq_matvec` inside the branch), so
-///
-///         k_eff = scale·cb[code] + qjl_scale·(√(π/2)/d)·γ·(Qᵀ·s)
-///
-///     is a per-element dequantized key that reproduces the full estimator
-///     exactly. It costs `tq_dequant_kv` a d×d sign-matvec per cached key —
-///     O(H·L·d²) against attention's own O(H·L²·d), i.e. noise at any `L` this
-///     path is used for. Doing it needs `k_signs`, `k_gamma` and `tables.qjl`
-///     handed back to that kernel (they were dropped from its signature on the
-///     — correct in itself, but incomplete — finding that the sign term is not
-///     a *per-element correction to the codebook value*), plus its own
-///     kernel-level correctness test. Kernel work, deliberately left to a
-///     follow-up rather than smuggled into the dispatch change.
-///
-///     The bit-width check is the narrower one: `tq_dequant_kv` has only been
+///   - **the quantization's bit widths.** `tq_dequant_kv` has only been
 ///     validated against a host reference at `k_bits=4`/`v_bits=4` (see
 ///     `crates/kernels/tests/turboquant.rs`), and running unverified
 ///     dequantization math is not something to do silently. It is a *gate*
 ///     rather than an error for the same reason as the other two, and the
-///     reason bites here specifically: with `uses_qjl` already excluded, the
-///     loads that reach this point are exactly the QJL-free ones, and of those
-///     only `k4v4` passes. `k8v4` — this repo's own quality sweep's
-///     recommended allocation, and a preset two tests in
-///     `crates/model/tests/turboquant.rs` use — is QJL-free, and as an error
-///     it made every >`TQ_DEQUANT_THRESHOLD` prefill fail outright under
-///     `INFERO_ATTN_MMA=1` (measured, on a configuration that works at any
-///     length today). Widening `tq_dequant_kv`'s own test coverage is what
-///     lifts this, not deleting the check.
+///     reason bites: `k8v4` — this repo's own quality sweep's recommended
+///     allocation, and a preset two tests in `crates/model/tests/turboquant.rs`
+///     use — hits it, and as an error it made every >`TQ_DEQUANT_THRESHOLD`
+///     prefill fail outright under `INFERO_ATTN_MMA=1` (measured, on a
+///     configuration that works at any length today). Widening
+///     `tq_dequant_kv`'s own test coverage is what lifts this, not deleting the
+///     check.
+///
+/// **`uses_qjl` is deliberately *not* a reason, and used to be.** It was, for
+/// as long as `tq_dequant_kv` materialized only the first of the two terms
+/// `tq_attn_decode` scores a key with:
+///
+///     est = scale·⟨q_rot, cb[code]⟩
+///         + qjl_scale·(√(π/2)/d)·γ·⟨q_qjl, s⟩       (s = ±1 sign sketch)
+///
+/// Dropping the second is not a rounding difference — on this repo's own 0.5B
+/// test model at a 401-token prompt, a `tq4` cache scored with and without it
+/// agrees at cosine 0.289 and picks a different next token — so QJL-enabled
+/// caches were held off the long path entirely. The kernel now carries the
+/// term: it is linear in `q_rot`, so with `q_qjl = S'·q_rot`,
+///
+///     ⟨q_qjl, s⟩ = ⟨S'·q_rot, s⟩ = ⟨q_rot, S'ᵀ·s⟩
+///
+/// and
+///
+///     k_eff = scale·cb[code] + qjl_scale·(√(π/2)/d)·γ·(S'ᵀ·s)
+///
+/// is a per-element dequantized key reproducing the estimator exactly, for one
+/// d×d sign-matvec per cached key — O(H·L·d²) against attention's own
+/// O(H·L²·d). `tq4`, the setting this path exists for, is therefore as eligible
+/// as any other. Pinned by `tq_dequant_kv_reproduces_the_full_qjl_estimator`
+/// and `a_dequantized_key_dotted_with_the_query_is_the_two_stage_score`
+/// (kernel level) and `a_qjl_enabled_long_prefill_now_agrees_via_the_dequant_path`
+/// (end to end).
 fn tq_dequant_threshold(quant: KvCacheQuant, enabled: bool, tile_kernel_eligible: bool) -> usize {
-    let usable = enabled
-        && tile_kernel_eligible
-        && !quant.uses_qjl()
-        && quant.k_mse_bits() == 4
-        && quant.v_bits() == 4;
+    let usable = enabled && tile_kernel_eligible && quant.k_mse_bits() == 4 && quant.v_bits() == 4;
     if usable { TQ_DEQUANT_THRESHOLD } else { usize::MAX }
 }
 
@@ -804,22 +788,31 @@ mod tq_dispatch_tests {
     /// to one whole-batch `tq_attn_decode` call, never an error.
     #[test]
     fn an_unavailable_long_path_is_always_an_infinite_threshold() {
-        // The one combination that is actually served today.
-        assert_eq!(
-            tq_dequant_threshold(KvCacheQuant::Tq4Mse, true, true),
-            TQ_DEQUANT_THRESHOLD
+        // Both 4/4 settings are served, QJL or not: `tq_dequant_kv` carries the
+        // estimator's QJL term now, so `uses_qjl` is not a reason. `tq4` being
+        // in this list is the whole point of the path existing.
+        for served in [KvCacheQuant::Tq4, KvCacheQuant::Tq4Mse] {
+            assert_eq!(
+                tq_dequant_threshold(served, true, true),
+                TQ_DEQUANT_THRESHOLD,
+                "{} should take the long path",
+                served.name()
+            );
+        }
+        assert!(
+            KvCacheQuant::Tq4.uses_qjl(),
+            "tq4 must actually be QJL-enabled, or the line above proves nothing"
         );
         for (why, quant, enabled, tile) in [
             ("INFERO_TQ_PREFILL_DEQUANT=0", KvCacheQuant::Tq4Mse, false, true),
             ("no eligible tile kernel", KvCacheQuant::Tq4Mse, true, false),
-            // `tq4` itself: QJL-enabled, so a dequantized key cannot carry the
-            // estimator's second term. See `tq_dequant_threshold`'s own doc.
-            ("qjl", KvCacheQuant::Tq4, true, true),
-            ("qjl", KvCacheQuant::Tq2, true, true),
-            // ...and the bit widths `tq_dequant_kv` has no host-reference
-            // coverage for. `k8v4` is the case that matters: QJL-free, and a
-            // preset this repo's own tests use, so it reaches the bit-width
-            // check and must come out of it slower rather than broken.
+            ("INFERO_TQ_PREFILL_DEQUANT=0", KvCacheQuant::Tq4, false, true),
+            ("no eligible tile kernel", KvCacheQuant::Tq4, true, false),
+            // The bit widths `tq_dequant_kv` has no host-reference coverage
+            // for. `k8v4` is the case that matters: a preset this repo's own
+            // tests use, so it reaches the bit-width check and must come out of
+            // it slower rather than broken.
+            ("tq2 bit width", KvCacheQuant::Tq2, true, true),
             ("k8v4 bit width", KvCacheQuant::new(8, 4, false).unwrap(), true, true),
             ("k8v2 bit width", KvCacheQuant::new(8, 2, false).unwrap(), true, true),
             ("k2v8 bit width", KvCacheQuant::new(2, 8, false).unwrap(), true, true),
@@ -842,9 +835,11 @@ mod tq_dispatch_tests {
     #[test]
     fn an_unvalidated_bit_width_falls_back_instead_of_failing() {
         let k8v4 = KvCacheQuant::new(8, 4, false).unwrap();
-        assert!(
-            !k8v4.uses_qjl(),
-            "k8v4 must reach the bit-width check for this to test it"
+        assert_eq!(
+            (k8v4.k_mse_bits(), k8v4.v_bits()),
+            (8, 4),
+            "the bit width is the only thing keeping k8v4 off the long path, so \
+             it is what this test has to exercise"
         );
         let toks = vec![1u32; 300];
         let items = [item(0, &toks, BatchItemKind::Prefill)];
@@ -5546,22 +5541,27 @@ impl Model {
                     );
                     let d_slots = self.dev.stream().clone_htod(&host_slots[..seq_kv])?;
                     {
-                        let (kcodes, _, kscale, _) = pool.tq_key(layer);
+                        let (kcodes, ksigns, kscale, kgamma) = pool.tq_key(layer);
                         let (vcodes, vscale) = pool.tq_value(layer);
-                        // No `k_signs`/`k_gamma`: the QJL stage is a *second*
-                        // dot product, against a differently-projected query,
-                        // combined with the codebook term only after both are
-                        // reduced -- there is no per-element value for it to
-                        // correct here. See `tq_dequant_kv`'s doc comment in
-                        // `turboquant.cu`; the consequence is that a long run
-                        // evaluates the MSE-only estimator where a short run
-                        // evaluates TurboQuant's two-stage one.
+                        // `k_signs`/`k_gamma`/`qjl_t` carry the estimator's QJL
+                        // term onto the dequantized key: it is a *second* dot
+                        // product at the score level, against a
+                        // differently-projected query, but it is linear in that
+                        // query, so `⟨S'·q_rot, s⟩ = ⟨q_rot, S'ᵀ·s⟩` moves it
+                        // onto the key as a per-element vector. A long run
+                        // therefore evaluates exactly the two-stage estimator a
+                        // short run does. See `tq_dequant_kv`'s doc comment in
+                        // `turboquant.cu` for the derivation, and
+                        // `tq_dequant_kv_reproduces_the_full_qjl_estimator` in
+                        // `crates/kernels/tests/turboquant.rs` for the proof.
                         let (dq_k, dq_v) = (&mut tq.dequant_k, &mut tq.dequant_v);
                         self.kern.tq_dequant_kv(
                             &mut dq_k.slice_mut(..dq_len),
                             &mut dq_v.slice_mut(..dq_len),
                             &kcodes.as_view(),
+                            &ksigns.as_view(),
                             &kscale.as_view(),
+                            &kgamma.as_view(),
                             &vcodes.as_view(),
                             &vscale.as_view(),
                             &d_slots.as_view(),
@@ -5569,6 +5569,8 @@ impl Model {
                             k_bits,
                             &tq.tables.v_levels.as_view(),
                             v_bits,
+                            &tq.tables.qjl_t.as_view(),
+                            quant.qjl_scale(),
                             n_kv_heads,
                             d_head,
                             dims.n_slots,

@@ -351,13 +351,12 @@ fn generation_stays_coherent_over_a_long_run() -> Result<()> {
 /// `TQ_DEQUANT_THRESHOLD` through `tq_dequant_kv` + `attn_prefill_ws4`, and
 /// the two are the same attention computed by different kernels.
 ///
-/// `tq4-mse`, not `tq4`, and that is the point rather than a convenience: the
-/// long path is gated off for any quantization whose score estimator carries
-/// the QJL sign-sketch term, because a per-element dequantized key cannot
-/// carry that term. See `the_qjl_estimator_keeps_long_runs_off_the_dequant_path`
-/// below and the gate's own comment in `forward_batch_rows`. `tq4-mse` is
-/// `tq4` with exactly that stage switched off, so it is both a real supported
-/// setting and the widest-coverage one the long path can serve today.
+/// `tq4-mse` here, the MSE-only ablation: this is the QJL-free half of the
+/// coverage, and `a_qjl_enabled_long_prefill_now_agrees_via_the_dequant_path`
+/// below is the other half. Both settings take the long path — the two differ
+/// only in whether `tq_dequant_kv` folds the estimator's QJL term into the
+/// dequantized key (`qjl_scale` one or zero), which is a whole branch of that
+/// kernel, so each needs its own end-to-end check.
 ///
 /// Requires `INFERO_ATTN_MMA=1` in the environment *before the test binary
 /// starts* (`Kernels::prefill_attention` caches it in a `OnceLock`): without
@@ -404,34 +403,102 @@ fn long_prefill_dequant_dispatch_agrees_with_tq_attn_decode() -> Result<()> {
     Ok(())
 }
 
-/// The QJL-enabled settings — `tq4` among them, and `tq4` is what this whole
-/// path was built for — must keep taking `tq_attn_decode` for long runs too,
-/// bit for bit, until `tq_dequant_kv` can carry the QJL term.
+/// `tq4` itself — the QJL-enabled setting this whole path was built for, and
+/// the one it could not serve until `tq_dequant_kv` learned to carry the
+/// estimator's second term.
 ///
 /// `tq_attn_decode` scores a key as `scale·⟨q_rot, cb[code]⟩ +
-/// qjl_scale·(√(π/2)/d)·γ·⟨q_qjl, s⟩`; a dequantized key materializes only the
-/// first term. Measured on this model at this prompt length, dropping the
-/// second is not a rounding difference — the two estimators sit at cosine
-/// ~0.29 from each other and choose different next tokens, and the QJL one is
-/// much the closer to an f16 cache (0.675 against 0.330). So the long path is
-/// gated off for them rather than being allowed to quietly serve a materially
-/// worse answer. See the gate's own comment in `forward_batch_rows`, which
-/// also derives the fix (`⟨Q·q, s⟩ = ⟨q, Qᵀ·s⟩`, so the term folds into a
-/// per-element key after all — kernel work, not dispatch work).
+/// qjl_scale·(√(π/2)/d)·γ·⟨q_qjl, s⟩`. An MSE-only dequantized key drops the
+/// second term, and that is not a rounding difference: measured on this model
+/// at this prompt length, the two estimators sat at cosine **0.289** from each
+/// other, and against an f16 cache `tq4` scored 0.675 where the same cache
+/// without its QJL term scored 0.330. The fold `⟨S'·q, s⟩ = ⟨q, S'ᵀ·s⟩` puts
+/// the term back on the key.
+///
+/// **What this asserts, and why it is not `> 0.999`.** `tq4`'s estimator is
+/// intrinsically far more sensitive to *which* kernel evaluates it than
+/// `tq4-mse`'s is, on this model, and that is true of code this task did not
+/// touch. Measured, 400-token prompt, `INFERO_TQ_PREFILL_DEQUANT=0` on both
+/// sides — i.e. the fused `tq_attn_decode` against the three-kernel
+/// `tq_attn_scores`/`attn_softmax`/`tq_attn_output` path, no dequantization
+/// anywhere:
+///
+/// | setting | fused vs unfused | fused vs dequant path |
+/// |---|---|---|
+/// | `tq4`     | 0.980 | 0.966 |
+/// | `tq4-mse` | 0.998 | 0.996 |
+///
+/// So 0.999 is unreachable for `tq4` between *any* two kernel routes here, and
+/// the dequant path sits at the same multiple of each setting's own floor
+/// (1.7× for `tq4`, 2.2× for `tq4-mse`). Asserting a fixed 0.999 would be
+/// asserting something about the estimator's conditioning, not about this
+/// fold. What is asserted instead is the property that actually broke:
+/// **quality against an f16 cache must survive the route change**, which an
+/// MSE-only key fails by a mile (0.330/0.675 = 0.49, against 0.94 here).
+///
+/// Next-token equality is deliberately not asserted either: `tq4` sits at
+/// cosine 0.675 from an f16 cache on this prompt, so its argmax is already a
+/// near-tie that the ~0.98 kernel-route floor above can flip on its own.
 #[test]
-fn the_qjl_estimator_keeps_long_runs_off_the_dequant_path() -> Result<()> {
+fn a_qjl_enabled_long_prefill_now_agrees_via_the_dequant_path() -> Result<()> {
     let _gpu = gpu_lock();
     if std::env::var("INFERO_ATTN_MMA").as_deref() != Ok("1") {
         eprintln!("skipping: needs INFERO_ATTN_MMA=1 set before the test binary starts");
         return Ok(());
     }
+    assert!(
+        KvCacheQuant::Tq4.uses_qjl(),
+        "tq4 must be QJL-enabled, or this test measures the wrong thing"
+    );
     let Some((logits_off, logits_on)) = both_paths(KvCacheQuant::Tq4)? else {
         return Ok(());
     };
-    assert_eq!(
-        logits_off, logits_on,
-        "a QJL-enabled cache took a different path with the flag on; the long \
-         run must stay on tq_attn_decode until the dequantizer carries the QJL term"
+    // The dense cache, as the thing both routes are trying to approximate.
+    let Some((mut model, tok)) = load(KvCacheQuant::F16)? else {
+        return Ok(());
+    };
+    let prompt = "The quick brown fox jumps over the lazy dog. ".repeat(40);
+    let ids = tok.encode(&prompt, Some(false), false);
+    let mut session = model.new_session()?;
+    let dense = model
+        .forward(&ids, BatchItemKind::Prefill, &mut session)?
+        .to_vec();
+
+    let cos = cosine(&logits_off, &logits_on);
+    let (q_off, q_on) = (cosine(&logits_off, &dense), cosine(&logits_on, &dense));
+    eprintln!(
+        "  tq4: dequant-dispatch vs tq_attn_decode cosine {cos:.6}; \
+         against f16 -- tq_attn_decode {q_off:.6}, dequant path {q_on:.6} \
+         ({:.3} of it)",
+        q_on / q_off
+    );
+
+    // The regression this task fixes, stated as the user-visible property:
+    // routing a `tq4` long run through `tq_dequant_kv` must not cost it its
+    // agreement with a dense cache. An MSE-only dequantized key keeps 0.49 of
+    // it; carrying the QJL term keeps 0.94.
+    assert!(
+        q_on > 0.9 * q_off,
+        "the dequant path tracks an f16 cache at {q_on:.6} where tq_attn_decode \
+         manages {q_off:.6} -- a QJL-enabled long run is losing the estimator's \
+         second term (an MSE-only key scores about half)"
+    );
+    // And directly: the two routes must agree far better than the 0.289 an
+    // MSE-only fold gave, comfortably inside `tq4`'s own ~0.98 kernel-route
+    // floor documented above.
+    assert!(
+        cos > 0.9,
+        "cosine {cos:.6} between the two kernel routes -- far below tq4's own \
+         fused-vs-unfused floor of ~0.98, so this is not accumulation order"
+    );
+    // ...and it must not be exactly 1.0, or the long path never ran: that is
+    // precisely how this read while the `uses_qjl` gate was in place, when both
+    // settings took `tq_attn_decode` and the comparison was bit-identical.
+    assert!(
+        cos < 0.99999,
+        "cosine {cos:.6} is indistinguishable from 1.0 -- both settings took \
+         the same kernel, so the uses_qjl gate (or another eligibility \
+         condition) is still holding tq4 off the dequant path"
     );
     Ok(())
 }
