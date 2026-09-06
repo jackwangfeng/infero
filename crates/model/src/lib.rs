@@ -95,12 +95,77 @@ const MIN_PREFILL_RUN: usize = 8;
 
 /// Below this many query tokens, a TurboQuant prefill run stays on
 /// `tq_attn_decode` -- not worth a dedicated dequantize-and-dispatch call.
-/// This starting value mirrors vLLM's own `_CONTINUATION_DECODE_THRESHOLD`
-/// as a conservative placeholder; Task 5 of the
-/// `2026-09-06-tq4-prefill-dequant-dispatch` plan measures infero's own
-/// crossover on this codebase's actual kernels and updates this constant
-/// with the real number.
-pub const TQ_DEQUANT_THRESHOLD: usize = 128;
+///
+/// Measured 2026-09-06 on an RTX A4000 (sm_86, 48 SMs), via
+/// `crates/kernels/examples/tq_prefill_dequant_vs_decode_bench.rs`
+/// (`INFERO_ATTN_MMA=1 cargo run --release -p infero-kernels --example
+/// tq_prefill_dequant_vs_decode_bench`), `kv_len=2048`, this checkpoint's
+/// real `N_HEADS=24`/`N_KV_HEADS=4`/`D_HEAD=256`, `k_bits=v_bits=4`, and
+/// `qjl_scale=1.0` on both sides of the comparison -- the real `Tq4` cost,
+/// with the QJL correction term actually paid for, not the cheaper
+/// QJL-free path (see `tq_dequant_kv`'s own doc comment for why the two
+/// differ: `tq_attn_decode` recomputes the QJL term fresh per query token,
+/// while the dequant path folds it onto each key once, independent of how
+/// many query tokens follow):
+///
+/// ```text
+/// run_tokens | tq_attn_decode (us) | dequant+ws4 (us) | speedup
+///          1 |               540.58 |            867.87 | 0.62x
+///          2 |               788.70 |            876.22 | 0.90x
+///          3 |              1330.95 |            883.90 | 1.51x
+///          4 |              1690.60 |            881.39 | 1.92x
+///          6 |              2626.19 |            894.48 | 2.94x
+///          8 |              3414.42 |            900.58 | 3.79x
+///         16 |              6822.01 |            953.09 | 7.16x
+///         24 |             10678.00 |            972.45 | 10.98x
+///         32 |             17988.96 |           1030.38 | 17.46x
+///         48 |             22262.37 |           1085.35 | 20.51x
+///         64 |             36964.78 |           1150.18 | 32.14x
+///         96 |             50788.63 |           1268.38 | 40.04x
+///        128 |             69888.60 |           1482.19 | 47.15x
+///        192 |            108606.50 |           1833.61 | 59.23x
+///        256 |            142663.46 |           2022.06 | 70.55x
+///        384 |            205791.03 |           2385.86 | 86.25x
+///        512 |            264864.53 |           2860.55 | 92.59x
+/// ```
+///
+/// (A second full run reproduced this within noise -- e.g. n=2: 0.89x,
+/// n=3: 1.43x -- same crossover.)
+///
+/// `tq_attn_decode`'s per-token cost (~250-650us/token here) dwarfs
+/// `tq_dequant_kv`'s fixed per-call cost (~870-900us for the whole
+/// `kv_len=2048` span, barely growing with `run_tokens`), so the *raw
+/// timing* crossover is between 2 and 3 query tokens -- not anywhere near
+/// the 8-512 range this task's brief expected to sweep, and nowhere close
+/// to the 128 placeholder (mirroring vLLM's own
+/// `_CONTINUATION_DECODE_THRESHOLD`) this constant started at.
+///
+/// **This constant is not set to that raw crossover, because a second, more
+/// important constraint binds first: numerical agreement.**
+/// `threshold_boundary_both_sides_agree_with_reference`
+/// (`crates/model/tests/turboquant.rs`) requires the dequant path's argmax
+/// to agree with `tq_attn_decode`'s at `TQ_DEQUANT_THRESHOLD + 1` tokens --
+/// both are the same TurboQuant estimator, but they reach it through
+/// different floating-point paths (see `tq_dequant_kv`'s own doc comment),
+/// and at a handful of cached keys that difference is large relative to
+/// the estimator's own noise floor. Measured directly: with the constant
+/// temporarily set to 2 and 3, that test's `n = threshold + 1` case (3 and
+/// 4 tokens respectively) failed outright -- cosine 0.985 and 0.863, with
+/// the argmax disagreeing both times (this is non-monotonic in `n`, not a
+/// smooth noise decay: 3 tokens disagreed, 5 tokens agreed, 4 tokens
+/// disagreed again -- each length is genuinely different cached content,
+/// not a point on a decreasing-noise curve). The same test passed cleanly
+/// at 4 (n=5 cosine 0.980) and at 8 (n=9 cosine 0.988, reproduced twice,
+/// bit-identical both times), so 8 is the smallest value measured to hold
+/// up. It also happens to match `MIN_PREFILL_RUN` above -- the codebase's
+/// own pre-existing floor under which a prefill run isn't given a
+/// dedicated tile-kernel launch at all -- so this constant introduces no
+/// new short-run code path shorter than one this codebase already treats
+/// as "not worth a dedicated kernel." At `n=8` the dequant path is still a
+/// real 3.79x faster than `tq_attn_decode` (see the table above), so this
+/// is a large win over the 128 placeholder, just not the largest one the
+/// raw timing numbers alone would suggest.
+pub const TQ_DEQUANT_THRESHOLD: usize = 8;
 
 /// The real ceiling on how many tokens the decode-only dispatch path (see the
 /// mixed-batch-attn-dispatch-split design doc) can be asked to carry in one
