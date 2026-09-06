@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use infero_cuda::Device;
 use infero_gguf::Gguf;
-use infero_model::{BatchItemKind, KvCacheQuant, Model, Sampler, SamplingParams};
+use infero_model::{BatchItem, BatchItemKind, KvCacheQuant, Model, Sampler, SamplingParams};
 use infero_tokenizer::Tokenizer;
 
 /// Enough prompts, and varied enough, that a two-point difference between
@@ -342,5 +342,340 @@ fn generation_stays_coherent_over_a_long_run() -> Result<()> {
         .filter(|w| text.contains(*w))
         .count();
     assert!(hits >= 3, "generation lost the thread: {text:?}");
+    Ok(())
+}
+
+/// A long TurboQuant prefill run must produce the same answer whether or not
+/// the dequantize-and-dispatch path serves it: `INFERO_TQ_PREFILL_DEQUANT=0`
+/// keeps every run on `tq_attn_decode`, the default routes runs wider than
+/// `TQ_DEQUANT_THRESHOLD` through `tq_dequant_kv` + `attn_prefill_ws4`, and
+/// the two are the same attention computed by different kernels.
+///
+/// `tq4-mse`, not `tq4`, and that is the point rather than a convenience: the
+/// long path is gated off for any quantization whose score estimator carries
+/// the QJL sign-sketch term, because a per-element dequantized key cannot
+/// carry that term. See `the_qjl_estimator_keeps_long_runs_off_the_dequant_path`
+/// below and the gate's own comment in `forward_batch_rows`. `tq4-mse` is
+/// `tq4` with exactly that stage switched off, so it is both a real supported
+/// setting and the widest-coverage one the long path can serve today.
+///
+/// Requires `INFERO_ATTN_MMA=1` in the environment *before the test binary
+/// starts* (`Kernels::prefill_attention` caches it in a `OnceLock`): without
+/// it no tile kernel is eligible, the dispatch keeps every run on
+/// `tq_attn_decode`, and this test would pass without exercising anything.
+#[test]
+fn long_prefill_dequant_dispatch_agrees_with_tq_attn_decode() -> Result<()> {
+    let _gpu = gpu_lock();
+    if std::env::var("INFERO_ATTN_MMA").as_deref() != Ok("1") {
+        eprintln!("skipping: needs INFERO_ATTN_MMA=1 set before the test binary starts");
+        return Ok(());
+    }
+    let Some((logits_off, logits_on)) = both_paths(KvCacheQuant::Tq4Mse)? else {
+        return Ok(());
+    };
+
+    let cos = cosine(&logits_off, &logits_on);
+    eprintln!("  dequant-dispatch vs tq_attn_decode logit cosine: {cos:.6}");
+    assert_eq!(
+        argmax(&logits_off),
+        argmax(&logits_on),
+        "the two kernel paths disagree on the next token"
+    );
+    // Not bit-identical, and never will be: `attn_prefill_ws4` stages K/V as
+    // f16 and accumulates PV in f16 fragments, where `tq_attn_decode` reads
+    // the codebook in f32 throughout. Twenty-four layers of that is the whole
+    // budget below.
+    assert!(
+        cos > 0.99,
+        "cosine {cos:.6} -- two kernel routes to the same attention should \
+         differ only by their accumulation precision"
+    );
+    // ...and it must not be *exactly* 1.0 either, or the long path never ran
+    // and this test proved nothing. That is precisely how it read before the
+    // dispatch was wired: identical to the last bit, because both settings
+    // took the same kernel.
+    assert!(
+        cos < 0.99999,
+        "cosine {cos:.6} is indistinguishable from 1.0 -- the two settings \
+         took the same kernel, so this test is not exercising the dequant \
+         dispatch at all (is TQ_DEQUANT_THRESHOLD above this prompt's length, \
+         or did the eligibility gate turn the long path off?)"
+    );
+    Ok(())
+}
+
+/// The QJL-enabled settings — `tq4` among them, and `tq4` is what this whole
+/// path was built for — must keep taking `tq_attn_decode` for long runs too,
+/// bit for bit, until `tq_dequant_kv` can carry the QJL term.
+///
+/// `tq_attn_decode` scores a key as `scale·⟨q_rot, cb[code]⟩ +
+/// qjl_scale·(√(π/2)/d)·γ·⟨q_qjl, s⟩`; a dequantized key materializes only the
+/// first term. Measured on this model at this prompt length, dropping the
+/// second is not a rounding difference — the two estimators sit at cosine
+/// ~0.29 from each other and choose different next tokens, and the QJL one is
+/// much the closer to an f16 cache (0.675 against 0.330). So the long path is
+/// gated off for them rather than being allowed to quietly serve a materially
+/// worse answer. See the gate's own comment in `forward_batch_rows`, which
+/// also derives the fix (`⟨Q·q, s⟩ = ⟨q, Qᵀ·s⟩`, so the term folds into a
+/// per-element key after all — kernel work, not dispatch work).
+#[test]
+fn the_qjl_estimator_keeps_long_runs_off_the_dequant_path() -> Result<()> {
+    let _gpu = gpu_lock();
+    if std::env::var("INFERO_ATTN_MMA").as_deref() != Ok("1") {
+        eprintln!("skipping: needs INFERO_ATTN_MMA=1 set before the test binary starts");
+        return Ok(());
+    }
+    let Some((logits_off, logits_on)) = both_paths(KvCacheQuant::Tq4)? else {
+        return Ok(());
+    };
+    assert_eq!(
+        logits_off, logits_on,
+        "a QJL-enabled cache took a different path with the flag on; the long \
+         run must stay on tq_attn_decode until the dequantizer carries the QJL term"
+    );
+    Ok(())
+}
+
+/// One long prefill, run twice over a freshly loaded model: once with
+/// `INFERO_TQ_PREFILL_DEQUANT=0` and once at the default. Returns
+/// `(logits_off, logits_on)`, or `None` when the test model isn't present.
+///
+/// The flag is read once at load (`Model::from_parts`), so it has to be set
+/// around `load_quantized` rather than around `forward`.
+fn both_paths(quant: KvCacheQuant) -> Result<Option<(Vec<f32>, Vec<f32>)>> {
+    let Some(path) = model_path() else {
+        return Ok(None);
+    };
+    let gguf = Gguf::open(&path)?;
+    let tok = Tokenizer::from_gguf(&gguf)?;
+
+    // Long enough to clear even a generously large `TQ_DEQUANT_THRESHOLD`.
+    let prompt = "The quick brown fox jumps over the lazy dog. ".repeat(40);
+    let ids = tok.encode(&prompt, Some(false), false);
+    assert!(
+        ids.len() > 256,
+        "prompt too short to exercise the long-run path: {} tokens",
+        ids.len()
+    );
+
+    let off = {
+        unsafe { std::env::set_var("INFERO_TQ_PREFILL_DEQUANT", "0") };
+        let mut model = Model::load_quantized(Device::new(0)?, &gguf, 1024, quant)?;
+        unsafe { std::env::remove_var("INFERO_TQ_PREFILL_DEQUANT") };
+        assert!(!model.tq_prefill_dequant(), "=0 should switch the path off");
+        assert!(
+            model.batch_tokens() >= ids.len(),
+            "this prompt would be split across {} passes; the test wants one long item",
+            ids.len().div_ceil(model.batch_tokens())
+        );
+        let mut session = model.new_session()?;
+        model
+            .forward(&ids, BatchItemKind::Prefill, &mut session)?
+            .to_vec()
+    };
+
+    let on = {
+        let mut model = Model::load_quantized(Device::new(0)?, &gguf, 1024, quant)?;
+        assert!(model.tq_prefill_dequant(), "dequant-dispatch should default on");
+        let mut session = model.new_session()?;
+        model
+            .forward(&ids, BatchItemKind::Prefill, &mut session)?
+            .to_vec()
+    };
+    Ok(Some((off, on)))
+}
+
+/// Load with `INFERO_TQ_PREFILL_DEQUANT` forced for the duration of the load,
+/// which is when `Model::from_parts` resolves it. Removed again immediately:
+/// nothing reads it after load, and leaving it set would leak into the next
+/// test.
+fn load_tq(quant: KvCacheQuant, dequant: bool) -> Result<Option<(Model, Tokenizer)>> {
+    let Some(path) = model_path() else {
+        return Ok(None);
+    };
+    let gguf = Gguf::open(&path)?;
+    let tok = Tokenizer::from_gguf(&gguf)?;
+    if !dequant {
+        unsafe { std::env::set_var("INFERO_TQ_PREFILL_DEQUANT", "0") };
+    }
+    let model = Model::load_quantized(Device::new(0)?, &gguf, 1024, quant);
+    unsafe { std::env::remove_var("INFERO_TQ_PREFILL_DEQUANT") };
+    let model = model?;
+    assert_eq!(
+        model.tq_prefill_dequant(),
+        dequant,
+        "INFERO_TQ_PREFILL_DEQUANT did not resolve as expected -- the rest of \
+         this test would be measuring nothing"
+    );
+    Ok(Some((model, tok)))
+}
+
+/// A real-text prompt of exactly `n` tokens, chosen by `seed` out of three
+/// unrelated passages.
+///
+/// Real text, deliberately, not pseudo-random token ids: at four-bit keys on a
+/// 0.5B model, random-token logits are near-degenerate, and every comparison
+/// below then measures the quantizer's noise floor rather than the dispatch.
+/// Measured, on the very comparison `long_prefill_dequant_dispatch_agrees_with_
+/// tq_attn_decode` makes: 0.996 on real text, 0.894 on token soup of the same
+/// length.
+fn prompt_tokens(tok: &Tokenizer, seed: usize, n: usize) -> Vec<u32> {
+    const PASSAGES: [&str; 3] = [
+        "The quick brown fox jumps over the lazy dog. ",
+        "In a distant valley the river turned slowly toward the sea. ",
+        "Every morning she walked to the market and bought fresh bread. ",
+    ];
+    let ids = tok.encode(&PASSAGES[seed % 3].repeat(200), Some(false), false);
+    assert!(ids.len() >= n, "passage {seed} is too short for {n} tokens");
+    ids[..n].to_vec()
+}
+
+/// The case the single-shot test above cannot reach: a long prefill chunk that
+/// *continues* a sequence, so its `kv_len` (the whole cached span) is much
+/// larger than its own token count.
+///
+/// This is where the long path's two most delicate numbers live, and both fail
+/// silently rather than loudly if they are wrong:
+///
+///   - `kv_len` must be `KvPool::len(seq)` — the sequence's post-extension
+///     length, history included — not this chunk's own width, or the chunk
+///     attends only the keys it brought with it and forgets everything before.
+///   - the synthetic `BatchLayout` handed to `attn_prefill_ws4` maps compact
+///     scratch row `i` to logical position `i`, so its `slot_table` is the
+///     identity — but its `positions` must stay this chunk's *absolute*
+///     positions, because that is what the tile kernel's causal mask compares
+///     each key index against (`abs_key <= row_last`, where `row_last` is read
+///     out of `positions`). Making `positions` the identity too is an easy and
+///     natural-looking mistake, since every other array in that layout is.
+///
+/// Both halves are MEASURED discriminators here, not assumed ones. Replacing
+/// `positions` with the identity moves this comparison from 0.982 to 0.670
+/// while leaving the single-chunk test above at its unchanged 0.980 — which is
+/// exactly why this test exists as well as that one.
+#[test]
+fn a_continuation_chunk_attends_its_own_history_through_the_dequant_path() -> Result<()> {
+    let _gpu = gpu_lock();
+    if std::env::var("INFERO_ATTN_MMA").as_deref() != Ok("1") {
+        eprintln!("skipping: needs INFERO_ATTN_MMA=1 set before the test binary starts");
+        return Ok(());
+    }
+    // Two chunks, each comfortably over `TQ_DEQUANT_THRESHOLD`, so the *second*
+    // one is a long run whose kv extent (400) is twice its own width (200).
+    const CHUNK: usize = 200;
+    let mut out = Vec::new();
+    for dequant in [false, true] {
+        let Some((mut model, tok)) = load_tq(KvCacheQuant::Tq4Mse, dequant)? else {
+            return Ok(());
+        };
+        let vocab = model.config().vocab_size;
+        let prompt = prompt_tokens(&tok, 1, 2 * CHUNK);
+        let mut pool = model.new_pool(1024, 2)?;
+        let seq = pool.alloc().expect("fresh pool had no rows");
+        let mut logits = Vec::new();
+        for chunk in prompt.chunks(CHUNK) {
+            let item = BatchItem::new(seq, chunk, BatchItemKind::Prefill);
+            logits =
+                model.forward_batch(std::slice::from_ref(&item), &mut pool)?[..vocab].to_vec();
+        }
+        assert_eq!(pool.len(seq), 2 * CHUNK);
+        out.push(logits);
+    }
+
+    let cos = cosine(&out[0], &out[1]);
+    eprintln!("  continuation chunk, dequant off vs on: cosine {cos:.6}");
+    assert_eq!(
+        argmax(&out[0]),
+        argmax(&out[1]),
+        "a continuation chunk predicted differently through the dequant path"
+    );
+    // Looser than the single-shot test's 0.99 because two long runs stack their
+    // f16-vs-f32 accumulation gap here, and the second one carries the first's
+    // divergence in its cache as well. Measured: 0.982.
+    assert!(cos > 0.96, "cosine {cos:.6}");
+    assert!(
+        cos < 0.99999,
+        "cosine {cos:.6} is indistinguishable from 1.0 -- the long path never ran"
+    );
+    Ok(())
+}
+
+/// An interleaved batch: a decode item, then the long prefill under test, then
+/// a short prefill chunk. That is deliberately not the easy "all short, then
+/// all long" shape — it splits the short/decode items into two separate
+/// contiguous runs on either side of the long one, which is exactly the
+/// partition a naive two-flat-lists split gets wrong (it would hand the
+/// trailing short item the leading run's base offset).
+///
+/// Every item's logits are compared against *the same batch* run with
+/// `INFERO_TQ_PREFILL_DEQUANT=0`, item by item, rather than against a solo run.
+/// That holds the batch shape fixed and varies only the dispatch, so a wrong
+/// `run.base` shows up as one item reading another's query rows. Comparing
+/// against a *solo* run would not work: the TurboQuant path's batch isolation
+/// is only ~0.977 on this model *before* this change, so such a comparison has
+/// no headroom left to detect anything.
+///
+/// On the tolerance. The measured numbers here are 0.983 / 0.970 / 0.997, and
+/// they are not the long path's doing — only item 1 is long. Splitting a batch
+/// into per-run calls changes each call's `n_tokens`, and `tq_attn_decode`
+/// derives its split-K chunk count from that (`decode_chunks`), so the same
+/// token's keys get summed in a different order. That is the same pre-existing
+/// sensitivity that makes a solo run and a batched run differ by ~0.977 on this
+/// path already. 0.95 is set below it and well above what a real bug does:
+/// giving every short run the *first* run's base — precisely the mistake a
+/// two-flat-lists partition makes on this interleaved shape — drops item 0 to
+/// 0.694, which this catches with room to spare.
+#[test]
+fn an_interleaved_batch_dispatches_every_item_to_its_own_rows() -> Result<()> {
+    let _gpu = gpu_lock();
+    if std::env::var("INFERO_ATTN_MMA").as_deref() != Ok("1") {
+        eprintln!("skipping: needs INFERO_ATTN_MMA=1 set before the test binary starts");
+        return Ok(());
+    }
+    let mut runs: Vec<Vec<Vec<f32>>> = Vec::new();
+    for dequant in [false, true] {
+        let Some((mut model, tok)) = load_tq(KvCacheQuant::Tq4Mse, dequant)? else {
+            return Ok(());
+        };
+        let vocab = model.config().vocab_size;
+        let long = prompt_tokens(&tok, 0, 200);
+        let short = prompt_tokens(&tok, 1, 40);
+        let other = prompt_tokens(&tok, 2, 300);
+
+        let mut pool = model.new_pool(1024, 4)?;
+        let decoder = pool.alloc().expect("fresh pool had no rows");
+        let target = pool.alloc().expect("fresh pool had no second row");
+        let tail = pool.alloc().expect("fresh pool had no third row");
+        let prime = BatchItem::without_logits(decoder, &other, BatchItemKind::Prefill);
+        model.forward_batch_device(std::slice::from_ref(&prime), &mut pool)?;
+        assert_eq!(pool.len(decoder), other.len());
+        let next = [other[0]];
+        let items = [
+            BatchItem::new(decoder, &next, BatchItemKind::Decode),
+            BatchItem::new(target, &long, BatchItemKind::Prefill),
+            BatchItem::new(tail, &short, BatchItemKind::Prefill),
+        ];
+        let out = model.forward_batch(&items, &mut pool)?;
+        // `logit_rows` is built in item order, one row per item here.
+        runs.push((0..items.len()).map(|i| out[i * vocab..(i + 1) * vocab].to_vec()).collect());
+    }
+
+    let mut any_moved = false;
+    for (i, (off, on)) in runs[0].iter().zip(&runs[1]).enumerate() {
+        let cos = cosine(off, on);
+        eprintln!("  item {i}: dequant off vs on cosine {cos:.9}");
+        assert_eq!(
+            argmax(off),
+            argmax(on),
+            "item {i} predicted differently once the batch took the dequant dispatch"
+        );
+        assert!(cos > 0.95, "item {i} cosine {cos:.9}");
+        any_moved |= cos < 0.99999;
+    }
+    // Item 1 is the only long one, so it is the only one that may move at all;
+    // if nothing moved, the long path never ran and this proved nothing.
+    assert!(
+        any_moved,
+        "no item's logits moved -- the dequant dispatch never took the long path"
+    );
     Ok(())
 }

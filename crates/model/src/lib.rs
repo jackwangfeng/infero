@@ -402,6 +402,322 @@ fn plan_attn_dispatch(items: &[BatchItem<'_>], item_kv_len: &[usize]) -> AttnDis
     }
 }
 
+/// One long prefill item routed through the dequantize-and-dispatch path.
+///
+/// `run.kv_len` is this sequence's *whole* cached extent after the write side
+/// has appended this call's own tokens — i.e. `KvPool::len(seq)`, which
+/// `forward_batch_rows` already computes per item as `item_kv_len` — not just
+/// `run.tokens`. `tq_dequant_kv` unpacks all of it, and the causal mask inside
+/// `attn_prefill_ws4` is what keeps each query token to its own prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TqLongRun {
+    run: AttnRun,
+    /// Whose cached span to unpack — the key `KvPool::seq_slots` takes.
+    seq: SeqId,
+}
+
+/// How one forward pass's *TurboQuant* attention work is cut into kernel calls.
+///
+/// The TurboQuant branch of `attention()` has always issued exactly one
+/// `tq_attn_decode` (or one unfused scores/softmax/output triple) covering the
+/// whole batch, re-unpacking every cached key and value once per *query token*.
+/// That is the right trade at decode width and badly wrong at prefill width,
+/// which is what this plan exists to fix: an item wide enough to pay for it
+/// gets its sequence's cached span dequantized once into dense f16 and then
+/// served by the ordinary `attn_prefill_ws4` tile kernel.
+///
+/// Both halves are needed because one batch can hold both, in any order. Only
+/// *decode* items are guaranteed a contiguous prefix (`plan_attn_dispatch`'s
+/// own `take_while`); a short prefill chunk can sit between two long ones. So
+/// short/decode items are coalesced into maximal contiguous runs — one
+/// `tq_attn_decode` each, exactly the kernel and math they get today — and
+/// long items are listed individually, since each needs its own `kv_len` and
+/// its own dequantized scratch.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct TqDispatch {
+    /// Maximal contiguous runs of short/decode items, in batch order.
+    short_runs: Vec<AttnRun>,
+    /// One dequantize + tile-kernel pair per long prefill item, in batch order.
+    long_runs: Vec<TqLongRun>,
+}
+
+impl TqDispatch {
+    /// The plan a pass gets when nothing wanted the split: the whole batch as
+    /// one short run, which is byte-for-byte the dispatch this branch has
+    /// always made.
+    fn whole_pass(n_tokens: usize, kv_len: usize) -> Self {
+        Self {
+            short_runs: vec![AttnRun {
+                base: 0,
+                tokens: n_tokens,
+                kv_len,
+            }],
+            long_runs: Vec::new(),
+        }
+    }
+
+    /// Whether this plan collapses to exactly ONE call covering the whole pass.
+    ///
+    /// Same role as [`AttnDispatch::is_single_whole_pass_call`], and the same
+    /// consequence: only such a pass may take `attention()`'s `kv_len`
+    /// *parameter*, which the caller has already rounded up to
+    /// `graph_kv_bucket()` when the pass is graphable. A multi-call pass is
+    /// never graphable, so its runs take their own real per-item extents.
+    fn is_single_whole_pass_call(&self) -> bool {
+        self.short_runs.len() + self.long_runs.len() <= 1
+    }
+
+    /// Whether this plan's kernel launches are read off *this* call's item
+    /// layout, and so must never be captured into or replayed from a CUDA
+    /// graph keyed only by `(pool, n_tokens, bucketed kv_len, armed)`.
+    ///
+    /// A long run is layout-dependent even on its own: `attn_prefill_ws4`'s
+    /// tiling comes from `run_tokens`, and the synthetic identity slot table
+    /// it reads is built per call from that sequence's own slot list.
+    fn is_layout_dependent(&self) -> bool {
+        !self.is_single_whole_pass_call() || !self.long_runs.is_empty()
+    }
+}
+
+/// Coalesce `items` into short/decode runs plus individually-listed long
+/// prefill items.
+///
+/// `item_kv_len[i]` is item `i`'s own post-extension KV extent, built alongside
+/// `starts` in `forward_batch_rows` — the same array [`plan_attn_dispatch`]
+/// takes, and exactly `KvPool::len(item.seq)` for that item.
+///
+/// `dequant_threshold` is `usize::MAX` whenever the long path is unavailable
+/// (`INFERO_TQ_PREFILL_DEQUANT=0`, or no tile kernel is eligible for this
+/// model's shape), which collapses this to one short run per contiguous stretch
+/// of the batch — i.e. the single whole-batch call this branch made before.
+fn plan_tq_dispatch(
+    items: &[BatchItem<'_>],
+    item_kv_len: &[usize],
+    dequant_threshold: usize,
+) -> TqDispatch {
+    debug_assert_eq!(
+        items.len(),
+        item_kv_len.len(),
+        "one kv extent per batch item"
+    );
+    let mut plan = TqDispatch::default();
+    let mut base = 0usize;
+    // (run base, tokens so far, max kv extent so far) for the short/decode run
+    // currently being accumulated.
+    let mut open: Option<(usize, usize, usize)> = None;
+    for (i, item) in items.iter().enumerate() {
+        let tokens = item.tokens.len();
+        let kv = item_kv_len[i];
+        // A `Decode` item never takes the long path however wide it is: a
+        // speculative verification pass is `k + 1` candidate tokens whose
+        // positions are contiguous but whose *acceptance* is decided after the
+        // fact, and this plan has only ever been measured on real prefill.
+        let long = item.kind == BatchItemKind::Prefill && tokens > dequant_threshold;
+        if long {
+            if let Some((run_base, run_tokens, run_kv)) = open.take() {
+                plan.short_runs.push(AttnRun {
+                    base: run_base,
+                    tokens: run_tokens,
+                    kv_len: run_kv,
+                });
+            }
+            plan.long_runs.push(TqLongRun {
+                run: AttnRun {
+                    base,
+                    tokens,
+                    kv_len: kv,
+                },
+                seq: item.seq,
+            });
+        } else {
+            open = Some(match open.take() {
+                // The max over just this run's own items, mirroring how
+                // `AttnDispatch::decode_kv_len` scopes its own shared extent
+                // rather than reusing the batch-wide maximum.
+                Some((run_base, run_tokens, run_kv)) => {
+                    (run_base, run_tokens + tokens, run_kv.max(kv))
+                }
+                None => (base, tokens, kv),
+            });
+        }
+        base += tokens;
+    }
+    if let Some((run_base, run_tokens, run_kv)) = open.take() {
+        plan.short_runs.push(AttnRun {
+            base: run_base,
+            tokens: run_tokens,
+            kv_len: run_kv,
+        });
+    }
+    plan
+}
+
+#[cfg(test)]
+mod tq_dispatch_tests {
+    use super::*;
+
+    fn item<'a>(seq: usize, tokens: &'a [u32], kind: BatchItemKind) -> BatchItem<'a> {
+        BatchItem::new(SeqId(seq), tokens, kind)
+    }
+
+    /// The shape this plan exists for: one wide prefill chunk, on its own.
+    #[test]
+    fn a_lone_long_prefill_becomes_one_long_run() {
+        let toks = vec![1u32; 300];
+        let items = [item(0, &toks, BatchItemKind::Prefill)];
+        let plan = plan_tq_dispatch(&items, &[300], 128);
+        assert!(plan.short_runs.is_empty());
+        assert_eq!(
+            plan.long_runs,
+            vec![TqLongRun {
+                run: AttnRun {
+                    base: 0,
+                    tokens: 300,
+                    kv_len: 300
+                },
+                seq: SeqId(0),
+            }]
+        );
+        // One call, but still layout-dependent: the tile kernel's grid comes
+        // from this call's own item widths.
+        assert!(plan.is_single_whole_pass_call());
+        assert!(plan.is_layout_dependent());
+    }
+
+    /// The threshold is a strict `>`, and it is the *item's* token count that
+    /// decides, not the sequence's cached extent.
+    #[test]
+    fn the_threshold_is_on_this_calls_own_tokens() {
+        let at = vec![1u32; 128];
+        let over = vec![1u32; 129];
+        // A 128-token chunk continuing a 4000-token sequence still stays short.
+        let items = [item(0, &at, BatchItemKind::Prefill)];
+        assert!(plan_tq_dispatch(&items, &[4128], 128).long_runs.is_empty());
+        let items = [item(0, &over, BatchItemKind::Prefill)];
+        assert_eq!(plan_tq_dispatch(&items, &[129], 128).long_runs.len(), 1);
+    }
+
+    /// A `Decode` item is never long, however wide the speculation window.
+    #[test]
+    fn a_wide_decode_item_stays_short() {
+        let toks = vec![1u32; 300];
+        let items = [item(0, &toks, BatchItemKind::Decode)];
+        let plan = plan_tq_dispatch(&items, &[900], 128);
+        assert!(plan.long_runs.is_empty());
+        assert_eq!(
+            plan.short_runs,
+            vec![AttnRun {
+                base: 0,
+                tokens: 300,
+                kv_len: 900
+            }]
+        );
+    }
+
+    /// The case a two-flat-lists partition would get wrong: short items on
+    /// *both* sides of a long one must stay two separate runs, each at its own
+    /// base, rather than being merged into one span that covers the long item's
+    /// tokens too.
+    #[test]
+    fn short_items_around_a_long_one_stay_separate_runs() {
+        let d = vec![1u32; 1];
+        let short = vec![1u32; 10];
+        let long = vec![1u32; 300];
+        let items = [
+            item(0, &d, BatchItemKind::Decode),
+            item(1, &d, BatchItemKind::Decode),
+            item(2, &long, BatchItemKind::Prefill),
+            item(3, &short, BatchItemKind::Prefill),
+            item(4, &long, BatchItemKind::Prefill),
+            item(5, &short, BatchItemKind::Prefill),
+        ];
+        let kv = [50, 60, 300, 10, 700, 10];
+        let plan = plan_tq_dispatch(&items, &kv, 128);
+        assert_eq!(
+            plan.short_runs,
+            vec![
+                // The two decode items coalesce; their shared extent is the max
+                // over just those two, not the batch's 700.
+                AttnRun {
+                    base: 0,
+                    tokens: 2,
+                    kv_len: 60
+                },
+                AttnRun {
+                    base: 302,
+                    tokens: 10,
+                    kv_len: 10
+                },
+                AttnRun {
+                    base: 612,
+                    tokens: 10,
+                    kv_len: 10
+                },
+            ]
+        );
+        assert_eq!(
+            plan.long_runs,
+            vec![
+                TqLongRun {
+                    run: AttnRun {
+                        base: 2,
+                        tokens: 300,
+                        kv_len: 300
+                    },
+                    seq: SeqId(2),
+                },
+                TqLongRun {
+                    run: AttnRun {
+                        base: 312,
+                        tokens: 300,
+                        kv_len: 700
+                    },
+                    seq: SeqId(4),
+                },
+            ]
+        );
+        // Every token in the batch is covered exactly once, in order.
+        let mut spans: Vec<(usize, usize)> = plan
+            .short_runs
+            .iter()
+            .chain(plan.long_runs.iter().map(|l| &l.run))
+            .map(|r| (r.base, r.tokens))
+            .collect();
+        spans.sort_unstable();
+        let mut at = 0usize;
+        for (base, tokens) in spans {
+            assert_eq!(base, at, "gap or overlap in the partition");
+            at += tokens;
+        }
+        assert_eq!(at, 622);
+    }
+
+    /// An unavailable long path collapses the plan to the single whole-batch
+    /// call this branch has always made.
+    #[test]
+    fn an_infinite_threshold_is_one_whole_pass_run() {
+        let long = vec![1u32; 300];
+        let short = vec![1u32; 4];
+        let items = [
+            item(0, &long, BatchItemKind::Prefill),
+            item(1, &short, BatchItemKind::Prefill),
+        ];
+        let plan = plan_tq_dispatch(&items, &[300, 900], usize::MAX);
+        assert!(plan.long_runs.is_empty());
+        assert_eq!(
+            plan.short_runs,
+            vec![AttnRun {
+                base: 0,
+                tokens: 304,
+                kv_len: 900
+            }]
+        );
+        assert!(plan.is_single_whole_pass_call());
+        assert!(!plan.is_layout_dependent());
+        assert_eq!(plan, TqDispatch::whole_pass(304, 900));
+    }
+}
+
 #[cfg(test)]
 mod attn_dispatch_tests {
     use super::*;
@@ -2777,6 +3093,70 @@ impl Model {
             plan_attn_dispatch(items, &item_kv_len)
         });
 
+        // The same decision for the TurboQuant branch, which the split above
+        // deliberately does not touch (it reads `pool.dense()`, which a
+        // quantized pool has none of). Built whenever the KV cache is
+        // quantized -- with the long path unavailable this collapses to the
+        // single whole-batch call that branch has always made, so it is not
+        // gated on the feature flag, only fed by it.
+        //
+        // `prefill_attention` is part of the threshold rather than a
+        // fallback inside `attention()` because it is where the long path's
+        // one hard requirement lives: `attn_prefill_ws4` *errors* on a shape
+        // it cannot serve (`ensure!(self.prefill_attention(&dims))`), and it
+        // is off entirely unless `INFERO_ATTN_MMA=1` is set. Deciding here
+        // means an ineligible shape quietly keeps every item on
+        // `tq_attn_decode` instead of failing the pass.
+        //
+        // `uses_qjl` is the other, and it is a *correctness* gate, not a
+        // shape one -- MEASURED, and it is why this path cannot serve `tq4`
+        // today. `tq_attn_decode` evaluates TurboQuant's two-stage score
+        // estimator:
+        //
+        //     est = scale·⟨q_rot, cb[code]⟩
+        //         + qjl_scale·(√(π/2)/d)·γ·⟨q_qjl, s⟩       (s = ±1 sign sketch)
+        //
+        // and `tq_dequant_kv` materializes only the first term, because a
+        // dequantized key has no per-element value for the second (see its
+        // own doc comment in `turboquant.cu`). That is not a rounding
+        // difference. On this repo's own 0.5B test model at a 401-token
+        // prompt, against an f16 cache: `tq4` scores cosine 0.675, and the
+        // same cache scored *without* its QJL term scores 0.330 -- the two
+        // disagree with each other at cosine 0.289 and pick different next
+        // tokens. So a QJL-enabled cache must keep taking `tq_attn_decode`
+        // until the dequantizer can carry the term, rather than silently
+        // running a materially worse estimator.
+        //
+        // It *is* carryable, and cheaply -- the term is linear in `q_rot`:
+        //
+        //     ⟨q_qjl, s⟩ = ⟨Q·q_rot, s⟩ = ⟨q_rot, Qᵀ·s⟩
+        //
+        // (`q_qjl` is `tables.qjl · q_rot`, one `tq_matvec` above), so
+        //
+        //     k_eff = scale·cb[code] + qjl_scale·(√(π/2)/d)·γ·(Qᵀ·s)
+        //
+        // is a per-element dequantized key that reproduces the full
+        // estimator exactly. It costs `tq_dequant_kv` a d×d sign-matvec per
+        // cached key -- O(H·L·d²) against attention's own O(H·L²·d), i.e.
+        // noise at any `L` this path is used for. Doing it needs `k_signs`,
+        // `k_gamma` and `tables.qjl` handed back to that kernel (they were
+        // dropped from its signature on the -- correct in itself, but
+        // incomplete -- finding that the sign term is not a *per-element
+        // correction to the codebook value*), plus its own kernel-level
+        // correctness test. That is kernel work, deliberately left to a
+        // follow-up rather than smuggled into this dispatch change.
+        let tq_dispatch = self.tq.is_some().then(|| {
+            let threshold = if self.tq_prefill_dequant
+                && !pool.quant().uses_qjl()
+                && self.kern.prefill_attention(&dims)
+            {
+                TQ_DEQUANT_THRESHOLD
+            } else {
+                usize::MAX
+            };
+            plan_tq_dispatch(items, &item_kv_len, threshold)
+        });
+
         let armed = self.gdn_rollback.as_ref().is_some_and(|r| r.is_armed());
         let key = (
             pool.id(),
@@ -2805,9 +3185,16 @@ impl Model {
         // (see `AttnDispatch::is_single_whole_pass_call`): a pass that may be
         // replayed from a graph must take the bucketed `kv` this function
         // hands `attention()` below, not the plan's own real extents.
+        //
+        // A TurboQuant plan carries the same hazard for the same reason, plus
+        // one of its own: a long run's `attn_prefill_ws4` tiling is read off
+        // this call's item widths and its synthetic slot table is uploaded per
+        // call, so a long run is layout-dependent even when it is the pass's
+        // only call. See `TqDispatch::is_layout_dependent`.
         let layout_dependent_dispatch = attn_dispatch
             .as_ref()
-            .is_some_and(|p| !p.is_single_whole_pass_call());
+            .is_some_and(|p| !p.is_single_whole_pass_call())
+            || tq_dispatch.as_ref().is_some_and(|p| p.is_layout_dependent());
         let graphable = self.use_graph
             && self.offload.is_none()
             && key.2 <= self.max_seq
@@ -2851,6 +3238,7 @@ impl Model {
                                 s,
                                 prefill_run,
                                 attn_dispatch.as_ref(),
+                                tq_dispatch.as_ref(),
                             )?;
                         }
                         self.feed_forward(layer, n_tokens, s)?;
@@ -3876,6 +4264,11 @@ impl Model {
         // per batch by `plan_attn_dispatch`. `None` (the default) takes the
         // one-call-per-pass dispatch this function has always taken.
         dispatch: Option<&AttnDispatch>,
+        // `Some` whenever this pool's KV cache is quantized: how the
+        // TurboQuant branch's work is cut into kernel calls, planned once per
+        // batch by `plan_tq_dispatch`. `None` (a dense pool, which never
+        // reaches that branch) falls back to the one whole-pass call.
+        tq_dispatch: Option<&TqDispatch>,
     ) -> Result<()> {
         let stage = slot.map(|s| &self.offload.as_ref().unwrap().stage[s]);
         let cfg = &self.cfg;
@@ -4350,14 +4743,11 @@ impl Model {
             )?;
         }
 
-        let score_len = cfg.n_heads * n * kv_len;
+        // No batch-wide `score_len` here any more: both branches now size the
+        // score buffer per *run* (`n_heads * run_tokens * run_kv_len`), which
+        // is never larger than the batch-wide product this used to hold.
         let attn_scale = cfg.attn_scale();
         let (n_heads, n_kv_heads, d_head) = (cfg.n_heads, cfg.n_kv_heads, cfg.d_head);
-
-        // These come from the activations, so they can be held across the
-        // stores; the slot table lives in the pool and is taken afterwards.
-        let seq_of = self.act.seq_of.slice(..n);
-        let batch_positions = self.act.positions.slice(..n);
 
         match self.tq.as_mut() {
             None => {
@@ -4889,92 +5279,263 @@ impl Model {
                 }
 
                 let table = pool.slot_table().as_view();
-                let batch = BatchLayout {
-                    seq_of: &seq_of,
-                    positions: &batch_positions,
-                    slot_table: &table,
-                    table_stride,
+
+                // How this pass's attention work is cut up. Every caller that
+                // can reach a quantized pool builds one (`forward_batch_rows`,
+                // alongside the dense path's own `attn_dispatch`); the
+                // fallback is the single whole-batch call this branch made
+                // before the split existed, and is what any future caller that
+                // does not plan gets.
+                let whole_pass;
+                let plan = match tq_dispatch {
+                    Some(p) => p,
+                    None => {
+                        whole_pass = TqDispatch::whole_pass(n, kv_len);
+                        &whole_pass
+                    }
                 };
-                // Fused, the same way `attn_decode` fuses the dense path's
-                // three kernels and for the same reason: the unfused path
-                // below writes the whole score row to HBM and reads it back
-                // twice, and at a batch of one that round trip is latency
-                // rather than bytes. `INFERO_TQ_DECODE_ATTN=0` restores the
-                // three-kernel path this replaces.
-                if self.kern.tq_decode_attention(&dims) {
-                    // The TurboQuant path is deliberately NOT split by
-                    // `INFERO_SPLIT_MIXED_BATCH` -- it keeps its one
-                    // whole-batch call -- but it reads the same `attn_partial`
-                    // buffer the flag shrinks, at the full `n`. So it needs
-                    // the same bounds check the dense path's kernels get, or
-                    // enabling the flag on a TurboQuant-quantized KV cache
-                    // would write past the end of the shrunk buffer with
-                    // nothing to notice. With the flag off this cannot fire
-                    // (`partial` is the full `batch_tokens` wide).
-                    ensure_partial_fits(n, self.attn_partial_tokens, "tq_attn_decode")?;
-                    let (kcodes, ksigns, kscale, kgamma) = pool.tq_key(layer);
-                    let (vcodes, vscale) = pool.tq_value(layer);
-                    self.kern.tq_attn_decode(
-                        &mut tq.acc_rot.slice_mut(..n * da),
-                        &tq.q_rot.slice(..n * da),
-                        &tq.q_qjl.slice(..n * da),
-                        &kcodes.as_view(),
-                        &ksigns.as_view(),
-                        &kscale.as_view(),
-                        &kgamma.as_view(),
-                        &vcodes.as_view(),
-                        &vscale.as_view(),
-                        batch,
-                        &tq.tables.k_levels.as_view(),
-                        k_bits,
-                        &tq.tables.v_levels.as_view(),
-                        v_bits,
-                        dims,
-                        kv_len,
-                        attn_scale,
-                        quant.qjl_scale(),
-                        &mut self.act.attn_partial.as_view_mut(),
-                    )?;
-                } else {
-                    {
-                        let (codes, signs, scale, gamma) = pool.tq_key(layer);
-                        self.kern.tq_attn_scores(
-                            &mut self.act.scores.slice_mut(..score_len),
-                            &tq.q_rot.slice(..n * da),
-                            &tq.q_qjl.slice(..n * da),
-                            &codes.as_view(),
-                            &signs.as_view(),
-                            &scale.as_view(),
-                            &gamma.as_view(),
+                // Exactly [`AttnDispatch::is_single_whole_pass_call`]'s rule,
+                // for exactly its reason: a pass that issues one call may have
+                // been captured into a CUDA graph, and a graph bakes `kv_len`
+                // in as a host scalar -- so that one call must take the
+                // (possibly bucketed) parameter, not the plan's real extent.
+                // A multi-call pass is never graphable, and there the plan's
+                // own per-run extents are both correct and required.
+                let one_call = plan.is_single_whole_pass_call();
+
+                // This task's own tests, and Task 2's kernel-level check of
+                // `tq_dequant_kv` against a host reference, only cover
+                // `KvCacheQuant::Tq4`. An untested bit-width must fail loud
+                // rather than quietly run unverified dequantization math. Only
+                // the long path is affected: a short/decode-only batch takes
+                // the same `tq_attn_decode` it always has, at every bit width.
+                if !plan.long_runs.is_empty() {
+                    anyhow::ensure!(
+                        k_bits == 4 && v_bits == 4,
+                        "tq_dequant_kv: only k_bits=4/v_bits=4 has been validated against a \
+                         host reference (see crates/kernels/tests/turboquant.rs); this load's \
+                         KvCacheQuant is k_bits={k_bits}/v_bits={v_bits}. Set \
+                         INFERO_TQ_PREFILL_DEQUANT=0 to use the (slower, but validated for \
+                         every bit width) tq_attn_decode path instead, or extend Task 2's \
+                         test coverage to this combination before removing this guard."
+                    );
+                }
+
+                // Short and decode items: unchanged kernels, unchanged math,
+                // just scoped to one contiguous run of the batch instead of
+                // all of it.
+                for run in &plan.short_runs {
+                    let run_kv_len = if one_call { kv_len } else { run.kv_len };
+                    let run_dims = AttnDims {
+                        n_tokens: run.tokens,
+                        ..dims
+                    };
+                    let (lo, hi) = (run.base * da, (run.base + run.tokens) * da);
+                    let run_seq_of = self.act.seq_of.slice(run.base..run.base + run.tokens);
+                    let run_positions = self.act.positions.slice(run.base..run.base + run.tokens);
+                    let batch = BatchLayout {
+                        seq_of: &run_seq_of,
+                        positions: &run_positions,
+                        slot_table: &table,
+                        table_stride,
+                    };
+                    // Fused, the same way `attn_decode` fuses the dense path's
+                    // three kernels and for the same reason: the unfused path
+                    // below writes the whole score row to HBM and reads it back
+                    // twice, and at a batch of one that round trip is latency
+                    // rather than bytes. `INFERO_TQ_DECODE_ATTN=0` restores the
+                    // three-kernel path this replaces.
+                    if self.kern.tq_decode_attention(&run_dims) {
+                        // The TurboQuant path is deliberately NOT split by
+                        // `INFERO_SPLIT_MIXED_BATCH` -- its short runs are cut
+                        // by item *width*, not by kind -- but it reads the same
+                        // `attn_partial` buffer that flag shrinks. So it needs
+                        // the same bounds check the dense path's kernels get,
+                        // or enabling the flag on a TurboQuant-quantized KV
+                        // cache would write past the end of the shrunk buffer
+                        // with nothing to notice. With the flag off this cannot
+                        // fire (`partial` is the full `batch_tokens` wide).
+                        ensure_partial_fits(run.tokens, self.attn_partial_tokens, "tq_attn_decode")?;
+                        let (kcodes, ksigns, kscale, kgamma) = pool.tq_key(layer);
+                        let (vcodes, vscale) = pool.tq_value(layer);
+                        self.kern.tq_attn_decode(
+                            &mut tq.acc_rot.slice_mut(lo..hi),
+                            &tq.q_rot.slice(lo..hi),
+                            &tq.q_qjl.slice(lo..hi),
+                            &kcodes.as_view(),
+                            &ksigns.as_view(),
+                            &kscale.as_view(),
+                            &kgamma.as_view(),
+                            &vcodes.as_view(),
+                            &vscale.as_view(),
                             batch,
                             &tq.tables.k_levels.as_view(),
                             k_bits,
-                            dims,
-                            kv_len,
-                            attn_scale,
-                            quant.qjl_scale(),
-                        )?;
-                    }
-                    self.kern.attn_softmax(
-                        &mut self.act.scores.slice_mut(..score_len),
-                        n_heads,
-                        n,
-                        kv_len,
-                    )?;
-                    {
-                        let (codes, scale) = pool.tq_value(layer);
-                        self.kern.tq_attn_output(
-                            &mut tq.acc_rot.slice_mut(..n * da),
-                            &self.act.scores.slice(..score_len),
-                            &codes.as_view(),
-                            &scale.as_view(),
-                            batch,
                             &tq.tables.v_levels.as_view(),
                             v_bits,
-                            dims,
-                            kv_len,
+                            run_dims,
+                            run_kv_len,
+                            attn_scale,
+                            quant.qjl_scale(),
+                            &mut self.act.attn_partial.as_view_mut(),
+                        )?;
+                    } else {
+                        let run_score_len = n_heads * run.tokens * run_kv_len;
+                        {
+                            let (codes, signs, scale, gamma) = pool.tq_key(layer);
+                            self.kern.tq_attn_scores(
+                                &mut self.act.scores.slice_mut(..run_score_len),
+                                &tq.q_rot.slice(lo..hi),
+                                &tq.q_qjl.slice(lo..hi),
+                                &codes.as_view(),
+                                &signs.as_view(),
+                                &scale.as_view(),
+                                &gamma.as_view(),
+                                batch,
+                                &tq.tables.k_levels.as_view(),
+                                k_bits,
+                                run_dims,
+                                run_kv_len,
+                                attn_scale,
+                                quant.qjl_scale(),
+                            )?;
+                        }
+                        self.kern.attn_softmax(
+                            &mut self.act.scores.slice_mut(..run_score_len),
+                            n_heads,
+                            run.tokens,
+                            run_kv_len,
+                        )?;
+                        {
+                            let (codes, scale) = pool.tq_value(layer);
+                            self.kern.tq_attn_output(
+                                &mut tq.acc_rot.slice_mut(lo..hi),
+                                &self.act.scores.slice(..run_score_len),
+                                &codes.as_view(),
+                                &scale.as_view(),
+                                batch,
+                                &tq.tables.v_levels.as_view(),
+                                v_bits,
+                                run_dims,
+                                run_kv_len,
+                            )?;
+                        }
+                    }
+                }
+
+                // Long prefill items: unpack this sequence's whole cached span
+                // once into dense f16, then serve every one of its query tokens
+                // with the ordinary tile kernel, instead of re-unpacking the
+                // entire span once per query token.
+                for long in &plan.long_runs {
+                    let AttnRun {
+                        base,
+                        tokens,
+                        kv_len: seq_kv,
+                    } = long.run;
+                    let dq_len = n_kv_heads * seq_kv * d_head;
+                    let dq_cap = tq.dequant_k.len().min(tq.dequant_v.len());
+                    anyhow::ensure!(
+                        dq_len <= dq_cap,
+                        "a {seq_kv}-position sequence needs {dq_len} dequant scratch entries \
+                         and the buffer holds {dq_cap} -- it is sized for the model's own \
+                         max_seq, so this pool was built wider than the model was loaded for"
+                    );
+                    let host_slots = pool.seq_slots(long.seq);
+                    anyhow::ensure!(
+                        host_slots.len() >= seq_kv,
+                        "sequence {} holds {} slots but its kv extent is {seq_kv}",
+                        long.seq.0,
+                        host_slots.len()
+                    );
+                    let d_slots = self.dev.stream().clone_htod(&host_slots[..seq_kv])?;
+                    {
+                        let (kcodes, _, kscale, _) = pool.tq_key(layer);
+                        let (vcodes, vscale) = pool.tq_value(layer);
+                        // No `k_signs`/`k_gamma`: the QJL stage is a *second*
+                        // dot product, against a differently-projected query,
+                        // combined with the codebook term only after both are
+                        // reduced -- there is no per-element value for it to
+                        // correct here. See `tq_dequant_kv`'s doc comment in
+                        // `turboquant.cu`; the consequence is that a long run
+                        // evaluates the MSE-only estimator where a short run
+                        // evaluates TurboQuant's two-stage one.
+                        let (dq_k, dq_v) = (&mut tq.dequant_k, &mut tq.dequant_v);
+                        self.kern.tq_dequant_kv(
+                            &mut dq_k.slice_mut(..dq_len),
+                            &mut dq_v.slice_mut(..dq_len),
+                            &kcodes.as_view(),
+                            &kscale.as_view(),
+                            &vcodes.as_view(),
+                            &vscale.as_view(),
+                            &d_slots.as_view(),
+                            &tq.tables.k_levels.as_view(),
+                            k_bits,
+                            &tq.tables.v_levels.as_view(),
+                            v_bits,
+                            n_kv_heads,
+                            d_head,
+                            dims.n_slots,
+                            seq_kv,
                         )?;
                     }
+
+                    // A synthetic, single-sequence, identity-mapped layout over
+                    // the compact scratch buffer above: `tq_dequant_kv` writes
+                    // logical position `i` at row `i` of `[n_kv_heads, seq_kv,
+                    // d_head]`, so the slot table is the identity and its
+                    // stride is `seq_kv`. The real pool's `slot_table` would be
+                    // doubly wrong here -- its entries are pool-wide physical
+                    // slots and its stride is the pool's `max_seq`.
+                    //
+                    // `positions` is deliberately NOT the identity: it is this
+                    // item's real absolute positions, already on the device,
+                    // which is what the tile kernel's causal mask compares each
+                    // key index against (`abs_key <= row_last`). A continuation
+                    // chunk's first token sits at `seq_kv - tokens`, not at 0,
+                    // and handing it 0 would mask away its whole history.
+                    let identity_seq_of = vec![0i32; tokens];
+                    let identity_slots: Vec<i32> = (0..seq_kv as i32).collect();
+                    let d_seq_of = self.dev.stream().clone_htod(&identity_seq_of)?;
+                    let d_slot_table = self.dev.stream().clone_htod(&identity_slots)?;
+                    let run_positions = self.act.positions.slice(base..base + tokens);
+                    let d_seq_of_view = d_seq_of.as_view();
+                    let d_slot_table_view = d_slot_table.as_view();
+                    let synth_batch = BatchLayout {
+                        seq_of: &d_seq_of_view,
+                        positions: &run_positions,
+                        slot_table: &d_slot_table_view,
+                        table_stride: seq_kv,
+                    };
+                    // `n_slots` is the scratch buffer's own row stride, not the
+                    // pool's.
+                    let run_dims = AttnDims {
+                        n_tokens: tokens,
+                        n_slots: seq_kv,
+                        ..dims
+                    };
+                    let (lo, hi) = (base * da, (base + tokens) * da);
+                    // Deliberately always `attn_prefill_ws4`, never
+                    // `decoupled6`/flash_attn2: `ws4` alone is eligible across
+                    // every shape this plan's tests exercise, and it is the one
+                    // whose `prefill_attention` gate `plan_tq_dispatch` already
+                    // consulted before classifying this item as long. Adding
+                    // the other two kernels' own eligibility branches is
+                    // separable follow-up work.
+                    ensure_partial_fits(tokens, self.attn_partial_tokens, "attn_prefill_ws4")?;
+                    self.kern.attn_prefill_ws4(
+                        &mut tq.acc_rot.slice_mut(lo..hi),
+                        &tq.q_rot.slice(lo..hi),
+                        &tq.dequant_k.slice(..dq_len),
+                        &tq.dequant_v.slice(..dq_len),
+                        synth_batch,
+                        run_dims,
+                        0,
+                        tokens,
+                        seq_kv,
+                        attn_scale,
+                        &mut self.act.attn_partial.as_view_mut(),
+                    )?;
                 }
                 // Back out of the rotated basis, once, on the output.
                 self.kern.tq_matvec(
