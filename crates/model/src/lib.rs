@@ -3440,21 +3440,21 @@ impl Model {
     /// for the design this verification supports). This block never reads
     /// `self.act.attn`/`attn_partial` at all -- GDN and regular-attention
     /// layers are mutually exclusive per layer (`self.layer_kinds[layer]`,
-    /// dispatched in `forward_batch_rows`'s layer loop, `~lib.rs:2192-2196`),
+    /// dispatched in `forward_batch_rows`'s layer loop, `~lib.rs:2810-2814`),
     /// so whatever Task 5 does inside `attention`'s dispatch branch (one
     /// kernel call over the whole batch vs. several over sub-batches) cannot
     /// reach this function at all. What it *does* read -- `self.act.x`/`xb`
-    /// (here, `~lib.rs:2862-2873` and `:2878-2880`) and the per-slot
-    /// recurrence layout `spans` (`pool.set_gdn_layout`, `~lib.rs:2022-2043`)
+    /// (here, `~lib.rs:3490-3494` and `:3506-3508`) and the per-slot
+    /// recurrence layout `spans` (`pool.set_gdn_layout`, `~lib.rs:2593-2613`)
     /// -- is built purely from `items`/`starts` while `forward_batch_rows`
-    /// lays the flat batch out (`~lib.rs:1902-1966`), strictly *before* the
+    /// lays the flat batch out (`~lib.rs:2462-2537`), strictly *before* the
     /// layer loop and any attention dispatch even runs; `spans[slot]` is
     /// `(starts[slot].0, item.tokens.len())`, i.e. absolute row offset and
     /// count, with no reference anywhere to which attention kernel
     /// populates which rows.
     /// `feed_forward` (shared by both layer kinds) and the sampling/logits
     /// path downstream (`take_rows` against `logit_rows`, itself built the
-    /// same way at `~lib.rs:1960-1965`) read `self.act.x` the same
+    /// same way at `~lib.rs:2531-2536`) read `self.act.x` the same
     /// absolute-row way. So a Task-5 split of attention's dispatch changes
     /// nothing here, as long as `attention()` still leaves every row of
     /// `self.act.attn` populated by the time its own `wo` projection runs.
@@ -6314,11 +6314,16 @@ impl Activations {
             //
             // Task 3: `partial_n_tokens` is the caller's resolved
             // `attn_partial_bound(max_logit_rows)` (== `max_logit_rows +
-            // MIN_PREFILL_RUN`) when `INFERO_SPLIT_MIXED_BATCH=1` opts in, or
-            // `chunk` (today's exact, safe, default behavior -- the flag
-            // defaults OFF, see `from_parts`'s own `split_mixed_batch`
-            // resolution for why) otherwise. Passed
-            // in as its own parameter rather than derived here so this
+            // MIN_PREFILL_RUN`) when the mixed-batch dispatch split is on, or
+            // `chunk` (the pre-plan behavior, and the full-width buffer the
+            // unsplit whole-pass dispatch needs) when it is off. Which of the
+            // two applies is `from_parts`' `INFERO_SPLIT_MIXED_BATCH`
+            // resolution -- three-way since Task 7, and the source of truth
+            // for the rule; read it there rather than trusting a restatement
+            // here. Under TP, `Model::gate_for_tp` can flip that resolution
+            // after this function has already run, which is why it reallocates
+            // this buffer itself rather than leaving the two disagreeing.
+            // Passed in as its own parameter rather than derived here so this
             // allocation site doesn't need to re-decide the flag itself. Every
             // OTHER buffer in this struct still uses `chunk` unconditionally
             // -- this is deliberately the only one Task 3 shrinks; the actual

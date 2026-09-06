@@ -25,6 +25,18 @@ This lets `attn_decode`'s real `n` (query-token count) ceiling revert to small (
 - **Short prefill remainders stay folded into `attn_decode`.** `MIN_PREFILL_RUN=8` exists because very short prefill chunks aren't worth a dedicated tile-kernel launch. This behavior is preserved: `attn_partial`'s new bound includes headroom for `MIN_PREFILL_RUN`-scale remainders riding along with the decode batch, rather than shrinking to the absolute theoretical minimum.
 - **Feature-flag gated**, matching this codebase's existing precedent for high-risk kernel-path changes (`INFERO_PREFILL_T6`, `INFERO_FUSE_FFN`): a new `INFERO_SPLIT_MIXED_BATCH` env var, default-on (new behavior), settable to `0` to instantly roll back to today's single-call-per-batch behavior without a rebuild.
 
+  **Amended after Task 7 (implementation).** The flat "default-on, settable to `0`" above was not what shipped, because it is not safe as stated. Shrinking `attn_partial` is only correct while every prefill run wider than `attn_partial_bound(max_logit_rows)` resolves to a kernel that takes no split-K scratch; `ensure_partial_fits` turns a shape where that stops holding into a loud error rather than a silent overrun — correct, but a 500 instead of an answer, and an on-by-default flag must not be able to do that to a model nobody opted in for. So the shipped default is **shape-gated three-way**:
+
+  | value | behavior |
+  |---|---|
+  | `"0"` | forced off — the rollback switch, byte-for-byte the pre-plan dispatch at the full `batch_tokens` buffer width |
+  | `"1"` | forced on, bypassing the shape check — the explicit opt-in Tasks 4–6 tested through, and the only way to exercise the split on a model whose wide prefill runs *do* read `attn_partial` |
+  | unset (default) | on **iff this model's own shape proves the error cannot fire** — `wide_prefill_avoids_attn_partial`, re-derived from `attention()`'s real eligibility chain (f16 KV, `Kernels::prefill_attention`'s MMA/GQA/`d_head` gate, `d_head == 256`, `INFERO_PREFILL_T6` not `"0"`) and deliberately conservative |
+
+  The real production checkpoint qualifies, so production runs the split on with the variable unset. `crates/model/src/lib.rs`'s `from_parts` holds the resolution and is the source of truth; this table is a description of it, not a second definition.
+
+  The TP gate below interacts with this: because the buffer is sized from the resolution, `Model::gate_for_tp` disabling the split under TP must also restore `attn_partial` to its full `batch_tokens` width, not merely clear the flag.
+
 ## Data Model
 
 `BatchItem` (`crates/model/src/lib.rs:277`) gains a `kind: BatchItemKind` field (`enum BatchItemKind { Decode, Prefill }`), set at both construction sites where `scheduler.rs`'s `Work::Decode`/`Work::Prefill` (lines 962, 989) become `BatchItem`s. The scheduler already knows this distinction when it builds the batch; today it's simply discarded on the way into `BatchItem` — carrying it through is not new information, just preserved information.
