@@ -1238,7 +1238,10 @@ pub struct Model {
     /// see that method's doc comment. That gate runs unconditionally (not
     /// only in debug builds), which is what actually keeps this off under
     /// TP; `attn_dispatch`'s construction-site `debug_assert!` is a second,
-    /// debug-only line of defense, not the mechanism itself.
+    /// debug-only line of defense, not the mechanism itself. It also
+    /// re-allocates `act.attn_partial` at the full width when it fires,
+    /// because this field and `attn_partial_tokens` below must never
+    /// disagree.
     split_mixed_batch: bool,
     /// How many tokens `act.attn_partial` was actually allocated for --
     /// `attn_partial_bound(max_logit_rows)` when `split_mixed_batch` is on,
@@ -1532,7 +1535,7 @@ impl Model {
         let shard = (rank.tp_size > 1).then_some((rank.tp_rank, rank.tp_size));
         let w = Weights::load_sharded(&dev, f, &cfg, n_gpu_layers, shard)?;
         let mut model = Self::from_parts(dev, kern, cfg, w, max_seq, kv_quant, max_logit_rows)?;
-        model.gate_for_tp(rank);
+        model.gate_for_tp(rank)?;
         if rank.tp_size > 1 {
             use crate::tp::{LocalFileBootstrap, RankBootstrap};
             let bootstrap = LocalFileBootstrap { run_id: run_id.to_string() };
@@ -1624,7 +1627,7 @@ impl Model {
         let shard = (rank.tp_size > 1).then_some((rank.tp_rank, rank.tp_size));
         let w = weights::load_awq(&dev, &shards, &cfg, &freqs, shard)?;
         let mut model = Self::from_parts(dev, kern, cfg, w, max_seq, kv_quant, max_logit_rows)?;
-        model.gate_for_tp(rank);
+        model.gate_for_tp(rank)?;
         if rank.tp_size > 1 {
             use crate::tp::{LocalFileBootstrap, RankBootstrap};
             let bootstrap = LocalFileBootstrap { run_id: run_id.to_string() };
@@ -2037,12 +2040,32 @@ impl Model {
         self.batch_tokens
     }
 
-    /// Whether the mixed-batch-attn-dispatch-split path is enabled
-    /// (`INFERO_SPLIT_MIXED_BATCH`, default OFF -- unsafe to flip before
-    /// Task 5's dispatch-split lands), resolved once at load. See
-    /// `attn_partial_bound`.
+    /// Whether the mixed-batch-attn-dispatch-split path is enabled, resolved
+    /// once at load from `INFERO_SPLIT_MIXED_BATCH` and then possibly forced
+    /// off by [`Self::gate_for_tp`].
+    ///
+    /// The env var is three-way -- `="0"` off, `="1"` on, and **unset (the
+    /// default) resolves from this model's own shape** -- but this accessor
+    /// deliberately does not restate the rule: `from_parts`' own
+    /// `INFERO_SPLIT_MIXED_BATCH` `match` (and the
+    /// [`wide_prefill_avoids_attn_partial`] predicate it calls) is the single
+    /// source of truth, and prose duplicated here would rot the moment that
+    /// changes. See also [`attn_partial_bound`], which is what the resolution
+    /// makes safe, and [`Self::attn_partial_tokens`], which must always agree
+    /// with this flag.
     pub fn split_mixed_batch(&self) -> bool {
         self.split_mixed_batch
+    }
+
+    /// How many tokens `act.attn_partial` was actually allocated for.
+    ///
+    /// Always the pair of [`Self::split_mixed_batch`]: `attn_partial_bound(
+    /// max_logit_rows)` when the split is on, the full [`Self::batch_tokens`]
+    /// when it is off. Exposed so that invariant is assertable from an
+    /// integration test -- `tests/tensor_parallel_load.rs` checks that
+    /// [`Self::gate_for_tp`] restores *both* halves, not just the flag.
+    pub fn attn_partial_tokens(&self) -> usize {
+        self.attn_partial_tokens
     }
 
     /// Which [`AttentionBackend`] serves `attention()`'s `prefill_run`
@@ -2086,11 +2109,56 @@ impl Model {
     /// real process to complete (see `tests/tensor_parallel_load.rs`'s
     /// module doc for why the existing TP tests already avoid calling
     /// `load_full_tp` directly).
+    ///
+    /// # Why this reallocates `attn_partial`
+    ///
+    /// `split_mixed_batch` and `attn_partial_tokens` are **one decision, not
+    /// two**: `from_parts` sizes `act.attn_partial` to
+    /// `attn_partial_bound(max_logit_rows)` precisely *because* the split's
+    /// per-item dispatch keeps every wide prefill run off the split-K
+    /// scratch. Flipping the flag back off without also restoring the buffer
+    /// leaves the unsplit whole-pass dispatch -- the one that then runs --
+    /// pointed at a decode-sized buffer, and `ensure_partial_fits` hard-fails
+    /// on the first prefill run wider than that bound. `crates/server/src/
+    /// engine.rs` fails every running *and* waiting request on any step
+    /// error, so that would be a total outage under TP on any checkpoint
+    /// whose shape resolves the split on (this deployment's does), not one
+    /// bad request. Hence the reallocation here rather than a bare `= false`,
+    /// and hence the `Result` -- a `cudaMalloc` can fail, and failing load
+    /// loudly beats coming up inconsistent.
+    ///
+    /// The full-width allocation is exactly what a non-TP, split-off load
+    /// would have made in `Activations::new`, so this costs TP nothing it did
+    /// not already pay before this plan.
     #[cfg(feature = "nccl")]
-    pub fn gate_for_tp(&mut self, rank: &crate::tp::RankId) {
-        if !crate::tp::split_mixed_batch_allowed(rank.tp_size) {
-            self.split_mixed_batch = false;
+    pub fn gate_for_tp(&mut self, rank: &crate::tp::RankId) -> Result<()> {
+        if crate::tp::split_mixed_batch_allowed(rank.tp_size) || !self.split_mixed_batch {
+            return Ok(());
         }
+        self.split_mixed_batch = false;
+        let floats =
+            Kernels::attn_partial_floats(self.cfg.n_heads, self.cfg.d_head, self.batch_tokens);
+        self.act.attn_partial = self
+            .dev
+            .stream()
+            .alloc_zeros::<f32>(floats)
+            .with_context(|| {
+                format!(
+                    "re-allocating attention partials at the full {} tokens ({} MiB) after the \
+                     TP gate disabled the mixed-batch dispatch split",
+                    self.batch_tokens,
+                    (floats * 4) >> 20
+                )
+            })?;
+        self.attn_partial_tokens = self.batch_tokens;
+        tracing::info!(
+            tp_size = rank.tp_size,
+            batch_tokens = self.batch_tokens,
+            partial_mib = (floats * 4) >> 20,
+            "tensor parallelism disabled the mixed-batch dispatch split; \
+             attention partials restored to full width"
+        );
+        Ok(())
     }
 
     /// Broadcasts `payload`'s bytes from `root_is_me` (`true` on exactly one

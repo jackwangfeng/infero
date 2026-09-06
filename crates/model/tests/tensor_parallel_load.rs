@@ -142,13 +142,37 @@ fn split_mixed_batch_disabled_under_tp() {
         "test setup broken: INFERO_SPLIT_MIXED_BATCH=1 must resolve true \
          before any TP gate runs, or the assertion below would prove nothing"
     );
+    let batch_tokens = model.batch_tokens();
+    assert!(
+        model.attn_partial_tokens() < batch_tokens,
+        "test setup broken: with the split resolved ON, attn_partial must have \
+         been allocated at the shrunk `attn_partial_bound(max_logit_rows)` width \
+         ({} tokens) and not the full {batch_tokens} -- otherwise the width \
+         assertion after the gate proves nothing",
+        model.attn_partial_tokens()
+    );
 
-    model.gate_for_tp(&rank);
+    model.gate_for_tp(&rank).expect("gate_for_tp");
     assert!(
         !model.split_mixed_batch(),
         "split_mixed_batch must be forced off once tp_size > 1, even with \
          INFERO_SPLIT_MIXED_BATCH=1 set -- and this must hold in release \
          builds too, not just via a debug_assert!"
+    );
+    // The flag and the buffer are one decision, not two. Disabling the split
+    // without also restoring `attn_partial` to its full `batch_tokens` width
+    // leaves the unsplit dispatch -- which is what runs once the flag is off --
+    // pointed at a decode-sized buffer, and `ensure_partial_fits` then hard-
+    // fails every wide prefill run. `engine.rs` fails all running *and*
+    // waiting requests on any step error, so that is a total outage under TP,
+    // not one bad request.
+    assert_eq!(
+        model.attn_partial_tokens(),
+        batch_tokens,
+        "gate_for_tp disabled the split but left attn_partial at the shrunk \
+         width -- the unsplit dispatch it just reverted to needs the full \
+         {batch_tokens}-token buffer, and ensure_partial_fits would hard-fail \
+         every wide prefill run under TP"
     );
 }
 
