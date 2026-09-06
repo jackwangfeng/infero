@@ -4503,6 +4503,54 @@ impl Model {
                         table_stride,
                     };
                     let mut wrote_h16 = false;
+                    // No per-run row-count gate here, deliberately -- MEASURED.
+                    //
+                    // The reasoning that says there should be one is sound on
+                    // its face: backend *selection* happens once at load
+                    // against `batch_tokens` (8192 here), and since the
+                    // mixed-batch dispatch split that is no longer the width
+                    // of every run -- a batch's prefill items each get their
+                    // own attention call, and the tail chunk of any prompt is
+                    // whatever is left over. `FlashAttn2Ffi::supports`' own
+                    // doc comment records `ws4`/`decoupled6` beating FA2 by
+                    // ~10-15x at 1024 rows on a CUDA-event microbenchmark, so
+                    // re-applying `FA2_ROW_THRESHOLD` (4096) to `run_tokens`
+                    // here -- and thereby also eliding the per-run
+                    // `kv_run_is_contiguous` D2H round-trip for the runs that
+                    // would fall through anyway -- looks like free speed.
+                    //
+                    // It was built and measured that way against the real
+                    // production checkpoint (`qwen38-27b-fp8`, 8192-token
+                    // chunks, pinned 131072-slot pool, `max_tokens=1` so the
+                    // wall clock is prefill and not decode, unique prompt
+                    // nonces so the prefix cache cannot serve a repeat, two
+                    // full A/B rounds in both orders). It is a **regression**:
+                    //
+                    //   prompt rows | with the per-run gate
+                    //          332  |  -0.7%  (faster, within a whisker)
+                    //          602  |   0.0%
+                    //          963  |  +0.2%
+                    //         1461  |  +1.3%  slower
+                    //         1962  |  +1.6%  slower
+                    //         2762  |  +2.3%  slower
+                    //         3560  |  +2.8%  slower
+                    //         4461  |  -0.4%  (control: path unchanged)
+                    //         7562  |   0.0%  (control: path unchanged)
+                    //
+                    // The two above-threshold rows are the controls -- their
+                    // dispatch is byte-identical either way, and they did not
+                    // move, which is what makes the sub-threshold rows real
+                    // rather than machine drift. Every width whose dispatch
+                    // actually changed got slower, monotonically in width.
+                    //
+                    // So the 1024-row microbenchmark does not transfer to this
+                    // decision. It compared the attention kernels in isolation;
+                    // end to end, on this checkpoint's real GQA/`d_head=256`
+                    // shape, FA2 serves a 1400-3600-row prefill run *better*
+                    // than `decoupled6` does, and the saved D2H round-trip does
+                    // not pay for the swap either. Don't re-derive this from
+                    // the microbenchmark and re-land it; measure prefill-only
+                    // wall time again if you want to revisit.
                     #[cfg(feature = "flash_attn2")]
                     let vendor_backend_run = if backend_name != "handrolled" {
                         tile_eligible.then_some(run_tokens).filter(|_| {

@@ -155,6 +155,14 @@ impl AttentionBackend for FlashAttn2Ffi {
     /// `batch_tokens()` at load time (the only row count `prefill_run` ever
     /// actually uses for this checkpoint), not a per-call value — selection
     /// happens once, per the trait's own contract.
+    ///
+    /// It is tempting to conclude from the 1024-row microbenchmark that the
+    /// same threshold should also be applied *per run*, so that a short run
+    /// falls through to the handrolled cascade even on a model this backend
+    /// won selection for. That was built and measured on the real production
+    /// checkpoint, and it is a **real regression** — see the long comment at
+    /// `Model::attention()`'s vendor-dispatch branch for the numbers and why
+    /// the microbenchmark does not transfer. Selection stays once-per-load.
     fn supports(&self, caps: &HardwareCaps, dims: &AttnDims, kv_quant: KvQuant) -> bool {
         const FA2_ROW_THRESHOLD: usize = 4096;
         caps.at_least(8, 0)
