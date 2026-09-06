@@ -94,7 +94,11 @@ if !short_items.is_empty() {
 }
 
 for item in &long_items {
-    let kv_len = item.position + item.tokens.len(); // this sequence's real history length
+    // The write side (tq_matvec/tq_store_k/tq_store_v, unconditional above
+    // this point) already extended the pool with this call's own tokens, so
+    // the pool's own tracked length already IS this sequence's real,
+    // post-extension history -- no separate arithmetic needed.
+    let kv_len = pool.len(item.seq); // KvPool::len(&self, id: SeqId) -> usize, cache.rs:537
     self.kern.tq_dequant_kv(
         &mut tq.dequant_k.slice_mut(..n_kv_heads * kv_len * d_head),
         &mut tq.dequant_v.slice_mut(..n_kv_heads * kv_len * d_head),
