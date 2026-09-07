@@ -183,6 +183,26 @@ pub struct Scheduler {
     /// whatever `INFERO_SPEC_K` set, which is the behaviour every measurement
     /// in this file's history was taken against.
     adaptive_spec: bool,
+    /// The most sequences `speculative_step` will run a round for; above it,
+    /// the round bails and every sequence takes the ordinary batched decode
+    /// path instead. Real, measured: `speculative_step` runs each eligible
+    /// sequence's draft+verify as its own *sequential* GPU call (never fused
+    /// across sequences), so its per-round cost scales with how many
+    /// sequences it serves, while the ordinary batched-decode path fuses
+    /// every sequence into one call regardless of how many there are. Three
+    /// repeated trials each, 150-token generations, `--max-seqs 16 --ctx
+    /// 2048`, same build: aggregate tok/s with speculation on was ~74 at one
+    /// concurrent sequence and ~73 at two (a second sequence added
+    /// essentially nothing) against ~40 and ~79 with speculation off at the
+    /// same two points (linear, as fused batching should be) — the crossover
+    /// sits between one and two, and by two speculation is already a net
+    /// loss (~73 against ~79). At eight it was 126.6 against 312.1, at
+    /// sixteen 265.0 against 485.2 — the gap only widens. Default 1, matching
+    /// where the data actually crosses; `INFERO_SPEC_MAX_CONCURRENCY`
+    /// overrides it for re-measuring on different hardware or after a real
+    /// fix (fusing multiple sequences' draft+verify into one call, which
+    /// this threshold works around rather than replaces).
+    spec_max_concurrency: usize,
     /// Exponential moving average of a round's emitted tokens (`1..=k+1`),
     /// the signal `speculative_step` adjusts `spec_k` from. `None` before the
     /// first round, so the first sample sets it rather than being blended
@@ -526,6 +546,10 @@ impl Scheduler {
             spec_k: 0,
             spec_k_max: 0,
             adaptive_spec: std::env::var_os("INFERO_ADAPTIVE_SPEC").is_some(),
+            spec_max_concurrency: std::env::var("INFERO_SPEC_MAX_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1),
             spec_ema_accept: None,
             spec_k_cooldown: 0,
             spec_steps: 0,
@@ -718,6 +742,16 @@ impl Scheduler {
             eligible.push(idx);
         }
         if eligible.is_empty() {
+            return Ok(false);
+        }
+        // More sequences than `spec_max_concurrency` would speculate this
+        // round: bail entirely rather than serve a subset. Speculating for
+        // a subset while the rest take the ordinary path would still pay the
+        // sequential-call cost this threshold exists to avoid, just for
+        // fewer sequences, so the whole round falls back — see
+        // `spec_max_concurrency`'s own doc comment for the measurement.
+        if eligible.len() > self.spec_max_concurrency {
+            skip("more sequences than spec_max_concurrency would speculate this round");
             return Ok(false);
         }
 
