@@ -54,6 +54,7 @@ fn server() -> Option<SocketAddr> {
             usize::MAX,
             4,
             Some(700),
+            None,
             4096,
             16,
             infero_server::video::DEFAULT_TARGET_FPS,

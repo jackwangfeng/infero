@@ -46,11 +46,11 @@ fn the_fast_path_allocates_the_pool_exactly_once() -> anyhow::Result<()> {
     // whenever the card has room for the full requested concurrency.
     let model = Model::load_quantized(Device::new(0)?, &gguf, 512, KvCacheQuant::F16)?;
 
-    let pool_a = make_pool(&model, 2, None)?;
+    let pool_a = make_pool(&model, 2, None, None)?;
     let id_a = pool_a.id();
     drop(pool_a);
 
-    let pool_b = make_pool(&model, 2, None)?;
+    let pool_b = make_pool(&model, 2, None, None)?;
     let id_b = pool_b.id();
 
     // Exactly one real KvPool construction per make_pool call in the fast
@@ -63,5 +63,41 @@ fn the_fast_path_allocates_the_pool_exactly_once() -> anyhow::Result<()> {
         "make_pool should construct exactly one KvPool in the fast path, \
          not allocate-and-discard a trial before returning the real one"
     );
+    Ok(())
+}
+
+/// `gpu_memory_fraction` must actually shrink the pool below what the
+/// default (whatever free VRAM allows) would pick -- an unenforced cap is
+/// worse than no cap at all, since it would look like it works from the CLI
+/// help text alone.
+#[test]
+fn gpu_memory_fraction_caps_the_pool_below_the_unconstrained_size() -> anyhow::Result<()> {
+    let Some(path) = model_path() else {
+        eprintln!("skipping: no local test GGUF");
+        return Ok(());
+    };
+    let gguf = infero_gguf::Gguf::open(&path)?;
+    // A large `max_seqs`/`ctx` so the unconstrained pool genuinely wants to
+    // grow large (this checkpoint's real free VRAM should comfortably back
+    // a request this size on the fast path), giving the fraction cap real
+    // room to bind rather than being a no-op because `want` was already
+    // small.
+    let model = Model::load_quantized(Device::new(0)?, &gguf, 4096, KvCacheQuant::F16)?;
+
+    let uncapped = make_pool(&model, 32, None, None)?;
+    let capped = make_pool(&model, 32, None, Some(0.01))?;
+
+    assert!(
+        capped.n_slots() < uncapped.n_slots(),
+        "a 1% memory-fraction cap should produce a meaningfully smaller pool \
+         than the uncapped default (uncapped n_slots={}, capped n_slots={})",
+        uncapped.n_slots(),
+        capped.n_slots()
+    );
+    // The cap must still respect the pool's real floor (one full-context
+    // sequence) rather than shrinking below what `make_pool` can actually
+    // serve -- `make_pool`'s own `lo = max_seq` invariant, not something
+    // this test re-derives.
+    assert!(capped.n_slots() >= model.max_seq());
     Ok(())
 }

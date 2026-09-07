@@ -1935,7 +1935,12 @@ impl Scheduler {
 }
 
 /// Build the pool a scheduler needs.
-pub fn make_pool(model: &Model, max_seqs: usize, slots: Option<usize>) -> Result<KvPool> {
+pub fn make_pool(
+    model: &Model,
+    max_seqs: usize,
+    slots: Option<usize>,
+    memory_fraction: Option<f64>,
+) -> Result<KvPool> {
     let max_seq = model.max_seq();
     if let Some(n) = slots {
         return model
@@ -1955,14 +1960,37 @@ pub fn make_pool(model: &Model, max_seqs: usize, slots: Option<usize>) -> Result
     // what the card has left after the weights, keep a margin for activations
     // and the CUDA context, and let the scheduler admit against the real slot
     // count. It already refuses a prompt that will not fit.
-    let (free, _) = model.device().mem_info().context("querying free vram")?;
+    let (free, total) = model.device().mem_info().context("querying free vram")?;
     let want = max_seqs.saturating_mul(max_seq).max(max_seq);
     let mut lo = max_seq;
     let mut hi = want;
     // The pool's byte count is not a simple product — TurboQuant carries
     // per-slot tables — so find the largest slot count that fits by bisection
     // on the pool's own accounting rather than by re-deriving it here.
-    let budget = free.saturating_sub(free / 8).saturating_sub(512 << 20);
+    //
+    // `memory_fraction`, when set, caps this at a fixed share of the GPU's
+    // *total* memory rather than however much happens to be free at load
+    // time — mirroring vLLM's `--gpu-memory-utilization`. Without it, this
+    // budget always tries to grow the pool toward `want`; a buffer shrinking
+    // elsewhere (more free VRAM at load time) grows the pool to spend the
+    // difference rather than lowering the process's total footprint. That is
+    // this function's real, intended behavior (real concurrency capacity
+    // matters more than a small footprint by default) — this cap exists for
+    // an operator who wants the opposite trade explicitly.
+    let mut budget = free.saturating_sub(free / 8).saturating_sub(512 << 20);
+    if let Some(fraction) = memory_fraction {
+        // Mirrors vLLM's real semantics (`requested_memory = total *
+        // gpu_memory_utilization`, KV cache gets what's left after
+        // everything already loaded): `total*fraction` bounds the whole
+        // PROCESS, not the KV pool alone, and `total - free` is already
+        // spent on weights/activations/the CUDA context by the time this
+        // runs -- so the KV pool's own share of that ceiling is whatever
+        // remains of it after that already-spent amount.
+        let process_cap = total as f64 * fraction.clamp(0.0, 1.0);
+        let already_used = total.saturating_sub(free);
+        let kv_cap = (process_cap - already_used as f64).max(0.0) as usize;
+        budget = budget.min(kv_cap);
+    }
     // Returns the pool itself, not just whether it fit -- the original
     // shape here (`fits: |n| -> bool`) threw the trial allocation away and
     // reconstructed an identical one at the end, which for the common case

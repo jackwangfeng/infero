@@ -159,6 +159,7 @@ impl Engine {
         n_gpu_layers: usize,
         max_seqs: usize,
         kv_slots: Option<usize>,
+        gpu_memory_fraction: Option<f64>,
         vision_max_patches: usize,
         video_max_frames: usize,
         video_target_fps: f64,
@@ -300,7 +301,7 @@ impl Engine {
         if has_vision {
             tracing::info!(vision_max_patches, "vision tower loaded");
         }
-        let pool = make_pool(&model, max_seqs, kv_slots)?;
+        let pool = make_pool(&model, max_seqs, kv_slots, gpu_memory_fraction)?;
         let kv_cache_bytes = pool.bytes();
         let pool_slots = pool.n_slots();
 

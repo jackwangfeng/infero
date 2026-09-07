@@ -66,6 +66,20 @@ struct Args {
     #[arg(long)]
     kv_slots: Option<usize>,
 
+    /// Cap the KV pool at this fraction of the GPU's *total* VRAM (0.0-1.0),
+    /// mirroring vLLM's `--gpu-memory-utilization` -- a fixed, predictable
+    /// ceiling on this process's total footprint, rather than the default
+    /// behavior of greedily sizing the pool toward `max-seqs * ctx` using
+    /// however much VRAM happens to be free at load time. Without this, a
+    /// buffer shrinking elsewhere (freeing VRAM) grows the KV pool to use
+    /// the freed budget instead of lowering the process's total footprint --
+    /// intentional (see `make_pool`'s own doc comment), but surprising if
+    /// what you actually want is a fixed, comparable-to-vLLM total. Ignored
+    /// when `--kv-slots` is also set (an explicit slot count already pins
+    /// the pool's size directly).
+    #[arg(long)]
+    gpu_memory_fraction: Option<f64>,
+
     /// Patch budget for one image, when the checkpoint has a vision tower.
     /// 4096 is a 1024x1024 image at patch 16 (~350 MiB of scratch); a single
     /// request is separately refused if it resizes to more language-model
@@ -174,8 +188,13 @@ async fn main() -> Result<()> {
                 )
                 .context("loading this rank's shard")?
             };
-            let pool = infero_server::scheduler::make_pool(&model, args.max_seqs, args.kv_slots)
-                .context("sizing this rank's kv pool")?;
+            let pool = infero_server::scheduler::make_pool(
+                &model,
+                args.max_seqs,
+                args.kv_slots,
+                args.gpu_memory_fraction,
+            )
+            .context("sizing this rank's kv pool")?;
             tracing::info!(tp_rank, tp_size = args.tensor_parallel_size, "follower rank ready");
             infero_server::tp::run_follower(model, pool).context("follower loop")?;
             return Ok(());
@@ -196,6 +215,7 @@ async fn main() -> Result<()> {
         args.gpu_layers.unwrap_or(usize::MAX),
         args.max_seqs,
         args.kv_slots,
+        args.gpu_memory_fraction,
         args.vision_max_patches,
         args.video_max_frames,
         args.video_target_fps,
