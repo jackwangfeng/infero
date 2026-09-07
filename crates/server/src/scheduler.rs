@@ -668,6 +668,23 @@ impl Scheduler {
         if self.spec_k == 0 {
             return Ok(false);
         }
+        // `step`'s own caller returns immediately on `Ok(true)` here, never
+        // reaching the ordinary `plan()`-based path this same call would
+        // otherwise take -- which is the only path that ever admits a new
+        // arrival's prefill or advances a sequence this function is not
+        // handling. A single sequence that keeps finding speculative work
+        // every round would otherwise starve every other running sequence's
+        // prefill indefinitely, not just slow it down: confirmed for real,
+        // two concurrent sampled requests, one's prefill genuinely never
+        // scheduled until the other's entire reply finished. Bowing out
+        // whenever ANY running sequence still needs an ordinary prefill step
+        // keeps this function's own multi-sequence batching (below) scoped
+        // to rounds where every sequence already has decode-phase work
+        // `plan()` would give it anyway, so nothing here can ever preempt an
+        // admission or a prefill chunk.
+        if self.running.iter().any(|r| !r.prompt_complete()) {
+            return Ok(false);
+        }
         let k = self.spec_k;
         let skip = |why: &'static str| tracing::debug!(why, "speculative step skipped");
 
