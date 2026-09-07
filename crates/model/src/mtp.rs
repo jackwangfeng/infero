@@ -140,6 +140,16 @@ pub struct MtpHead {
     /// both what `lm_head` scores and what the next draft step feeds back in.
     out: Buf<f32>,
     logits: Buf<f32>,
+    /// Buffers for [`Self::logits_rows_batch_device`], sized to however many
+    /// concurrent sequences the largest call so far actually asked for --
+    /// *not* `self.max_seq` (this struct's own field, despite the name: it is
+    /// `max_seqs * context_length`, the drafter's KV-cache width in token
+    /// positions across every sequence, not a count of sequences -- sizing
+    /// these buffers by it once OOM'd allocating ~16 GiB for a real `vocab`
+    /// at production's own shapes). Grown like `samp` below, on the same
+    /// reasoning: no caller-supplied bound above the real concurrent-sequence
+    /// count exists anywhere in this constructor's own parameters.
+    draft_batch: Option<DraftBatchBufs>,
     x16: Buf<f16>,
 
     ids: Buf<i32>,
@@ -330,6 +340,7 @@ impl MtpHead {
             // every draft reads exactly one. At a vocabulary of 248320 the
             // difference is 993 KiB a row against nothing gained.
             logits: alloc(dims.vocab, "draft logits")?,
+            draft_batch: None,
             x16: stream.alloc_zeros::<f16>(t * (2 * d).max(dims.d_ff).max(da))?,
             ids: stream.alloc_zeros::<i32>(t)?,
             positions: stream.alloc_zeros::<i32>(t)?,
@@ -1438,12 +1449,89 @@ impl MtpHead {
         self.lens[branch]
     }
 
+    /// The vocabulary projection for several sequences at once, one row each,
+    /// left on the device in `self.draft_batch`'s own `logits` field
+    /// (`[rows.len(), vocab]`, row-major).
+    ///
+    /// This is what `draft_with_head_sampled_batch`'s own cross-sequence
+    /// batching (`prime_batch`/`step_tree`) already does for the hidden-state
+    /// forward pass, extended to the one step after it that wasn't batched
+    /// before: sampling used to call [`Self::logits_row_device`] once a
+    /// sequence, each call re-streaming the *entire* vocabulary matrix (1.29
+    /// GiB on this checkpoint) just to serve one row of it. `rows[i]` is
+    /// sequence `i`'s own current row in `self.out` -- not generally
+    /// contiguous (see `take_rows`'s own gather below), since different
+    /// sequences can reach their own draft-depth boundary at different widths
+    /// during priming.
+    ///
+    /// Declines (returns `Ok(false)`) exactly where [`Self::logits_row_device`]
+    /// would fall through to the plain `matmul` path (non-Q8_0 heads, or `d`
+    /// not a multiple of 32) -- callers fall back to looping
+    /// [`Self::logits_row_device`] per sequence in that case, unchanged from
+    /// before this existed.
+    pub fn logits_rows_batch_device(
+        &mut self,
+        kern: &Kernels,
+        head: &Matrix,
+        rows: &[usize],
+    ) -> Result<bool> {
+        let d = self.dims.d_model;
+        anyhow::ensure!(
+            head.k == d,
+            "the vocabulary projection contracts over {} where the head is {d} wide",
+            head.k
+        );
+        if !(Kernels::has_mmvq(head.ty) && d.is_multiple_of(32)) {
+            return Ok(false);
+        }
+        let n = rows.len();
+        let fits = matches!(&self.draft_batch, Some(b) if b.seqs >= n);
+        if !fits {
+            let st = self.dev.stream().clone();
+            self.draft_batch = Some(DraftBatchBufs {
+                gather: st.alloc_zeros::<f32>(n * d)?,
+                gather_rows: st.alloc_zeros::<i32>(n)?,
+                q8_1: st.alloc_zeros::<u8>(Kernels::q8_1_bytes(n * d))?,
+                logits: st.alloc_zeros::<f32>(n * head.n)?,
+                seqs: n,
+            });
+        }
+        let b = self.draft_batch.as_mut().unwrap();
+        let idx: Vec<i32> = rows
+            .iter()
+            .map(|&r| {
+                anyhow::ensure!(r < self.rows, "row {r} of {}", self.rows);
+                Ok(r as i32)
+            })
+            .collect::<Result<_>>()?;
+        let stream = self.dev.stream().clone();
+        stream.memcpy_htod(&idx, &mut b.gather_rows.slice_mut(..n))?;
+        kern.take_rows(
+            &mut b.gather.slice_mut(..n * d),
+            &self.out.slice(..self.rows * d),
+            &b.gather_rows.slice(..n),
+            n,
+            d,
+        )?;
+        let bytes = Kernels::q8_1_bytes(n * d);
+        kern.quantize_q8_1(&mut b.q8_1.slice_mut(..bytes), &b.gather.slice(..n * d), n * d)?;
+        kern.mmvq_batch(
+            &mut b.logits.slice_mut(..n * head.n),
+            &head.view(None)?,
+            head.ty,
+            &b.q8_1.slice(..bytes),
+            d,
+            head.n,
+            n,
+        )?;
+        Ok(true)
+    }
+
     /// `head @ out[row]`, brought back to the host.
     ///
     /// `head` is the text model's `lm_head`. The head has none of its own —
     /// `tie_word_embeddings` is false on this checkpoint, so `lm_head` and the
     /// embedding are different tensors and the drafter wants the former.
-    /// The vocabulary projection for one row, left on the device.
     ///
     /// A sampled draft does not need the logits on the host: the device sampler
     /// returns the token and the truncated distribution the acceptance rule
@@ -1546,6 +1634,63 @@ impl MtpHead {
              takes the greedy acceptance rule"
         );
         let n = self.logits_row_device(kern, head, row)?;
+        let logits = self.logits.slice(..n);
+        Self::sample_from_logits(&self.dev, &mut self.samp, kern, &logits, n, sampler, history)
+    }
+
+    /// One sequence's own row of a batch [`Self::logits_rows_batch_device`]
+    /// already computed, sampled the same way [`Self::draft_row_dist`]
+    /// samples a single freshly-computed row -- same downstream penalty
+    /// window, top-k/top-p, and device sampler, only the logits' own source
+    /// differs. Each sequence still gets its own, independently-computed,
+    /// correct distribution (`mmvq_batch` streams the same weight matrix once
+    /// for every row, not once for all of them combined); batching changes
+    /// which kernel launch produced row `seq_idx`'s logits, not what they are.
+    pub fn draft_row_sampled_from_batch(
+        &mut self,
+        kern: &Kernels,
+        seq_idx: usize,
+        vocab: usize,
+        sampler: &mut crate::Sampler,
+        history: &[u32],
+    ) -> Result<(u32, Vec<(u32, f32)>)> {
+        anyhow::ensure!(
+            !sampler.params().is_greedy(),
+            "draft_row_sampled needs a sampling distribution; a greedy request \
+             takes the greedy acceptance rule"
+        );
+        let batch = self
+            .draft_batch
+            .as_ref()
+            .context("logits_rows_batch_device must run before this")?;
+        let logits = batch.logits.slice(seq_idx * vocab..(seq_idx + 1) * vocab);
+        let (token, q) =
+            Self::sample_from_logits(&self.dev, &mut self.samp, kern, &logits, vocab, sampler, history)?;
+        anyhow::ensure!(
+            q.iter().any(|(t, w)| *t == token && *w > 0.0),
+            "the draft sampled {token}, which carries no weight in its own distribution"
+        );
+        Ok((token, q))
+    }
+
+    /// The shared tail of [`Self::draft_row_dist`] and
+    /// [`Self::draft_row_sampled_from_batch`]: penalty window, top-k/top-p,
+    /// device sampler, given logits already computed somewhere. Takes `dev`
+    /// and `samp` as explicit fields rather than `&mut self` so a caller can
+    /// hold a borrowed `View` into one of `self`'s own logits buffers
+    /// (`self.logits` or `self.draft_batch`'s own `logits` field) across the call --
+    /// otherwise re-bundling every field under one `&mut self` would conflict
+    /// with the view already borrowed from a sibling field.
+    #[allow(clippy::too_many_arguments)]
+    fn sample_from_logits(
+        dev: &Device,
+        samp: &mut Option<DraftSampleBufs>,
+        kern: &Kernels,
+        logits: &View<'_, f32>,
+        n: usize,
+        sampler: &mut crate::Sampler,
+        history: &[u32],
+    ) -> Result<(u32, Vec<(u32, f32)>)> {
         let sp = sampler.params().clone();
         let draw = sampler.next_draw();
 
@@ -1573,11 +1718,11 @@ impl MtpHead {
 
         let top_k = sp.top_k.max(1);
         let stride = top_k.max(ptok.len()).max(1);
-        let fits = matches!(&self.samp, Some(b) if b.stride >= stride);
+        let fits = matches!(&*samp, Some(b) if b.stride >= stride);
         if !fits {
-            let st = self.dev.stream().clone();
+            let st = dev.stream().clone();
             let cand = Kernels::SAMPLE_SPLITS * stride;
-            self.samp = Some(DraftSampleBufs {
+            *samp = Some(DraftSampleBufs {
                 params: st.alloc_zeros::<f32>(4)?,
                 pen_tok: st.alloc_zeros::<i32>(stride)?,
                 pen_cnt: st.alloc_zeros::<i32>(stride)?,
@@ -1592,9 +1737,9 @@ impl MtpHead {
                 stride,
             });
         }
-        let b = self.samp.as_mut().unwrap();
+        let b = samp.as_mut().unwrap();
         let stride = b.stride;
-        let stream = self.dev.stream().clone();
+        let stream = dev.stream().clone();
         let params = [
             sp.temperature,
             sp.top_p,
@@ -1628,7 +1773,7 @@ impl MtpHead {
                 &mut out_v,
                 &mut cav,
                 &mut cai,
-                &self.logits.slice(..n),
+                logits,
                 &pv,
                 &tv,
                 &cv2,
@@ -1655,7 +1800,7 @@ impl MtpHead {
         stream.memcpy_dtoh(&b.surv_len.slice(..1), &mut len_out)?;
         stream.memcpy_dtoh(&b.surv_id.slice(..stride), &mut ids)?;
         stream.memcpy_dtoh(&b.surv_p.slice(..stride), &mut ps)?;
-        self.dev.synchronize()?;
+        dev.synchronize()?;
         let token = tok_out[0];
         let keep = (len_out[0].max(0) as usize).min(stride);
         anyhow::ensure!(
@@ -2306,11 +2451,30 @@ impl crate::Model {
             let mut positions: Vec<usize> =
                 items.iter().map(|it| *it.feed.positions.last().unwrap()).collect();
             let mut cur_token: Vec<u32> = Vec::with_capacity(n);
-            for i in 0..n {
-                let (token, q) =
-                    head.draft_row_sampled(&self.kern, lm, cur_row[i], samplers[i], &windows[i])?;
-                drafted[i].push(Drafted { token, q });
-                cur_token.push(token);
+            // Batches the vocabulary projection across all `n` sequences at
+            // this shared draft depth into one `mmvq_batch` call (streaming
+            // the head's weight matrix once instead of once a sequence),
+            // falling back to the original per-sequence loop wherever it
+            // declines (non-Q8_0 heads, or `d` not a multiple of 32 -- the
+            // same cases `logits_row_device`'s own single-row path falls
+            // through on). See `MtpHead::logits_rows_batch_device`'s own doc
+            // comment for why this is safe: each sequence still gets its own,
+            // independently-computed row: batching changes which kernel
+            // launch produces it, not what it is.
+            if head.logits_rows_batch_device(&self.kern, lm, &cur_row)? {
+                for i in 0..n {
+                    let (token, q) =
+                        head.draft_row_sampled_from_batch(&self.kern, i, lm.n, samplers[i], &windows[i])?;
+                    drafted[i].push(Drafted { token, q });
+                    cur_token.push(token);
+                }
+            } else {
+                for i in 0..n {
+                    let (token, q) =
+                        head.draft_row_sampled(&self.kern, lm, cur_row[i], samplers[i], &windows[i])?;
+                    drafted[i].push(Drafted { token, q });
+                    cur_token.push(token);
+                }
             }
             for _ in 1..k {
                 for i in 0..n {
@@ -2327,12 +2491,21 @@ impl crate::Model {
                     &branch_of,
                     head.tail,
                 )?;
-                for i in 0..n {
-                    let (token, q) = head.draft_row_sampled(&self.kern, lm, i, samplers[i], &windows[i])?;
-                    drafted[i].push(Drafted { token, q });
-                    cur_token[i] = token;
-                }
                 cur_row = (0..n).collect();
+                if head.logits_rows_batch_device(&self.kern, lm, &cur_row)? {
+                    for i in 0..n {
+                        let (token, q) =
+                            head.draft_row_sampled_from_batch(&self.kern, i, lm.n, samplers[i], &windows[i])?;
+                        drafted[i].push(Drafted { token, q });
+                        cur_token[i] = token;
+                    }
+                } else {
+                    for i in 0..n {
+                        let (token, q) = head.draft_row_sampled(&self.kern, lm, i, samplers[i], &windows[i])?;
+                        drafted[i].push(Drafted { token, q });
+                        cur_token[i] = token;
+                    }
+                }
             }
             Ok(drafted)
         })();
@@ -2523,4 +2696,21 @@ struct DraftSampleBufs {
     surv_len: Buf<i32>,
     /// Survivor entries and the penalty window's pitch.
     stride: usize,
+}
+
+/// [`MtpHead::logits_rows_batch_device`]'s own scratch, grown to the widest
+/// `rows.len()` seen so far -- see `MtpHead::draft_batch`'s own field comment
+/// for why this can't be sized once at construction the way most of this
+/// struct's other buffers are.
+struct DraftBatchBufs {
+    /// `[seqs, d_model]`.
+    gather: Buf<f32>,
+    /// `[seqs]`, `take_rows`'s own index type.
+    gather_rows: Buf<i32>,
+    /// Quantized activations, `seqs` rows' worth.
+    q8_1: Buf<u8>,
+    /// `[seqs, vocab]` -- `mmvq_batch`'s own output layout.
+    logits: Buf<f32>,
+    /// How many sequences this allocation covers.
+    seqs: usize,
 }
