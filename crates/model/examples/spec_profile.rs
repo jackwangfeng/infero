@@ -39,7 +39,7 @@ fn main() -> Result<()> {
     // recurrence cannot fork and every root-to-leaf path has to be its own
     // linear sequence.
     let mut model = Model::load_awq(dev, &dir, 8192, KvCacheQuant::F16, (k + 1).max(32))?;
-    anyhow::ensure!(model.load_mtp_head(&dir, 64)?, "this checkpoint has no MTP head");
+    anyhow::ensure!(model.load_mtp_head(&dir, 64, 2)?, "this checkpoint has no MTP head");
 
     let prompt = tok.encode(
         "<|im_start|>user\n用一句话说明什么是投机解码<|im_end|>\n<|im_start|>assistant\n",
@@ -157,7 +157,7 @@ fn main() -> Result<()> {
         model.forward_batch_device(std::slice::from_ref(&it), &mut p2)?;
         let first = argmax(model.logits_host()?);
         let feed = infero_model::spec::DraftFeed::after_prefill(&prompt, first);
-        model.draft_with_head_sampled(k, &feed, &mut sampler, &history)?;
+        model.draft_with_head_sampled(k, &feed, &mut sampler, &history, 0)?;
 
         // One decode step, so `mtp_hidden` holds one row at a known position,
         // and that row is what a steady-state round drafts from.
@@ -175,7 +175,7 @@ fn main() -> Result<()> {
         let t = time(
             REPS,
             |m: &mut Model| {
-                m.draft_with_head_sampled(k, &feed, &mut sampler, &history)?;
+                m.draft_with_head_sampled(k, &feed, &mut sampler, &history, 0)?;
                 Ok(())
             },
             &mut model,
@@ -196,7 +196,7 @@ fn main() -> Result<()> {
             let wall = time_serial(
                 REPS,
                 |m: &mut Model| {
-                    m.draft_with_head_sampled(k, &feed, &mut sampler, &history)?;
+                    m.draft_with_head_sampled(k, &feed, &mut sampler, &history, 0)?;
                     Ok(())
                 },
                 &mut model,
