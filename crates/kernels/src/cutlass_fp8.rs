@@ -14,6 +14,15 @@ use crate::attn_backend;
 use crate::fp8::{FP8_BLOCK, ROW_GROUP};
 use crate::{Kernels, fp8_src};
 
+/// [`Kernels::mma_e4m3_cutlass_sfa_f32out`]'s crossover, in tokens, between
+/// the small-M tile (`fp8_bw_gemm.cu`'s `small_m` namespace, `<64,128,128>`)
+/// and the plain, prefill-tuned tile (`<128,128,128>`). Provisional pending a
+/// real sweep on `bw`'s SM120 hardware (`examples/cutlass_small_m_sweep.rs`
+/// once it exists) -- 64 because that is the small tile's own M, past which
+/// it needs a second M-tile iteration the wide tile would not, not because
+/// 64 is measured as the actual crossover.
+const SMALL_M_MAX_TOKENS: usize = 64;
+
 /// A [`crate::WeightType::F8E4M3`] matrix's precomputed CUTLASS-side state:
 /// the scale grid transposed from `[n/128,k/128]` to `[k/128,n/128]`, and --
 /// only when the matrix's own storage is still [`crate::fp8::ROW_GROUP`]-
@@ -240,6 +249,27 @@ mod ffi {
         pub fn infero_cutlass_fp8_bw_gemm_f32out_workspace_sm100(m: i32, n: i32, k: i32) -> usize;
         #[allow(clippy::too_many_arguments)]
         pub fn infero_cutlass_fp8_bw_gemm_f32out_sm100(
+            a: *const c_void,
+            b: *const c_void,
+            sfa: *const f32,
+            sfb: *const f32,
+            d: *mut f32,
+            workspace: *mut c_void,
+            m: i32,
+            n: i32,
+            k: i32,
+            accum: i32,
+            stream: cudarc::driver::sys::CUstream,
+        ) -> i32;
+
+        // SM120 only, small-M tile (`<64,128,128>` against the plain entry
+        // point's `<128,128,128>`) -- see `fp8_bw_gemm.cu`'s `small_m`
+        // namespace comment for why this exists (decode-shaped `n_tokens`
+        // wastes most of a 128-wide M tile) and why it is SM120-only for now
+        // (no SM90/SM100 hardware to verify a second small-M body against).
+        pub fn infero_cutlass_fp8_bw_gemm_f32out_small_m_workspace(m: i32, n: i32, k: i32) -> usize;
+        #[allow(clippy::too_many_arguments)]
+        pub fn infero_cutlass_fp8_bw_gemm_f32out_small_m(
             a: *const c_void,
             b: *const c_void,
             sfa: *const f32,
@@ -595,6 +625,17 @@ impl Kernels {
             }
             GemmArchTier::Sm100 => {
                 (ffi::infero_cutlass_fp8_bw_gemm_f32out_workspace_sm100, ffi::infero_cutlass_fp8_bw_gemm_f32out_sm100)
+            }
+            // The small-M tile (`<64,128,128>`, `fp8_bw_gemm.cu`'s `small_m`
+            // namespace) is SM120-only -- no SM90/SM100 hardware to verify a
+            // second small-M body against, same reason the plain vs sm90/
+            // sm100 split above stops at "real, compiled, one is execution-
+            // verified." `SMALL_M_MAX_TOKENS` is provisional pending a real
+            // crossover sweep on `bw` (this file's own `mma_e4m3_gemm.rs`
+            // tests exercise correctness at both sides of it, not the
+            // threshold's own value).
+            GemmArchTier::Sm120 if n_tokens <= SMALL_M_MAX_TOKENS => {
+                (ffi::infero_cutlass_fp8_bw_gemm_f32out_small_m_workspace, ffi::infero_cutlass_fp8_bw_gemm_f32out_small_m)
             }
             GemmArchTier::Sm120 => (ffi::infero_cutlass_fp8_bw_gemm_f32out_workspace, ffi::infero_cutlass_fp8_bw_gemm_f32out),
         };

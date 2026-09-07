@@ -200,6 +200,113 @@ using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 using StrideD = typename Gemm::GemmKernel::StrideD;
 }  // namespace f32out
 
+// Small-M instantiation of the same f32out kernel, for decode-shaped calls
+// (n_tokens in the low tens, not prefill's thousands). `f32out`'s own
+// `CooperativeMmaTileShape_MNK` is `<128,128,128>` -- fixed, chosen for
+// prefill's large M -- so a batch=16 call still schedules the full 128-wide
+// M tile and wastes 112 of it. vLLM's own `cutlass_scaled_mm` binding does
+// not special-case small M at the Python call site the way this file's
+// `f32out` vs plain split does per-dtype (verified by reading
+// `CutlassFp8BlockScaledMMKernel.apply_block_scaled_mm` in the installed
+// vLLM source directly: one call, no M threshold) -- so the fix is not "stop
+// using CUTLASS below some M", it's "CUTLASS's own tile-shape selection is
+// the lever", the same one a well-tuned CUTLASS deployment already pulls.
+// `<64,128,128>` still wastes M at n_tokens < 64 but only half as much;
+// picked over `<32,...>` because `EpilogueTileAuto` selects a 64-wide
+// epilogue tile for this element/layout combination and CUTLASS requires
+// EPI_TILE_M to divide CTA_M (`sm90_epilogue_tma_warpspecialized.hpp`'s own
+// static_assert) -- 32 failed to compile for exactly this reason, verified
+// by trying it first, not assumed. Narrowing to 32 with an explicit
+// (non-auto) smaller epilogue tile is a follow-up, not this change.
+//
+// `KernelTmaWarpSpecializedBlockwisePingpongSm120`, not the plain
+// `KernelScheduleSm120Blockwise` tag the other three instantiations in this
+// file use (which resolves to the *Cooperative* schedule): CUTLASS's own
+// `sm90_gemm_tma_warpspecialized_cooperative.hpp` static_asserts "Cooperative
+// kernel requires Tile Size to be greater than or equal to 128 along the
+// M-dimension" -- a hard schedule-level floor, not a tunable, so `<64,...>`
+// under Cooperative failed to compile for a second, different reason than
+// the epilogue-tile one above. Pingpong is CUTLASS's other TMA
+// warp-specialized schedule for this same blockwise-scaled family
+// (`dispatch_policy.hpp`'s `KernelTmaWarpSpecializedBlockwisePingpongSm120`,
+// alongside `...CooperativeSm120` -- both real, sibling schedule tags, not
+// one improvised) and has no such floor.
+namespace small_m {
+using CooperativeMmaTileShape_MNK = Shape<_64, _128, _128>;
+
+using ElementC = float;
+using LayoutC = cutlass::layout::RowMajor;
+constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+using ElementD = ElementC;
+using AlignmentD = std::integral_constant<int, AlignmentC>;
+
+using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+    cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, CooperativeMmaTileShape_MNK, ClusterShape_MNK,
+    cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementCompute, ElementC, LayoutC,
+    AlignmentC, ElementD, LayoutC, AlignmentD::value,
+    cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+
+using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+    cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, ElementA, cute::tuple<LayoutA, LayoutSFA>, AlignmentA,
+    ElementB, cute::tuple<LayoutB, LayoutSFB>, AlignmentB, ElementAccumulator, CooperativeMmaTileShape_MNK,
+    ClusterShape_MNK,
+    cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+    cutlass::gemm::KernelTmaWarpSpecializedBlockwisePingpongSm120>::CollectiveOp;
+
+using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop,
+                                                         CollectiveEpilogue, void>;
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+using StrideD = typename Gemm::GemmKernel::StrideD;
+}  // namespace small_m
+
+extern "C" size_t infero_cutlass_fp8_bw_gemm_f32out_small_m_workspace(int m, int n, int k) {
+  auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
+  auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
+  auto stride_D = cutlass::make_cute_packed_stride(small_m::StrideD{}, cute::make_shape(m, n, 1));
+  auto layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(m, n, k, 1));
+  auto layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, 1));
+  typename small_m::Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {m, n, k, 1},
+      {nullptr, stride_A, nullptr, stride_B, nullptr, layout_SFA, nullptr, layout_SFB},
+      {{}, nullptr, stride_D, nullptr, stride_D}};
+  return small_m::Gemm::get_workspace_size(arguments);
+}
+
+// Same contract as `infero_cutlass_fp8_bw_gemm_f32out` (`d` is the model's
+// own `out` buffer, `accum` selects CUTLASS's own beta=1 accumulate) -- only
+// the tile shape differs. Caller (Rust side) picks this over the plain
+// entry point below some `n_tokens` threshold; `can_implement` is still
+// checked here rather than assumed, so a shape this tile genuinely cannot
+// cover fails loudly instead of silently.
+extern "C" int32_t infero_cutlass_fp8_bw_gemm_f32out_small_m(const void* a, const void* b, const float* sfa,
+                                                              const float* sfb, float* d, void* workspace, int m,
+                                                              int n, int k, int accum, cudaStream_t stream) {
+  auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
+  auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
+  auto stride_D = cutlass::make_cute_packed_stride(small_m::StrideD{}, cute::make_shape(m, n, 1));
+  auto layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(m, n, k, 1));
+  auto layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, 1));
+
+  typename small_m::Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {m, n, k, 1},
+      {static_cast<const ElementA*>(a), stride_A, static_cast<const ElementB*>(b), stride_B, sfa, layout_SFA, sfb,
+       layout_SFB},
+      {{}, d, stride_D, d, stride_D}};
+  arguments.epilogue.thread.alpha = 1.0f;
+  arguments.epilogue.thread.beta = accum ? 1.0f : 0.0f;
+
+  small_m::Gemm gemm;
+  auto status = gemm.can_implement(arguments);
+  if (status != cutlass::Status::kSuccess) return static_cast<int32_t>(status);
+  status = gemm.initialize(arguments, workspace, stream);
+  if (status != cutlass::Status::kSuccess) return static_cast<int32_t>(status);
+  status = gemm.run(arguments, workspace, stream);
+  return static_cast<int32_t>(status);
+}
+
 // Genuine per-architecture kernel bodies for Hopper (SM90) and Blackwell
 // datacenter (SM100) -- NOT the same device code as the SM120 kernel above
 // recompiled with a different `-gencode`. CUTLASS's collective builders pick

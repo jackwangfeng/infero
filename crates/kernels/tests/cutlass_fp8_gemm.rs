@@ -344,7 +344,12 @@ fn the_f32out_gemm_matches_the_bf16_path() -> Result<()> {
     let d_w = stream.clone_htod(&w_buf)?;
     let cutlass_w = k.prepare_cutlass_weight(&d_w.as_view(), K, N, false)?;
 
-    for n_tokens in [1usize, 2, 3, 5, 8, 9, 17, 127, 128, 129] {
+    // 64/65 straddle `SMALL_M_MAX_TOKENS` -- `mma_e4m3_cutlass_sfa_f32out`
+    // routes internally to the small-M CUTLASS tile at and below it, the
+    // plain wide tile above it, so this list exercises both new kernel
+    // bodies and the exact boundary between them, not just the unchanged
+    // `mma_e4m3_cutlass_sfa` reference path.
+    for n_tokens in [1usize, 2, 3, 5, 8, 9, 17, 32, 64, 65, 127, 128, 129] {
         let x: Vec<f32> =
             (0..n_tokens).flat_map(|t| pseudo_random_f32(K, 0xD00D + t as u64, 3.0 + t as f32)).collect();
         let d_x = stream.clone_htod(&x)?;
