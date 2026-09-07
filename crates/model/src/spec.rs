@@ -277,6 +277,17 @@ impl GdnRollback {
         self.armed
     }
 
+    /// Which sequence slot the armed pass is for.
+    ///
+    /// Only meaningful when [`Self::is_armed`] is true. A caller keying a
+    /// decode-graph cache on "a verification pass is armed" needs this, not
+    /// just the bool: `stage`'s journal addresses are computed from this slot
+    /// at capture time and baked into the graph, so two sequences' armed
+    /// passes must never share a cache key even though both are "armed".
+    pub fn armed_slot(&self) -> usize {
+        self.slot
+    }
+
     /// One layer's state, for a caller checking what a pass left behind.
     pub fn working_state(&self) -> View<'_, f32> {
         self.state_scratch.as_view()

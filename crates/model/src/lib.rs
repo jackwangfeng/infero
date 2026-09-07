@@ -409,7 +409,7 @@ impl AttnDispatch {
     ///   - **CUDA graph capture** (`forward_batch_rows`). A pass that issues
     ///     more than one call reads `items` to decide where each call's
     ///     `run_base`/`run_tokens` fall, and a graph keyed only by
-    ///     `(pool, n_tokens, bucketed kv_len, armed)` cannot see that — so it
+    ///     `(pool, n_tokens, bucketed kv_len, armed slot)` cannot see that — so it
     ///     must not be captured or replayed. A single-call pass covers
     ///     `[0, n_tokens)` and is safe to capture, which is what keeps
     ///     ordinary decode steps graphable.
@@ -570,7 +570,7 @@ impl TqDispatch {
 
     /// Whether this plan's kernel launches are read off *this* call's item
     /// layout, and so must never be captured into or replayed from a CUDA
-    /// graph keyed only by `(pool, n_tokens, bucketed kv_len, armed)`.
+    /// graph keyed only by `(pool, n_tokens, bucketed kv_len, armed slot)`.
     ///
     /// A long run is layout-dependent even on its own: `attn_prefill_ws4`'s
     /// tiling comes from `run_tokens`, and the synthetic identity slot table
@@ -1923,9 +1923,28 @@ pub struct Model {
     /// `dequant_to_f16` + cuBLAS. Separate from `use_mmvq` so the tensor-core
     /// GEMM can be A/B'd without also disabling the batch-1 mat-vec.
     use_mmq: bool,
-    /// Decode graphs by (tokens, kv bucket). A step issues roughly 700 kernel
-    /// launches; replaying one graph removes that cost.
-    graphs: std::collections::HashMap<(u64, usize, usize, bool), GraphSlot>,
+    /// Decode graphs by (tokens, kv bucket, armed slot). A step issues
+    /// roughly 700 kernel launches; replaying one graph removes that cost.
+    ///
+    /// The fourth component used to be a plain `bool` for "a speculative
+    /// verification pass is armed" -- correct for a single sequence, wrong
+    /// the moment two concurrent sequences' verification passes can share a
+    /// `(pool, n_tokens, kv bucket)` key (identical `n_tokens = k + 1` and
+    /// nearby lengths bucketing the same, which two sequences speculating in
+    /// lockstep do constantly). `GdnRollback::stage`'s journal addresses
+    /// (`state_slot_span`/`conv_pre_slot_span`) are computed from `self.slot`
+    /// *at capture time* and baked into the graph as fixed pointers; a replay
+    /// for a different slot silently rewinds/stages the wrong sequence's
+    /// persistent GDN state while the rest of the pass (driven by freshly
+    /// uploaded `SeqLayout` data) correctly targets the replaying slot's own
+    /// region -- which that slot's `state_scratch` was then never staged
+    /// into, so its recurrence runs on stale or zeroed state. Symptom: the
+    /// sequence whose calls end up on the *replay* side of a shared key gets
+    /// near-zero draft acceptance and garbled output from its first
+    /// speculative round on, while the other sequence (whose call did the
+    /// capture) is unaffected. Keying on the armed slot itself, not just
+    /// whether one is armed, is what a `bool` could never distinguish.
+    graphs: std::collections::HashMap<(u64, usize, usize, Option<usize>), GraphSlot>,
     /// Cleared by `INFERO_NO_GRAPH`, for measuring what the graphs are worth.
     use_graph: bool,
     max_logit_rows: usize,
@@ -3584,16 +3603,24 @@ impl Model {
             None => Vec::new(),
         };
 
-        let armed = self.gdn_rollback.as_ref().is_some_and(|r| r.is_armed());
+        // `Some(slot)` when a speculative verification pass is armed for that
+        // slot, `None` otherwise -- not a plain `bool`. See the `graphs`
+        // field's own doc comment for why a `bool` here let two concurrent
+        // sequences' verification passes alias the same cached graph and
+        // silently rewind/stage each other's persistent GDN state.
+        let armed_slot = self
+            .gdn_rollback
+            .as_ref()
+            .and_then(|r| r.is_armed().then(|| r.armed_slot()));
         let key = (
             pool.id(),
             n_tokens,
             kv_len.next_multiple_of(graph_kv_bucket()),
-            armed,
+            armed_slot,
         );
         // A pass whose attention dispatch depends on *this call's item layout*
         // must not be captured or replayed: a graph is keyed by `(pool,
-        // n_tokens, bucketed kv_len, armed)`, and two batches sharing that key
+        // n_tokens, bucketed kv_len, armed slot)`, and two batches sharing that key
         // can still differ in how their tokens are split across items -- the
         // exact hazard the long comment above already spells out for
         // `prefill_run`. Today only `prefill_run` (a one-item pass) reads the
