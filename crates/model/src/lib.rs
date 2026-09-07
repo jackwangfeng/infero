@@ -6001,7 +6001,25 @@ impl Model {
                     // `tq.identity_slots`), and is called anyway -- same
                     // pre-check the dense path makes, and a real guard if that
                     // synthetic layout is ever changed.
-                    let t6_enabled = !std::env::var("INFERO_PREFILL_T6").is_ok_and(|v| v == "0");
+                    // Deliberately NOT `INFERO_PREFILL_T6` (the dense path's own
+                    // decoupled6 switch, on by default there) -- opt-in and
+                    // off by default here instead, pending real measurement.
+                    // `decoupled6` has no split-K of its own: its grid scales
+                    // with `run_tokens`, not `kv_len`. The dense path's
+                    // measured 1.082x win was taken on a wide run (30552
+                    // tokens); this TQ path's own long-run classification
+                    // starts at `TQ_DEQUANT_THRESHOLD` (9 tokens) against
+                    // whatever `kv_len` the sequence has grown to -- exactly
+                    // the shape a multi-turn conversation's second-and-later
+                    // turns produce (a handful of new tokens, tens of
+                    // thousands of cached ones), which the wide-run
+                    // measurement does not cover and nothing has measured.
+                    // `INFERO_TQ_DECOUPLED6=1` opts in once that shape is
+                    // actually benchmarked; until then this path only ever
+                    // reaches `FlashAttn2` (inert without the `flash_attn2`
+                    // feature + a `d_head=256`+contiguous+>=4096-token run)
+                    // or `Ws4` (today's shipped, tested behavior).
+                    let t6_enabled = std::env::var("INFERO_TQ_DECOUPLED6").is_ok_and(|v| v == "1");
                     match tq_long_run_kernel(fa2_ok, run_dims.d_head, t6_enabled) {
                         TqLongRunKernel::FlashAttn2 => {
                             #[cfg(feature = "flash_attn2")]
