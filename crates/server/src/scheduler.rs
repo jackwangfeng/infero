@@ -572,10 +572,10 @@ impl Scheduler {
         // leaves the text model's file ending at `blk.63` — so the path has to
         // be found rather than derived.
         let found = if std::path::Path::new(dir).is_dir() {
-            self.model.load_mtp_head(dir, rows)?
+            self.model.load_mtp_head(dir, rows, self.pool.max_seqs())?
         } else if let Some(side) = mtp_sidecar(dir) {
             tracing::info!(path = %side.display(), "MTP sidecar");
-            self.model.load_mtp_head_gguf(&side, rows)?
+            self.model.load_mtp_head_gguf(&side, rows, self.pool.max_seqs())?
         } else {
             false
         };
@@ -638,236 +638,287 @@ impl Scheduler {
         (self.t_issue, self.t_sample, self.t_advance, self.steps)
     }
 
-    /// Admit what fits, run one batched forward, and deliver its output.
-    /// One speculative round, or `Ok(false)` if this step is not one.
+    /// Admit what fits, run one speculative round *per eligible running
+    /// sequence*, and deliver each one's output. `Ok(true)` if any sequence's
+    /// round actually ran, `Ok(false)` if none did (every sequence falls
+    /// through to the ordinary step instead).
     ///
-    /// Deliberately narrow. It runs only when there is exactly one running
-    /// sequence, past its prompt, with a sampling (not greedy) request, a
-    /// drafter feed from the previous round, and `k + 1` free pool slots.
-    /// Everything else falls through to the ordinary step.
+    /// A sequence is eligible past its prompt, with a sampling (not greedy)
+    /// request, a drafter feed from the previous round, `k + 1` free pool
+    /// slots (checked against the pool's *remaining* budget after earlier
+    /// sequences in this same call already claimed theirs, not a stale
+    /// snapshot — the same reasoning `admit`'s own `committed_this_pass`
+    /// exists for), and room in its own context.
     ///
-    /// Single-sequence because `verify_draft_sampled` is: batched speculation
-    /// needs the recurrent working copy and the journal indexed per slot, which
-    /// is a separate piece of work. Not greedy because the acceptance rule here
-    /// is a probability ratio — a greedy request has no distribution to take a
-    /// ratio of, and `Sampler::distribution` refuses rather than inventing one.
+    /// Each eligible sequence gets its own call to
+    /// `draft_with_head_sampled`/`verify_draft_sampled` — this is NOT one
+    /// GPU pass covering several sequences' rows at once, just no longer
+    /// artificially restricted to exactly one sequence's turn a step. The
+    /// pool slot a sequence occupies (`seq.0`) doubles as which region of the
+    /// drafter's own cache its rows read and write
+    /// (`Model::load_mtp_head`'s doc comment on `MtpHead::fork`) — the same
+    /// number `GdnRollback::arm` already keys its own per-slot journal on, so
+    /// nothing new is invented here, just reused where this function used to
+    /// hardcode `0`.
+    ///
+    /// Not greedy because the acceptance rule here is a probability ratio —
+    /// a greedy request has no distribution to take a ratio of, and
+    /// `Sampler::distribution` refuses rather than inventing one.
     fn speculative_step(&mut self) -> Result<bool> {
-        if self.spec_k == 0 || self.running.len() != 1 {
+        if self.spec_k == 0 {
             return Ok(false);
         }
-        let idx = 0usize;
         let k = self.spec_k;
-        // Each skip is named, because "speculation is on" and "speculation is
-        // running" are different claims and only the second one is worth
-        // anything. A round that never fires looks exactly like a round that
-        // fires and accepts nothing.
-        let skip = |why: &'static str| -> Result<bool> {
-            tracing::debug!(why, "speculative step skipped");
-            Ok(false)
-        };
-        {
+        let skip = |why: &'static str| tracing::debug!(why, "speculative step skipped");
+
+        let mut eligible: Vec<usize> = Vec::new();
+        for idx in 0..self.running.len() {
             let r = &self.running[idx];
             if !r.prompt_complete() {
-                return skip("still prefilling");
+                skip("still prefilling");
+                continue;
             }
             if r.next.is_none() {
-                return skip("no pending token");
+                skip("no pending token");
+                continue;
             }
             if r.sampler.params().is_greedy() {
-                return skip("greedy request");
+                skip("greedy request");
+                continue;
             }
             if r.spec_feed.is_none() {
-                return skip("no drafter feed from the last pass");
+                skip("no drafter feed from the last pass");
+                continue;
             }
             if r.spec_desynced {
-                return skip("drafter desynced earlier in this sequence");
+                skip("drafter desynced earlier in this sequence");
+                continue;
             }
-        }
-        // The verification pass appends `k + 1` tokens before rolling back to
-        // the accepted prefix, so the slots have to be there for the whole pass.
-        if self.pool.free_slots() < k + 1 {
-            return skip("pool has no free slots");
-        }
-        if self.pool.headroom(self.running[idx].seq) < k + 1 {
-            return skip("sequence is at its context limit");
-        }
-
-        let seq = self.running[idx].seq;
-        let pending = self.running[idx].next.expect("checked above");
-        let feed = self.running[idx].spec_feed.take().expect("checked above");
-
-        // The drafter keeps a cache of its own, and it only advances on the
-        // rounds that run. Any step that skips speculation — a second sequence
-        // arriving is the ordinary one — leaves it behind the sequence, and it
-        // cannot catch up: `mtp_hidden` holds the rows of the *last* pass, so the
-        // hidden states for the gap are gone by the time anyone notices.
-        //
-        // Priming across the gap anyway would be reading slots nobody wrote.
-        // That is not a correctness question — verification uses the target
-        // model's distribution, so a bad draft only lowers the acceptance rate —
-        // but it is a cost with no upside, so the sequence stops speculating
-        // instead. Two concurrent requests used to reach this as a 500 from
-        // `MtpHead::run`'s own guard, which is where the gap was first seen.
-        let cached = self.model.mtp_head().map_or(0, |h| h.cached());
-        // An empty feed would slip past the comparison below and then fail
-        // inside `prime`, which is a 500 for a condition the scheduler can see.
-        let Some(first) = feed.positions.first().copied() else {
-            return skip("empty drafter feed");
-        };
-        if first > cached {
-            if !self.running[idx].spec_desynced {
-                self.running[idx].spec_desynced = true;
-                tracing::info!(
-                    seq = seq.0,
-                    position = first,
-                    cached,
-                    "the drafter fell behind this sequence; it will decode \
-                     without speculation from here"
-                );
+            if self.pool.headroom(r.seq) < k + 1 {
+                skip("sequence is at its context limit");
+                continue;
             }
+            eligible.push(idx);
+        }
+        if eligible.is_empty() {
             return Ok(false);
         }
-        // The window the repetition penalty reads, which both sides have to
-        // score against — see `verify_draft_sampled`.
-        let history: Vec<u32> = {
-            let r = &self.running[idx];
-            let mut h = r.prompt.clone();
-            h.extend_from_slice(&r.generated);
-            r.sampler.window(&h).to_vec()
-        };
 
-        tracing::debug!(
-            first = feed.positions.first().copied(),
-            rows = feed.rows.len(),
-            cached = self.model.mtp_head().map(|h| h.cached()),
-            "speculative round"
-        );
-        // A round's three parts, timed separately under `INFERO_STEP_TIMING`.
-        // The whole is measurable end to end and the verification pass is
-        // measurable on its own, so what this adds is the *difference* — the
-        // drafting and the bookkeeping — which at k=3 was 9.7 ms of a 50.8 ms
-        // round and had no attribution at all.
-        let t0 = self.profile.then(std::time::Instant::now);
-        let draft = {
-            let r = &mut self.running[idx];
-            self.model
-                .draft_with_head_sampled(k, &feed, &mut r.sampler, &history)?
-        };
-        let t1 = self.profile.then(std::time::Instant::now);
-        let outcome = {
-            let r = &mut self.running[idx];
-            self.model.verify_draft_sampled(
-                seq,
-                &mut self.pool,
-                pending,
-                &draft,
-                &mut r.sampler,
-                &history,
-                r.mrope_delta,
-            )?
-        };
-
-        let t2 = self.profile.then(std::time::Instant::now);
-        self.steps += 1;
-        self.spec_steps += 1;
-        self.spec_tokens += outcome.tokens.len() as u64;
-        self.running[idx].spec_rounds += 1;
-        self.running[idx].spec_emitted += outcome.tokens.len() as u64;
-
-        // `INFERO_ADAPTIVE_SPEC`: fold this round's yield into the running
-        // average and let it move `spec_k` toward whatever the average says a
-        // draft this deep is worth — up to `spec_k_max`, never past it, since
-        // that is what `enable_speculation` sized the GDN rollback journal
-        // for and going higher would need a reallocation this is not one.
-        // Going lower needs nothing: the journal already holds `k_max + 1`
-        // rows and a smaller round just uses fewer of them.
-        //
-        // The two thresholds are a band, not a line, on purpose — a value
-        // that decided every round by comparing the same average to the same
-        // single cutoff would flip `spec_k` back and forth across it as the
-        // average drifted a few hundredths either side.
-        if self.adaptive_spec {
-            let yielded = outcome.tokens.len() as f64;
-            const ALPHA: f64 = 0.15;
-            self.spec_ema_accept = Some(match self.spec_ema_accept {
-                Some(prev) => prev * (1.0 - ALPHA) + yielded * ALPHA,
-                None => yielded,
-            });
-            let ema = self.spec_ema_accept.expect("just set above");
-            self.spec_k_cooldown = self.spec_k_cooldown.saturating_sub(1);
-            // Rounds, not seconds: a round is the unit both the EMA and the
-            // thresholds are already in, so this stays the same number of
-            // *decisions* apart whatever the round rate a request happens to
-            // run at. 20 measured as 0.7 s at this model's round rate — under
-            // one exchange's length, so it still flipped inside a single
-            // short reply. 80 is closer to a short reply's whole round count,
-            // which is the granularity a change should default to.
-            const COOLDOWN: u64 = 80;
-            if self.spec_k_cooldown == 0 {
-                let k = self.spec_k as f64;
-                if ema > k * 0.85 + 0.15 && self.spec_k < self.spec_k_max {
-                    self.spec_k += 1;
-                    self.spec_k_cooldown = COOLDOWN;
-                    tracing::debug!(k = self.spec_k, ema, "adaptive spec: deeper draft");
-                } else if ema < k * 0.4 && self.spec_k > 1 {
-                    self.spec_k -= 1;
-                    self.spec_k_cooldown = COOLDOWN;
-                    tracing::debug!(k = self.spec_k, ema, "adaptive spec: shallower draft");
-                }
-            }
-        }
-
-        // Every emitted token goes through the same bookkeeping a plain step's
-        // single token does, in order, and the first one that ends the sequence
-        // stops the rest — a stop sequence found at token two must not be
-        // overrun by token three.
-        let mut finished = false;
-        for &t in &outcome.tokens {
-            if self.advance_token(idx, t)? {
-                finished = true;
+        let mut any_ran = false;
+        let mut finished_indices: Vec<usize> = Vec::new();
+        // The verification pass appends `k + 1` tokens before rolling back to
+        // the accepted prefix, so the slots have to be there for the whole
+        // pass -- tracked across this loop's own sequences, not re-read from
+        // a snapshot `pool.free_slots()` would otherwise report as if none of
+        // this call's earlier sequences had claimed anything yet.
+        let mut free_slots_left = self.pool.free_slots();
+        for idx in eligible {
+            if free_slots_left < k + 1 {
+                skip("pool has no free slots left this round");
                 break;
             }
-        }
-        if let (Some(t0), Some(t1), Some(t2)) = (t0, t1, t2) {
-            let t3 = std::time::Instant::now();
-            self.spec_draft_ms += (t1 - t0).as_secs_f64() * 1e3;
-            self.spec_verify_ms += (t2 - t1).as_secs_f64() * 1e3;
-            self.spec_after_ms += (t3 - t2).as_secs_f64() * 1e3;
-            self.spec_window += 1;
-            if self.spec_window >= 100 {
-                let w = self.spec_window as f64;
-                tracing::warn!(
-                    draft_ms = format!("{:.2}", self.spec_draft_ms / w),
-                    verify_ms = format!("{:.2}", self.spec_verify_ms / w),
-                    after_ms = format!("{:.2}", self.spec_after_ms / w),
-                    k = self.spec_k,
-                    accept = format!("{:.2}", self.spec_tokens as f64 / self.spec_steps as f64),
-                    "per-round timing"
-                );
-                // The per-kernel table, which the device layer has been
-                // accumulating all along and nothing was printing. Beside the
-                // draft/verify split because the two are one question: that
-                // split says *which half* the round is spent in, and this says
-                // which kernel inside it. Reset with the window so the next
-                // hundred rounds are read on their own.
-                let report = self.model.device().profile().report();
-                if !report.is_empty() {
-                    tracing::warn!("per-kernel, last {} rounds:\n{report}", self.spec_window);
+            let seq = self.running[idx].seq;
+            let branch = seq.0;
+            let pending = self.running[idx].next.expect("checked above");
+            let feed = self.running[idx].spec_feed.take().expect("checked above");
+
+            // The drafter keeps a cache of its own, and it only advances on the
+            // rounds that run. Any round that skips a sequence — this one
+            // falling through above, or another sequence's round claiming the
+            // last free slots first — leaves that sequence's drafter behind,
+            // and it cannot catch up: `mtp_hidden` holds the rows of the
+            // *last* pass, so the hidden states for the gap are gone by the
+            // time anyone notices.
+            //
+            // Priming across the gap anyway would be reading slots nobody
+            // wrote. That is not a correctness question — verification uses
+            // the target model's distribution, so a bad draft only lowers the
+            // acceptance rate — but it is a cost with no upside, so the
+            // sequence stops speculating instead. Two concurrent requests
+            // used to reach this as a 500 from `MtpHead::run`'s own guard,
+            // which is where the gap was first seen.
+            let cached = self.model.mtp_head().map_or(0, |h| h.cached(branch));
+            // An empty feed would slip past the comparison below and then
+            // fail inside `prime`, which is a 500 for a condition the
+            // scheduler can see.
+            let Some(first) = feed.positions.first().copied() else {
+                skip("empty drafter feed");
+                self.running[idx].spec_feed = None;
+                continue;
+            };
+            if first > cached {
+                if !self.running[idx].spec_desynced {
+                    self.running[idx].spec_desynced = true;
+                    tracing::info!(
+                        seq = seq.0,
+                        position = first,
+                        cached,
+                        "the drafter fell behind this sequence; it will decode \
+                         without speculation from here"
+                    );
                 }
-                self.model.device().profile().reset();
-                self.spec_draft_ms = 0.0;
-                self.spec_verify_ms = 0.0;
-                self.spec_after_ms = 0.0;
-                self.spec_window = 0;
+                continue;
+            }
+            // The window the repetition penalty reads, which both sides have
+            // to score against — see `verify_draft_sampled`.
+            let history: Vec<u32> = {
+                let r = &self.running[idx];
+                let mut h = r.prompt.clone();
+                h.extend_from_slice(&r.generated);
+                r.sampler.window(&h).to_vec()
+            };
+
+            tracing::debug!(
+                seq = seq.0,
+                first = feed.positions.first().copied(),
+                rows = feed.rows.len(),
+                cached = self.model.mtp_head().map(|h| h.cached(branch)),
+                "speculative round"
+            );
+            // A round's three parts, timed separately under
+            // `INFERO_STEP_TIMING`. The whole is measurable end to end and
+            // the verification pass is measurable on its own, so what this
+            // adds is the *difference* — the drafting and the bookkeeping —
+            // which at k=3 was 9.7 ms of a 50.8 ms round and had no
+            // attribution at all.
+            let t0 = self.profile.then(std::time::Instant::now);
+            let draft = {
+                let r = &mut self.running[idx];
+                self.model.draft_with_head_sampled(k, &feed, &mut r.sampler, &history, branch)?
+            };
+            let t1 = self.profile.then(std::time::Instant::now);
+            let outcome = {
+                let r = &mut self.running[idx];
+                self.model.verify_draft_sampled(
+                    seq,
+                    &mut self.pool,
+                    pending,
+                    &draft,
+                    &mut r.sampler,
+                    &history,
+                    r.mrope_delta,
+                )?
+            };
+            free_slots_left = free_slots_left.saturating_sub(k + 1);
+
+            let t2 = self.profile.then(std::time::Instant::now);
+            self.steps += 1;
+            self.spec_steps += 1;
+            self.spec_tokens += outcome.tokens.len() as u64;
+            self.running[idx].spec_rounds += 1;
+            self.running[idx].spec_emitted += outcome.tokens.len() as u64;
+
+            // `INFERO_ADAPTIVE_SPEC`: fold this round's yield into the
+            // running average and let it move `spec_k` toward whatever the
+            // average says a draft this deep is worth — up to `spec_k_max`,
+            // never past it, since that is what `enable_speculation` sized
+            // the GDN rollback journal for and going higher would need a
+            // reallocation this is not one. Going lower needs nothing: the
+            // journal already holds `k_max + 1` rows and a smaller round just
+            // uses fewer of them. Shared across every sequence's rounds
+            // (there is one `spec_k` for the whole scheduler, not one a
+            // sequence) — same as before this function handled more than one
+            // sequence a step.
+            //
+            // The two thresholds are a band, not a line, on purpose — a value
+            // that decided every round by comparing the same average to the
+            // same single cutoff would flip `spec_k` back and forth across it
+            // as the average drifted a few hundredths either side.
+            if self.adaptive_spec {
+                let yielded = outcome.tokens.len() as f64;
+                const ALPHA: f64 = 0.15;
+                self.spec_ema_accept = Some(match self.spec_ema_accept {
+                    Some(prev) => prev * (1.0 - ALPHA) + yielded * ALPHA,
+                    None => yielded,
+                });
+                let ema = self.spec_ema_accept.expect("just set above");
+                self.spec_k_cooldown = self.spec_k_cooldown.saturating_sub(1);
+                // Rounds, not seconds: a round is the unit both the EMA and
+                // the thresholds are already in, so this stays the same
+                // number of *decisions* apart whatever the round rate a
+                // request happens to run at. 20 measured as 0.7 s at this
+                // model's round rate — under one exchange's length, so it
+                // still flipped inside a single short reply. 80 is closer to
+                // a short reply's whole round count, which is the
+                // granularity a change should default to.
+                const COOLDOWN: u64 = 80;
+                if self.spec_k_cooldown == 0 {
+                    let k = self.spec_k as f64;
+                    if ema > k * 0.85 + 0.15 && self.spec_k < self.spec_k_max {
+                        self.spec_k += 1;
+                        self.spec_k_cooldown = COOLDOWN;
+                        tracing::debug!(k = self.spec_k, ema, "adaptive spec: deeper draft");
+                    } else if ema < k * 0.4 && self.spec_k > 1 {
+                        self.spec_k -= 1;
+                        self.spec_k_cooldown = COOLDOWN;
+                        tracing::debug!(k = self.spec_k, ema, "adaptive spec: shallower draft");
+                    }
+                }
+            }
+
+            // Every emitted token goes through the same bookkeeping a plain
+            // step's single token does, in order, and the first one that ends
+            // the sequence stops the rest — a stop sequence found at token
+            // two must not be overrun by token three.
+            let mut finished = false;
+            for &t in &outcome.tokens {
+                if self.advance_token(idx, t)? {
+                    finished = true;
+                    break;
+                }
+            }
+            if let (Some(t0), Some(t1), Some(t2)) = (t0, t1, t2) {
+                let t3 = std::time::Instant::now();
+                self.spec_draft_ms += (t1 - t0).as_secs_f64() * 1e3;
+                self.spec_verify_ms += (t2 - t1).as_secs_f64() * 1e3;
+                self.spec_after_ms += (t3 - t2).as_secs_f64() * 1e3;
+                self.spec_window += 1;
+                if self.spec_window >= 100 {
+                    let w = self.spec_window as f64;
+                    tracing::warn!(
+                        draft_ms = format!("{:.2}", self.spec_draft_ms / w),
+                        verify_ms = format!("{:.2}", self.spec_verify_ms / w),
+                        after_ms = format!("{:.2}", self.spec_after_ms / w),
+                        k = self.spec_k,
+                        accept = format!("{:.2}", self.spec_tokens as f64 / self.spec_steps as f64),
+                        "per-round timing"
+                    );
+                    // The per-kernel table, which the device layer has been
+                    // accumulating all along and nothing was printing. Beside
+                    // the draft/verify split because the two are one
+                    // question: that split says *which half* the round is
+                    // spent in, and this says which kernel inside it. Reset
+                    // with the window so the next hundred rounds are read on
+                    // their own.
+                    let report = self.model.device().profile().report();
+                    if !report.is_empty() {
+                        tracing::warn!("per-kernel, last {} rounds:\n{report}", self.spec_window);
+                    }
+                    self.model.device().profile().reset();
+                    self.spec_draft_ms = 0.0;
+                    self.spec_verify_ms = 0.0;
+                    self.spec_after_ms = 0.0;
+                    self.spec_window = 0;
+                }
+            }
+            any_ran = true;
+            if finished {
+                finished_indices.push(idx);
+            } else {
+                self.running[idx].spec_feed = Some(outcome.feed);
             }
         }
-        if finished {
+        // Retire finished sequences after every eligible sequence's round has
+        // run, in descending index order: `swap_remove` moves the current
+        // last element into the removed slot, and removing highest-first
+        // means every other index still in this list is untouched by an
+        // earlier removal (it can only ever be *below* the slot just freed).
+        finished_indices.sort_unstable_by(|a, b| b.cmp(a));
+        for idx in finished_indices {
             let r = self.running.swap_remove(idx);
             self.retire(r);
-            return Ok(true);
         }
-        self.running[idx].spec_feed = Some(outcome.feed);
-        Ok(true)
+        Ok(any_ran)
     }
 
     pub fn step(&mut self) -> Result<()> {

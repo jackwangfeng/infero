@@ -124,7 +124,7 @@ fn two_branches_at_one_position_keep_their_own_keys() -> Result<()> {
         let (w, embed) = synth(&dev, dm)?;
         // Room for the prefix plus one forked slot a branch.
         let mut head = MtpHead::new(&dev, &kern, w, dm, PREFIX.max(branches), PREFIX + branches, branches)?;
-        head.step(&kern, &embed, &ids, &positions, &hidden.as_view(), None)?;
+        head.step(&kern, &embed, &ids, &positions, &hidden.as_view(), None, 0)?;
         let rows = run(&mut head, &embed)?;
         rows.into_iter()
             .map(|r| head.logits_row(&kern, &embed, r).map(|v| v.to_vec()))
@@ -148,11 +148,11 @@ fn two_branches_at_one_position_keep_their_own_keys() -> Result<()> {
 
     // Each branch alone, on the path the linear draft already takes.
     let want_a = logits_for(1, &|h, embed| {
-        h.step_from_own_output(&kern, embed, tok_a, PREFIX, PREFIX - 1)?;
+        h.step_from_own_output(&kern, embed, tok_a, PREFIX, PREFIX - 1, 0)?;
         Ok(vec![0])
     })?;
     let want_b = logits_for(1, &|h, embed| {
-        h.step_from_own_output(&kern, embed, tok_b, PREFIX, PREFIX - 1)?;
+        h.step_from_own_output(&kern, embed, tok_b, PREFIX, PREFIX - 1, 0)?;
         Ok(vec![0])
     })?;
 

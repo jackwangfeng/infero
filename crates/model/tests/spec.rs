@@ -625,7 +625,7 @@ fn priming_the_drafter_across_a_gap_is_an_error() -> Result<()> {
     // Contiguous first, so that the failure below is the gap and not the setup.
     let feed = DraftFeed::after_prefill(&prompt, pending);
     model.draft_with_head(K, &feed)?;
-    let reached = model.mtp_head().expect("installed above").cached();
+    let reached = model.mtp_head().expect("installed above").cached(0);
     // The prompt's rows, plus one slot for each draft after the first: a
     // `k`-token draft re-enters the head `k - 1` times through
     // `step_from_own_output`, and each of those writes a key. This is the drafter
@@ -658,7 +658,7 @@ fn priming_the_drafter_across_a_gap_is_an_error() -> Result<()> {
     // And the refusal left the cache where it was, so a caller that skips this
     // round and comes back contiguous is still in business.
     assert_eq!(
-        model.mtp_head().expect("installed above").cached(),
+        model.mtp_head().expect("installed above").cached(0),
         reached,
         "a refused prime must not move the drafter's cache"
     );
@@ -703,7 +703,7 @@ fn a_tree_of_width_one_drafts_what_the_linear_path_drafts() -> Result<()> {
     };
     let linear = {
         let mut s = infero_model::Sampler::new(sp.clone());
-        model.draft_with_head_sampled(K, &feed, &mut s, &prompt)?
+        model.draft_with_head_sampled(K, &feed, &mut s, &prompt, 0)?
     };
     let tree = {
         let mut s = infero_model::Sampler::new(sp.clone());

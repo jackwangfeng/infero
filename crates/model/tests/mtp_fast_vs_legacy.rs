@@ -115,7 +115,7 @@ fn prints_row0_logits_for_cross_process_diff() -> Result<()> {
     let hidden_host: Vec<f32> = (0..T * d).map(|i| ((i * 37 % 101) as f32 - 50.0) / 97.0).collect();
     let hidden = dev.stream().clone_htod(&hidden_host)?;
 
-    head.step(&kern, &embed, &ids, &positions, &hidden.as_view(), None)?;
+    head.step(&kern, &embed, &ids, &positions, &hidden.as_view(), None, 0)?;
 
     let env = std::env::var("INFERO_ATTN_MMA").unwrap_or_default();
     eprintln!("mode: INFERO_ATTN_MMA={env:?} d_head={}", dm.d_head);

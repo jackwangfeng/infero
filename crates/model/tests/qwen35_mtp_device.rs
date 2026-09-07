@@ -352,7 +352,7 @@ fn the_device_head_reproduces_the_reference_output_on_the_real_weights() -> Resu
         ] {
             let mut head = head_from_capture(&dev, c, reading)?;
             let (embed, ids) = stub_embedding(&dev, c)?;
-            head.step(&kern, &embed, &ids, &positions, &hidden.as_view(), None)?;
+            head.step(&kern, &embed, &ids, &positions, &hidden.as_view(), None, 0)?;
             let out = dev.stream().clone_dtoh(&head.output())?;
             dev.synchronize()?;
             assert_eq!(out.len(), t * d);
@@ -403,25 +403,25 @@ fn the_drafters_cache_sits_one_position_behind_the_targets() -> Result<()> {
         let (embed, ids) = stub_embedding(&dev, c)?;
         let hidden = dev.stream().clone_htod(c.get("target.final_hidden"))?;
 
-        assert_eq!(head.cache_len(), 0, "a fresh drafter has no history");
+        assert_eq!(head.cache_len(0), 0, "a fresh drafter has no history");
         let positions: Vec<usize> = (0..t).collect();
-        head.step(&kern, &embed, &ids, &positions, &hidden.as_view(), None)?;
+        head.step(&kern, &embed, &ids, &positions, &hidden.as_view(), None, 0)?;
         // Slot `p` holds the pair `(h_p, emb(t_{p+1}))`, so a pass over the
         // target's positions `0..t` fills exactly `t` slots — one *behind* the
         // target, which has by then seen `t + 1` tokens counting the one it just
         // sampled.
-        assert_eq!(head.cache_len(), t, "the drafter's cache should hold {t}");
+        assert_eq!(head.cache_len(0), t, "the drafter's cache should hold {t}");
         assert_eq!(head.rows(), t);
 
         // A second draft step: one row, at the next position, fed the head's own
         // output rather than the target's hidden state.
-        head.step_from_own_output(&kern, &embed, ids[0], t, t - 1)?;
-        assert_eq!(head.cache_len(), t + 1);
+        head.step_from_own_output(&kern, &embed, ids[0], t, t - 1, 0)?;
+        assert_eq!(head.cache_len(0), t + 1);
         assert_eq!(head.rows(), 1);
 
         // And rolling back is expressible: the drafter's own coordinate system.
-        head.truncate(t);
-        assert_eq!(head.cache_len(), t);
+        head.truncate(0, t);
+        assert_eq!(head.cache_len(0), t);
         Ok(())
     })
 }
@@ -456,7 +456,7 @@ fn the_device_head_drafts_the_reference_tokens_and_agrees_with_the_target() -> R
         let (embed, ids) = stub_embedding(&dev, c)?;
         let hidden = dev.stream().clone_htod(c.get("target.final_hidden"))?;
         let positions: Vec<usize> = (0..t).collect();
-        head.step(&kern, &embed, &ids, &positions, &hidden.as_view(), None)?;
+        head.step(&kern, &embed, &ids, &positions, &hidden.as_view(), None, 0)?;
 
         let want: Vec<u32> = c.get("draft_argmax").iter().map(|v| *v as u32).collect();
         let target: Vec<u32> = c.get("target.argmax").iter().map(|v| *v as u32).collect();
@@ -573,6 +573,7 @@ fn the_head_reaches_a_useful_acceptance_length_at_k_2() -> Result<()> {
             &positions,
             &hidden.as_view(),
             None,
+            0,
         )?;
         let first: Vec<u32> = (0..t)
             .map(|row| head.draft_row(&kern, &lm, row))
@@ -588,7 +589,7 @@ fn the_head_reaches_a_useful_acceptance_length_at_k_2() -> Result<()> {
             // probe that read `out[row]` after another probe had run would be
             // feeding back the wrong row. Re-running is a few milliseconds and
             // leaves no room for that mistake.
-            head.truncate(0);
+            head.truncate(0, 0);
             head.step(
                 &kern,
                 &embed,
@@ -596,8 +597,9 @@ fn the_head_reaches_a_useful_acceptance_length_at_k_2() -> Result<()> {
                 &positions,
                 &hidden.as_view(),
                 None,
+                0,
             )?;
-            head.step_from_own_output(&kern, &embed, first[row], row + 1, row)?;
+            head.step_from_own_output(&kern, &embed, first[row], row + 1, row, 0)?;
             second[row] = head.draft_row(&kern, &lm, 0)?;
         }
 
@@ -993,7 +995,7 @@ fn chunked_priming_agrees_with_one_wide_step() -> Result<()> {
         let whole = {
             let mut head = head_from_capture(&dev, c, Reading::Reference)?;
             let (embed, ids) = stub_embedding(&dev, c)?;
-            head.step(&kern, &embed, &ids, &positions, &hidden.as_view(), None)?;
+            head.step(&kern, &embed, &ids, &positions, &hidden.as_view(), None, 0)?;
             let out = dev.stream().clone_dtoh(&head.output())?;
             dev.synchronize()?;
             assert_eq!(out.len(), t * d);
@@ -1003,7 +1005,7 @@ fn chunked_priming_agrees_with_one_wide_step() -> Result<()> {
         // The same feed, five chunks, into a head that cannot hold it whole.
         let mut head = head_from_capture_width(&dev, c, Reading::Reference, WIDTH, 1)?;
         let (embed, ids) = stub_embedding(&dev, c)?;
-        let last = head.prime(&kern, &embed, &ids, &positions, &hidden.as_view(), None)?;
+        let last = head.prime(&kern, &embed, &ids, &positions, &hidden.as_view(), None, 0)?;
         let chunked = dev.stream().clone_dtoh(&head.output())?;
         dev.synchronize()?;
 
@@ -1012,7 +1014,7 @@ fn chunked_priming_agrees_with_one_wide_step() -> Result<()> {
         let tail = if t % WIDTH == 0 { WIDTH } else { t % WIDTH };
         assert_eq!(chunked.len(), tail * d, "the last chunk's rows");
         assert_eq!(last, tail - 1, "the row `prime` points at");
-        assert_eq!(head.cached(), t, "the drafter's cache after priming");
+        assert_eq!(head.cached(0), t, "the drafter's cache after priming");
 
         let start = t - tail;
         let aligned = relative_l2(&chunked, &whole[start * d..]);

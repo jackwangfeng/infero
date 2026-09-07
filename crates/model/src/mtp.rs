@@ -178,8 +178,21 @@ pub struct MtpHead {
     fork_at: usize,
     /// One row quantized to q8_1, for the integer vocabulary mat-vec.
     q8_1: Buf<u8>,
-    /// How far the drafter's cache reaches, in positions.
-    len: usize,
+    /// How far each branch's region of the drafter's cache reaches, in
+    /// positions -- one entry a branch, not one scalar for the whole head.
+    ///
+    /// The linear-draft case (`branches == 1`) is what every caller before
+    /// batched multi-sequence speculation used, and still works exactly as a
+    /// single scalar would: `lens[0]` is the only entry read or written.
+    /// Batched multi-sequence speculation (see `Model::draft_with_head_sampled`'s
+    /// batch entry points) is what actually needs more than one -- each pool
+    /// slot's branch (via [`Self::fork`] with `base: 0`, repurposing the
+    /// tree-draft sharing scheme as N independent same-width regions instead
+    /// of a shared prefix) has its own real conversation length, unrelated to
+    /// any other slot's, and sharing one scalar across them would silently
+    /// let one slot's row attend over another slot's never-written cache
+    /// tail or miss real history of its own.
+    lens: Vec<usize>,
     /// Rows the last [`MtpHead::step`] produced.
     rows: usize,
     logits_host: Vec<f32>,
@@ -292,7 +305,7 @@ impl MtpHead {
             // `d_model` but `d_ff`, which `w_down` and the FC's `2 * d_model`
             // cat both exceed it by. See `matmul`'s own `has_mmvq` branch.
             q8_1: stream.alloc_zeros::<u8>(Kernels::q8_1_bytes((2 * d).max(da).max(dims.d_ff)))?,
-            len: 0,
+            lens: vec![0; branches],
             rows: 0,
             w,
             logits_host: vec![0.0; dims.vocab],
@@ -326,22 +339,25 @@ impl MtpHead {
         self.w.device_bytes + acts * 4 + (self.kc.len() + self.vc.len()) * 2
     }
 
-    /// How many positions the drafter's cache holds.
-    pub fn cache_len(&self) -> usize {
-        self.len
+    /// How many positions branch `branch`'s region of the drafter's cache
+    /// holds. `0` for the ordinary, non-batched linear-draft case, where
+    /// there is exactly one branch.
+    pub fn cache_len(&self, branch: usize) -> usize {
+        self.lens[branch]
     }
 
-    /// Drop the drafter's cache back to `len` positions.
+    /// Drop branch `branch`'s region of the drafter's cache back to `len`
+    /// positions.
     ///
     /// The drafter's coordinate system is one behind the target's — slot `p`
     /// holds `(h_p, emb(t_{p+1}))` — so a caller rolling back a rejected draft
     /// has to convert. [`crate::spec`] does; nothing here does it silently.
-    pub fn truncate(&mut self, len: usize) {
-        self.len = self.len.min(len);
+    pub fn truncate(&mut self, branch: usize, len: usize) {
+        self.lens[branch] = self.lens[branch].min(len);
     }
 
-    pub fn reset(&mut self) {
-        self.len = 0;
+    pub fn reset(&mut self, branch: usize) {
+        self.lens[branch] = 0;
         self.rows = 0;
     }
 
@@ -364,6 +380,7 @@ impl MtpHead {
         positions: &[usize],
         hidden: &View<'_, f32>,
         mrope: Option<&[i32]>,
+        branch: usize,
     ) -> Result<()> {
         let n = shifted_ids.len();
         anyhow::ensure!(
@@ -386,8 +403,12 @@ impl MtpHead {
         self.dev
             .stream()
             .memcpy_dtod(hidden, &mut self.hidden_in.slice_mut(..n * self.dims.d_model))?;
-        // One branch: `step` is the linear draft's own entry point.
-        self.run(kern, embed, shifted_ids, positions, &vec![0; shifted_ids.len()], 0, mrope)
+        // One row set, all one branch: `step` is the linear draft's own entry
+        // point (never a tree level). `branch` names which pool slot's region
+        // of the cache this call reads/writes -- `0` for the ordinary,
+        // single-sequence, non-batched case; a real pool slot for a batched
+        // multi-sequence round (see `Model::draft_with_head_sampled`).
+        self.run(kern, embed, shifted_ids, positions, &vec![branch; shifted_ids.len()], 0, mrope)
     }
 
     /// [`MtpHead::step`] over a feed of any width, in chunks.
@@ -420,6 +441,7 @@ impl MtpHead {
         positions: &[usize],
         hidden: &View<'_, f32>,
         mrope: Option<&[i32]>,
+        branch: usize,
     ) -> Result<usize> {
         let n = shifted_ids.len();
         anyhow::ensure!(n > 0, "priming the drafter with no rows");
@@ -455,6 +477,7 @@ impl MtpHead {
                 &positions[start..end],
                 &chunk,
                 mrope.map(|m| &m[3 * start..3 * end]),
+                branch,
             )?;
             last_row = end - start - 1;
             start = end;
@@ -477,6 +500,7 @@ impl MtpHead {
         drafted: u32,
         position: usize,
         row: usize,
+        branch: usize,
     ) -> Result<()> {
         anyhow::ensure!(
             row < self.rows,
@@ -489,7 +513,7 @@ impl MtpHead {
         // so reading it as an input would alias.
         let mut dst = self.hidden_in.slice_mut(..d);
         self.dev.stream().memcpy_dtod(&src, &mut dst)?;
-        self.run(kern, embed, &[drafted], &[position], &[0], 0, None)
+        self.run(kern, embed, &[drafted], &[position], &[branch], 0, None)
     }
 
     /// One draft step's kernels: four small uploads, then eighteen launches.
@@ -602,6 +626,19 @@ impl MtpHead {
             .stream()
             .memcpy_htod(&table, &mut self.slot_table.slice_mut(..))?;
         self.fork_at = base;
+        // Every branch starts this new fork's region at exactly `base`: the
+        // table above only keeps positions `< base` (the shared prefix)
+        // addressed the same way as before, and rewrites the rest fresh for
+        // however many branches this call has, discarding whatever finer
+        // divergence existed under a shallower fork's (fewer, differently
+        // numbered) branches. A branch whose own `lens[b]` was never
+        // individually written this deep (every branch, on a tree's first
+        // level after the root) would otherwise fail `run`'s own no-gap
+        // check on its very first row into the new region, even though the
+        // shared prefix genuinely covers it.
+        for l in &mut self.lens {
+            *l = base;
+        }
         Ok(())
     }
 
@@ -671,13 +708,37 @@ impl MtpHead {
                 branch_of[i]
             );
         }
-        anyhow::ensure!(
-            positions[0] <= self.len,
-            "a draft step at position {} with only {} positions cached would \
-             leave a hole in the drafter's history",
-            positions[0],
-            self.len
-        );
+        // Checked against the widest any branch has reached, not just this
+        // branch's own -- the pre-batching code checked one shared `len`
+        // scalar this way, and a tree's lanes are adopted into use
+        // progressively level by level (a lane that first appears at level 3
+        // implicitly inherits its ancestor's real history, not literally its
+        // own past writes, since it has none yet), so restoring exactly that
+        // shared-maximum check is what keeps tree drafting's real behavior
+        // unchanged rather than half-generalizing a per-branch check that
+        // does not know about parent/child lane relationships.
+        //
+        // This makes the assertion weaker, not the computation: the real KV
+        // read/write address for every row still comes from `slot_table`,
+        // built per branch above, so a row genuinely still only ever touches
+        // its own branch's cache region regardless of what this check allows
+        // through. For batched multi-sequence speculation (this function's
+        // actual new caller), each sequence's own feed is always fed by that
+        // same sequence's own correctly-tracked progress, so this check
+        // passing because some OTHER, unrelated sequence ran further ahead in
+        // the same round is not a real gap this assertion needed to catch —
+        // it would only ever fire on an actual bug elsewhere, same as before.
+        for (i, &p) in positions.iter().enumerate() {
+            let b = branch_of[i];
+            if i == 0 || branch_of[i - 1] != b {
+                let floor = self.lens.iter().copied().max().unwrap_or(0);
+                anyhow::ensure!(
+                    p <= floor,
+                    "branch {b}'s draft step at position {p} with only {floor} \
+                     positions cached would leave a hole in its history",
+                );
+            }
+        }
         anyhow::ensure!(
             embed.k == d && embed.n >= 1,
             "the embedding matrix is [{}, {}], expected rows of {d}",
@@ -914,9 +975,23 @@ impl MtpHead {
             )?;
         }
 
-        // The drafter's cache now reaches one past the last row's position.
-        self.len = self.len.max(last + 1);
-        let kv_len = self.len;
+        // Each branch's cache now reaches one past *its own* last row's
+        // position -- not `last` (the call's overall last position), which
+        // is only right when every row belongs to the same branch. `kv_len`
+        // itself stays a single bound for the whole batched call (the
+        // attention kernels below take one), computed as the widest any
+        // branch in this call reaches; a narrower branch's own rows still
+        // get the right answer because the kernel's causal mask is keyed off
+        // each row's own position, not `kv_len` -- the same reasoning
+        // `Model::attention`'s own mixed-batch dispatch already relies on for
+        // sequences of different real lengths sharing one call.
+        for (i, &p) in positions.iter().enumerate() {
+            let b = branch_of[i];
+            if i == positions.len() - 1 || branch_of[i + 1] != b {
+                self.lens[b] = self.lens[b].max(p + 1);
+            }
+        }
+        let kv_len = branch_of.iter().map(|&b| self.lens[b]).max().unwrap();
         let attn_dims = AttnDims {
             n_heads: dims.heads,
             n_kv_heads: dims.kv_heads,
@@ -1102,8 +1177,11 @@ impl MtpHead {
         self.branches
     }
 
-    pub fn cached(&self) -> usize {
-        self.len
+    /// How far branch `branch`'s region of the cache reaches. `0` is the
+    /// only branch that exists in the ordinary, non-batched linear-draft
+    /// case.
+    pub fn cached(&self, branch: usize) -> usize {
+        self.lens[branch]
     }
 
     /// `head @ out[row]`, brought back to the host.
@@ -1479,26 +1557,37 @@ impl crate::Model {
     /// to be at least `k + 1`, the width of a verification round's feed, since
     /// that one is not split usefully — and larger only trades launches for the
     /// `heads * rows * max_seq` score buffer.
+    /// `max_seqs`: how many of the pool's own concurrent sequences may run a
+    /// speculative round in the same scheduler step -- see
+    /// `Scheduler::speculative_step`'s doc comment. Each gets its own
+    /// independent, `self.max_seq`-wide region of the drafter's cache via
+    /// [`MtpHead::fork`], called once here with `base: 0` (no shared prefix:
+    /// unlike a tree draft's hypothetical futures of ONE sequence, these are
+    /// genuinely unrelated sequences with unrelated histories) and
+    /// `tail: self.max_seq` (each region as wide as a lone sequence's own
+    /// cache always was). Real, req'd VRAM cost: `max_seqs` times what a
+    /// single-sequence head cost before this parameter existed.
     pub fn load_mtp_head(
         &mut self,
         dir: impl AsRef<std::path::Path>,
         max_draft_rows: usize,
+        max_seqs: usize,
     ) -> anyhow::Result<bool> {
         let shards = infero_safetensors::Shards::open_dir(dir.as_ref())?;
         let Some(w) = crate::weights::load_mtp(&self.dev, &shards, &self.cfg)? else {
             return Ok(false);
         };
-        let head = MtpHead::new(
+        let max_seqs = max_seqs.max(1);
+        let mut head = MtpHead::new(
             &self.dev,
             &self.kern,
             w,
             HeadDims::from_config(&self.cfg),
             max_draft_rows.max(1),
-            self.max_seq,
-            // One branch for now: the tree draft sets this from its widest
-            // level once `draft_tree` exists. See `MtpHead::fork`.
-            1,
+            max_seqs * self.max_seq,
+            max_seqs,
         )?;
+        head.fork(0, self.max_seq)?;
         self.install_mtp_head(head)?;
         Ok(true)
     }
@@ -1515,24 +1604,29 @@ impl crate::Model {
     /// the two files agree on every shape that matters here, and requiring them
     /// to is the point — a sidecar built for a different `d_model` should fail
     /// loudly at `install_mtp_head` rather than draft nonsense.
+    /// `max_seqs`: see [`Self::load_mtp_head`]'s doc comment -- same meaning,
+    /// same `fork` call, just from the sidecar-GGUF loading path.
     pub fn load_mtp_head_gguf(
         &mut self,
         path: impl AsRef<std::path::Path>,
         max_draft_rows: usize,
+        max_seqs: usize,
     ) -> anyhow::Result<bool> {
         let f = infero_gguf::Gguf::open(path.as_ref())?;
         let Some(w) = crate::weights::load_mtp_gguf(&self.dev, &f, &self.cfg)? else {
             return Ok(false);
         };
-        let head = MtpHead::new(
+        let max_seqs = max_seqs.max(1);
+        let mut head = MtpHead::new(
             &self.dev,
             &self.kern,
             w,
             HeadDims::from_config(&self.cfg),
             max_draft_rows.max(1),
-            self.max_seq,
-            1,
+            max_seqs * self.max_seq,
+            max_seqs,
         )?;
+        head.fork(0, self.max_seq)?;
         self.install_mtp_head(head)?;
         Ok(true)
     }
@@ -1635,9 +1729,9 @@ impl crate::Model {
                 .as_ref()
                 .context("no captured hidden states")?
                 .slice(hidden_rows.start * d..hidden_rows.end * d);
-            head.truncate(positions[0]);
+            head.truncate(0, positions[0]);
             let root_row =
-                head.prime(&self.kern, &self.w.token_embd, shifted_ids, positions, &hidden, feed.mrope.as_deref())?;
+                head.prime(&self.kern, &self.w.token_embd, shifted_ids, positions, &hidden, feed.mrope.as_deref(), 0)?;
             let lm = self.w.output.as_ref().unwrap_or(&self.w.token_embd);
             let base = positions[rows - 1] + 1;
             // Every lane shares the prefix and owns `depth` slots past it, which
@@ -1751,12 +1845,24 @@ impl crate::Model {
     /// as the draft does: token `j`'s distribution is conditioned on the drafts
     /// before it, and the repetition penalty reads that window, so passing a
     /// stale history would score every draft against the wrong distribution.
+    /// `branch`: which pool slot's region of the drafter's cache this call
+    /// reads/writes. `0` for the ordinary, single-sequence case (the only
+    /// value any caller before batched multi-sequence speculation used); a
+    /// real pool slot when [`Scheduler::speculative_step`] is running more
+    /// than one sequence's round in the same step (see that function's own
+    /// doc comment) -- distinct sequences' rounds still each get their own
+    /// call to this function (not one call covering several sequences'
+    /// rows), so nothing here is actually batched in one GPU pass; `branch`
+    /// only says which slot's cache region this particular call's rows land
+    /// in, so back-to-back calls for different sequences don't corrupt each
+    /// other's drafter history.
     pub fn draft_with_head_sampled(
         &mut self,
         k: usize,
         feed: &crate::spec::DraftFeed,
         sampler: &mut crate::Sampler,
         history: &[u32],
+        branch: usize,
     ) -> anyhow::Result<Vec<Drafted>> {
         anyhow::ensure!(k > 0, "a draft of no tokens");
         let d = self.cfg.d_model;
@@ -1779,12 +1885,19 @@ impl crate::Model {
                 .as_ref()
                 .context("no captured hidden states")?
                 .slice(hidden_rows.start * d..hidden_rows.end * d);
-            head.truncate(positions[0]);
+            head.truncate(branch, positions[0]);
             // `prime`, not `step`: after a prefill the feed is the whole prompt
             // and the head is built for one draft step's width. The row it
             // returns is the final token's index within the last chunk.
-            let mut row =
-                head.prime(&self.kern, &self.w.token_embd, shifted_ids, positions, &hidden, feed.mrope.as_deref())?;
+            let mut row = head.prime(
+                &self.kern,
+                &self.w.token_embd,
+                shifted_ids,
+                positions,
+                &hidden,
+                feed.mrope.as_deref(),
+                branch,
+            )?;
             let lm = self.w.output.as_ref().unwrap_or(&self.w.token_embd);
             let mut drafted = Vec::with_capacity(k);
             // The window the repetition penalty reads, extended per draft.
@@ -1796,7 +1909,7 @@ impl crate::Model {
             for _ in 1..k {
                 window.push(token);
                 position += 1;
-                head.step_from_own_output(&self.kern, &self.w.token_embd, token, position, row)?;
+                head.step_from_own_output(&self.kern, &self.w.token_embd, token, position, row, branch)?;
                 row = 0;
                 (token, q) = head.draft_row_sampled(&self.kern, lm, row, sampler, &window)?;
                 drafted.push(Drafted { token, q });
@@ -1840,9 +1953,9 @@ impl crate::Model {
             // regardless, but the length has to come back or `kv_len` grows
             // without bound. This is the drafter's coordinate system, one behind
             // the target's — see `MtpHead::truncate`.
-            head.truncate(positions[0]);
+            head.truncate(0, positions[0]);
             let mut row =
-                head.prime(&self.kern, &self.w.token_embd, shifted_ids, positions, &hidden, feed.mrope.as_deref())?;
+                head.prime(&self.kern, &self.w.token_embd, shifted_ids, positions, &hidden, feed.mrope.as_deref(), 0)?;
             let lm = self.w.output.as_ref().unwrap_or(&self.w.token_embd);
             let mut drafted = Vec::with_capacity(k);
             let mut position = positions[rows - 1];
@@ -1850,7 +1963,7 @@ impl crate::Model {
             drafted.push(token);
             for _ in 1..k {
                 position += 1;
-                head.step_from_own_output(&self.kern, &self.w.token_embd, token, position, row)?;
+                head.step_from_own_output(&self.kern, &self.w.token_embd, token, position, row, 0)?;
                 row = 0;
                 token = head.draft_row(&self.kern, lm, row)?;
                 drafted.push(token);

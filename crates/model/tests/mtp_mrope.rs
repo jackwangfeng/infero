@@ -134,8 +134,8 @@ fn step_logits(
     hidden: &infero_gpu::View<'_, f32>,
     mrope: Option<&[i32]>,
 ) -> Result<Vec<Vec<f32>>> {
-    head.truncate(0);
-    head.step(kern, embed, ids, positions, hidden, mrope)?;
+    head.truncate(0, 0);
+    head.step(kern, embed, ids, positions, hidden, mrope, 0)?;
     (0..T).map(|r| head.logits_row(kern, embed, r).map(|v| v.to_vec())).collect()
 }
 
