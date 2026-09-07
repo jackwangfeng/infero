@@ -176,6 +176,13 @@ pub struct MtpHead {
     /// Slots the shared prefix occupies. Positions below it map to themselves in
     /// every branch; above it each branch has its own.
     fork_at: usize,
+    /// The last real [`Self::fork`] call's own `tail` -- how many slots past
+    /// `fork_at` each branch owns. `step`/`step_from_own_output` (the linear,
+    /// non-tree entry points) need this to build `run`'s per-branch
+    /// addressing correctly; a caller building a row set with its own
+    /// explicit tree level (`step_tree`) already has the real `tail` for
+    /// that specific level in hand and does not read this field.
+    tail: usize,
     /// One row quantized to q8_1, for the integer vocabulary mat-vec.
     q8_1: Buf<u8>,
     /// How far each branch's region of the drafter's cache reaches, in
@@ -300,6 +307,7 @@ impl MtpHead {
             slot_table: stream.alloc_zeros::<i32>(branches * max_seq)?,
             branches,
             fork_at: 0,
+            tail: 0,
             // The activation of whichever projection is being quantized,
             // sized for the widest single row `matmul` ever passes it: not
             // `d_model` but `d_ff`, which `w_down` and the FC's `2 * d_model`
@@ -408,7 +416,21 @@ impl MtpHead {
         // of the cache this call reads/writes -- `0` for the ordinary,
         // single-sequence, non-batched case; a real pool slot for a batched
         // multi-sequence round (see `Model::draft_with_head_sampled`).
-        self.run(kern, embed, shifted_ids, positions, &vec![branch; shifted_ids.len()], 0, mrope)
+        //
+        // `self.tail`, not a literal `0`: `slot_of`'s real formula is
+        // `fork_at + branch * tail + (position - fork_at)`, so a `tail` that
+        // does not match the one `fork` actually partitioned the cache with
+        // collapses every branch onto the same physical slots (`branch * 0
+        // == 0` for every branch) -- the cache still *looks* like it is
+        // forked (multiple branches configured) but every one of them
+        // silently reads and writes the identical region, corrupting
+        // whichever sequences' rounds happen to interleave. `step`/
+        // `step_from_own_output` are the ordinary linear-draft callers, so
+        // `self.tail` (set once, at `fork` time, and unchanged since) is
+        // always the right value here -- `step_tree`'s own tree levels pass
+        // their own explicit `tail` instead, since a tree can use a
+        // different one per level.
+        self.run(kern, embed, shifted_ids, positions, &vec![branch; shifted_ids.len()], self.tail, mrope)
     }
 
     /// [`MtpHead::step`] over a feed of any width, in chunks.
@@ -513,7 +535,10 @@ impl MtpHead {
         // so reading it as an input would alias.
         let mut dst = self.hidden_in.slice_mut(..d);
         self.dev.stream().memcpy_dtod(&src, &mut dst)?;
-        self.run(kern, embed, &[drafted], &[position], &[branch], 0, None)
+        // `self.tail`, not a literal `0` -- see `step`'s own doc comment for
+        // why a mismatched `tail` silently collapses every branch onto the
+        // same physical cache slots instead of actually isolating them.
+        self.run(kern, embed, &[drafted], &[position], &[branch], self.tail, None)
     }
 
     /// One draft step's kernels: four small uploads, then eighteen launches.
@@ -626,6 +651,7 @@ impl MtpHead {
             .stream()
             .memcpy_htod(&table, &mut self.slot_table.slice_mut(..))?;
         self.fork_at = base;
+        self.tail = tail;
         // Every branch starts this new fork's region at exactly `base`: the
         // table above only keeps positions `< base` (the shared prefix)
         // addressed the same way as before, and rewrites the rest fresh for
