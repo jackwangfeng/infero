@@ -257,6 +257,98 @@ extern "C" __global__ void gemv_f16(float* __restrict__ out,
     GEMV_EPILOGUE
 }
 
+// `gemv_f16`, one row a block still, but `k` split `ksplit`-many ways across
+// `blockIdx.z` -- real `ncu` data (this GPU's own `sudo`-unblocked hardware
+// counters, see project memory) on GDN's own real `in_proj_ba` shape
+// (K=5120, N=96, the fused `in_proj_a`+`in_proj_b`) found `n` output rows
+// means exactly `n` blocks, so at N=96 against this GPU's 188 SMs, most sit
+// completely idle for the kernel's whole duration -- "grid too small to
+// fill available resources... 0.0 full waves" is ncu's own words for it.
+// Unlike the CUTLASS gate/up GEMM's own SM-idle finding (a hard
+// `ScaleGranularityN` constraint, confirmed dead by the compiler, not
+// fixable by tiling), a plain mat-vec is not tied to any tile-shape scale
+// scheme -- splitting the reduction dimension itself across more blocks is
+// a real, available degree of freedom here.
+//
+// `GEMV_KSPLIT_TOKENS` tokens a call, `GEMV_SPREAD`'s own reasoning: a
+// runtime-bounded trip count leaves `acc` unable to prove its indices and
+// spills to local memory, an order-of-magnitude cost for what is otherwise
+// pure streaming. Real GDN usage is always `1..=k+1` tokens (a plain decode
+// step is 1, a speculative verify pass is `k+1` -- checked directly against
+// a real production trace with `INFERO_SPEC_K=3`: every real call was
+// `n_tokens=4`, never 1, because this checkpoint's own production config
+// always runs with speculation on -- an `n_tokens==1`-only first version of
+// this kernel was real, tested, and dead code for every real request this
+// server has ever served).
+//
+// Writes each `z`-slice's own partial sums to
+// `partial[(kz * n_tokens + t) * n + row]` (`kz`-major, then token, matching
+// `combine_ksplit_multi_f32`'s own read order) rather than combining
+// in-kernel -- an `atomicAdd`-based first version of this combined here
+// directly, and real testing caught a genuine problem with that:
+// floating-point addition is not associative, and the order different
+// blocks' atomics land in is a hardware-scheduling detail this crate does
+// not control, so the *same* call could return measurably different bits
+// run to run. That broke a real, existing invariant this codebase tests for
+// (`mrope_on_is_bit_identical_to_mrope_off_for_plain_text` failed by ~1e-5
+// relative -- the exact signature of summation-order noise) -- caught by
+// that test before shipping. `combine_ksplit_multi_f32` reduces in a fixed,
+// deterministic order instead.
+#define GEMV_KSPLIT_TOKENS 8
+extern "C" __global__ void gemv_f16_ksplit_partial(float* __restrict__ partial,
+                                    const void* __restrict__ w,
+                                    const float* __restrict__ x, int k, int n,
+                                    int n_tokens, int ksplit) {
+    const int row = blockIdx.x;
+    if (row >= n) return;
+    const int kz = blockIdx.z;
+    const int k_per_split = (k + ksplit - 1) / ksplit;
+    const int k0 = kz * k_per_split;
+    const int k1 = min(k, k0 + k_per_split);
+
+    float acc[GEMV_KSPLIT_TOKENS];
+    #pragma unroll
+    for (int t = 0; t < GEMV_KSPLIT_TOKENS; ++t) acc[t] = 0.0f;
+
+    const __half* wr = (const __half*)w + (size_t)row * k;
+    for (int i = k0 + threadIdx.x; i < k1; i += blockDim.x) {
+        const float wv = __half2float(wr[i]);
+        #pragma unroll
+        for (int t = 0; t < GEMV_KSPLIT_TOKENS; ++t) {
+            if (t < n_tokens) acc[t] += wv * x[(size_t)t * k + i];
+        }
+    }
+
+    #pragma unroll
+    for (int t = 0; t < GEMV_KSPLIT_TOKENS; ++t) {
+        if (t < n_tokens) {
+            const float total = block_reduce_sum(acc[t]);
+            if (threadIdx.x == 0) partial[((size_t)kz * n_tokens + t) * n + row] = total;
+        }
+    }
+}
+
+// Reduces `gemv_f16_ksplit_partial`'s own `[ksplit, n_tokens, n]` output
+// into `out[n_tokens, n]` (token-major, matching every other mat-vec's own
+// output layout in this file), one thread a `(token, row)` pair, summing
+// `kz = 0..ksplit` in that fixed order every call -- deterministic, unlike
+// the atomic combine this replaced. `ksplit` is small (single digits) and
+// `n * n_tokens` is the whole point of splitting in the first place, so
+// this is cheap next to the mat-vec itself: no block-wide reduction needed,
+// no shared memory, just independent length-`ksplit` sums.
+extern "C" __global__ void combine_ksplit_multi_f32(float* __restrict__ out,
+                                    const float* __restrict__ partial,
+                                    int n, int n_tokens, int ksplit) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_rows = n * n_tokens;
+    if (idx >= total_rows) return;
+    const int t = idx / n;
+    const int row = idx % n;
+    float sum = 0.0f;
+    for (int kz = 0; kz < ksplit; ++kz) sum += partial[((size_t)kz * n_tokens + t) * n + row];
+    out[(size_t)t * n + row] = sum;
+}
+
 // The block-32 legacy quants decode one element at a time. Consecutive lanes
 // land in the same block, so the scale and nibble loads coalesce and stay in
 // L1 — close enough to a block-at-a-time version to not be worth the code.

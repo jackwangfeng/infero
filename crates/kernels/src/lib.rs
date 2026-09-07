@@ -7592,6 +7592,90 @@ impl Kernels {
         Ok(())
     }
 
+    /// [`Self::gemv`]'s F16 path, one row a block still (as fine-grained as
+    /// row-splitting alone gets), but `k` split `ksplit`-many ways -- real
+    /// `ncu` data (this GPU's own hardware counters, `sudo`-unblocked; see
+    /// project memory) found a narrow-`n` F16 gemv (GDN's own fused
+    /// `in_proj_ba`, K=5120 N=96 on this checkpoint) launches exactly `n`
+    /// blocks, leaving most of this GPU's 188 SMs completely idle for the
+    /// kernel's whole duration. Splitting the reduction dimension is
+    /// available here in a way it is not for the CUTLASS GEMM's own
+    /// SM-idle finding (a hard `ScaleGranularityN`-tied tile-shape
+    /// constraint, confirmed dead by the compiler): this is a plain mat-vec
+    /// with no scale-scheme tile to respect.
+    ///
+    /// Two kernels, not one atomic-combining one: an `atomicAdd`-based first
+    /// version of this combined `ksplit`'s partial sums in-kernel, and real
+    /// testing caught a genuine correctness problem with that before it
+    /// shipped -- floating-point addition is not associative, and which
+    /// block's atomic lands first is a hardware-scheduling detail this
+    /// crate does not control, so the *same* call could return measurably
+    /// different bits from one run to the next. That broke a real, existing
+    /// invariant this codebase tests for (a bit-identical-output test failed
+    /// by ~1e-5 relative, the exact signature of summation-order noise).
+    /// `partial` (`[ksplit, n_tokens, n]`, `kz`-major then token) holds each
+    /// split's own sums; `combine_ksplit_multi_f32` reduces it into `out` in
+    /// a fixed, deterministic order every call.
+    ///
+    /// `n_tokens` up to `GEMV_KSPLIT_TOKENS` (8, the `.cu` side's own
+    /// unrolled register cap -- checked here, not assumed): a first version
+    /// of this gated on `n_tokens == 1` on the theory that GDN calls this
+    /// once a plain decode token, which turned out false for this
+    /// checkpoint's real deployment -- a real production trace
+    /// (`INFERO_SPEC_K=3`, this checkpoint's own real running config) showed
+    /// every real call at `n_tokens=4` (a speculative verify pass, `k+1`
+    /// rows), never 1, because production always runs with speculation on.
+    /// The `n_tokens==1`-only version was real, tested, correctness-verified
+    /// -- and dead code for every request this server has ever actually
+    /// served.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_f16_ksplit(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        partial: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
+        x: &View<'_, f32>,
+        k: usize,
+        n: usize,
+        n_tokens: usize,
+        ksplit: usize,
+    ) -> Result<bool> {
+        anyhow::ensure!(ksplit > 0, "a K-split of zero pieces");
+        const GEMV_KSPLIT_TOKENS: usize = 8;
+        if n_tokens == 0 || n_tokens > GEMV_KSPLIT_TOKENS {
+            return Ok(false);
+        }
+        debug_assert!(
+            partial.len() >= ksplit * n_tokens * n,
+            "partial buffer holds {} floats, need {}",
+            partial.len(),
+            ksplit * n_tokens * n
+        );
+        let f = self.dev.kernels().get("infero_quant", quant_src(), "gemv_f16_ksplit_partial")?;
+        // Same block width `gemv_f16` itself launches with (confirmed via
+        // `ncu`'s own launch-statistics section) -- no reason to re-derive
+        // it per shape, the block covers a K-chunk the same way either way.
+        const BLOCK: u32 = 64;
+        let cfg =
+            LaunchConfig { grid_dim: (n as u32, 1, ksplit as u32), block_dim: (BLOCK, 1, 1), shared_mem_bytes: 0 };
+        let (k_i, n_i, nt_i, ks_i) = (k as i32, n as i32, n_tokens as i32, ksplit as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(&mut *partial).arg(w).arg(x).arg(&k_i).arg(&n_i).arg(&nt_i).arg(&ks_i);
+        self.dev.profile().time("gemv_f16_ksplit_partial", self.dev.stream(), || {
+            unsafe { b.launch(cfg) }.context("gemv_f16_ksplit_partial")?;
+            Ok(())
+        })?;
+
+        let cf = self.dev.kernels().get("infero_quant", quant_src(), "combine_ksplit_multi_f32")?;
+        let mut cb = self.dev.stream().launch_builder(&cf);
+        cb.arg(out).arg(partial).arg(&n_i).arg(&nt_i).arg(&ks_i);
+        self.dev.profile().time("combine_ksplit_multi_f32", self.dev.stream(), || {
+            unsafe { cb.launch(elementwise((n * n_tokens) as u32)) }.context("combine_ksplit_multi_f32")?;
+            Ok(())
+        })?;
+        Ok(true)
+    }
+
     // ---- TurboQuant KV cache ------------------------------------------
     //
     // The paper's estimator is evaluated entirely in the rotated basis, so a
