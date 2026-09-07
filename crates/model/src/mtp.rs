@@ -1667,13 +1667,30 @@ impl crate::Model {
             self.cfg.d_model
         );
         tracing::info!(mib = head.bytes() >> 20, "mtp head installed");
+        // `mtp_hidden_slot_width`, not `self.batch_tokens()` alone: this
+        // buffer is every real forward pass's *second* output (the MTP
+        // head's own input), and with `head.branch_count() > 1` (batched
+        // multi-sequence speculation, see `load_mtp_head`'s doc comment)
+        // more than one sequence's own hidden-state capture has to be able
+        // to coexist here at once. A single, un-widened buffer would have
+        // every sequence's forward pass overwrite the *same* `[0, n_tokens)`
+        // region regardless of which sequence it belongs to -- a real,
+        // confirmed bug: sequence A's own drafter round reading sequence B's
+        // hidden states because B's own verify pass ran in between and
+        // clobbered the shared buffer, corrupting A's continuation with no
+        // error, no crash, just wrong (and visibly garbled) output. One
+        // region a branch, `self.batch_tokens()` wide each (the widest any
+        // single sequence's own forward call could contribute alone) is
+        // conservative -- real, req'd VRAM cost scales with `branch_count()`,
+        // same tradeoff as the drafter's own per-branch cache.
+        self.mtp_hidden_slot_width = self.batch_tokens();
         self.mtp = Some(head);
         // The head's second input, captured from every pass — one row per token,
         // not per sampled row, because the drafter needs a history to attend to.
         self.mtp_hidden = Some(
-            self.dev
-                .stream()
-                .alloc_zeros::<f32>(self.batch_tokens() * self.cfg.d_model)?,
+            self.dev.stream().alloc_zeros::<f32>(
+                self.mtp.as_ref().unwrap().branch_count() * self.mtp_hidden_slot_width * self.cfg.d_model,
+            )?,
         );
         Ok(())
     }
@@ -1906,11 +1923,19 @@ impl crate::Model {
             .take()
             .context("this model has no MTP head; call load_mtp_head first")?;
         let res = (|| -> anyhow::Result<Vec<Drafted>> {
+            // `hidden_rows` (from `feed.rows`) is branch-relative -- always
+            // starts at 0, exactly matching where `Model::forward_batch_rows`
+            // wrote *this* branch's own rows within its own
+            // `mtp_hidden_slot_width`-wide region (see that function's own
+            // per-item write loop). `branch * self.mtp_hidden_slot_width * d`
+            // is what turns that local range back into where this branch's
+            // region actually starts in the real, multi-branch buffer.
+            let base = branch * self.mtp_hidden_slot_width * d;
             let hidden = self
                 .mtp_hidden
                 .as_ref()
                 .context("no captured hidden states")?
-                .slice(hidden_rows.start * d..hidden_rows.end * d);
+                .slice(base + hidden_rows.start * d..base + hidden_rows.end * d);
             head.truncate(branch, positions[0]);
             // `prime`, not `step`: after a prefill the feed is the whole prompt
             // and the head is built for one draft step's width. The row it

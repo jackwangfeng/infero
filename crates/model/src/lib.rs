@@ -2061,6 +2061,12 @@ pub struct Model {
     /// is the final norm. `tests/qwen35_mtp.rs` pins it numerically against the
     /// capture, which carries both tensors for exactly this reason.
     mtp_hidden: Option<Buf<f32>>,
+    /// How many tokens' worth of hidden states one branch's own region of
+    /// `mtp_hidden` holds -- `0` until [`Model::install_mtp_head`] sets it
+    /// (matching `mtp_hidden.is_none()`'s own meaning). See that function's
+    /// doc comment for why this is a real, separate width per branch rather
+    /// than one flat `[0, n_tokens)` region shared by every sequence.
+    mtp_hidden_slot_width: usize,
     /// The journal that undoes a rejected candidate's effect on the recurrent
     /// state. Only allocated for a model that has linear-attention blocks.
     gdn_rollback: Option<spec::GdnRollback>,
@@ -2777,6 +2783,7 @@ impl Model {
             logits_host,
             mtp: None,
             mtp_hidden: None,
+            mtp_hidden_slot_width: 0,
             gdn_rollback: None,
             vision: None,
             vision_scratch: None,
@@ -3734,15 +3741,39 @@ impl Model {
         //
         // Before the early return below: a mid-prompt chunk takes no logits and
         // still has to reach the drafter.
+        //
+        // One `rms_norm` call a batch *item*, not one flat call over all
+        // `n_tokens` — `act.x` lays every item's rows back to back in this
+        // call's own order, but `mtp_hidden` is `branch_count()` separate,
+        // `mtp_hidden_slot_width`-wide regions (see
+        // `Model::install_mtp_head`'s doc comment for why), one a real pool
+        // slot (`item.seq.0`), not a flat `[0, n_tokens)` shared by whichever
+        // sequences happen to share this call. A single-item call (every
+        // speculative-round call in this file is one) still does exactly one
+        // iteration here, so the ordinary single-sequence case pays nothing
+        // extra beyond the slice-offset arithmetic.
         if let Some(h) = self.mtp_hidden.as_mut() {
-            self.kern.rms_norm(
-                &mut h.slice_mut(..n_tokens * d),
-                &self.act.x.slice(..n_tokens * d),
-                &self.w.output_norm.as_view(),
-                n_tokens,
-                d,
-                rms_eps,
-            )?;
+            let mut local = 0usize;
+            for item in items {
+                let rows = item.tokens.len();
+                anyhow::ensure!(
+                    rows <= self.mtp_hidden_slot_width,
+                    "sequence {}'s own {rows} tokens in this call exceed the \
+                     {} `mtp_hidden` reserves for any one branch",
+                    item.seq.0,
+                    self.mtp_hidden_slot_width
+                );
+                let dst = item.seq.0 * self.mtp_hidden_slot_width * d;
+                self.kern.rms_norm(
+                    &mut h.slice_mut(dst..dst + rows * d),
+                    &self.act.x.slice(local * d..(local + rows) * d),
+                    &self.w.output_norm.as_view(),
+                    rows,
+                    d,
+                    rms_eps,
+                )?;
+                local += rows;
+            }
         }
         if n_logit_rows == 0 {
             phase.report();
