@@ -216,6 +216,13 @@ pub struct MtpHead {
     /// Device-sampler state for a sampled draft, one row wide. Allocated on
     /// first use; a greedy draft never touches it.
     samp: Option<DraftSampleBufs>,
+    /// Device-sampler state for [`Self::sample_batch_from_logits`], every
+    /// concurrently-drafting sequence's own row at once. Separate from
+    /// `samp` (rather than growing it an `n` dimension) so the existing
+    /// single-row callers (`draft_row_dist`, `draft_row_sampled`,
+    /// `draft_row_sampled_from_batch`) stay untouched. Allocated on first
+    /// use.
+    samp_batch: Option<DraftSampleBufsBatch>,
 }
 
 /// Where [`MtpHead::run`]'s `shifted_ids` come from.
@@ -365,6 +372,7 @@ impl MtpHead {
             w,
             logits_host: vec![0.0; dims.vocab],
             samp: None,
+            samp_batch: None,
         })
     }
 
@@ -1673,6 +1681,201 @@ impl MtpHead {
         Ok((token, q))
     }
 
+    /// Every concurrently-drafting sequence's own row of `draft_batch.logits`,
+    /// sampled in one `sample_rows_split` call and one `dev.synchronize()` --
+    /// same per-row math as calling [`Self::draft_row_sampled_from_batch`]
+    /// once a sequence (same kernel, same per-row params/penalty window/RNG
+    /// draw, each row still its own independently-computed distribution),
+    /// only `n` host<->device round trips collapsed into one.
+    ///
+    /// Real motivation: a real `INFERO_STEP_TIMING` trace on real dual-stream
+    /// production found `draft_ms` (4.75ms/round) barely moves between a
+    /// graphed and an ungraphed run, unlike `verify_ms` (already batched this
+    /// way via `Model::survivors_on_device`, 4.2x cheaper graphed) — the
+    /// per-sequence `dev.synchronize()` inside the old `for i in 0..n` loop
+    /// (each sequence its own full `sample_from_logits` call) is exactly the
+    /// kind of call CUDA graph capture cannot hide, and at real dual-stream
+    /// concurrency it costs as many syncs as there are sequences, once a
+    /// draft step, `k` times a round.
+    ///
+    /// `samplers[i]`'s own `next_draw()` is pulled in row order, matching the
+    /// order the old per-sequence loop drew from each sequence's own RNG --
+    /// not required for correctness (each sampler's stream is independent),
+    /// but keeps this call's RNG consumption identical to the loop it
+    /// replaces, which is what makes a bit-identical-output comparison
+    /// between the two a real correctness check rather than a coincidence.
+    pub fn sample_batch_from_logits(
+        &mut self,
+        kern: &Kernels,
+        vocab: usize,
+        samplers: &mut [&mut crate::Sampler],
+        windows: &[&[u32]],
+    ) -> Result<Vec<(u32, Vec<(u32, f32)>)>> {
+        let n = samplers.len();
+        anyhow::ensure!(n == windows.len(), "{n} samplers against {} windows", windows.len());
+        anyhow::ensure!(
+            samplers.iter().all(|s| !s.params().is_greedy()),
+            "draft sampling needs a distribution; a greedy request takes the \
+             greedy acceptance rule"
+        );
+        let batch = self
+            .draft_batch
+            .as_ref()
+            .context("logits_rows_batch_device must run before this")?;
+        anyhow::ensure!(
+            batch.seqs >= n,
+            "{n} samplers against {} batched logit rows",
+            batch.seqs
+        );
+        let logits = batch.logits.slice(..n * vocab);
+
+        // Penalty windows, run-length encoded the way the kernel wants them --
+        // same construction `prepare_sample_bufs` uses for `Model`'s own
+        // batched sampling, ported here rather than shared because `Model`'s
+        // version is private and keyed off `RowSample`/`self.act.logits`,
+        // neither of which this type has.
+        let stride = windows.iter().map(|w| w.len()).max().unwrap_or(0).max(1);
+        let mut tok = vec![0i32; n * stride];
+        let mut cnt = vec![0i32; n * stride];
+        let mut len = vec![0i32; n];
+        let mut scratch: Vec<u32> = Vec::new();
+        for (i, w) in windows.iter().enumerate() {
+            scratch.clear();
+            scratch.extend_from_slice(w);
+            scratch.sort_unstable();
+            let mut m = 0usize;
+            let mut j = 0usize;
+            while j < scratch.len() {
+                let t = scratch[j];
+                let mut c = 0i32;
+                while j < scratch.len() && scratch[j] == t {
+                    c += 1;
+                    j += 1;
+                }
+                if (t as usize) < vocab {
+                    tok[i * stride + m] = t as i32;
+                    cnt[i * stride + m] = c;
+                    m += 1;
+                }
+            }
+            len[i] = m as i32;
+        }
+
+        let top_k = samplers.iter().map(|s| s.params().top_k.max(1)).max().unwrap_or(1);
+        let mut params = vec![0f32; n * 4];
+        let mut rnd = vec![0f64; n];
+        for (i, s) in samplers.iter_mut().enumerate() {
+            let draw = s.next_draw();
+            let p = s.params();
+            params[i * 4] = p.temperature;
+            params[i * 4 + 1] = p.top_p;
+            params[i * 4 + 2] = f32::from_bits(p.top_k.max(1) as u32);
+            params[i * 4 + 3] = p.repetition_penalty;
+            rnd[i] = draw;
+        }
+
+        let stream = self.dev.stream().clone();
+        let fits = matches!(
+            &self.samp_batch,
+            Some(b) if b.n >= n && b.stride >= stride && b.top_k >= top_k
+        );
+        if !fits {
+            self.samp_batch = Some(DraftSampleBufsBatch {
+                params: stream.alloc_zeros::<f32>(n * 4)?,
+                pen_tok: stream.alloc_zeros::<i32>(n * stride)?,
+                pen_cnt: stream.alloc_zeros::<i32>(n * stride)?,
+                pen_len: stream.alloc_zeros::<i32>(n)?,
+                rnd: stream.alloc_zeros::<f64>(n)?,
+                out: stream.alloc_zeros::<u32>(n)?,
+                cand_v: stream.alloc_zeros::<f32>(n * Kernels::SAMPLE_SPLITS * top_k)?,
+                cand_i: stream.alloc_zeros::<i32>(n * Kernels::SAMPLE_SPLITS * top_k)?,
+                surv_id: stream.alloc_zeros::<u32>(n * top_k)?,
+                surv_p: stream.alloc_zeros::<f32>(n * top_k)?,
+                surv_len: stream.alloc_zeros::<i32>(n)?,
+                n,
+                stride,
+                top_k,
+            });
+        }
+        let b = self.samp_batch.as_mut().unwrap();
+        let (stride, top_k) = (b.stride, b.top_k);
+        stream.memcpy_htod(&params, &mut b.params.slice_mut(..n * 4))?;
+        stream.memcpy_htod(&tok, &mut b.pen_tok.slice_mut(..n * stride))?;
+        stream.memcpy_htod(&cnt, &mut b.pen_cnt.slice_mut(..n * stride))?;
+        stream.memcpy_htod(&len, &mut b.pen_len.slice_mut(..n))?;
+        stream.memcpy_htod(&rnd, &mut b.rnd.slice_mut(..n))?;
+
+        {
+            let (pv, tv, cv, lv, rv) = (
+                b.params.slice(..n * 4),
+                b.pen_tok.slice(..n * stride),
+                b.pen_cnt.slice(..n * stride),
+                b.pen_len.slice(..n),
+                b.rnd.slice(..n),
+            );
+            let mut out_v = b.out.slice_mut(..n);
+            let mut cav = b.cand_v.slice_mut(..n * Kernels::SAMPLE_SPLITS * top_k);
+            let mut cai = b.cand_i.slice_mut(..n * Kernels::SAMPLE_SPLITS * top_k);
+            let mut id_v = b.surv_id.slice_mut(..n * top_k);
+            let mut p_v = b.surv_p.slice_mut(..n * top_k);
+            let mut len_v = b.surv_len.slice_mut(..n);
+            kern.sample_rows_split(
+                &mut out_v,
+                &mut cav,
+                &mut cai,
+                &logits,
+                &pv,
+                &tv,
+                &cv,
+                &lv,
+                &rv,
+                n,
+                vocab,
+                stride,
+                top_k,
+                Some(infero_kernels::Survivors {
+                    id: &mut id_v,
+                    p: &mut p_v,
+                    len: &mut len_v,
+                    stride: top_k,
+                }),
+            )?;
+        }
+
+        let mut tok_out = vec![0u32; n];
+        let mut lens = vec![0i32; n];
+        let mut ids = vec![0u32; n * top_k];
+        let mut ps = vec![0f32; n * top_k];
+        stream.memcpy_dtoh(&b.out.slice(..n), &mut tok_out)?;
+        stream.memcpy_dtoh(&b.surv_len.slice(..n), &mut lens)?;
+        stream.memcpy_dtoh(&b.surv_id.slice(..n * top_k), &mut ids)?;
+        stream.memcpy_dtoh(&b.surv_p.slice(..n * top_k), &mut ps)?;
+        self.dev.synchronize()?;
+
+        (0..n)
+            .map(|i| {
+                let token = tok_out[i];
+                let keep = (lens[i].max(0) as usize).min(top_k);
+                anyhow::ensure!(
+                    keep > 0,
+                    "row {i}: the device sampler kept no survivors, so there \
+                     is no `q` to accept against"
+                );
+                let q: Vec<(u32, f32)> = ids[i * top_k..i * top_k + keep]
+                    .iter()
+                    .copied()
+                    .zip(ps[i * top_k..i * top_k + keep].iter().copied())
+                    .collect();
+                anyhow::ensure!(
+                    q.iter().any(|(t, w)| *t == token && *w > 0.0),
+                    "row {i}: the draft sampled {token}, which carries no \
+                     weight in its own distribution"
+                );
+                Ok((token, q))
+            })
+            .collect()
+    }
+
     /// The shared tail of [`Self::draft_row_dist`] and
     /// [`Self::draft_row_sampled_from_batch`]: penalty window, top-k/top-p,
     /// device sampler, given logits already computed somewhere. Takes `dev`
@@ -2462,9 +2665,13 @@ impl crate::Model {
             // independently-computed row: batching changes which kernel
             // launch produces it, not what it is.
             if head.logits_rows_batch_device(&self.kern, lm, &cur_row)? {
-                for i in 0..n {
-                    let (token, q) =
-                        head.draft_row_sampled_from_batch(&self.kern, i, lm.n, samplers[i], &windows[i])?;
+                // One `sample_rows_split` call and one `dev.synchronize()`
+                // for every sequence's row, instead of `n` of each -- see
+                // `sample_batch_from_logits`'s own doc comment for the real
+                // `draft_ms` measurement motivating this.
+                let window_refs: Vec<&[u32]> = windows.iter().map(|w| w.as_slice()).collect();
+                let results = head.sample_batch_from_logits(&self.kern, lm.n, samplers, &window_refs)?;
+                for (i, (token, q)) in results.into_iter().enumerate() {
                     drafted[i].push(Drafted { token, q });
                     cur_token.push(token);
                 }
@@ -2493,9 +2700,9 @@ impl crate::Model {
                 )?;
                 cur_row = (0..n).collect();
                 if head.logits_rows_batch_device(&self.kern, lm, &cur_row)? {
-                    for i in 0..n {
-                        let (token, q) =
-                            head.draft_row_sampled_from_batch(&self.kern, i, lm.n, samplers[i], &windows[i])?;
+                    let window_refs: Vec<&[u32]> = windows.iter().map(|w| w.as_slice()).collect();
+                    let results = head.sample_batch_from_logits(&self.kern, lm.n, samplers, &window_refs)?;
+                    for (i, (token, q)) in results.into_iter().enumerate() {
                         drafted[i].push(Drafted { token, q });
                         cur_token[i] = token;
                     }
@@ -2696,6 +2903,38 @@ struct DraftSampleBufs {
     surv_len: Buf<i32>,
     /// Survivor entries and the penalty window's pitch.
     stride: usize,
+}
+
+/// [`MtpHead::sample_batch_from_logits`]'s own scratch: `DraftSampleBufs`
+/// widened to hold every concurrently-drafting sequence's row at once,
+/// mirroring `Model::SampleBufs`'s own `n`-scaled layout (`n * stride`
+/// rather than `stride`) rather than `DraftSampleBufs`'s single-row one.
+/// Unlike `DraftSampleBufs`, `stride` (the penalty window's own pitch) and
+/// `top_k` (the candidate/survivor capacity) are separate fields, matching
+/// `Model::SampleBufs` — `DraftSampleBufs` could conflate the two into one
+/// `stride` because at one row "large enough for either" was the only
+/// requirement; at `n` rows the two dimensions size genuinely different
+/// buffers (`pen_tok`/`pen_cnt` are `n * stride`, `cand_v`/`cand_i` are
+/// `n * SAMPLE_SPLITS * top_k`) and reusing one variable for both would
+/// either waste memory or undersize one of them.
+struct DraftSampleBufsBatch {
+    params: Buf<f32>,
+    pen_tok: Buf<i32>,
+    pen_cnt: Buf<i32>,
+    pen_len: Buf<i32>,
+    rnd: Buf<f64>,
+    out: Buf<u32>,
+    cand_v: Buf<f32>,
+    cand_i: Buf<i32>,
+    surv_id: Buf<u32>,
+    surv_p: Buf<f32>,
+    surv_len: Buf<i32>,
+    /// Rows this allocation covers.
+    n: usize,
+    /// The penalty window's own pitch.
+    stride: usize,
+    /// Candidate/survivor capacity a row.
+    top_k: usize,
 }
 
 /// [`MtpHead::logits_rows_batch_device`]'s own scratch, grown to the widest
