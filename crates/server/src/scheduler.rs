@@ -241,17 +241,28 @@ pub struct Scheduler {
     /// average, not to a concurrency spike that just happened this round.
     /// These two are the same idea, kept deliberately coarse rather than a
     /// full per-level table: at or below this many concurrently-running
-    /// sequences, draft at the full configured `spec_k` (measured a real win
-    /// at low concurrency, where the pass is memory-bandwidth- not
-    /// compute-bound, so extra draft rows are nearly free); at or above
+    /// sequences, draft at the full configured `spec_k`; at or above
     /// `spec_skip_min_concurrency`, skip speculation entirely (measured a
     /// real, substantial loss at 16-way concurrency with a fixed k -- see
     /// `project_infero_perf_gap.md`'s 2026-09-06/07 entries). Everything
-    /// between the two runs at half depth as a single coarse middle tier,
-    /// not yet independently validated -- both constants are carried over
-    /// from an older architecture's own measurements and need a real sweep
-    /// under this scheduler before being trusted at production scale, which
-    /// is why both are overridable via env var without a rebuild.
+    /// between the two drafts one shallower than the ceiling
+    /// (`spec_k.saturating_sub(1)`), floored at 1.
+    ///
+    /// `spec_full_k_max_concurrency` default is 1, not the earlier-measured
+    /// 4: a real matched-temperature A/B at this checkpoint's own real
+    /// `spec_k=3` found concurrency=1 wants the full depth (accept 2.0-2.4 of
+    /// a possible 4, real win from the extra draft row being nearly free
+    /// against no competing work) but concurrency=2 -- the *other* real
+    /// value production's own `--max-seqs 2` can ever produce -- does
+    /// measurably better at `k=2` (accept 1.95-2.00 of a possible 3, ~116
+    /// tok/s dual-stream) than at the full `k=3` (~105 tok/s) or `k=1` (~98
+    /// tok/s): a real, not just theoretical, case where the ceiling itself
+    /// costs more in wasted verification-row width than it returns in
+    /// accepted tokens. The `-1` (not `/2`) middle-tier formula matches this
+    /// real concurrency=2 data point exactly (`3 - 1 = 2`); it is
+    /// unvalidated for concurrency 3-8, carried over from the same
+    /// reasoning rather than swept, and the doc comment on
+    /// `spec_skip_min_concurrency` above still applies to the top tier.
     spec_full_k_max_concurrency: usize,
     spec_skip_min_concurrency: usize,
     last_end: Option<std::time::Instant>,
@@ -587,7 +598,7 @@ impl Scheduler {
             spec_full_k_max_concurrency: std::env::var("INFERO_SPEC_FULL_K_MAX_CONCURRENCY")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(4),
+                .unwrap_or(1),
             spec_skip_min_concurrency: std::env::var("INFERO_SPEC_SKIP_MIN_CONCURRENCY")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -607,7 +618,7 @@ impl Scheduler {
         } else if concurrency >= self.spec_skip_min_concurrency {
             0
         } else {
-            (self.spec_k / 2).max(1)
+            self.spec_k.saturating_sub(1).max(1)
         }
     }
 
