@@ -223,7 +223,20 @@ impl Engine {
         // for 1". Asking the user to raise a concurrency limit to get a
         // latency feature is the wrong shape; the requirement is the engine's to
         // know. One extra row of an f32 vocab is 993 KiB here.
-        let logit_rows = max_seqs.max(spec_k + 1);
+        //
+        // `max_seqs * (spec_k + 1)`, not `max_seqs.max(spec_k + 1)`:
+        // `Scheduler::speculative_step` fuses every eligible sequence's
+        // candidates into one `verify_draft_sampled_batch` call now, so the
+        // worst case a round can ask for is *every* running sequence's own
+        // `k + 1` rows at once, not just one sequence's. The old formula
+        // undersized this the moment more than one sequence could be
+        // eligible simultaneously -- confirmed for real, a fused round of
+        // seven sequences at k=3 asking for 28 rows against a buffer sized
+        // for `max(max_seqs, k+1)`, a clean 500 rather than a crash, but
+        // still a real ceiling this has to account for. `spec_k == 0`
+        // (speculation off) keeps the old, smaller `max_seqs` floor, since
+        // nothing fuses in that case.
+        let logit_rows = if spec_k > 0 { max_seqs * (spec_k + 1) } else { max_seqs };
         // `mut`: the vision tower is loaded onto this binding below, once the
         // text model exists.
         // The `(Some(_), Some(_))` arm below is unreachable when `nccl` is

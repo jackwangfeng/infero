@@ -20,6 +20,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 use infero_model::qwen35_vision::{Grid, llm_position_ids};
+use infero_model::spec::VerifyItem;
 use infero_model::{BatchItem, BatchItemKind, KvPool, Model, Sampler, SeqId, VisionFeatures};
 use infero_tokenizer::Tokenizer;
 
@@ -185,23 +186,36 @@ pub struct Scheduler {
     adaptive_spec: bool,
     /// The most sequences `speculative_step` will run a round for; above it,
     /// the round bails and every sequence takes the ordinary batched decode
-    /// path instead. Real, measured: `speculative_step` runs each eligible
-    /// sequence's draft+verify as its own *sequential* GPU call (never fused
-    /// across sequences), so its per-round cost scales with how many
-    /// sequences it serves, while the ordinary batched-decode path fuses
-    /// every sequence into one call regardless of how many there are. Three
-    /// repeated trials each, 150-token generations, `--max-seqs 16 --ctx
-    /// 2048`, same build: aggregate tok/s with speculation on was ~74 at one
-    /// concurrent sequence and ~73 at two (a second sequence added
-    /// essentially nothing) against ~40 and ~79 with speculation off at the
-    /// same two points (linear, as fused batching should be) — the crossover
-    /// sits between one and two, and by two speculation is already a net
-    /// loss (~73 against ~79). At eight it was 126.6 against 312.1, at
-    /// sixteen 265.0 against 485.2 — the gap only widens. Default 1, matching
-    /// where the data actually crosses; `INFERO_SPEC_MAX_CONCURRENCY`
-    /// overrides it for re-measuring on different hardware or after a real
-    /// fix (fusing multiple sequences' draft+verify into one call, which
-    /// this threshold works around rather than replaces).
+    /// path instead.
+    ///
+    /// Two real measurements back this, not one. Before
+    /// `verify_draft_sampled_batch` existed, each eligible sequence's
+    /// draft+verify ran as its own *sequential* GPU call: three repeated
+    /// trials each, 150-token generations, `--max-seqs 16 --ctx 2048`,
+    /// aggregate tok/s with speculation on was ~74 at one concurrent
+    /// sequence and ~73 at two (a second sequence added essentially
+    /// nothing) against ~40 and ~79 with speculation off at the same two
+    /// points (linear, as fused batching should be); at eight, 126.6
+    /// against 312.1; at sixteen, 265.0 against 485.2 — a regression at any
+    /// concurrency above one. Fusing every eligible sequence's candidates
+    /// into one `verify_draft_sampled_batch` call (verified to produce
+    /// identical outcomes to the sequential calls it replaces, see that
+    /// function's own tests) fixed the *sequential-call* cost, but not every
+    /// cost: a fused round still verifies `n_total = sum(k + 1 a sequence)`
+    /// rows in one forward pass, against one row a sequence for an ordinary
+    /// decode step, and that extra compute does not always pay for itself.
+    /// Same build, same harness, fusion in place: 119.6 against 79.2 at two
+    /// concurrent sequences (a real ~1.5x win), 169.3 against 156.4 at four
+    /// (a real but thin ~8% win), then 133.7 against 312.1 at eight and
+    /// 226.1 against 485.2 at sixteen — a real regression again, just at a
+    /// higher concurrency than the sequential design's. Default 4, at the
+    /// edge of where this measurement still shows a net win rather than in
+    /// the middle of the loss; `INFERO_SPEC_MAX_CONCURRENCY` overrides it,
+    /// for re-measuring on different hardware or after the next real fix
+    /// (the draft step is still sequential per sequence too, and verifying
+    /// a full `k + 1`-row pass for a sequence whose draft is already
+    /// trending toward rejection is itself unexamined — neither is
+    /// attempted here).
     spec_max_concurrency: usize,
     /// Exponential moving average of a round's emitted tokens (`1..=k+1`),
     /// the signal `speculative_step` adjusts `spec_k` from. `None` before the
@@ -549,7 +563,7 @@ impl Scheduler {
             spec_max_concurrency: std::env::var("INFERO_SPEC_MAX_CONCURRENCY")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(1),
+                .unwrap_or(4),
             spec_ema_accept: None,
             spec_k_cooldown: 0,
             spec_steps: 0,
@@ -744,12 +758,15 @@ impl Scheduler {
         if eligible.is_empty() {
             return Ok(false);
         }
-        // More sequences than `spec_max_concurrency` would speculate this
-        // round: bail entirely rather than serve a subset. Speculating for
-        // a subset while the rest take the ordinary path would still pay the
-        // sequential-call cost this threshold exists to avoid, just for
-        // fewer sequences, so the whole round falls back — see
-        // `spec_max_concurrency`'s own doc comment for the measurement.
+        // A real, measured throughput ceiling, not a correctness one: fusion
+        // below handles any number of eligible sequences *correctly*
+        // (verified against the sequential calls it replaces, see
+        // `verify_draft_sampled_batch`'s own tests), but not *profitably* --
+        // see `spec_max_concurrency`'s own doc comment for the concurrency
+        // where a fused round stops paying for its own extra rows. Bailing
+        // entirely rather than serving a subset keeps the semantics simple:
+        // a round either fuses everyone eligible or defers the whole round to
+        // the ordinary batched-decode path.
         if eligible.len() > self.spec_max_concurrency {
             skip("more sequences than spec_max_concurrency would speculate this round");
             return Ok(false);
@@ -763,6 +780,25 @@ impl Scheduler {
         // a snapshot `pool.free_slots()` would otherwise report as if none of
         // this call's earlier sequences had claimed anything yet.
         let mut free_slots_left = self.pool.free_slots();
+        // Phase 1: draft every sequence this round will actually cover.
+        // Drafting stays sequential and cheap (the MTP head is one layer),
+        // one call a sequence exactly as before -- fusion targets the
+        // *verification* pass below, which is the expensive full-model
+        // forward pass and the one whose sequential cost this whole change
+        // exists to remove. `history` and `mrope_delta` are captured here,
+        // not re-read later, because both are per-sequence and this is the
+        // one point in the round where borrowing `self.running[idx]`
+        // individually is still straightforward.
+        struct Round {
+            idx: usize,
+            seq: SeqId,
+            pending: u32,
+            mrope_delta: i32,
+            history: Vec<u32>,
+            draft: Vec<infero_model::mtp::Drafted>,
+        }
+        let t0 = self.profile.then(std::time::Instant::now);
+        let mut round: Vec<Round> = Vec::with_capacity(eligible.len());
         for idx in eligible {
             if free_slots_left < k + 1 {
                 skip("pool has no free slots left this round");
@@ -826,33 +862,57 @@ impl Scheduler {
                 cached = self.model.mtp_head().map(|h| h.cached(branch)),
                 "speculative round"
             );
-            // A round's three parts, timed separately under
-            // `INFERO_STEP_TIMING`. The whole is measurable end to end and
-            // the verification pass is measurable on its own, so what this
-            // adds is the *difference* — the drafting and the bookkeeping —
-            // which at k=3 was 9.7 ms of a 50.8 ms round and had no
-            // attribution at all.
-            let t0 = self.profile.then(std::time::Instant::now);
             let draft = {
                 let r = &mut self.running[idx];
                 self.model.draft_with_head_sampled(k, &feed, &mut r.sampler, &history, branch)?
             };
-            let t1 = self.profile.then(std::time::Instant::now);
-            let outcome = {
-                let r = &mut self.running[idx];
-                self.model.verify_draft_sampled(
-                    seq,
-                    &mut self.pool,
-                    pending,
-                    &draft,
-                    &mut r.sampler,
-                    &history,
-                    r.mrope_delta,
-                )?
-            };
             free_slots_left = free_slots_left.saturating_sub(k + 1);
+            round.push(Round {
+                idx,
+                seq,
+                pending,
+                mrope_delta: self.running[idx].mrope_delta,
+                history,
+                draft,
+            });
+        }
+        let t1 = self.profile.then(std::time::Instant::now);
+        if round.is_empty() {
+            return Ok(false);
+        }
 
-            let t2 = self.profile.then(std::time::Instant::now);
+        // Phase 2: one fused verification call over every drafted sequence's
+        // candidates. `self.running.iter_mut().filter` (not indexing
+        // `self.running[idx]` in a loop) is what lets several sequences'
+        // samplers be borrowed mutably at once here -- each element `iter_mut`
+        // yields is already known disjoint from every other, which indexing
+        // the same `Vec` twice cannot express to the borrow checker.
+        let round_idxs: Vec<usize> = round.iter().map(|r| r.idx).collect();
+        let items: Vec<VerifyItem<'_>> = round
+            .iter()
+            .map(|r| VerifyItem {
+                seq: r.seq,
+                pending: r.pending,
+                draft: &r.draft,
+                mrope_delta: r.mrope_delta,
+            })
+            .collect();
+        let histories: Vec<&[u32]> = round.iter().map(|r| r.history.as_slice()).collect();
+        let mut samplers: Vec<&mut Sampler> = self
+            .running
+            .iter_mut()
+            .enumerate()
+            .filter(|(i, _)| round_idxs.contains(i))
+            .map(|(_, r)| &mut r.sampler)
+            .collect();
+        let outcomes =
+            self.model.verify_draft_sampled_batch(&items, &mut self.pool, &mut samplers, &histories)?;
+        let t2 = self.profile.then(std::time::Instant::now);
+
+        // Phase 3: the same per-sequence bookkeeping a single sequential
+        // round always did, once a sequence in this round.
+        for (r, outcome) in round.into_iter().zip(outcomes) {
+            let idx = r.idx;
             self.steps += 1;
             self.spec_steps += 1;
             self.spec_tokens += outcome.tokens.len() as u64;
@@ -918,45 +978,45 @@ impl Scheduler {
                     break;
                 }
             }
-            if let (Some(t0), Some(t1), Some(t2)) = (t0, t1, t2) {
-                let t3 = std::time::Instant::now();
-                self.spec_draft_ms += (t1 - t0).as_secs_f64() * 1e3;
-                self.spec_verify_ms += (t2 - t1).as_secs_f64() * 1e3;
-                self.spec_after_ms += (t3 - t2).as_secs_f64() * 1e3;
-                self.spec_window += 1;
-                if self.spec_window >= 100 {
-                    let w = self.spec_window as f64;
-                    tracing::warn!(
-                        draft_ms = format!("{:.2}", self.spec_draft_ms / w),
-                        verify_ms = format!("{:.2}", self.spec_verify_ms / w),
-                        after_ms = format!("{:.2}", self.spec_after_ms / w),
-                        k = self.spec_k,
-                        accept = format!("{:.2}", self.spec_tokens as f64 / self.spec_steps as f64),
-                        "per-round timing"
-                    );
-                    // The per-kernel table, which the device layer has been
-                    // accumulating all along and nothing was printing. Beside
-                    // the draft/verify split because the two are one
-                    // question: that split says *which half* the round is
-                    // spent in, and this says which kernel inside it. Reset
-                    // with the window so the next hundred rounds are read on
-                    // their own.
-                    let report = self.model.device().profile().report();
-                    if !report.is_empty() {
-                        tracing::warn!("per-kernel, last {} rounds:\n{report}", self.spec_window);
-                    }
-                    self.model.device().profile().reset();
-                    self.spec_draft_ms = 0.0;
-                    self.spec_verify_ms = 0.0;
-                    self.spec_after_ms = 0.0;
-                    self.spec_window = 0;
-                }
-            }
             any_ran = true;
             if finished {
                 finished_indices.push(idx);
             } else {
                 self.running[idx].spec_feed = Some(outcome.feed);
+            }
+        }
+        if let (Some(t0), Some(t1), Some(t2)) = (t0, t1, t2) {
+            let t3 = std::time::Instant::now();
+            self.spec_draft_ms += (t1 - t0).as_secs_f64() * 1e3;
+            self.spec_verify_ms += (t2 - t1).as_secs_f64() * 1e3;
+            self.spec_after_ms += (t3 - t2).as_secs_f64() * 1e3;
+            self.spec_window += 1;
+            if self.spec_window >= 100 {
+                let w = self.spec_window as f64;
+                tracing::warn!(
+                    draft_ms = format!("{:.2}", self.spec_draft_ms / w),
+                    verify_ms = format!("{:.2}", self.spec_verify_ms / w),
+                    after_ms = format!("{:.2}", self.spec_after_ms / w),
+                    k = self.spec_k,
+                    accept = format!("{:.2}", self.spec_tokens as f64 / self.spec_steps as f64),
+                    "per-round timing"
+                );
+                // The per-kernel table, which the device layer has been
+                // accumulating all along and nothing was printing. Beside
+                // the draft/verify split because the two are one
+                // question: that split says *which half* the round is
+                // spent in, and this says which kernel inside it. Reset
+                // with the window so the next hundred rounds are read on
+                // their own.
+                let report = self.model.device().profile().report();
+                if !report.is_empty() {
+                    tracing::warn!("per-kernel, last {} rounds:\n{report}", self.spec_window);
+                }
+                self.model.device().profile().reset();
+                self.spec_draft_ms = 0.0;
+                self.spec_verify_ms = 0.0;
+                self.spec_after_ms = 0.0;
+                self.spec_window = 0;
             }
         }
         // Retire finished sequences after every eligible sequence's round has

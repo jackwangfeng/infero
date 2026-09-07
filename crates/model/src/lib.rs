@@ -1944,7 +1944,7 @@ pub struct Model {
     /// speculative round on, while the other sequence (whose call did the
     /// capture) is unaffected. Keying on the armed slot itself, not just
     /// whether one is armed, is what a `bool` could never distinguish.
-    graphs: std::collections::HashMap<(u64, usize, usize, Option<usize>), GraphSlot>,
+    graphs: std::collections::HashMap<(u64, usize, usize, Vec<usize>), GraphSlot>,
     /// Cleared by `INFERO_NO_GRAPH`, for measuring what the graphs are worth.
     use_graph: bool,
     max_logit_rows: usize,
@@ -3603,20 +3603,23 @@ impl Model {
             None => Vec::new(),
         };
 
-        // `Some(slot)` when a speculative verification pass is armed for that
-        // slot, `None` otherwise -- not a plain `bool`. See the `graphs`
-        // field's own doc comment for why a `bool` here let two concurrent
-        // sequences' verification passes alias the same cached graph and
-        // silently rewind/stage each other's persistent GDN state.
-        let armed_slot = self
+        // The exact, ordered set of armed slots this call touches -- empty
+        // when none is armed, `[a, b]` (not just "2 armed") when a fused
+        // multi-sequence verification pass arms both. See the `graphs`
+        // field's own doc comment for why anything less specific (a plain
+        // `bool`, or even a slot count) let two calls arming a *different*
+        // set of slots alias the same cached graph and silently rewind/stage
+        // the wrong sequence's persistent GDN state.
+        let armed_slots = self
             .gdn_rollback
             .as_ref()
-            .and_then(|r| r.is_armed().then(|| r.armed_slot()));
+            .map(|r| r.armed_slots())
+            .unwrap_or_default();
         let key = (
             pool.id(),
             n_tokens,
             kv_len.next_multiple_of(graph_kv_bucket()),
-            armed_slot,
+            armed_slots,
         );
         // A pass whose attention dispatch depends on *this call's item layout*
         // must not be captured or replayed: a graph is keyed by `(pool,
@@ -4486,10 +4489,19 @@ impl Model {
         // convolution taps and take a working copy of its recurrent state, so
         // that the pass can be undone down to the accepted prefix. Both are
         // no-ops on an ordinary step. See `crate::spec`.
-        let armed = self.gdn_rollback.as_ref().is_some_and(|r| r.is_armed());
+        //
+        // One `stage` a armed slot, not one for the whole call: a fused,
+        // multi-sequence verification pass arms every sequence it covers
+        // before this runs, and each slot's own share of `conv`/`recurrent`
+        // is independent (see `stage`'s own doc comment), so there is no
+        // ordering requirement between these calls.
+        let armed = self.gdn_rollback.as_ref().is_some_and(|r| r.any_armed());
         if armed {
+            let armed_slots = self.gdn_rollback.as_ref().unwrap().armed_slots();
             let r = self.gdn_rollback.as_mut().unwrap();
-            r.stage(&self.kern, ordinal, &conv.as_view(), &recurrent.as_view())?;
+            for slot in armed_slots {
+                r.stage(&self.kern, ordinal, slot, &conv.as_view(), &recurrent.as_view())?;
+            }
         }
 
         // The convolution needs a separate output: it reads three tokens back,
@@ -4590,18 +4602,28 @@ impl Model {
         // the values a replay has to feed it — journalling `acts.qkv` instead
         // would replay the recurrence over unfiltered, unnormalized inputs, run
         // to completion, and leave a state that is wrong by a few percent.
+        //
+        // Once a armed slot, over this *whole* call's `n`-row activations —
+        // `record` narrows to each slot's own `row_start`/`rows` window
+        // itself, which is what lets a fused, multi-sequence call (several
+        // sequences' rows sharing these same flat buffers) journal each of
+        // them without one overwriting another's share.
         if armed {
+            let armed_slots = self.gdn_rollback.as_ref().unwrap().armed_slots();
             let r = self.gdn_rollback.as_mut().unwrap();
-            r.record(
-                &self.kern,
-                ordinal,
-                crate::spec::GdnTap {
-                    pre_conv: acts.qkv.slice(..n * width),
-                    post_conv: acts.qkv_conv.slice(..n * width),
-                    g: acts.g.slice(..n * heads),
-                    beta: acts.beta.slice(..n * heads),
-                },
-            )?;
+            for slot in armed_slots {
+                r.record(
+                    &self.kern,
+                    ordinal,
+                    slot,
+                    crate::spec::GdnTap {
+                        pre_conv: acts.qkv.slice(..n * width),
+                        post_conv: acts.qkv_conv.slice(..n * width),
+                        g: acts.g.slice(..n * heads),
+                        beta: acts.beta.slice(..n * heads),
+                    },
+                )?;
+            }
         }
         // The recurrence runs on the working copy while a verification pass is
         // in flight, leaving the persistent state at its pre-step value for the

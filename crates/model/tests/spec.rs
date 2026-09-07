@@ -927,3 +927,107 @@ fn a_forked_sequence_shares_its_prefix_and_computes_from_it() -> Result<()> {
     );
     Ok(())
 }
+
+/// `verify_draft_sampled_batch` (one fused call over several sequences) must
+/// produce *exactly* the same outcomes as calling `verify_draft_sampled` once
+/// a sequence — the fused path exists to fuse the model forward pass for
+/// throughput, not to change what that pass computes.
+///
+/// Two independent pairs of sequences, on the same model and the same
+/// prompt, given identically-seeded samplers: pair A goes through the old,
+/// sequential `verify_draft_sampled` (one call a sequence); pair B goes
+/// through the new `verify_draft_sampled_batch` (one call for both). Same
+/// prompt, same drafter, same seeds -> the drafts and the acceptance draws
+/// have to match, and a real bug in the fused path's row-slicing (a sequence
+/// reading or journalling the other's rows) would show up as a difference in
+/// the *tokens*, not just in timing.
+#[test]
+fn fused_multi_sequence_verify_matches_the_sequential_calls_it_replaces() -> Result<()> {
+    let _gpu = gpu_lock();
+    const K: usize = 3;
+    // Two sequences a pair, two pairs: 4 independent branches/pool slots.
+    let Some((mut model, tok)) = load("qwen2.5-0.5b-instruct-q8_0.gguf", 2 * (K + 1))? else {
+        return Ok(());
+    };
+    let prompt = tok.encode(PROMPT, Some(false), false);
+    let cfg = model.config().clone();
+    let mut head = synthetic_head_branched(model.device(), &cfg, prompt.len().max(K + 1), model.max_seq(), 4)?;
+    // Each branch its own full-length cache region, matching how
+    // `Model::load_mtp_head` forks a real, multi-sequence-capable head --
+    // `synthetic_head_branched`'s raw constructor does not do this itself
+    // (see its own doc comment), so tests that want independent sequences
+    // rather than a tree's shared prefix have to ask for it explicitly.
+    head.fork(0, model.max_seq())?;
+    model.install_mtp_head(head)?;
+
+    let mut pool = model.new_pool(512, 4)?;
+    model.enable_speculation(K, &pool)?;
+
+    let sp = |seed: u64| infero_model::SamplingParams {
+        temperature: 0.8,
+        top_p: 0.95,
+        top_k: 32,
+        seed: Some(seed),
+        ..Default::default()
+    };
+
+    // One drafter run a branch, `branch` and `draft_seed` chosen so that
+    // branch 0 (pair A's first sequence) and branch 2 (pair B's first) draft
+    // *identically* -- same prompt, same pending token, same drafter seed --
+    // and likewise 1/3 for the second sequence of each pair. That is what
+    // makes the two pairs' verify calls comparable at all: any difference
+    // between pair A's and pair B's outcomes has to come from how they were
+    // verified, not from having drafted different candidates.
+    let mut draft_for = |branch: usize, draft_seed: u64| -> Result<(SeqId, u32, Vec<infero_model::mtp::Drafted>)> {
+        let seq = pool.alloc().expect("no slot");
+        let pending = prime(&mut model, &mut pool, seq, &prompt)?;
+        let feed = DraftFeed::after_prefill(&prompt, pending);
+        let mut s = infero_model::Sampler::new(sp(draft_seed));
+        let draft = model.draft_with_head_sampled(K, &feed, &mut s, &prompt, branch)?;
+        Ok((seq, pending, draft))
+    };
+    let (seq_a0, pending_a0, draft_a0) = draft_for(0, 111)?;
+    let (seq_a1, pending_a1, draft_a1) = draft_for(1, 222)?;
+    let (seq_b0, pending_b0, draft_b0) = draft_for(2, 111)?;
+    let (seq_b1, pending_b1, draft_b1) = draft_for(3, 222)?;
+    assert_eq!(
+        draft_a0.iter().map(|d| d.token).collect::<Vec<_>>(),
+        draft_b0.iter().map(|d| d.token).collect::<Vec<_>>(),
+        "identically-seeded branches drafted different tokens; the pairs are \
+         not actually comparable"
+    );
+    assert_eq!(
+        draft_a1.iter().map(|d| d.token).collect::<Vec<_>>(),
+        draft_b1.iter().map(|d| d.token).collect::<Vec<_>>()
+    );
+
+    // Pair A: the sequential path, one `verify_draft_sampled` call a
+    // sequence -- what `Scheduler::speculative_step` did before tonight's
+    // fusion, and what it still does whenever only one sequence is eligible.
+    let mut s_a0 = infero_model::Sampler::new(sp(333));
+    let outcome_a0 = model.verify_draft_sampled(seq_a0, &mut pool, pending_a0, &draft_a0, &mut s_a0, &prompt, 0)?;
+    let mut s_a1 = infero_model::Sampler::new(sp(444));
+    let outcome_a1 = model.verify_draft_sampled(seq_a1, &mut pool, pending_a1, &draft_a1, &mut s_a1, &prompt, 0)?;
+
+    // Pair B: the fused path, one `verify_draft_sampled_batch` call for
+    // both -- what a fused `Scheduler::speculative_step` round takes instead.
+    let mut s_b0 = infero_model::Sampler::new(sp(333));
+    let mut s_b1 = infero_model::Sampler::new(sp(444));
+    let items = [
+        infero_model::spec::VerifyItem { seq: seq_b0, pending: pending_b0, draft: &draft_b0, mrope_delta: 0 },
+        infero_model::spec::VerifyItem { seq: seq_b1, pending: pending_b1, draft: &draft_b1, mrope_delta: 0 },
+    ];
+    let mut samplers: Vec<&mut infero_model::Sampler> = vec![&mut s_b0, &mut s_b1];
+    let histories: [&[u32]; 2] = [&prompt, &prompt];
+    let outcomes_b = model.verify_draft_sampled_batch(&items, &mut pool, &mut samplers, &histories)?;
+
+    assert_eq!(
+        outcome_a0, outcomes_b[0],
+        "the fused path's first sequence disagreed with the sequential path"
+    );
+    assert_eq!(
+        outcome_a1, outcomes_b[1],
+        "the fused path's second sequence disagreed with the sequential path"
+    );
+    Ok(())
+}

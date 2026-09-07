@@ -135,6 +135,16 @@ impl SpecOutcome {
     }
 }
 
+/// One sequence's own inputs to
+/// [`Model::verify_draft_sampled_batch`] — that function's `items[i]`
+/// pairs with `samplers[i]`/`histories[i]` positionally.
+pub struct VerifyItem<'a> {
+    pub seq: SeqId,
+    pub pending: u32,
+    pub draft: &'a [crate::mtp::Drafted],
+    pub mrope_delta: i32,
+}
+
 /// The per-step journal that lets a rejected candidate be un-run.
 ///
 /// One of these per model that has linear-attention blocks; `None` on a pure
@@ -146,8 +156,11 @@ pub struct GdnRollback {
     /// Candidate tokens one step may carry, `k + 1`.
     cap: usize,
 
-    /// `[n_linear, cap, conv_channels]` — the packed row **after** the causal
-    /// convolution and **after** `q`/`k` were l2-normalized and `q` scaled.
+    /// `[n_linear, max_seqs, cap, conv_channels]` — the packed row **after**
+    /// the causal convolution and **after** `q`/`k` were l2-normalized and `q`
+    /// scaled, one journal a sequence slot so several armed passes (a fused,
+    /// multi-sequence verification call) can be recorded without one
+    /// clobbering another's.
     ///
     /// This capture point is the whole correctness of the replay, and the two
     /// wrong ones both run: journalling the pre-convolution row replays a
@@ -155,11 +168,13 @@ pub struct GdnRollback {
     /// convolution and the normalization replays it over unnormalized keys.
     /// `crates/model/tests/spec.rs` requires both to give a different state.
     qkv: Buf<f32>,
-    /// `[n_linear, cap, value_heads]` each, as `gdn_gate_decay` produced them.
+    /// `[n_linear, max_seqs, cap, value_heads]` each, as `gdn_gate_decay`
+    /// produced them.
     g: Buf<f32>,
     beta: Buf<f32>,
-    /// `[n_linear, cap, conv_channels]` — the **pre**-convolution row, which is
-    /// what re-advancing the window over the accepted prefix needs.
+    /// `[n_linear, max_seqs, cap, conv_channels]` — the **pre**-convolution
+    /// row, which is what re-advancing the window over the accepted prefix
+    /// needs.
     qkv_pre: Buf<f32>,
     /// `[n_linear, max_seqs, conv_channels * (conv_k - 1)]` — the convolution
     /// taps as they stood before the verification pass.
@@ -181,12 +196,23 @@ pub struct GdnRollback {
     out_scratch: Buf<f32>,
     conv_out_scratch: Buf<f32>,
 
-    /// Set for the duration of a verification pass.
-    armed: bool,
-    /// Rows the armed pass carried.
-    rows: usize,
-    /// Which sequence slot the armed pass is for.
-    slot: usize,
+    /// `armed[slot]`: set for the duration of a verification pass armed for
+    /// that sequence slot. Several slots may be armed at once — a fused,
+    /// multi-sequence verification call arms each of its sequences before
+    /// running the shared forward pass — which is why this is per-slot
+    /// rather than the single bool (plus a single `slot`) it used to be:
+    /// a single value could not tell two concurrently armed sequences apart,
+    /// which is exactly the hazard `Model`'s decode-graph cache key hit
+    /// before keying on the *set* of armed slots (see its own doc comment).
+    armed: Vec<bool>,
+    /// `rows[slot]`: candidates the armed pass for that slot carried.
+    rows: Vec<usize>,
+    /// `row_start[slot]`: where that slot's rows begin within *this call's*
+    /// flat batch — `acts.qkv`/`g`/`beta` are one flat `[n_tokens, ...]` array
+    /// covering every sequence in a fused call, and `record` needs this to
+    /// find its own sequence's rows inside it rather than assuming they are
+    /// the whole array (true only when exactly one sequence is armed).
+    row_start: Vec<usize>,
     /// Copies *issued from the host*, for the report — this is the cost the
     /// kernel change below would remove.
     ///
@@ -239,17 +265,17 @@ impl GdnRollback {
             n_linear,
             max_seqs,
             cap,
-            qkv: stream.alloc_zeros::<f32>(n_linear * cap * width)?,
-            g: stream.alloc_zeros::<f32>(n_linear * cap * heads)?,
-            beta: stream.alloc_zeros::<f32>(n_linear * cap * heads)?,
-            qkv_pre: stream.alloc_zeros::<f32>(n_linear * cap * width)?,
+            qkv: stream.alloc_zeros::<f32>(n_linear * max_seqs * cap * width)?,
+            g: stream.alloc_zeros::<f32>(n_linear * max_seqs * cap * heads)?,
+            beta: stream.alloc_zeros::<f32>(n_linear * max_seqs * cap * heads)?,
+            qkv_pre: stream.alloc_zeros::<f32>(n_linear * max_seqs * cap * width)?,
             conv_pre: stream.alloc_zeros::<f32>(n_linear * max_seqs * conv)?,
             state_scratch: stream.alloc_zeros::<f32>(max_seqs * state)?,
             out_scratch: stream.alloc_zeros::<f32>(cap * la.value_dim())?,
             conv_out_scratch: stream.alloc_zeros::<f32>(cap * width)?,
-            armed: false,
-            rows: 0,
-            slot: 0,
+            armed: vec![false; max_seqs],
+            rows: vec![0; max_seqs],
+            row_start: vec![0; max_seqs],
             state_copies: 0,
         };
         tracing::info!(
@@ -273,19 +299,29 @@ impl GdnRollback {
         self.state_copies
     }
 
-    pub fn is_armed(&self) -> bool {
-        self.armed
+    /// Whether `slot` specifically is armed.
+    pub fn is_armed(&self, slot: usize) -> bool {
+        self.armed.get(slot).copied().unwrap_or(false)
     }
 
-    /// Which sequence slot the armed pass is for.
-    ///
-    /// Only meaningful when [`Self::is_armed`] is true. A caller keying a
-    /// decode-graph cache on "a verification pass is armed" needs this, not
-    /// just the bool: `stage`'s journal addresses are computed from this slot
-    /// at capture time and baked into the graph, so two sequences' armed
-    /// passes must never share a cache key even though both are "armed".
-    pub fn armed_slot(&self) -> usize {
-        self.slot
+    /// Whether *any* slot is armed — what gates `linear_attention`'s choice
+    /// between the persistent state and the working copy for the whole call.
+    pub fn any_armed(&self) -> bool {
+        self.armed.iter().any(|&a| a)
+    }
+
+    /// Every currently armed slot, ascending. A caller keying a decode-graph
+    /// cache on "a verification pass is armed" needs this exact set, not just
+    /// a bool: `stage`'s journal addresses are computed from a slot at
+    /// capture time and baked into the graph, so two calls arming a
+    /// different *set* of slots must never share a cache key even though
+    /// both are "armed" — see [`crate::Model`]'s own graph-key doc comment.
+    pub fn armed_slots(&self) -> Vec<usize> {
+        self.armed
+            .iter()
+            .enumerate()
+            .filter_map(|(s, &a)| a.then_some(s))
+            .collect()
     }
 
     /// One layer's state, for a caller checking what a pass left behind.
@@ -293,14 +329,26 @@ impl GdnRollback {
         self.state_scratch.as_view()
     }
 
-    /// Begin recording a verification pass over `rows` candidates.
+    /// `slot`'s own recorded rows of `qkv` (the post-convolution, post-l2norm
+    /// journal `record` writes), for a test checking that a fused,
+    /// multi-slot call's `row_start`-based slicing landed each slot's own
+    /// rows in its own journal region rather than another slot's.
+    /// `crates/model/tests/gdn_rollback_multi_seq.rs` is the only caller;
+    /// nothing in the real engine needs to read the journal back.
+    pub fn debug_journal_qkv(&self, ordinal: usize, slot: usize) -> View<'_, f32> {
+        let width = self.la.conv_channels();
+        self.qkv.slice(self.row_span(ordinal, slot, width, self.rows[slot]))
+    }
+
+    /// Begin recording a verification pass over `rows` candidates for
+    /// `slot`, whose rows begin at `row_start` in this call's flat batch.
     ///
     /// [`Model::verify_draft`] does this; it is public so that
     /// `crates/model/tests/gdn_rollback.rs` can drive the same code against the
     /// kernels directly. A test that reimplemented the replay would be checking
     /// its own copy of the algorithm, which is the failure this codebase has
     /// already paid for once.
-    pub fn arm(&mut self, slot: usize, rows: usize) -> Result<()> {
+    pub fn arm(&mut self, slot: usize, rows: usize, row_start: usize) -> Result<()> {
         anyhow::ensure!(
             rows <= self.cap,
             "a verification pass of {rows} candidates against a journal built \
@@ -308,14 +356,14 @@ impl GdnRollback {
             self.cap
         );
         anyhow::ensure!(slot < self.max_seqs, "sequence slot {slot} is past the pool");
-        self.armed = true;
-        self.rows = rows;
-        self.slot = slot;
+        self.armed[slot] = true;
+        self.rows[slot] = rows;
+        self.row_start[slot] = row_start;
         Ok(())
     }
 
-    pub fn disarm(&mut self) {
-        self.armed = false;
+    pub fn disarm(&mut self, slot: usize) {
+        self.armed[slot] = false;
     }
 
     fn conv_span(&self, ordinal: usize) -> std::ops::Range<usize> {
@@ -323,35 +371,37 @@ impl GdnRollback {
         ordinal * n..(ordinal + 1) * n
     }
 
-    /// This armed pass's own slice of `self.conv_pre`'s `[n_linear, max_seqs,
+    /// `slot`'s own slice of `self.conv_pre`'s `[n_linear, max_seqs,
     /// conv]` layout — `conv_span(ordinal)` narrowed to one sequence slot.
     /// See the note on `stage` for why only this slice, and not the whole
     /// span, needs a working copy at all.
-    fn conv_pre_slot_span(&self, ordinal: usize) -> std::ops::Range<usize> {
+    fn conv_pre_slot_span(&self, ordinal: usize, slot: usize) -> std::ops::Range<usize> {
         let per_seq = self.la.conv_channels() * (self.la.conv_kernel - 1);
-        let base = ordinal * per_seq * self.max_seqs + self.slot * per_seq;
+        let base = ordinal * per_seq * self.max_seqs + slot * per_seq;
         base..base + per_seq
     }
 
     /// The same slot, but within a single layer's own `[max_seqs, conv]`
     /// view — the pool's `conv`/`conv_w` argument, which carries no
     /// `ordinal` stride of its own.
-    fn conv_layer_slot_span(&self) -> std::ops::Range<usize> {
+    fn conv_layer_slot_span(&self, slot: usize) -> std::ops::Range<usize> {
         let per_seq = self.la.conv_channels() * (self.la.conv_kernel - 1);
-        self.slot * per_seq..(self.slot + 1) * per_seq
+        slot * per_seq..(slot + 1) * per_seq
     }
 
-    /// This armed pass's own slice of `state_scratch`, which — unlike
+    /// `slot`'s own slice of `state_scratch`, which — unlike
     /// `conv_pre` — holds only one layer at a time (`linear_attention` reuses
     /// it across the layer loop), so there is no `ordinal` term.
-    fn state_slot_span(&self) -> std::ops::Range<usize> {
+    fn state_slot_span(&self, slot: usize) -> std::ops::Range<usize> {
         let per_seq = self.la.value_heads * self.la.key_head_dim * self.la.value_head_dim;
-        let base = self.slot * per_seq;
+        let base = slot * per_seq;
         base..base + per_seq
     }
 
-    fn row_span(&self, ordinal: usize, width: usize, rows: usize) -> std::ops::Range<usize> {
-        let base = ordinal * self.cap * width;
+    /// `slot`'s own row range within one layer's `[max_seqs, cap, width]`
+    /// journal (`qkv`/`qkv_pre`/`g`/`beta`), narrowed to `rows` of it.
+    fn row_span(&self, ordinal: usize, slot: usize, width: usize, rows: usize) -> std::ops::Range<usize> {
+        let base = (ordinal * self.max_seqs + slot) * self.cap * width;
         base..base + rows * width
     }
 }
@@ -370,19 +420,21 @@ pub struct GdnTap<'a> {
 
 impl GdnRollback {
     /// Copy this layer's convolution taps and recurrent state out before
-    /// anything overwrites them — but only this armed pass's own sequence
-    /// slot, not the whole `max_seqs`-wide buffer both live in.
+    /// anything overwrites them — but only `slot`'s own sequence share, not
+    /// the whole `max_seqs`-wide buffer both live in. Called once a slot for
+    /// every slot a fused, multi-sequence verification call arms — each
+    /// slot's own share is independent, so there is no ordering requirement
+    /// between these calls.
     ///
     /// `forward_batch_rows` zeroes every slot's token count except the ones
     /// in this call's own batch before this pass runs (see its own comment,
-    /// `pool.set_gdn_layout`), and `verify_draft_sampled` batches exactly one
-    /// sequence. So every other slot's `n_tok` is already `<= 0` for the
-    /// whole armed pass, and `gdn_conv`/`gdn_delta_rule` — which check that
-    /// before touching a slot's state at all — never read or write them.
-    /// Copying all `max_seqs` of them anyway moved thirty-one sequences'
-    /// worth of state nobody was going to look at: one sequence's share is 3
-    /// MiB a layer on the 27B, the whole pool's is 96 MiB, and 48 layers a
-    /// round turns that difference into 147 MiB against 4.5 GiB.
+    /// `pool.set_gdn_layout`). So every slot this call did not arm has
+    /// `n_tok <= 0` for the whole armed pass, and `gdn_conv`/`gdn_delta_rule`
+    /// — which check that before touching a slot's state at all — never read
+    /// or write them. Copying all `max_seqs` of them anyway moved thirty-one
+    /// sequences' worth of state nobody was going to look at: one sequence's
+    /// share is 3 MiB a layer on the 27B, the whole pool's is 96 MiB, and 48
+    /// layers a round turns that difference into 147 MiB against 4.5 GiB.
     ///
     /// One launch for both buffers rather than two `memcpy_dtod`s, on top of
     /// that: see the note on `Kernels::gdn_rollback_stage2`.
@@ -390,6 +442,7 @@ impl GdnRollback {
         &mut self,
         kern: &Kernels,
         ordinal: usize,
+        slot: usize,
         conv: &View<'_, f32>,
         state: &View<'_, f32>,
     ) -> Result<()> {
@@ -407,9 +460,9 @@ impl GdnRollback {
         );
         self.state_copies += 1;
         let (conv_pre_slot, conv_layer_slot, state_slot) = (
-            self.conv_pre_slot_span(ordinal),
-            self.conv_layer_slot_span(),
-            self.state_slot_span(),
+            self.conv_pre_slot_span(ordinal, slot),
+            self.conv_layer_slot_span(slot),
+            self.state_slot_span(slot),
         );
         // Disjoint fields, borrowed independently so both destinations are
         // live at once for the one kernel call below.
@@ -450,13 +503,14 @@ impl GdnRollback {
         dev: &Device,
         kern: &infero_kernels::Kernels,
         ordinal: usize,
+        slot: usize,
         keep: usize,
         seqs: &SeqLayout<'_>,
         conv_w: &View<'_, f32>,
         state: &mut infero_gpu::ViewMut<'_, f32>,
         conv: &mut infero_gpu::ViewMut<'_, f32>,
     ) -> Result<()> {
-        anyhow::ensure!(keep <= self.rows, "keeping {keep} of {} rows", self.rows);
+        anyhow::ensure!(keep <= self.rows[slot], "keeping {keep} of {} rows", self.rows[slot]);
         let la = self.la;
         let width = la.conv_channels();
         let heads = la.value_heads;
@@ -465,13 +519,13 @@ impl GdnRollback {
         // persistent conv window was never touched and there is nothing to
         // put back.
         dev.stream().memcpy_dtod(
-            &self.conv_pre.slice(self.conv_pre_slot_span(ordinal)),
-            &mut conv.slice_mut(self.conv_layer_slot_span()),
+            &self.conv_pre.slice(self.conv_pre_slot_span(ordinal, slot)),
+            &mut conv.slice_mut(self.conv_layer_slot_span(slot)),
         )?;
         if keep == 0 {
             return Ok(());
         }
-        let rows = self.row_span(ordinal, width, keep);
+        let rows = self.row_span(ordinal, slot, width, keep);
         kern.gdn_conv(
             &mut self.conv_out_scratch.slice_mut(..keep * width),
             &self.qkv_pre.slice(rows.clone()),
@@ -481,7 +535,7 @@ impl GdnRollback {
             width,
             la.conv_kernel,
         )?;
-        let gr = self.row_span(ordinal, heads, keep);
+        let gr = self.row_span(ordinal, slot, heads, keep);
         kern.gdn_delta_rule(
             &mut self.out_scratch.slice_mut(..keep * la.value_dim()),
             state,
@@ -499,11 +553,23 @@ impl GdnRollback {
         Ok(())
     }
 
-    /// Record one layer's candidate rows.
-    pub fn record(&mut self, kern: &Kernels, ordinal: usize, tap: GdnTap<'_>) -> Result<()> {
-        let rows = self.rows;
+    /// Record one layer's candidate rows for `slot`. `tap`'s views are this
+    /// *whole call's* flat `[n_tokens, ...]` activations (every armed
+    /// sequence's rows together, when this is a fused call) — `slot`'s own
+    /// `rows[slot]`-wide window starting at `row_start[slot]` is sliced out
+    /// of them here, not by the caller, so the bookkeeping for where a slot's
+    /// rows live stays in one place.
+    pub fn record(&mut self, kern: &Kernels, ordinal: usize, slot: usize, tap: GdnTap<'_>) -> Result<()> {
+        let rows = self.rows[slot];
+        let (row_lo, row_hi) = (self.row_start[slot], self.row_start[slot] + rows);
         let width = self.la.conv_channels();
         let heads = self.la.value_heads;
+        let tap = GdnTap {
+            pre_conv: tap.pre_conv.slice(row_lo * width..row_hi * width),
+            post_conv: tap.post_conv.slice(row_lo * width..row_hi * width),
+            g: tap.g.slice(row_lo * heads..row_hi * heads),
+            beta: tap.beta.slice(row_lo * heads..row_hi * heads),
+        };
         // The tap has to be exactly the armed pass's rows. A shorter one would
         // leave the tail of the journal holding the previous step's numbers,
         // which replays a state that never existed; a longer one would be
@@ -521,8 +587,8 @@ impl GdnRollback {
             tap.beta.len(),
         );
         let (qkv_span, g_span) = (
-            self.row_span(ordinal, width, rows),
-            self.row_span(ordinal, heads, rows),
+            self.row_span(ordinal, slot, width, rows),
+            self.row_span(ordinal, slot, heads, rows),
         );
         // Disjoint fields, borrowed independently so all four destinations
         // are live at once for the one kernel call below — one launch
@@ -631,7 +697,8 @@ impl Model {
         candidates.extend_from_slice(draft);
 
         if let Some(r) = self.gdn_rollback.as_mut() {
-            r.arm(seq.0, n)?;
+            // `row_start: 0` -- this call's one item is the whole batch.
+            r.arm(seq.0, n, 0)?;
         }
         let rows = {
             let item = BatchItem {
@@ -645,7 +712,7 @@ impl Model {
             // A failed pass leaves the journal armed, and the next step would
             // then commit rows it never recorded.
             if let (true, Some(j)) = (r.is_err(), self.gdn_rollback.as_mut()) {
-                j.disarm();
+                j.disarm(seq.0);
             }
             r?
         };
@@ -729,7 +796,8 @@ impl Model {
         candidates.extend(draft.iter().map(|d| d.token));
 
         if let Some(r) = self.gdn_rollback.as_mut() {
-            r.arm(seq.0, n)?;
+            // `row_start: 0` -- this call's one item is the whole batch.
+            r.arm(seq.0, n, 0)?;
         }
         let rows = {
             let item = BatchItem {
@@ -738,7 +806,7 @@ impl Model {
             };
             let r = self.forward_batch_rows(std::slice::from_ref(&item), pool, &[n]);
             if let (true, Some(j)) = (r.is_err(), self.gdn_rollback.as_mut()) {
-                j.disarm();
+                j.disarm(seq.0);
             }
             r?
         };
@@ -878,6 +946,216 @@ impl Model {
             drafted: draft.len(),
             feed,
         })
+    }
+
+    /// Verify several sequences' drafts in ONE forward pass, instead of one
+    /// sequential call a sequence.
+    ///
+    /// `verify_draft_sampled` fully covers correctness for any number of
+    /// concurrent sequences already — `Scheduler::speculative_step` calling
+    /// it once a sequence, in a loop, is what shipped tonight's graph-key and
+    /// concurrency-gate fixes. What that loop costs is throughput: each call
+    /// is its own full model forward pass, and at real concurrency (measured:
+    /// two sequences already erase each other's speculative gain, see
+    /// `Scheduler::spec_max_concurrency`'s own doc comment) the *ordinary*
+    /// batched-decode path would fuse the same sequences into one pass for a
+    /// fraction of the cost. This does the same fusion for verification: one
+    /// `forward_batch_rows` call over every item's candidates together, one
+    /// `survivors_on_device` call over every item's rows together, and only
+    /// the cheap per-sequence bookkeeping (the accept/reject walk, the
+    /// journal replay) stays sequential — matching `GdnRollback`'s own
+    /// design, where `stage`/`record` are already one call a slot (see their
+    /// own doc comments) and only the expensive forward pass was ever the
+    /// single-sequence bottleneck.
+    ///
+    /// `samplers`/`histories` are positional, matching `items` — item `i`'s
+    /// acceptance test reads `samplers[i]`/`histories[i]`.
+    pub fn verify_draft_sampled_batch(
+        &mut self,
+        items: &[VerifyItem<'_>],
+        pool: &mut KvPool,
+        samplers: &mut [&mut crate::Sampler],
+        histories: &[&[u32]],
+    ) -> Result<Vec<SpecOutcome>> {
+        anyhow::ensure!(!items.is_empty(), "a fused verify batch with nothing to verify");
+        anyhow::ensure!(
+            items.len() == samplers.len() && items.len() == histories.len(),
+            "{} items against {} samplers and {} histories",
+            items.len(),
+            samplers.len(),
+            histories.len()
+        );
+        let ns: Vec<usize> = items.iter().map(|it| it.draft.len() + 1).collect();
+        let n_total: usize = ns.iter().sum();
+        anyhow::ensure!(
+            n_total <= self.max_logit_rows,
+            "verifying {n_total} candidates across {} sequences needs that many \
+             logit rows, the model was built for {}",
+            items.len(),
+            self.max_logit_rows
+        );
+        for s in samplers.iter() {
+            anyhow::ensure!(
+                !s.params().is_greedy(),
+                "a greedy request takes `verify_draft`, whose acceptance rule is \
+                 exact rather than a ratio"
+            );
+        }
+
+        let len_befores: Vec<usize> = items.iter().map(|it| pool.len(it.seq)).collect();
+        let all_candidates: Vec<Vec<u32>> = items
+            .iter()
+            .map(|it| {
+                let mut c = Vec::with_capacity(it.draft.len() + 1);
+                c.push(it.pending);
+                c.extend(it.draft.iter().map(|d| d.token));
+                c
+            })
+            .collect();
+
+        // Each item's own slot, armed at its own row's start in this call's
+        // flat batch -- `BatchItem`s below are built in the same order, so
+        // the running offset here matches where `forward_batch_rows` will
+        // actually place each item's rows.
+        if let Some(r) = self.gdn_rollback.as_mut() {
+            let mut row_start = 0usize;
+            for (it, &n) in items.iter().zip(&ns) {
+                r.arm(it.seq.0, n, row_start)?;
+                row_start += n;
+            }
+        }
+        let batch_items: Vec<BatchItem> = items
+            .iter()
+            .zip(&all_candidates)
+            .map(|(it, c)| BatchItem {
+                mrope_delta: it.mrope_delta,
+                ..BatchItem::new(it.seq, c, BatchItemKind::Decode)
+            })
+            .collect();
+        let rows = {
+            let r = self.forward_batch_rows(&batch_items, pool, &ns);
+            if let (true, Some(j)) = (r.is_err(), self.gdn_rollback.as_mut()) {
+                for it in items {
+                    j.disarm(it.seq.0);
+                }
+            }
+            r?
+        };
+        anyhow::ensure!(rows == n_total, "asked for {n_total} logit rows and got {rows}");
+
+        let vocab = self.cfg.vocab_size;
+        // One row spec/window a row, across every item's candidates, in the
+        // same flat order as `batch_items` -- exactly what `survivors_on_device`
+        // needs to answer every item's rows in one device call.
+        let mut row_specs: Vec<crate::RowSample> = Vec::with_capacity(n_total);
+        let mut win_owned: Vec<Vec<u32>> = Vec::with_capacity(n_total);
+        for (i, it) in items.iter().enumerate() {
+            let sp = samplers[i].params().clone();
+            let mut w: Vec<u32> = histories[i].to_vec();
+            w.push(it.pending);
+            for j in 0..ns[i] {
+                win_owned.push(w.clone());
+                row_specs.push(crate::RowSample {
+                    temperature: sp.temperature,
+                    top_p: sp.top_p,
+                    top_k: sp.top_k as u32,
+                    rep_penalty: sp.repetition_penalty,
+                    rnd: 0.0,
+                });
+                if let Some(d) = it.draft.get(j) {
+                    w.push(d.token);
+                }
+            }
+        }
+        let win_refs: Vec<&[u32]> = win_owned.iter().map(|w| w.as_slice()).collect();
+        let device_dists = self.survivors_on_device(&row_specs, &win_refs)?;
+        let logits: Vec<f32> = if device_dists.is_some() {
+            Vec::new()
+        } else {
+            self.logits_host()?.to_vec()
+        };
+
+        let mut outcomes = Vec::with_capacity(items.len());
+        let mut row_start = 0usize;
+        for (i, it) in items.iter().enumerate() {
+            let n = ns[i];
+            let sampler = &mut *samplers[i];
+            let mut window: Vec<u32> = histories[i].to_vec();
+            window.push(it.pending);
+            let mut tokens: Vec<u32> = Vec::with_capacity(n);
+            let mut accepted = 0usize;
+            for (j, d) in it.draft.iter().enumerate() {
+                let token = d.token;
+                let draw = sampler.next_draw();
+                let residual_draw = sampler.next_draw();
+                let (dist, total): (&[(u32, f32)], f64) = match &device_dists {
+                    Some(d) => (&d[row_start + j], 1.0),
+                    None => {
+                        let row_idx = row_start + j;
+                        let row = &logits[row_idx * vocab..(row_idx + 1) * vocab];
+                        let (dd, tt) = sampler.distribution(row, &window);
+                        (dd, tt)
+                    }
+                };
+                let p_target = dist
+                    .iter()
+                    .find(|(t, _)| *t == token)
+                    .map(|(_, w)| *w as f64 / total)
+                    .unwrap_or(0.0);
+                let p_draft = d
+                    .q
+                    .iter()
+                    .find(|(t, _)| *t == token)
+                    .map(|(_, w)| *w)
+                    .unwrap_or(0.0);
+                if p_draft > 0.0 && p_target / p_draft as f64 >= draw {
+                    tokens.push(token);
+                    window.push(token);
+                    accepted += 1;
+                    continue;
+                }
+                let recovered = Self::draw_residual(dist, total, &d.q, residual_draw);
+                tokens.push(recovered);
+                break;
+            }
+            if accepted == it.draft.len() {
+                let draw = sampler.next_draw();
+                let (dist, total): (&[(u32, f32)], f64) = match &device_dists {
+                    Some(d) => (&d[row_start + it.draft.len()], 1.0),
+                    None => {
+                        let row_idx = row_start + it.draft.len();
+                        let row = &logits[row_idx * vocab..(row_idx + 1) * vocab];
+                        let (dd, tt) = sampler.distribution(row, &window);
+                        (dd, tt)
+                    }
+                };
+                tokens.push(crate::Sampler::pick(dist, total, draw));
+            }
+            debug_assert!(!tokens.is_empty(), "a step has to emit something");
+
+            let acc = crate::qwen35_mtp::Accepted {
+                tokens: tokens.clone(),
+                accepted,
+            };
+            self.settle(it.seq, pool, len_befores[i], &acc)?;
+            let keep = accepted + 1;
+            let mut shifted: Vec<u32> = all_candidates[i][1..keep].to_vec();
+            shifted.push(*tokens.last().expect("a step emits at least one"));
+            let feed = DraftFeed {
+                rows: 0..keep,
+                positions: (len_befores[i]..len_befores[i] + keep).collect(),
+                shifted,
+                mrope: None,
+            };
+            outcomes.push(SpecOutcome {
+                tokens,
+                accepted,
+                drafted: it.draft.len(),
+                feed,
+            });
+            row_start += n;
+        }
+        Ok(outcomes)
     }
 
     /// Sample from `(p_target - q)+`, normalized, where `q` is the drafter's
@@ -1037,17 +1315,11 @@ impl Model {
             .take()
             .context("no rollback journal to commit")?;
         let res = (|| -> Result<()> {
-            anyhow::ensure!(r.armed, "committing a journal that was never armed");
+            anyhow::ensure!(r.is_armed(seq.0), "committing a journal that was never armed");
             anyhow::ensure!(
-                keep <= r.rows,
+                keep <= r.rows[seq.0],
                 "keeping {keep} of a {}-candidate pass",
-                r.rows
-            );
-            anyhow::ensure!(
-                r.slot == seq.0,
-                "the journal was armed for slot {} and is being committed for {}",
-                r.slot,
-                seq.0
+                r.rows[seq.0]
             );
             // One row per sequence slot: this one contributes the accepted
             // prefix, starting at the journal's row 0, and every other slot
@@ -1070,6 +1342,7 @@ impl Model {
                     &dev,
                     &self.kern,
                     ordinal,
+                    seq.0,
                     keep,
                     &seqs,
                     &conv_w,
@@ -1079,7 +1352,7 @@ impl Model {
             }
             Ok(())
         })();
-        r.disarm();
+        r.disarm(seq.0);
         self.gdn_rollback = Some(r);
         res
     }
