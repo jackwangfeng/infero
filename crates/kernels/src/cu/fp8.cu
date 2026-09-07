@@ -344,6 +344,104 @@ extern "C" __global__ void mmv_f8_plain_g1_f32(float* __restrict__ out,
     mmv_f8_plain_body<1>(out, w_plain, x, k, n, scale_cols, accum);
 }
 
+// `mmv_f8_plain_body<1>`, generalized to `TOKENS` tokens a call -- the real
+// multi-stream decode shape (`--max-seqs 2` means every batched decode step
+// is `n_tokens=2`). CUTLASS's own small-M path (`fp8_bw_gemm.cu`'s `small_m`
+// namespace) is the deployed kernel there today, and profiling
+// (`examples/cutlass_smallm_grid_probe.rs`) found the same grid-too-narrow
+// problem this file's `GROUP` templating fixed for the scalar one-token
+// case -- but CUTLASS's own tile is fixed to N>=128 by `ScaleGranularityN`
+// (the blockwise-scale scheme itself, not a tuning choice), so shrinking
+// its tile isn't available the way shrinking `GROUP` was. The existing
+// interleaved tensor-core path (`mma_e4m3_block`) measured 2.5-5x faster
+// than CUTLASS at `n_tokens<=8` or so (`examples/cutlass_vs_block.rs`), but
+// needs `fp8::repack_rows`'s interleaved layout -- a second full copy of
+// every FP8 weight under the unified layout this build uses, which is the
+// exact VRAM cost `mmv_f8_plain` was written to avoid in the first place.
+// This kernel keeps the plain (unified, single-copy) layout and amortizes
+// the same weight read across `TOKENS` dot products instead, the same
+// trade CUTLASS's own GEMM makes -- one `x` load a token instead of one,
+// everything else (`GROUP`, the reduction) unchanged.
+template <int TOKENS>
+__device__ __forceinline__ void mmv_f8_plain_multi_body(float* __restrict__ out,
+                                            const unsigned char* __restrict__ w_plain,
+                                            const float* __restrict__ x, int k, int n,
+                                            int scale_cols, int n_tokens, int accum) {
+    const int row0 = blockIdx.x;
+    if (row0 >= n) return;
+    const int padded = ((n + FP8_ROW_GROUP - 1) / FP8_ROW_GROUP) * FP8_ROW_GROUP;
+    const float* scale_grid = (const float*)(w_plain + (size_t)padded * k);
+    const float* srow = scale_grid + (size_t)(row0 / 128) * scale_cols;
+
+    float acc[TOKENS];
+#pragma unroll
+    for (int t = 0; t < TOKENS; ++t) acc[t] = 0.0f;
+
+    const int chunks = k / 4;
+    for (int c = threadIdx.x; c < chunks; c += blockDim.x) {
+        const int i0 = c * 4;
+        const float s = srow[i0 >> 7];
+        const unsigned int wq = *(const unsigned int*)(const void*)(w_plain + (size_t)row0 * k + i0);
+        float wv[4];
+        fp8_unpack4(wq, s, wv);
+#pragma unroll
+        for (int t = 0; t < TOKENS; ++t) {
+            if (t >= n_tokens) break;
+            const float4 xv4 = *(const float4*)(const void*)(x + (size_t)t * k + i0);
+            acc[t] += wv[0] * xv4.x + wv[1] * xv4.y + wv[2] * xv4.z + wv[3] * xv4.w;
+        }
+    }
+
+    __shared__ float partial[32][TOKENS];
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int warps = blockDim.x / WARP_SIZE;
+#pragma unroll
+    for (int t = 0; t < TOKENS; ++t) {
+        if (t >= n_tokens) break;
+        float v = acc[t];
+        for (int off = WARP_SIZE / 2; off > 0; off >>= 1) v += __shfl_down_sync(FULL_MASK, v, off);
+        if (lane == 0) partial[warp][t] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < (unsigned)n_tokens) {
+        const int t = threadIdx.x;
+        float sum = 0.0f;
+        for (int wi = 0; wi < warps; ++wi) sum += partial[wi][t];
+        float* o = out + (size_t)t * n + row0;
+        *o = accum ? *o + sum : sum;
+    }
+}
+
+// `TOKENS=8`: covers the `n_tokens<=8` range CUTLASS's small-M tile also
+// covers badly (`SMALL_M_MAX_TOKENS=64` is CUTLASS's own ceiling, not a
+// claim it's good all the way there -- `cutlass_smallm_grid_probe.rs`
+// measured the grid-too-narrow problem is flat from `n_tokens=2` to `64`,
+// since it depends only on `n`, not `n_tokens`). The real dispatch caller
+// picks this over CUTLASS below some measured `n_tokens` crossover, same
+// shape of decision `SMALL_M_MAX_TOKENS` itself already is.
+extern "C" __global__ void mmv_f8_plain_multi8_f32(float* __restrict__ out,
+                                            const unsigned char* __restrict__ w_plain,
+                                            const float* __restrict__ x, int k, int n,
+                                            int scale_cols, int n_tokens, int accum) {
+    mmv_f8_plain_multi_body<8>(out, w_plain, x, k, n, scale_cols, n_tokens, accum);
+}
+
+// `TOKENS=2` exactly -- production's own real decode batch width
+// (`--max-seqs 2`). A separate instantiation, not `multi8` called with
+// `n_tokens=2`: `multi8`'s fixed 8-wide accumulator/register footprint is
+// carried even when only 2 of its 8 token slots do real work, the same
+// reason `MMA_E4M3_GROUPS` compiles multiple tensor-core instantiations
+// instead of one wide one for the interleaved path. Measured
+// (`examples/cutlass_smallm_grid_probe.rs`) meaningfully faster than
+// `multi8` at real `n_tokens=2` across every shape tested.
+extern "C" __global__ void mmv_f8_plain_multi2_f32(float* __restrict__ out,
+                                            const unsigned char* __restrict__ w_plain,
+                                            const float* __restrict__ x, int k, int n,
+                                            int scale_cols, int n_tokens, int accum) {
+    mmv_f8_plain_multi_body<2>(out, w_plain, x, k, n, scale_cols, n_tokens, accum);
+}
+
 // The one-token case, which is every plain decode step. A dedicated
 // instantiation rather than a call with `n_tokens = 1`, so the accumulator array
 // is four floats and the token loop unrolls to nothing.

@@ -1195,6 +1195,101 @@ impl Kernels {
         Ok(())
     }
 
+    /// [`Self::mmv_f8_plain_g1`] widened to up to 8 tokens a call, amortizing
+    /// the same weight read across all of them -- the real multi-stream
+    /// decode shape (this checkpoint's production config batches decode at
+    /// `n_tokens=2`). Exists because CUTLASS's own small-M GEMM path has the
+    /// identical grid-too-narrow problem `mmv_f8_plain_g1` fixed for the
+    /// one-token case, but its tile can't shrink below `N=128` (tied to the
+    /// blockwise FP8 scale granularity, not a tuning knob), and the existing
+    /// faster interleaved path (`mma_e4m3_block`) needs a second,
+    /// `repack_rows`d copy of every weight -- the exact VRAM cost the
+    /// unified plain layout exists to avoid. Declines above 8 tokens (call
+    /// `mmv_f8_plain_g1` in a loop, or CUTLASS, above that) since the fixed
+    /// `acc[8]`/`partial[32][8]` arrays are sized for it.
+    pub fn mmv_f8_plain_multi8(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
+        x: &View<'_, f32>,
+        k: usize,
+        n: usize,
+        n_tokens: usize,
+        accum: bool,
+    ) -> Result<bool> {
+        if n_tokens == 0 || n_tokens > 8 {
+            return Ok(false);
+        }
+        debug_assert!(
+            w.len() >= fp8_bytes(k, n),
+            "an [{n}, {k}] FP8 matrix wants {} bytes, the view holds {}",
+            fp8_bytes(k, n),
+            w.len()
+        );
+        debug_assert!(x.len() >= n_tokens * k);
+        debug_assert!(out.len() >= n_tokens * n);
+        let f = self.dev.kernels().get("infero_fp8", fp8_src(), "mmv_f8_plain_multi8_f32")?;
+        const BLOCK: u32 = 256;
+        let cfg = LaunchConfig { grid_dim: (n as u32, 1, 1), block_dim: (BLOCK, 1, 1), shared_mem_bytes: 0 };
+        let (ki, ni, nt) = (k as i32, n as i32, n_tokens as i32);
+        let scols = k.div_ceil(FP8_BLOCK) as i32;
+        let acc = i32::from(accum);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(w).arg(x).arg(&ki).arg(&ni).arg(&scols).arg(&nt).arg(&acc);
+        self.dev
+            .profile()
+            .time("mmv_f8_plain_multi8", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("mmv_f8_plain_multi8")?;
+                Ok(())
+            })?;
+        Ok(true)
+    }
+
+    /// [`Self::mmv_f8_plain_multi8`]'s exact `TOKENS=2` instantiation --
+    /// production's own real shape (`--max-seqs 2`). Measured
+    /// (`examples/cutlass_smallm_grid_probe.rs`) meaningfully faster than
+    /// `multi8` at real `n_tokens=2` (e.g. 968 vs 714 GB/s at the FFN
+    /// gate/up shape): `multi8`'s fixed 8-wide accumulator/register
+    /// footprint is carried even when only 2 of its 8 token slots do real
+    /// work, exactly the kind of waste `MMA_E4M3_GROUPS`'s own multiple
+    /// compiled instantiations exist to avoid for the interleaved tensor-core
+    /// path. Requires `n_tokens == 2` exactly; a caller with `n_tokens == 1`
+    /// wants [`Self::mmv_f8_plain_g1`] instead (no wasted second token slot
+    /// at all), and `3..=8` wants `multi8`.
+    pub fn mmv_f8_plain_multi2(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
+        x: &View<'_, f32>,
+        k: usize,
+        n: usize,
+        accum: bool,
+    ) -> Result<()> {
+        debug_assert!(
+            w.len() >= fp8_bytes(k, n),
+            "an [{n}, {k}] FP8 matrix wants {} bytes, the view holds {}",
+            fp8_bytes(k, n),
+            w.len()
+        );
+        debug_assert!(x.len() >= 2 * k);
+        debug_assert!(out.len() >= 2 * n);
+        let f = self.dev.kernels().get("infero_fp8", fp8_src(), "mmv_f8_plain_multi2_f32")?;
+        const BLOCK: u32 = 256;
+        let cfg = LaunchConfig { grid_dim: (n as u32, 1, 1), block_dim: (BLOCK, 1, 1), shared_mem_bytes: 0 };
+        let (ki, ni, nt) = (k as i32, n as i32, 2i32);
+        let scols = k.div_ceil(FP8_BLOCK) as i32;
+        let acc = i32::from(accum);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(w).arg(x).arg(&ki).arg(&ni).arg(&scols).arg(&nt).arg(&acc);
+        self.dev
+            .profile()
+            .time("mmv_f8_plain_multi2", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("mmv_f8_plain_multi2")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     /// The same product on tensor cores: `mma.m16n8k16`, f16 operands, f32
     /// accumulator.
     ///

@@ -6981,6 +6981,34 @@ impl Model {
                     kern.mmv_f8_plain_g1(out, &weights, x, w.k, w.n, false)?;
                     return Ok(());
                 }
+                // NOT dispatched here despite being real, tested, and faster
+                // per-kernel: `mmv_f8_plain_multi2`/`multi8` beat CUTLASS's
+                // small-M GEMM by 1.4-3x on narrow matrices (N<=~4096,
+                // K*N<=~24M bytes -- measured tied at N=4096/K=5120 (~21M
+                // bytes), CUTLASS ahead 1.4x at N=6144 (~31M bytes) --
+                // `examples/cutlass_smallm_grid_probe.rs`) at real n_tokens
+                // in `2..=8`. CUTLASS's own small-M tile is fixed at N>=128
+                // (tied to the blockwise FP8 scale granularity, not a tuning
+                // choice) and its grid is just `ceil(m/64) * ceil(n/128)`
+                // tiles with no split-K, so a small `n` starves it the same
+                // way a small `n` starved the four-row scalar matvec grid
+                // `mmv_f8_plain_g1` exists to fix.
+                //
+                // But a real dual-stream A/B on `bw` (`bench_decode.py`,
+                // before/after, same checkpoint) showed ~0% end-to-end
+                // change, 74.0-76.1 vs the pre-fix 74.0-74.1 tok/s. Root
+                // cause: this model's narrow-N matrices (the attention K/V
+                // projection at 4 KV heads, GDN's own K projection) are only
+                // ~3.4% of the FP8 weight bytes a decode step moves -- the
+                // FFN gate/up/down and GDN's wider projections dominate, and
+                // those are all *wide* enough that CUTLASS already wins
+                // there. Same shape of finding as `decoupled6`'s T=6
+                // attention kernel: a real per-kernel win on a low-volume
+                // slice of the step. Kept as tested, correct, available
+                // kernels (not wired to any real call site) rather than
+                // deleted, in case a future model shape or a larger
+                // `--max-seqs` shifts this balance.
+                //
                 // `quantize_act_e4m3_cutlass` writes the activation scale
                 // straight into the transposed `[scale_cols, n_tokens]`
                 // layout `mma_e4m3_cutlass_sfa_f32out`'s CUTLASS kernel

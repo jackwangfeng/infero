@@ -328,6 +328,105 @@ fn the_plain_layout_g1_matvec_accumulates_into_the_output() -> Result<()> {
     Ok(())
 }
 
+/// `mmv_f8_plain_multi2`/`mmv_f8_plain_multi8` against the same oracle,
+/// multi-token this time -- production's own real decode batch width
+/// (`n_tokens=2`) for the first, an arbitrary width in its `3..=8` range for
+/// the second. Each token gets its own independent activation vector, so a
+/// bug that mixes up which token's `x` a row reads shows up as a wrong
+/// answer for that token specifically, not a shape mismatch.
+#[test]
+fn the_multi_token_plain_matvecs_match_the_verified_host_dequantizer() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+
+    let quants = quant_bytes(N * K, 0xB0B0);
+    let scales: Vec<f32> = (0..scale_grid(K, N))
+        .map(|i| 0.25 * (i as f32 + 1.0) * if i % 2 == 0 { 1.0 } else { 3.0 })
+        .collect();
+    let want_m = reference_matrix(&quants, &scales);
+
+    let mut buf = infero_kernels::fp8::pad_rows(&quants, K, N)?;
+    for s in &scales {
+        buf.extend_from_slice(&s.to_le_bytes());
+    }
+    let d_w = stream.clone_htod(&buf)?;
+
+    // multi2: n_tokens=2, each token an independent random vector.
+    {
+        let x0 = pseudo_random(K, 0xabc);
+        let x1 = pseudo_random(K, 0xdef);
+        let want0 = reference_matvec(&want_m, &x0);
+        let want1 = reference_matvec(&want_m, &x1);
+        let x: Vec<f32> = x0.iter().chain(&x1).copied().collect();
+        let d_x = stream.clone_htod(&x)?;
+        let mut d_out = stream.alloc_zeros::<f32>(2 * N)?;
+        k.mmv_f8_plain_multi2(&mut d_out.as_view_mut(), &d_w.as_view(), &d_x.as_view(), K, N, false)?;
+        k.device().synchronize()?;
+        let got = stream.clone_dtoh(&d_out)?;
+        let (worst0, at0) = worst_ratio(&got[..N], &want0, 1e-5, 1e-6);
+        assert!(worst0 <= 1.0, "multi2 token 0 is {worst0:.1}x the tolerance at {at0}");
+        let (worst1, at1) = worst_ratio(&got[N..], &want1, 1e-5, 1e-6);
+        assert!(worst1 <= 1.0, "multi2 token 1 is {worst1:.1}x the tolerance at {at1}");
+    }
+
+    // multi8 at n_tokens=5 (an arbitrary width in its 3..=8 range, and not a
+    // power of two -- a boundary an off-by-one in the `n_tokens` guard would
+    // more plausibly miss than 4 or 8 would).
+    {
+        const NT: usize = 5;
+        let xs: Vec<Vec<f32>> = (0..NT).map(|i| pseudo_random(K, 0x9000 + i as u64)).collect();
+        let wants: Vec<Vec<f32>> = xs.iter().map(|x| reference_matvec(&want_m, x)).collect();
+        let x: Vec<f32> = xs.iter().flatten().copied().collect();
+        let d_x = stream.clone_htod(&x)?;
+        let mut d_out = stream.alloc_zeros::<f32>(NT * N)?;
+        let ran = k.mmv_f8_plain_multi8(&mut d_out.as_view_mut(), &d_w.as_view(), &d_x.as_view(), K, N, NT, false)?;
+        assert!(ran, "multi8 declined n_tokens={NT}, which is inside its documented 1..=8 range");
+        k.device().synchronize()?;
+        let got = stream.clone_dtoh(&d_out)?;
+        for (t, want) in wants.iter().enumerate() {
+            let (worst, at) = worst_ratio(&got[t * N..(t + 1) * N], want, 1e-5, 1e-6);
+            assert!(worst <= 1.0, "multi8 token {t} is {worst:.1}x the tolerance at {at}");
+        }
+    }
+    Ok(())
+}
+
+/// `accum` under `mmv_f8_plain_multi2` specifically -- same reasoning as
+/// `the_plain_layout_g1_matvec_accumulates_into_the_output`, for the
+/// multi-token kernel this time.
+#[test]
+fn the_multi2_matvec_accumulates_into_the_output() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    let quants = quant_bytes(N * K, 0x2468);
+    let scales: Vec<f32> = (0..scale_grid(K, N)).map(|i| 0.5 + i as f32).collect();
+    let x0 = pseudo_random(K, 0x111);
+    let x1 = pseudo_random(K, 0x222);
+    let want_m = reference_matrix(&quants, &scales);
+    let want0 = reference_matvec(&want_m, &x0);
+    let want1 = reference_matvec(&want_m, &x1);
+
+    let mut buf = infero_kernels::fp8::pad_rows(&quants, K, N)?;
+    for s in &scales {
+        buf.extend_from_slice(&s.to_le_bytes());
+    }
+    let d_w = stream.clone_htod(&buf)?;
+    let x: Vec<f32> = x0.iter().chain(&x1).copied().collect();
+    let d_x = stream.clone_htod(&x)?;
+    let seed: Vec<f32> = (0..2 * N).map(|i| i as f32 * 0.1).collect();
+    let mut d_out = stream.clone_htod(&seed)?;
+    k.mmv_f8_plain_multi2(&mut d_out.as_view_mut(), &d_w.as_view(), &d_x.as_view(), K, N, true)?;
+    k.device().synchronize()?;
+    let got = stream.clone_dtoh(&d_out)?;
+    let expect0: Vec<f32> = want0.iter().zip(&seed[..N]).map(|(a, b)| a + b).collect();
+    let expect1: Vec<f32> = want1.iter().zip(&seed[N..]).map(|(a, b)| a + b).collect();
+    let (worst0, at0) = worst_ratio(&got[..N], &expect0, 1e-5, 1e-6);
+    assert!(worst0 <= 1.0, "accumulate token 0 is {worst0:.1}x the tolerance at {at0}");
+    let (worst1, at1) = worst_ratio(&got[N..], &expect1, 1e-5, 1e-6);
+    assert!(worst1 <= 1.0, "accumulate token 1 is {worst1:.1}x the tolerance at {at1}");
+    Ok(())
+}
+
 /// The on-device expansion must produce exactly what the host dequantizer does,
 /// because prefill's GEMM reads it and the two paths have to be the same model.
 #[test]
