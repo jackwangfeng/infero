@@ -660,3 +660,227 @@ fn the_split_sampler_agrees_with_the_single_block_one() -> Result<()> {
     }
     Ok(())
 }
+
+/// The vLLM-style draft path (`Kernels::gumbel_sample_rows`): deterministic
+/// from `(seed, position)` alone, no host draw needed. Two calls with the
+/// same seeds and positions have to reproduce exactly the same draws — that
+/// determinism is the entire point (a whole multi-step draft round can run
+/// without the host reading a token back between steps only because the
+/// *next* call's inputs don't depend on what this one drew).
+#[test]
+fn gumbel_sample_is_deterministic_given_the_same_seed_and_position() -> Result<()> {
+    let Ok(dev) = Device::new(0) else {
+        eprintln!("skipping: no cuda device");
+        return Ok(());
+    };
+    let kern = Kernels::new(dev.clone());
+    let stream = dev.stream();
+    let rows = 4usize;
+    let mut all = Vec::with_capacity(rows * VOCAB);
+    for r in 0..rows {
+        all.extend_from_slice(&logits_for(r, VOCAB));
+    }
+    let d_logits = stream.clone_htod(&all)?;
+    let d_temp = stream.clone_htod(&vec![0.8f32; rows])?;
+    let d_seed = stream.clone_htod(&vec![42u64; rows])?;
+    let d_pos = stream.clone_htod(&[7i64, 8, 9, 10])?;
+
+    let run = || -> Result<Vec<u32>> {
+        let mut out = stream.alloc_zeros::<u32>(rows)?;
+        let mut pv = stream.alloc_zeros::<f32>(rows * Kernels::ARGMAX_SPLITS)?;
+        let mut pi = stream.alloc_zeros::<i32>(rows * Kernels::ARGMAX_SPLITS)?;
+        let mut scaled = stream.clone_htod(&all)?;
+        kern.gumbel_sample_rows(
+            &mut out.as_view_mut(),
+            &mut pv.as_view_mut(),
+            &mut pi.as_view_mut(),
+            &d_logits.as_view(),
+            &mut scaled.as_view_mut(),
+            &d_temp.as_view(),
+            &d_seed.as_view(),
+            &d_pos.as_view(),
+            rows,
+            VOCAB,
+        )?;
+        Ok(stream.clone_dtoh(&out)?)
+    };
+    let a = run()?;
+    let b = run()?;
+    dev.synchronize()?;
+    assert_eq!(a, b, "same (seed, position) must reproduce the same draw");
+
+    // Greedy (temperature <= 0) ignores the seed entirely and always picks
+    // the raw argmax -- no Gumbel noise applied.
+    let mut out = stream.alloc_zeros::<u32>(rows)?;
+    let mut pv = stream.alloc_zeros::<f32>(rows * Kernels::ARGMAX_SPLITS)?;
+    let mut pi = stream.alloc_zeros::<i32>(rows * Kernels::ARGMAX_SPLITS)?;
+    let mut scaled = stream.clone_htod(&all)?;
+    let d_temp0 = stream.clone_htod(&vec![0.0f32; rows])?;
+    kern.gumbel_sample_rows(
+        &mut out.as_view_mut(),
+        &mut pv.as_view_mut(),
+        &mut pi.as_view_mut(),
+        &d_logits.as_view(),
+        &mut scaled.as_view_mut(),
+        &d_temp0.as_view(),
+        &d_seed.as_view(),
+        &d_pos.as_view(),
+        rows,
+        VOCAB,
+    )?;
+    let greedy_picks = stream.clone_dtoh(&out)?;
+    dev.synchronize()?;
+    for r in 0..rows {
+        let row = logits_for(r, VOCAB);
+        let want = row
+            .iter()
+            .enumerate()
+            .fold((f32::MIN, 0usize), |(bv, bi), (i, &v)| {
+                if v > bv { (v, i) } else { (bv, bi) }
+            })
+            .1;
+        assert_eq!(
+            greedy_picks[r] as usize, want,
+            "row {r}: greedy draft pick disagrees with the plain argmax"
+        );
+    }
+    Ok(())
+}
+
+/// The Gumbel-max trick is supposed to be an *exact* categorical draw from
+/// `softmax(logits / temperature)` — not merely "usually picks the biggest
+/// one". Draw many independent samples (one per distinct `position`, same
+/// seed) from a small, deliberately skewed distribution and check the
+/// empirical frequencies against the closed-form softmax, each within a
+/// tolerance built from that token's own binomial standard error (so the
+/// test is not flaky at any reasonable sample size, but a real implementation
+/// bug — wrong noise formula, wrong temperature order of operations, a
+/// biased hash — would still fail it).
+#[test]
+fn gumbel_sample_matches_the_softmax_it_draws_from() -> Result<()> {
+    let Ok(dev) = Device::new(0) else {
+        eprintln!("skipping: no cuda device");
+        return Ok(());
+    };
+    let kern = Kernels::new(dev.clone());
+    let stream = dev.stream();
+    const V: usize = 16;
+    const N: usize = 40_000;
+    let temperature = 1.3f64;
+    let logits: Vec<f32> = (0..V).map(|i| i as f32 * 0.7 - 3.0).collect();
+
+    let scaled: Vec<f64> = logits.iter().map(|&l| l as f64 / temperature).collect();
+    let mx = scaled.iter().cloned().fold(f64::MIN, f64::max);
+    let exps: Vec<f64> = scaled.iter().map(|&s| (s - mx).exp()).collect();
+    let z: f64 = exps.iter().sum();
+    let probs: Vec<f64> = exps.iter().map(|&e| e / z).collect();
+
+    let mut all = Vec::with_capacity(N * V);
+    for _ in 0..N {
+        all.extend_from_slice(&logits);
+    }
+    let d_logits = stream.clone_htod(&all)?;
+    let d_temp = stream.clone_htod(&vec![temperature as f32; N])?;
+    let d_seed = stream.clone_htod(&vec![0xC0FF_EEu64; N])?;
+    let positions: Vec<i64> = (0..N as i64).collect();
+    let d_pos = stream.clone_htod(&positions)?;
+
+    let mut out = stream.alloc_zeros::<u32>(N)?;
+    let mut pv = stream.alloc_zeros::<f32>(N * Kernels::ARGMAX_SPLITS)?;
+    let mut pi = stream.alloc_zeros::<i32>(N * Kernels::ARGMAX_SPLITS)?;
+    let mut scaled_buf = stream.clone_htod(&all)?;
+    kern.gumbel_sample_rows(
+        &mut out.as_view_mut(),
+        &mut pv.as_view_mut(),
+        &mut pi.as_view_mut(),
+        &d_logits.as_view(),
+        &mut scaled_buf.as_view_mut(),
+        &d_temp.as_view(),
+        &d_seed.as_view(),
+        &d_pos.as_view(),
+        N,
+        V,
+    )?;
+    let picks = stream.clone_dtoh(&out)?;
+    let scaled_out = stream.clone_dtoh(&scaled_buf)?;
+    dev.synchronize()?;
+
+    // `scaled_logits` is written in place: every row should hold this
+    // temperature's `logits / T`, independent of which token got drawn.
+    for row in 0..N.min(8) {
+        for i in 0..V {
+            let want = logits[i] as f64 / temperature;
+            let got = scaled_out[row * V + i] as f64;
+            assert!(
+                (got - want).abs() <= 1e-4,
+                "row {row} token {i}: scaled logit {got} != logits/T {want}"
+            );
+        }
+    }
+
+    let mut counts = vec![0usize; V];
+    for &p in &picks {
+        assert!((p as usize) < V, "sampled token {p} outside the vocabulary");
+        counts[p as usize] += 1;
+    }
+    for i in 0..V {
+        let empirical = counts[i] as f64 / N as f64;
+        let theoretical = probs[i];
+        let sd = (theoretical * (1.0 - theoretical) / N as f64).sqrt();
+        let tol = (6.0 * sd).max(0.004);
+        assert!(
+            (empirical - theoretical).abs() <= tol,
+            "token {i}: empirical frequency {empirical:.4} vs softmax {theoretical:.4} \
+             (tolerance {tol:.4}, count {})",
+            counts[i]
+        );
+    }
+    Ok(())
+}
+
+/// `Kernels::logsumexp_rows` against a host `f64` reference — the
+/// normalizer a verification pass turns a draft's raw logits back into a
+/// real probability with, so a wrong reduction here would silently distort
+/// every acceptance ratio a GPU-resident draft round computes.
+#[test]
+fn logsumexp_rows_matches_a_host_f64_reference() -> Result<()> {
+    let Ok(dev) = Device::new(0) else {
+        eprintln!("skipping: no cuda device");
+        return Ok(());
+    };
+    let kern = Kernels::new(dev.clone());
+    let stream = dev.stream();
+    let rows = 6usize;
+    let mut all = Vec::with_capacity(rows * VOCAB);
+    let mut want = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let row = logits_for(r, VOCAB);
+        let mx = row.iter().cloned().fold(f32::MIN, f32::max) as f64;
+        let sum: f64 = row.iter().map(|&x| ((x as f64) - mx).exp()).sum();
+        want.push(mx + sum.ln());
+        all.extend_from_slice(&row);
+    }
+    let d_logits = stream.clone_htod(&all)?;
+    let mut out = stream.alloc_zeros::<f32>(rows)?;
+    let mut pmax = stream.alloc_zeros::<f32>(rows * Kernels::ARGMAX_SPLITS)?;
+    let mut psumexp = stream.alloc_zeros::<f32>(rows * Kernels::ARGMAX_SPLITS)?;
+    kern.logsumexp_rows(
+        &mut out.as_view_mut(),
+        &mut pmax.as_view_mut(),
+        &mut psumexp.as_view_mut(),
+        &d_logits.as_view(),
+        rows,
+        VOCAB,
+    )?;
+    let got = stream.clone_dtoh(&out)?;
+    dev.synchronize()?;
+    for r in 0..rows {
+        assert!(
+            (got[r] as f64 - want[r]).abs() <= 1e-3 * want[r].abs().max(1.0),
+            "row {r}: logsumexp {} vs host reference {}",
+            got[r],
+            want[r]
+        );
+    }
+    Ok(())
+}

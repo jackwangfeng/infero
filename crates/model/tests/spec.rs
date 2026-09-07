@@ -89,6 +89,33 @@ fn argmax(v: &[f32]) -> u32 {
     best as u32
 }
 
+/// Two draft distributions "agree" when a batched, several-branches-at-once
+/// forward pass and a single-branch one disagree only at the level ordinary
+/// floating-point non-associativity produces -- the same widened-batch tile
+/// or GEMM-kernel choice explains it as the mixed-batch dispatch's own
+/// `cosine > 0.9999` tolerance does (see `mixed_batch_dispatch.rs`), not a
+/// routing bug. A routing bug (one branch's rows landing on another's) would
+/// show up as genuinely different tokens or wildly different weights, not a
+/// fifth-decimal-place wobble, so this checks token identity exactly (via
+/// the caller's own `assert_eq!(x.token, y.token, ...)`) and only relaxes
+/// the probability comparison, by token id rather than position since a
+/// near-tied pair can swap order across the two paths.
+fn assert_q_close(a: &[(u32, f32)], b: &[(u32, f32)], who: &str, step: usize) {
+    assert_eq!(a.len(), b.len(), "{who}, draft step {step}: distribution has a different width");
+    let bm: std::collections::HashMap<u32, f32> = b.iter().copied().collect();
+    for &(id, pa) in a {
+        let pb = *bm
+            .get(&id)
+            .unwrap_or_else(|| panic!("{who}, draft step {step}: token {id} missing from the other side"));
+        let tol = 1e-3 * pa.abs().max(1e-6);
+        assert!(
+            (pa - pb).abs() <= tol,
+            "{who}, draft step {step}: token {id} disagrees by more than \
+             floating-point noise ({pa} vs {pb})"
+        );
+    }
+}
+
 /// Prefill and return the first generated token.
 fn prime(model: &mut Model, pool: &mut KvPool, seq: SeqId, prompt: &[u32]) -> Result<u32> {
     let item = BatchItem::new(seq, prompt, BatchItemKind::Prefill);
@@ -951,7 +978,20 @@ fn fused_multi_sequence_verify_matches_the_sequential_calls_it_replaces() -> Res
     };
     let prompt = tok.encode(PROMPT, Some(false), false);
     let cfg = model.config().clone();
-    let mut head = synthetic_head_branched(model.device(), &cfg, prompt.len().max(K + 1), model.max_seq(), 4)?;
+    // `MtpHead::new`'s own `max_seq` is the *whole* forked cache's width,
+    // `branches` times what one branch gets -- see `Model::load_mtp_head`'s
+    // own `max_seqs * self.max_seq` call for the real production version of
+    // this same arithmetic. Passing `model.max_seq()` bare here (as if one
+    // branch's width were the whole cache) is a real, pre-existing bug in
+    // this test scaffold: `fork(0, model.max_seq())` below then asks for
+    // `4 * model.max_seq()` slots from a cache built for only
+    // `model.max_seq()`, which `fork` correctly refuses. Caught because this
+    // machine actually has `qwen2.5-0.5b-instruct-q8_0.gguf` downloaded;
+    // apparently missing wherever this test last reported passing, since
+    // `load` returns `Ok(None)` (a skip, not a pass) when the file is
+    // absent.
+    let mut head =
+        synthetic_head_branched(model.device(), &cfg, prompt.len().max(K + 1), 4 * model.max_seq(), 4)?;
     // Each branch its own full-length cache region, matching how
     // `Model::load_mtp_head` forks a real, multi-sequence-capable head --
     // `synthetic_head_branched`'s raw constructor does not do this itself
@@ -1029,5 +1069,95 @@ fn fused_multi_sequence_verify_matches_the_sequential_calls_it_replaces() -> Res
         outcome_a1, outcomes_b[1],
         "the fused path's second sequence disagreed with the sequential path"
     );
+    Ok(())
+}
+
+/// The counterpart of `fused_multi_sequence_verify_matches_the_sequential_calls_it_replaces`
+/// for the *draft* side: `Model::draft_with_head_sampled_batch`, one
+/// `MtpHead::prime_batch` call for several sequences at once, must draft
+/// exactly what looping `Model::draft_with_head_sampled` over the same
+/// sequences one at a time does. Same drafter, same seeds, same prompt ->
+/// the drafted tokens and the distributions they came from have to match; a
+/// real bug in the batch's row bookkeeping (one sequence's rows landing in
+/// another's, or a stale `src_rows`/`branch_of` pairing) would show up as a
+/// difference in the drafted *tokens*, not just in timing.
+#[test]
+fn batched_draft_matches_the_sequential_calls_it_replaces() -> Result<()> {
+    let _gpu = gpu_lock();
+    const K: usize = 3;
+    let Some((mut model, tok)) = load("qwen2.5-0.5b-instruct-q8_0.gguf", K + 1)? else {
+        return Ok(());
+    };
+    let prompt = tok.encode(PROMPT, Some(false), false);
+    let cfg = model.config().clone();
+    // Wide enough for TWO sequences' whole-prompt `after_prefill` feeds in
+    // one `prime_batch` call -- `synthetic_head_branched`'s `max_rows`
+    // bounds one batch's combined row count, see `MtpHead::prime_batch`'s
+    // own doc comment on why a batch that does not fit is rejected rather
+    // than chunked.
+    let max_tokens = 2 * prompt.len().max(K + 1);
+    // See the identical fix's own comment on the fusion test above: the
+    // head's `max_seq` is the whole forked cache's width, `branches` times
+    // one branch's own share.
+    let mut head = synthetic_head_branched(model.device(), &cfg, max_tokens, 4 * model.max_seq(), 4)?;
+    head.fork(0, model.max_seq())?;
+    model.install_mtp_head(head)?;
+
+    let mut pool = model.new_pool(512, 4)?;
+    model.enable_speculation(K, &pool)?;
+
+    let sp = |seed: u64| infero_model::SamplingParams {
+        temperature: 0.8,
+        top_p: 0.95,
+        top_k: 32,
+        seed: Some(seed),
+        ..Default::default()
+    };
+
+    let prime_one = |model: &mut Model, pool: &mut KvPool| -> Result<(SeqId, u32)> {
+        let seq = pool.alloc().expect("no slot");
+        let pending = prime(model, pool, seq, &prompt)?;
+        Ok((seq, pending))
+    };
+    let (_seq_a0, pending_a0) = prime_one(&mut model, &mut pool)?;
+    let (_seq_a1, pending_a1) = prime_one(&mut model, &mut pool)?;
+    let (_seq_b0, pending_b0) = prime_one(&mut model, &mut pool)?;
+    let (_seq_b1, pending_b1) = prime_one(&mut model, &mut pool)?;
+
+    let feed_a0 = DraftFeed::after_prefill(&prompt, pending_a0);
+    let feed_a1 = DraftFeed::after_prefill(&prompt, pending_a1);
+    let feed_b0 = DraftFeed::after_prefill(&prompt, pending_b0);
+    let feed_b1 = DraftFeed::after_prefill(&prompt, pending_b1);
+
+    // Branches 0/1: the sequential path, one `draft_with_head_sampled` call
+    // apiece -- what `Scheduler::speculative_step`'s Phase 1 did before this
+    // batching, and what it still does for a round this batch call rejects.
+    let mut s_a0 = infero_model::Sampler::new(sp(111));
+    let draft_a0 = model.draft_with_head_sampled(K, &feed_a0, &mut s_a0, &prompt, 0)?;
+    let mut s_a1 = infero_model::Sampler::new(sp(222));
+    let draft_a1 = model.draft_with_head_sampled(K, &feed_a1, &mut s_a1, &prompt, 1)?;
+
+    // Branches 2/3: the batched path, one `draft_with_head_sampled_batch`
+    // call for both, same seeds.
+    let mut s_b0 = infero_model::Sampler::new(sp(111));
+    let mut s_b1 = infero_model::Sampler::new(sp(222));
+    let items = [
+        infero_model::mtp::BatchDraftItem { branch: 2, feed: &feed_b0, history: &prompt },
+        infero_model::mtp::BatchDraftItem { branch: 3, feed: &feed_b1, history: &prompt },
+    ];
+    let mut samplers: Vec<&mut infero_model::Sampler> = vec![&mut s_b0, &mut s_b1];
+    let drafts_b = model.draft_with_head_sampled_batch(K, &items, &mut samplers)?;
+
+    assert_eq!(drafts_b.len(), 2, "one drafted sequence a item");
+    assert_eq!(draft_a0.len(), drafts_b[0].len(), "sequence 0: drafted a different number of tokens");
+    for (i, (x, y)) in draft_a0.iter().zip(&drafts_b[0]).enumerate() {
+        assert_eq!(x.token, y.token, "sequence 0, draft step {i}: token disagreement");
+        assert_q_close(&x.q, &y.q, "sequence 0", i);
+    }
+    assert_eq!(draft_a1.len(), drafts_b[1].len(), "sequence 1: drafted a different number of tokens");
+    for (i, (x, y)) in draft_a1.iter().zip(&drafts_b[1]).enumerate() {
+        assert_eq!(x.token, y.token, "sequence 1, draft step {i}: token disagreement");
+        assert_q_close(&x.q, &y.q, "sequence 1", i);
+    }
     Ok(())
 }

@@ -144,6 +144,33 @@ enum Work {
     Prefill { from: usize, len: usize, last: bool },
     /// Feed the token this sequence sampled last step.
     Decode,
+    /// Feed this round's drafted candidates for verification against the
+    /// target model, in the *same* batch as however many other sequences'
+    /// `Prefill`/`Decode` rows -- vLLM's own scheduler has no separate
+    /// "speculative mode" at all (`num_scheduled_tokens` is just a per-request
+    /// count, draft tokens included), and this is that: unlike the version of
+    /// this scheduler that came before it, verification is not a whole-step
+    /// alternative to `plan()` that bails the instant any sequence still
+    /// needs an ordinary prefill step, it is simply one more shape a
+    /// sequence's own row of the same batch can take. `pending` is the
+    /// token already sampled last step (this candidate set's row 0 input);
+    /// `draft` is what the MTP head proposed for the `draft.len()` rows
+    /// after it. A sequence not drafted this round (no free budget, no
+    /// drafter feed, desynced, greedy, still prefilling) simply never gets
+    /// this variant -- degrading to `Decode` is automatic, per sequence, not
+    /// a batch-wide fallback.
+    Verify { pending: u32, history: Vec<u32>, draft: Vec<infero_model::mtp::Drafted> },
+}
+
+/// One sequence's own result from [`Scheduler::draft_eligible`] -- everything
+/// `plan()` and the verify-side bookkeeping after this step's forward pass
+/// need, keyed by the sequence's index into `running` (which stays valid
+/// across `draft_eligible` and `plan`, both borrowing `running` read-only,
+/// but not past a `swap_remove`).
+struct DraftedRound {
+    pending: u32,
+    history: Vec<u32>,
+    draft: Vec<infero_model::mtp::Drafted>,
 }
 
 pub struct Scheduler {
@@ -184,39 +211,6 @@ pub struct Scheduler {
     /// whatever `INFERO_SPEC_K` set, which is the behaviour every measurement
     /// in this file's history was taken against.
     adaptive_spec: bool,
-    /// The most sequences `speculative_step` will run a round for; above it,
-    /// the round bails and every sequence takes the ordinary batched decode
-    /// path instead.
-    ///
-    /// Two real measurements back this, not one. Before
-    /// `verify_draft_sampled_batch` existed, each eligible sequence's
-    /// draft+verify ran as its own *sequential* GPU call: three repeated
-    /// trials each, 150-token generations, `--max-seqs 16 --ctx 2048`,
-    /// aggregate tok/s with speculation on was ~74 at one concurrent
-    /// sequence and ~73 at two (a second sequence added essentially
-    /// nothing) against ~40 and ~79 with speculation off at the same two
-    /// points (linear, as fused batching should be); at eight, 126.6
-    /// against 312.1; at sixteen, 265.0 against 485.2 — a regression at any
-    /// concurrency above one. Fusing every eligible sequence's candidates
-    /// into one `verify_draft_sampled_batch` call (verified to produce
-    /// identical outcomes to the sequential calls it replaces, see that
-    /// function's own tests) fixed the *sequential-call* cost, but not every
-    /// cost: a fused round still verifies `n_total = sum(k + 1 a sequence)`
-    /// rows in one forward pass, against one row a sequence for an ordinary
-    /// decode step, and that extra compute does not always pay for itself.
-    /// Same build, same harness, fusion in place: 119.6 against 79.2 at two
-    /// concurrent sequences (a real ~1.5x win), 169.3 against 156.4 at four
-    /// (a real but thin ~8% win), then 133.7 against 312.1 at eight and
-    /// 226.1 against 485.2 at sixteen — a real regression again, just at a
-    /// higher concurrency than the sequential design's. Default 4, at the
-    /// edge of where this measurement still shows a net win rather than in
-    /// the middle of the loss; `INFERO_SPEC_MAX_CONCURRENCY` overrides it,
-    /// for re-measuring on different hardware or after the next real fix
-    /// (the draft step is still sequential per sequence too, and verifying
-    /// a full `k + 1`-row pass for a sequence whose draft is already
-    /// trending toward rejection is itself unexamined — neither is
-    /// attempted here).
-    spec_max_concurrency: usize,
     /// Exponential moving average of a round's emitted tokens (`1..=k+1`),
     /// the signal `speculative_step` adjusts `spec_k` from. `None` before the
     /// first round, so the first sample sets it rather than being blended
@@ -232,11 +226,34 @@ pub struct Scheduler {
     spec_k_cooldown: u64,
     spec_steps: u64,
     spec_tokens: u64,
-    /// A round's three parts, summed over a window; see `speculative_step`.
+    /// Draft and verify time, summed over a window of steps that carried at
+    /// least one `Work::Verify` row -- unlike before mixed-batch scheduling,
+    /// there is no third "after" part to separately time any more: a
+    /// verified sequence's post-processing runs inside the same per-plan-row
+    /// loop every `Prefill`/`Decode` sequence's does, not on its own.
     spec_draft_ms: f64,
     spec_verify_ms: f64,
-    spec_after_ms: f64,
     spec_window: u64,
+    /// vLLM's scheduler picks how deep to draft *this round* from a table
+    /// keyed by the round's own batch size (`dynamic_sd_lookup`), recomputed
+    /// fresh every `schedule()` call -- a decision `adaptive_spec`'s EMA
+    /// cannot make because it reacts to a slow historical acceptance-rate
+    /// average, not to a concurrency spike that just happened this round.
+    /// These two are the same idea, kept deliberately coarse rather than a
+    /// full per-level table: at or below this many concurrently-running
+    /// sequences, draft at the full configured `spec_k` (measured a real win
+    /// at low concurrency, where the pass is memory-bandwidth- not
+    /// compute-bound, so extra draft rows are nearly free); at or above
+    /// `spec_skip_min_concurrency`, skip speculation entirely (measured a
+    /// real, substantial loss at 16-way concurrency with a fixed k -- see
+    /// `project_infero_perf_gap.md`'s 2026-09-06/07 entries). Everything
+    /// between the two runs at half depth as a single coarse middle tier,
+    /// not yet independently validated -- both constants are carried over
+    /// from an older architecture's own measurements and need a real sweep
+    /// under this scheduler before being trusted at production scale, which
+    /// is why both are overridable via env var without a rebuild.
+    spec_full_k_max_concurrency: usize,
+    spec_skip_min_concurrency: usize,
     last_end: Option<std::time::Instant>,
     window: u64,
     /// Cross-request KV reuse. `None` on a model whose recurrent state a shared
@@ -560,18 +577,37 @@ impl Scheduler {
             spec_k: 0,
             spec_k_max: 0,
             adaptive_spec: std::env::var_os("INFERO_ADAPTIVE_SPEC").is_some(),
-            spec_max_concurrency: std::env::var("INFERO_SPEC_MAX_CONCURRENCY")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(4),
             spec_ema_accept: None,
             spec_k_cooldown: 0,
             spec_steps: 0,
             spec_tokens: 0,
             spec_draft_ms: 0.0,
             spec_verify_ms: 0.0,
-            spec_after_ms: 0.0,
             spec_window: 0,
+            spec_full_k_max_concurrency: std::env::var("INFERO_SPEC_FULL_K_MAX_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4),
+            spec_skip_min_concurrency: std::env::var("INFERO_SPEC_SKIP_MIN_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(9),
+        }
+    }
+
+    /// This round's draft depth, as a function of `concurrency` (how many
+    /// sequences `draft_eligible` is being asked to consider this step) --
+    /// see the field doc comments on `spec_full_k_max_concurrency`/
+    /// `spec_skip_min_concurrency` for the reasoning and calibration status.
+    /// Returns 0 to mean "don't draft at all this round", same as
+    /// `spec_k == 0` meaning speculation is off entirely.
+    fn effective_spec_k(&self, concurrency: usize) -> usize {
+        if concurrency <= self.spec_full_k_max_concurrency {
+            self.spec_k
+        } else if concurrency >= self.spec_skip_min_concurrency {
+            0
+        } else {
+            (self.spec_k / 2).max(1)
         }
     }
 
@@ -676,10 +712,21 @@ impl Scheduler {
         (self.t_issue, self.t_sample, self.t_advance, self.steps)
     }
 
-    /// Admit what fits, run one speculative round *per eligible running
-    /// sequence*, and deliver each one's output. `Ok(true)` if any sequence's
-    /// round actually ran, `Ok(false)` if none did (every sequence falls
-    /// through to the ordinary step instead).
+    /// Batched draft for every sequence eligible to speculate this round.
+    ///
+    /// Unlike the version of this scheduler that predates mixed-batch
+    /// scheduling, this does not decide *whether* the step speculates --
+    /// there is no such thing any more, the same way vLLM's own scheduler
+    /// has no separate "speculative mode" (`num_scheduled_tokens` is just a
+    /// per-request count, draft tokens included). This only decides *which*
+    /// sequences drafted candidates this round, for `plan()` to turn into
+    /// `Work::Verify` rows alongside however many other sequences'
+    /// `Prefill`/`Decode` rows in the very same batch. A sequence not in the
+    /// returned map is not being denied speculation for some batch-wide
+    /// reason -- it just has nothing to verify this round (still
+    /// prefilling, no pending token, greedy, desynced, or out of context
+    /// room), and `plan()` gives it whatever ordinary work it would have
+    /// gotten anyway.
     ///
     /// A sequence is eligible past its prompt, with a sampling (not greedy)
     /// request, a drafter feed from the previous round, `k + 1` free pool
@@ -688,43 +735,25 @@ impl Scheduler {
     /// snapshot — the same reasoning `admit`'s own `committed_this_pass`
     /// exists for), and room in its own context.
     ///
-    /// Each eligible sequence gets its own call to
-    /// `draft_with_head_sampled`/`verify_draft_sampled` — this is NOT one
-    /// GPU pass covering several sequences' rows at once, just no longer
-    /// artificially restricted to exactly one sequence's turn a step. The
-    /// pool slot a sequence occupies (`seq.0`) doubles as which region of the
-    /// drafter's own cache its rows read and write
-    /// (`Model::load_mtp_head`'s doc comment on `MtpHead::fork`) — the same
-    /// number `GdnRollback::arm` already keys its own per-slot journal on, so
-    /// nothing new is invented here, just reused where this function used to
-    /// hardcode `0`.
-    ///
     /// Not greedy because the acceptance rule here is a probability ratio —
     /// a greedy request has no distribution to take a ratio of, and
     /// `Sampler::distribution` refuses rather than inventing one.
-    fn speculative_step(&mut self) -> Result<bool> {
+    fn draft_eligible(&mut self) -> Result<std::collections::HashMap<usize, DraftedRound>> {
         if self.spec_k == 0 {
-            return Ok(false);
+            return Ok(std::collections::HashMap::new());
         }
-        // `step`'s own caller returns immediately on `Ok(true)` here, never
-        // reaching the ordinary `plan()`-based path this same call would
-        // otherwise take -- which is the only path that ever admits a new
-        // arrival's prefill or advances a sequence this function is not
-        // handling. A single sequence that keeps finding speculative work
-        // every round would otherwise starve every other running sequence's
-        // prefill indefinitely, not just slow it down: confirmed for real,
-        // two concurrent sampled requests, one's prefill genuinely never
-        // scheduled until the other's entire reply finished. Bowing out
-        // whenever ANY running sequence still needs an ordinary prefill step
-        // keeps this function's own multi-sequence batching (below) scoped
-        // to rounds where every sequence already has decode-phase work
-        // `plan()` would give it anyway, so nothing here can ever preempt an
-        // admission or a prefill chunk.
-        if self.running.iter().any(|r| !r.prompt_complete()) {
-            return Ok(false);
+        // Keyed off the round's own batch size, not a slow historical
+        // average -- see `effective_spec_k`'s doc comment.
+        let k = self.effective_spec_k(self.running.len());
+        if k == 0 {
+            tracing::debug!(
+                concurrency = self.running.len(),
+                skip_min = self.spec_skip_min_concurrency,
+                "speculative draft skipped: concurrency too high this round"
+            );
+            return Ok(std::collections::HashMap::new());
         }
-        let k = self.spec_k;
-        let skip = |why: &'static str| tracing::debug!(why, "speculative step skipped");
+        let skip = |why: &'static str| tracing::debug!(why, "speculative draft skipped");
 
         let mut eligible: Vec<usize> = Vec::new();
         for idx in 0..self.running.len() {
@@ -756,49 +785,24 @@ impl Scheduler {
             eligible.push(idx);
         }
         if eligible.is_empty() {
-            return Ok(false);
-        }
-        // A real, measured throughput ceiling, not a correctness one: fusion
-        // below handles any number of eligible sequences *correctly*
-        // (verified against the sequential calls it replaces, see
-        // `verify_draft_sampled_batch`'s own tests), but not *profitably* --
-        // see `spec_max_concurrency`'s own doc comment for the concurrency
-        // where a fused round stops paying for its own extra rows. Bailing
-        // entirely rather than serving a subset keeps the semantics simple:
-        // a round either fuses everyone eligible or defers the whole round to
-        // the ordinary batched-decode path.
-        if eligible.len() > self.spec_max_concurrency {
-            skip("more sequences than spec_max_concurrency would speculate this round");
-            return Ok(false);
+            return Ok(std::collections::HashMap::new());
         }
 
-        let mut any_ran = false;
-        let mut finished_indices: Vec<usize> = Vec::new();
         // The verification pass appends `k + 1` tokens before rolling back to
         // the accepted prefix, so the slots have to be there for the whole
         // pass -- tracked across this loop's own sequences, not re-read from
         // a snapshot `pool.free_slots()` would otherwise report as if none of
         // this call's earlier sequences had claimed anything yet.
         let mut free_slots_left = self.pool.free_slots();
-        // Phase 1: draft every sequence this round will actually cover.
-        // Drafting stays sequential and cheap (the MTP head is one layer),
-        // one call a sequence exactly as before -- fusion targets the
-        // *verification* pass below, which is the expensive full-model
-        // forward pass and the one whose sequential cost this whole change
-        // exists to remove. `history` and `mrope_delta` are captured here,
-        // not re-read later, because both are per-sequence and this is the
-        // one point in the round where borrowing `self.running[idx]`
-        // individually is still straightforward.
-        struct Round {
+        struct PreRound {
             idx: usize,
             seq: SeqId,
             pending: u32,
-            mrope_delta: i32,
             history: Vec<u32>,
-            draft: Vec<infero_model::mtp::Drafted>,
+            feed: infero_model::spec::DraftFeed,
         }
         let t0 = self.profile.then(std::time::Instant::now);
-        let mut round: Vec<Round> = Vec::with_capacity(eligible.len());
+        let mut pre: Vec<PreRound> = Vec::with_capacity(eligible.len());
         for idx in eligible {
             if free_slots_left < k + 1 {
                 skip("pool has no free slots left this round");
@@ -862,174 +866,60 @@ impl Scheduler {
                 cached = self.model.mtp_head().map(|h| h.cached(branch)),
                 "speculative round"
             );
-            let draft = {
-                let r = &mut self.running[idx];
-                self.model.draft_with_head_sampled(k, &feed, &mut r.sampler, &history, branch)?
-            };
             free_slots_left = free_slots_left.saturating_sub(k + 1);
-            round.push(Round {
-                idx,
-                seq,
-                pending,
-                mrope_delta: self.running[idx].mrope_delta,
-                history,
-                draft,
-            });
+            pre.push(PreRound { idx, seq, pending, history, feed });
         }
-        let t1 = self.profile.then(std::time::Instant::now);
-        if round.is_empty() {
-            return Ok(false);
+        if pre.is_empty() {
+            return Ok(std::collections::HashMap::new());
         }
 
-        // Phase 2: one fused verification call over every drafted sequence's
-        // candidates. `self.running.iter_mut().filter` (not indexing
-        // `self.running[idx]` in a loop) is what lets several sequences'
-        // samplers be borrowed mutably at once here -- each element `iter_mut`
-        // yields is already known disjoint from every other, which indexing
-        // the same `Vec` twice cannot express to the borrow checker.
-        let round_idxs: Vec<usize> = round.iter().map(|r| r.idx).collect();
-        let items: Vec<VerifyItem<'_>> = round
-            .iter()
-            .map(|r| VerifyItem {
-                seq: r.seq,
-                pending: r.pending,
-                draft: &r.draft,
-                mrope_delta: r.mrope_delta,
-            })
-            .collect();
-        let histories: Vec<&[u32]> = round.iter().map(|r| r.history.as_slice()).collect();
-        let mut samplers: Vec<&mut Sampler> = self
-            .running
-            .iter_mut()
-            .enumerate()
-            .filter(|(i, _)| round_idxs.contains(i))
-            .map(|(_, r)| &mut r.sampler)
-            .collect();
-        let outcomes =
-            self.model.verify_draft_sampled_batch(&items, &mut self.pool, &mut samplers, &histories)?;
-        let t2 = self.profile.then(std::time::Instant::now);
-
-        // Phase 3: the same per-sequence bookkeeping a single sequential
-        // round always did, once a sequence in this round.
-        for (r, outcome) in round.into_iter().zip(outcomes) {
-            let idx = r.idx;
-            self.steps += 1;
-            self.spec_steps += 1;
-            self.spec_tokens += outcome.tokens.len() as u64;
-            self.running[idx].spec_rounds += 1;
-            self.running[idx].spec_emitted += outcome.tokens.len() as u64;
-
-            // `INFERO_ADAPTIVE_SPEC`: fold this round's yield into the
-            // running average and let it move `spec_k` toward whatever the
-            // average says a draft this deep is worth — up to `spec_k_max`,
-            // never past it, since that is what `enable_speculation` sized
-            // the GDN rollback journal for and going higher would need a
-            // reallocation this is not one. Going lower needs nothing: the
-            // journal already holds `k_max + 1` rows and a smaller round just
-            // uses fewer of them. Shared across every sequence's rounds
-            // (there is one `spec_k` for the whole scheduler, not one a
-            // sequence) — same as before this function handled more than one
-            // sequence a step.
-            //
-            // The two thresholds are a band, not a line, on purpose — a value
-            // that decided every round by comparing the same average to the
-            // same single cutoff would flip `spec_k` back and forth across it
-            // as the average drifted a few hundredths either side.
-            if self.adaptive_spec {
-                let yielded = outcome.tokens.len() as f64;
-                const ALPHA: f64 = 0.15;
-                self.spec_ema_accept = Some(match self.spec_ema_accept {
-                    Some(prev) => prev * (1.0 - ALPHA) + yielded * ALPHA,
-                    None => yielded,
-                });
-                let ema = self.spec_ema_accept.expect("just set above");
-                self.spec_k_cooldown = self.spec_k_cooldown.saturating_sub(1);
-                // Rounds, not seconds: a round is the unit both the EMA and
-                // the thresholds are already in, so this stays the same
-                // number of *decisions* apart whatever the round rate a
-                // request happens to run at. 20 measured as 0.7 s at this
-                // model's round rate — under one exchange's length, so it
-                // still flipped inside a single short reply. 80 is closer to
-                // a short reply's whole round count, which is the
-                // granularity a change should default to.
-                const COOLDOWN: u64 = 80;
-                if self.spec_k_cooldown == 0 {
-                    let k = self.spec_k as f64;
-                    if ema > k * 0.85 + 0.15 && self.spec_k < self.spec_k_max {
-                        self.spec_k += 1;
-                        self.spec_k_cooldown = COOLDOWN;
-                        tracing::debug!(k = self.spec_k, ema, "adaptive spec: deeper draft");
-                    } else if ema < k * 0.4 && self.spec_k > 1 {
-                        self.spec_k -= 1;
-                        self.spec_k_cooldown = COOLDOWN;
-                        tracing::debug!(k = self.spec_k, ema, "adaptive spec: shallower draft");
-                    }
-                }
+        // Batched or sequential drafting: real, measured motivation for the
+        // batched path in `MtpHead::prime_batch`'s own doc comment. Only one
+        // sequence, or a combined feed width `prime_batch` would reject
+        // (checked here, not by calling and catching an error): falls back
+        // to the exact sequential loop this replaces. Real but rare for the
+        // width case -- once a sequence's whole lifetime, the round its
+        // prompt finishes and its first, whole-prompt-wide feed arrives.
+        let total_rows: usize = pre.iter().map(|p| p.feed.rows.len()).sum();
+        let batched = pre.len() > 1
+            && self.model.mtp_max_draft_rows().is_some_and(|max| total_rows <= max);
+        let mut result = std::collections::HashMap::with_capacity(pre.len());
+        if batched {
+            let pre_idxs: Vec<usize> = pre.iter().map(|p| p.idx).collect();
+            let items: Vec<infero_model::mtp::BatchDraftItem<'_>> = pre
+                .iter()
+                .map(|p| infero_model::mtp::BatchDraftItem {
+                    branch: p.seq.0,
+                    feed: &p.feed,
+                    history: &p.history,
+                })
+                .collect();
+            let mut samplers: Vec<&mut Sampler> = self
+                .running
+                .iter_mut()
+                .enumerate()
+                .filter(|(i, _)| pre_idxs.contains(i))
+                .map(|(_, r)| &mut r.sampler)
+                .collect();
+            let drafts = self.model.draft_with_head_sampled_batch(k, &items, &mut samplers)?;
+            drop(items);
+            drop(samplers);
+            for (p, draft) in pre.into_iter().zip(drafts) {
+                result.insert(p.idx, DraftedRound { pending: p.pending, history: p.history, draft });
             }
-
-            // Every emitted token goes through the same bookkeeping a plain
-            // step's single token does, in order, and the first one that ends
-            // the sequence stops the rest — a stop sequence found at token
-            // two must not be overrun by token three.
-            let mut finished = false;
-            for &t in &outcome.tokens {
-                if self.advance_token(idx, t)? {
-                    finished = true;
-                    break;
-                }
-            }
-            any_ran = true;
-            if finished {
-                finished_indices.push(idx);
-            } else {
-                self.running[idx].spec_feed = Some(outcome.feed);
+        } else {
+            for p in pre {
+                let draft = {
+                    let r = &mut self.running[p.idx];
+                    self.model.draft_with_head_sampled(k, &p.feed, &mut r.sampler, &p.history, p.seq.0)?
+                };
+                result.insert(p.idx, DraftedRound { pending: p.pending, history: p.history, draft });
             }
         }
-        if let (Some(t0), Some(t1), Some(t2)) = (t0, t1, t2) {
-            let t3 = std::time::Instant::now();
-            self.spec_draft_ms += (t1 - t0).as_secs_f64() * 1e3;
-            self.spec_verify_ms += (t2 - t1).as_secs_f64() * 1e3;
-            self.spec_after_ms += (t3 - t2).as_secs_f64() * 1e3;
-            self.spec_window += 1;
-            if self.spec_window >= 100 {
-                let w = self.spec_window as f64;
-                tracing::warn!(
-                    draft_ms = format!("{:.2}", self.spec_draft_ms / w),
-                    verify_ms = format!("{:.2}", self.spec_verify_ms / w),
-                    after_ms = format!("{:.2}", self.spec_after_ms / w),
-                    k = self.spec_k,
-                    accept = format!("{:.2}", self.spec_tokens as f64 / self.spec_steps as f64),
-                    "per-round timing"
-                );
-                // The per-kernel table, which the device layer has been
-                // accumulating all along and nothing was printing. Beside
-                // the draft/verify split because the two are one
-                // question: that split says *which half* the round is
-                // spent in, and this says which kernel inside it. Reset
-                // with the window so the next hundred rounds are read on
-                // their own.
-                let report = self.model.device().profile().report();
-                if !report.is_empty() {
-                    tracing::warn!("per-kernel, last {} rounds:\n{report}", self.spec_window);
-                }
-                self.model.device().profile().reset();
-                self.spec_draft_ms = 0.0;
-                self.spec_verify_ms = 0.0;
-                self.spec_after_ms = 0.0;
-                self.spec_window = 0;
-            }
+        if let Some(t0) = t0 {
+            self.spec_draft_ms += (std::time::Instant::now() - t0).as_secs_f64() * 1e3;
         }
-        // Retire finished sequences after every eligible sequence's round has
-        // run, in descending index order: `swap_remove` moves the current
-        // last element into the removed slot, and removing highest-first
-        // means every other index still in this list is untouched by an
-        // earlier removal (it can only ever be *below* the slot just freed).
-        finished_indices.sort_unstable_by(|a, b| b.cmp(a));
-        for idx in finished_indices {
-            let r = self.running.swap_remove(idx);
-            self.retire(r);
-        }
-        Ok(any_ran)
+        Ok(result)
     }
 
     pub fn step(&mut self) -> Result<()> {
@@ -1096,11 +986,24 @@ impl Scheduler {
             "speculative decoding is not supported under tensor parallelism yet -- \
              this should have been refused at load time (see engine::Engine::start)"
         );
-        if self.speculative_step()? {
-            return Ok(());
-        }
-
-        let plan = self.plan();
+        let drafted = self.draft_eligible()?;
+        let mut plan = self.plan(drafted);
+        // Every row this step's forward pass produces is one flat,
+        // `tail`-shaped output (`row_starts` below), and both device
+        // samplers (`sample_on_device`, `sample_rows_host`) still assume
+        // the rows *they* care about -- one apiece, from an ordinary
+        // `Prefill { last: true }` or `Decode` -- are the batch's own
+        // leading, contiguous prefix, same as before `Work::Verify` (whose
+        // own `k + 1` rows are read a different way entirely, by
+        // `finish_verify_batch`) existed. A stable sort, not a rebuild of
+        // `plan`'s own scheduling order: it only ever moves `Verify` and
+        // non-final `Prefill` rows *after* the single-row items, never
+        // reorders items within either group.
+        plan.sort_by_key(|(_, w)| match w {
+            Work::Prefill { last: true, .. } | Work::Decode => 0,
+            Work::Prefill { last: false, .. } => 1,
+            Work::Verify { .. } => 2,
+        });
         if plan.is_empty() {
             // Same reasoning as the `running.is_empty()` broadcast above --
             // a follower waiting on this step's broadcast must not be left
@@ -1116,9 +1019,38 @@ impl Scheduler {
             anyhow::bail!("no sequence could make progress: kv pool is exhausted");
         }
 
+        // Every `Verify` row's own candidates, `pending` first then the
+        // draft -- built before `items` because `BatchItem::tokens` only
+        // borrows, and this is what it borrows from. Positional with
+        // `plan`, `None` for every non-`Verify` entry.
+        let verify_candidates: Vec<Option<Vec<u32>>> = plan
+            .iter()
+            .map(|(_, work)| match work {
+                Work::Verify { pending, draft, .. } => {
+                    let mut c = Vec::with_capacity(draft.len() + 1);
+                    c.push(*pending);
+                    c.extend(draft.iter().map(|d| d.token));
+                    Some(c)
+                }
+                _ => None,
+            })
+            .collect();
+        // How many trailing rows of each item's own logits a caller wants --
+        // generalizes the old `wants_logits` bool `forward_batch_device`
+        // computed on its own, since a `Verify` row wants every one of its
+        // `draft.len() + 1` candidates scored, not just the last.
+        let tail: Vec<usize> = plan
+            .iter()
+            .map(|(_, work)| match work {
+                Work::Prefill { last, .. } => usize::from(*last),
+                Work::Decode => 1,
+                Work::Verify { draft, .. } => draft.len() + 1,
+            })
+            .collect();
         let items: Vec<BatchItem<'_>> = plan
             .iter()
-            .map(|(idx, work)| {
+            .zip(&verify_candidates)
+            .map(|((idx, work), verify_cand)| {
                 let r = &self.running[*idx];
                 match work {
                     Work::Prefill { from, len, last } => BatchItem {
@@ -1165,6 +1097,23 @@ impl Scheduler {
                         mrope: None,
                         mrope_delta: r.mrope_delta,
                     },
+                    // Same shape as `Work::Decode` from the model's point of
+                    // view -- a causal continuation of this sequence's own
+                    // cached prefix, just several new rows instead of one.
+                    // `wants_logits` is meaningless here (`tail` above is
+                    // what actually governs how many rows come back); left
+                    // `true` only so nothing downstream that still reads it
+                    // is surprised.
+                    Work::Verify { .. } => BatchItem {
+                        seq: r.seq,
+                        kind: BatchItemKind::Decode,
+                        tokens: verify_cand.as_ref().expect("Work::Verify has its own candidates"),
+                        wants_logits: true,
+                        vision: None,
+                        vision_row_offset: 0,
+                        mrope: None,
+                        mrope_delta: r.mrope_delta,
+                    },
                 }
             })
             .collect();
@@ -1192,6 +1141,11 @@ impl Scheduler {
                         Work::Decode => {
                             crate::tp::WorkMsg::Decode { token: *r.next.as_ref().unwrap() }
                         }
+                        Work::Verify { .. } => unreachable!(
+                            "speculative decoding is refused under tensor parallelism before \
+                             `plan` can ever produce a Verify row here -- see the `ensure!` \
+                             above this function's own `draft_eligible` call"
+                        ),
                     };
                     (r.seq.0, msg)
                 })
@@ -1202,8 +1156,47 @@ impl Scheduler {
 
         let vocab = self.model.config().vocab_size;
         let timed = self.profile;
+        // Where each item's own rows begin in the flat, `tail`-shaped output
+        // -- what `Work::Verify`'s own GDN-rollback arming and, later,
+        // `finish_verify_batch`'s per-item nucleus reads both need to find
+        // their rows regardless of whatever other sequences' prefill/decode
+        // rows sit before or after them in this same batch.
+        let row_starts: Vec<usize> = {
+            let mut acc = 0usize;
+            tail.iter()
+                .map(|&n| {
+                    let s = acc;
+                    acc += n;
+                    s
+                })
+                .collect()
+        };
+        for ((idx, work), &row_start) in plan.iter().zip(&row_starts) {
+            if let Work::Verify { draft, .. } = work {
+                self.model.arm_verify(self.running[*idx].seq, draft.len() + 1, row_start)?;
+            }
+        }
+        // Read before the forward pass appends this round's candidates:
+        // `finish_verify_batch` needs each `Verify` sequence's length as it
+        // stood *before* this pass, to place `DraftFeed.positions`
+        // correctly, and `pool.len` grows the moment the forward pass runs
+        // -- the exact bug `finish_verify_batch`'s own doc comment warns
+        // about, reproduced here at the call site instead of inside it.
+        let verify_len_befores: std::collections::HashMap<usize, usize> = plan
+            .iter()
+            .filter(|(_, w)| matches!(w, Work::Verify { .. }))
+            .map(|(idx, _)| (*idx, self.pool.len(self.running[*idx].seq)))
+            .collect();
         let t0 = timed.then(std::time::Instant::now);
-        self.model.forward_batch_device(&items, &mut self.pool)?;
+        let forward_result = self.model.forward_batch_rows(&items, &mut self.pool, &tail);
+        if forward_result.is_err() {
+            for (idx, work) in &plan {
+                if let Work::Verify { .. } = work {
+                    self.model.disarm_verify(self.running[*idx].seq);
+                }
+            }
+        }
+        forward_result?;
         let t1 = timed.then(std::time::Instant::now);
 
         // Drop a sequence's vision features once every pad token they
@@ -1242,6 +1235,9 @@ impl Scheduler {
             .filter(|(_, w)| match w {
                 Work::Prefill { last, .. } => *last,
                 Work::Decode => true,
+                // Verified separately, from these same rows' own start
+                // offsets -- see `finish_verify_batch`'s own call below.
+                Work::Verify { .. } => false,
             })
             .map(|(idx, _)| *idx)
             .collect();
@@ -1290,6 +1286,90 @@ impl Scheduler {
                 self.sample_rows_host(&plan, &logits, vocab, &rows, &draws);
             }
         }
+
+        // Every `Work::Verify` row's own candidates, verified together --
+        // `finish_verify_batch` reads each one's own `k + 1` rows at its own
+        // `row_starts[i]` (see that function's doc comment), regardless of
+        // whatever other sequences' `Prefill`/`Decode` rows this same batch
+        // also carried. Positional with `verify_rows` below, not with
+        // `plan` itself.
+        let verify_rows: Vec<usize> = plan
+            .iter()
+            .filter(|(_, w)| matches!(w, Work::Verify { .. }))
+            .map(|(idx, _)| *idx)
+            .collect();
+        let mut verify_outcomes: std::collections::HashMap<usize, infero_model::spec::SpecOutcome> =
+            std::collections::HashMap::with_capacity(verify_rows.len());
+        if !verify_rows.is_empty() {
+            let verify_row_starts: Vec<usize> = plan
+                .iter()
+                .zip(&row_starts)
+                .filter(|((_, w), _)| matches!(w, Work::Verify { .. }))
+                .map(|(_, &rs)| rs)
+                .collect();
+            let verify_items: Vec<VerifyItem<'_>> = plan
+                .iter()
+                .filter_map(|(idx, w)| match w {
+                    Work::Verify { pending, draft, .. } => Some(VerifyItem {
+                        seq: self.running[*idx].seq,
+                        pending: *pending,
+                        draft,
+                        mrope_delta: self.running[*idx].mrope_delta,
+                    }),
+                    _ => None,
+                })
+                .collect();
+            let histories: Vec<&[u32]> = plan
+                .iter()
+                .filter_map(|(_, w)| match w {
+                    Work::Verify { history, .. } => Some(history.as_slice()),
+                    _ => None,
+                })
+                .collect();
+            let len_befores: Vec<usize> =
+                verify_rows.iter().map(|&i| verify_len_befores[&i]).collect();
+            let mut samplers: Vec<&mut Sampler> = self
+                .running
+                .iter_mut()
+                .enumerate()
+                .filter(|(i, _)| verify_rows.contains(i))
+                .map(|(_, r)| &mut r.sampler)
+                .collect();
+            let t_verify0 = timed.then(std::time::Instant::now);
+            let outcomes = self.model.finish_verify_batch(
+                &verify_items,
+                &mut self.pool,
+                &mut samplers,
+                &histories,
+                &verify_row_starts,
+                &len_befores,
+            )?;
+            if let Some(t_verify0) = t_verify0 {
+                self.spec_verify_ms += (std::time::Instant::now() - t_verify0).as_secs_f64() * 1e3;
+            }
+            for (&idx, outcome) in verify_rows.iter().zip(outcomes) {
+                verify_outcomes.insert(idx, outcome);
+            }
+            self.spec_window += 1;
+            if self.spec_window >= 100 {
+                let w = self.spec_window as f64;
+                tracing::warn!(
+                    draft_ms = format!("{:.2}", self.spec_draft_ms / w),
+                    verify_ms = format!("{:.2}", self.spec_verify_ms / w),
+                    k = self.spec_k,
+                    accept = format!("{:.2}", self.spec_tokens as f64 / self.spec_steps as f64),
+                    "per-round timing"
+                );
+                let report = self.model.device().profile().report();
+                if !report.is_empty() {
+                    tracing::warn!("per-kernel, last {} steps carrying a Verify row:\n{report}", self.spec_window);
+                }
+                self.model.device().profile().reset();
+                self.spec_draft_ms = 0.0;
+                self.spec_verify_ms = 0.0;
+                self.spec_window = 0;
+            }
+        }
         self.steps += 1;
 
         // The sampled token already sits on each `Running`; this pass is the
@@ -1297,69 +1377,122 @@ impl Scheduler {
         // matched to sequences by `rows` above, where the sampling happens.
         let mut finished = Vec::new();
         for (idx, work) in &plan {
-            let wants = match work {
-                Work::Prefill { last, .. } => *last,
-                Work::Decode => true,
-            };
             if let Work::Prefill { len, .. } = work {
                 self.running[*idx].prefilled += len;
             }
-            if !wants {
-                continue;
-            }
-            let ended = self.advance(*idx)?;
-            if ended {
-                finished.push(*idx);
-            } else if self.spec_k > 0 {
-                // Hand the drafter what this pass actually covered.
-                //
-                // Not `DraftFeed::after_prefill`, which assumes the whole prompt
-                // went through in one pass: `mtp_hidden` holds only the rows of
-                // the *last* pass, so a chunked prefill would point the drafter
-                // at hidden states that are not there. The general form is the
-                // rows this pass ran, and a decode step is the one-row case.
-                let r = &self.running[*idx];
-                let pending = r.sampled;
-                let (from, len) = match work {
-                    Work::Prefill { from, len, .. } => (*from, *len),
-                    // `prefilled` and `generated` already include this step's
-                    // token, so the row just run sits one before the end.
-                    Work::Decode => (r.prompt.len() + r.generated.len() - 2, 1),
+            let Work::Verify { .. } = work else {
+                let wants = match work {
+                    Work::Prefill { last, .. } => *last,
+                    Work::Decode => true,
+                    Work::Verify { .. } => unreachable!("handled by the branch above"),
                 };
-                // `shifted[i]` is the embedding that pairs with hidden row `i`:
-                // the token *after* the one at that position. For every row but
-                // the last that is the next token of the sequence; for the last
-                // it is the token this step just sampled.
-                let seq_tokens: Vec<u32> = r
-                    .prompt
-                    .iter()
-                    .chain(r.generated.iter())
-                    .copied()
-                    .collect();
-                let mut shifted: Vec<u32> = Vec::with_capacity(len);
-                for p in from..from + len {
-                    shifted.push(if p + 1 < seq_tokens.len() {
-                        seq_tokens[p + 1]
-                    } else {
-                        pending
+                if !wants {
+                    continue;
+                }
+                let ended = self.advance(*idx)?;
+                if ended {
+                    finished.push(*idx);
+                } else if self.spec_k > 0 {
+                    // Hand the drafter what this pass actually covered.
+                    //
+                    // Not `DraftFeed::after_prefill`, which assumes the whole prompt
+                    // went through in one pass: `mtp_hidden` holds only the rows of
+                    // the *last* pass, so a chunked prefill would point the drafter
+                    // at hidden states that are not there. The general form is the
+                    // rows this pass ran, and a decode step is the one-row case.
+                    let r = &self.running[*idx];
+                    let pending = r.sampled;
+                    let (from, len) = match work {
+                        Work::Prefill { from, len, .. } => (*from, *len),
+                        // `prefilled` and `generated` already include this step's
+                        // token, so the row just run sits one before the end.
+                        Work::Decode => (r.prompt.len() + r.generated.len() - 2, 1),
+                        Work::Verify { .. } => unreachable!("handled by the branch above"),
+                    };
+                    // `shifted[i]` is the embedding that pairs with hidden row `i`:
+                    // the token *after* the one at that position. For every row but
+                    // the last that is the next token of the sequence; for the last
+                    // it is the token this step just sampled.
+                    let seq_tokens: Vec<u32> = r
+                        .prompt
+                        .iter()
+                        .chain(r.generated.iter())
+                        .copied()
+                        .collect();
+                    let mut shifted: Vec<u32> = Vec::with_capacity(len);
+                    for p in from..from + len {
+                        shifted.push(if p + 1 < seq_tokens.len() {
+                            seq_tokens[p + 1]
+                        } else {
+                            pending
+                        });
+                    }
+                    // Only a prefill's rows can be mid-image; a decode row's
+                    // `from` indexes past `r.prompt.len()` into `r.generated`,
+                    // which `r.mrope` (sized to the prompt alone) does not cover
+                    // and does not need to -- see `MtpHead::run`'s doc comment.
+                    let mrope = match work {
+                        Work::Prefill { .. } => {
+                            r.mrope.as_deref().map(|m| m[3 * from..3 * (from + len)].to_vec())
+                        }
+                        Work::Decode => None,
+                        Work::Verify { .. } => unreachable!("handled by the branch above"),
+                    };
+                    self.running[*idx].spec_feed = Some(infero_model::spec::DraftFeed {
+                        rows: 0..len,
+                        positions: (from..from + len).collect(),
+                        shifted,
+                        mrope,
                     });
                 }
-                // Only a prefill's rows can be mid-image; a decode row's
-                // `from` indexes past `r.prompt.len()` into `r.generated`,
-                // which `r.mrope` (sized to the prompt alone) does not cover
-                // and does not need to -- see `MtpHead::run`'s doc comment.
-                let mrope = match work {
-                    Work::Prefill { .. } => {
-                        r.mrope.as_deref().map(|m| m[3 * from..3 * (from + len)].to_vec())
-                    }
-                    Work::Decode => None,
-                };
-                self.running[*idx].spec_feed = Some(infero_model::spec::DraftFeed {
-                    rows: 0..len,
-                    positions: (from..from + len).collect(),
-                    shifted,
-                    mrope,
+                continue;
+            };
+
+            // `Work::Verify`: the same per-sequence bookkeeping the old,
+            // whole-step-alternative `speculative_step` always did, once a
+            // sequence here instead of once for the whole (formerly
+            // separate) round.
+            let outcome = verify_outcomes.remove(idx).expect("every Verify row has its own outcome");
+            self.spec_steps += 1;
+            self.spec_tokens += outcome.tokens.len() as u64;
+            self.running[*idx].spec_rounds += 1;
+            self.running[*idx].spec_emitted += outcome.tokens.len() as u64;
+
+            if self.adaptive_spec {
+                let yielded = outcome.tokens.len() as f64;
+                const ALPHA: f64 = 0.15;
+                self.spec_ema_accept = Some(match self.spec_ema_accept {
+                    Some(prev) => prev * (1.0 - ALPHA) + yielded * ALPHA,
+                    None => yielded,
                 });
+                let ema = self.spec_ema_accept.expect("just set above");
+                self.spec_k_cooldown = self.spec_k_cooldown.saturating_sub(1);
+                const COOLDOWN: u64 = 80;
+                if self.spec_k_cooldown == 0 {
+                    let k = self.spec_k as f64;
+                    if ema > k * 0.85 + 0.15 && self.spec_k < self.spec_k_max {
+                        self.spec_k += 1;
+                        self.spec_k_cooldown = COOLDOWN;
+                        tracing::debug!(k = self.spec_k, ema, "adaptive spec: deeper draft");
+                    } else if ema < k * 0.4 && self.spec_k > 1 {
+                        self.spec_k -= 1;
+                        self.spec_k_cooldown = COOLDOWN;
+                        tracing::debug!(k = self.spec_k, ema, "adaptive spec: shallower draft");
+                    }
+                }
+            }
+
+            let mut seq_finished = false;
+            for &t in &outcome.tokens {
+                if self.advance_token(*idx, t)? {
+                    seq_finished = true;
+                    break;
+                }
+            }
+            if seq_finished {
+                finished.push(*idx);
+            } else {
+                self.running[*idx].spec_feed = Some(outcome.feed);
             }
         }
 
@@ -1838,7 +1971,15 @@ impl Scheduler {
     }
 
     /// Decide who gets tokens this step.
-    fn plan(&self) -> Vec<(usize, Work)> {
+    /// `drafted` is [`Self::draft_eligible`]'s own output -- consumed here
+    /// (`remove`d, not borrowed) because each entry is used at most once,
+    /// turned into that sequence's own `Work::Verify` row. A sequence whose
+    /// draft this round's token/pool budget cannot afford (rare -- it means
+    /// a batch nearly full of *other* sequences' work already) degrades to
+    /// `Work::Decode` instead of being dropped from the batch entirely:
+    /// the draft candidates are wasted, but the sequence still advances one
+    /// token, same as it would have if `draft_eligible` had skipped it.
+    fn plan(&self, mut drafted: std::collections::HashMap<usize, DraftedRound>) -> Vec<(usize, Work)> {
         let mut plan = Vec::with_capacity(self.running.len());
         let mut budget = self.model.batch_tokens();
         // `batch_tokens` bounds how much a single forward pass can carry
@@ -1854,11 +1995,25 @@ impl Scheduler {
         // as flat exhaustion.
         let mut pool_budget = self.pool.free_slots();
 
-        // Decodes first: one token each, and a running sequence starved by a
-        // prefill is a stall the client feels.
+        // Decodes and verifies first: both are one row a token-budget slot
+        // a sequence already past its prompt, and a running sequence starved
+        // by a prefill is a stall the client feels.
         for (i, r) in self.running.iter().enumerate() {
             if budget == 0 || pool_budget == 0 {
                 break;
+            }
+            if let Some(d) = drafted.remove(&i) {
+                let n = d.draft.len() + 1;
+                if n <= budget && n <= pool_budget {
+                    plan.push((i, Work::Verify { pending: d.pending, history: d.history, draft: d.draft }));
+                    budget -= n;
+                    pool_budget -= n;
+                    continue;
+                }
+                // Falls through to the plain decode check below -- `pending`
+                // is exactly `r.next` here (`draft_eligible` only drafted
+                // sequences that had one), so nothing is lost but the wasted
+                // draft candidates themselves.
             }
             if r.prompt_complete() && r.next.is_some() {
                 plan.push((i, Work::Decode));

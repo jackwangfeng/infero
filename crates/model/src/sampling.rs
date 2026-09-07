@@ -50,6 +50,14 @@ impl SamplingParams {
 pub struct Sampler {
     params: SamplingParams,
     rng: StdRng,
+    /// A concrete `u64`, always -- unlike `params.seed`, which is `None`
+    /// whenever the request didn't ask for one. The GPU-resident draft path
+    /// (`Kernels::gumbel_sample_rows`) needs a real seed to derive its
+    /// per-position randomness from deterministically, with no host RNG
+    /// state to fall back on; an unseeded request still gets one here (from
+    /// the same OS entropy `rng` itself would have used), it just isn't
+    /// reproducible across runs, same as `rng` itself isn't.
+    draft_seed: u64,
     /// Scratch, reused across tokens to keep sampling allocation-free.
     candidates: Vec<(u32, f32)>,
     /// One bit per vocabulary entry, marking what the penalty touches.
@@ -58,16 +66,29 @@ pub struct Sampler {
 
 impl Sampler {
     pub fn new(params: SamplingParams) -> Self {
-        let rng = match params.seed {
-            Some(s) => StdRng::seed_from_u64(s),
-            None => StdRng::from_os_rng(),
+        let (rng, draft_seed) = match params.seed {
+            Some(s) => (StdRng::seed_from_u64(s), s),
+            None => {
+                let mut r = StdRng::from_os_rng();
+                (StdRng::from_rng(&mut r), r.random())
+            }
         };
         Self {
             params,
             rng,
+            draft_seed,
             candidates: Vec::new(),
             penalized: Vec::new(),
         }
+    }
+
+    /// The concrete seed [`Kernels::gumbel_sample_rows`] derives this
+    /// sequence's draft-phase randomness from — independent of `rng` (which
+    /// still drives host-side residual/acceptance draws unchanged), so
+    /// drafting and verifying never share, and therefore never
+    /// cross-contaminate, one random stream.
+    pub fn draft_seed(&self) -> u64 {
+        self.draft_seed
     }
 
     /// The slice of `history` the repetition penalty actually reads.

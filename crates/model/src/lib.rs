@@ -4074,15 +4074,25 @@ impl Model {
     /// The distributions come back normalized, which is what
     /// `Sampler::pick` and `Self::draw_residual` want with `total = 1.0`. They
     /// take unnormalized weights and a normalizer, and `w / 1.0` is `w`.
+    ///
+    /// `row_offset` is where `rows` starts within the last forward pass's
+    /// `act.logits` -- `0` for a caller whose rows are the *whole* pass
+    /// (every caller before mixed-batch speculative verification), a real
+    /// offset for one candidate's own slice of a batch that also carried
+    /// other sequences' ordinary prefill/decode rows before or after it.
+    /// Only `row_offset + n <= self.logit_rows` is required, not full
+    /// coverage — the rows this call does not ask about are simply never
+    /// read.
     pub fn survivors_on_device(
         &mut self,
         rows: &[RowSample],
         windows: &[&[u32]],
+        row_offset: usize,
     ) -> Result<Option<Vec<Vec<(u32, f32)>>>> {
         let vocab = self.cfg.vocab_size;
         let n = rows.len();
         anyhow::ensure!(n == windows.len(), "{n} rows against {} windows", windows.len());
-        if n == 0 || n != self.logit_rows {
+        if n == 0 || row_offset + n > self.logit_rows {
             return Ok(None);
         }
         let max_k = rows.iter().map(|r| r.top_k as usize).max().unwrap_or(1).max(1);
@@ -4108,7 +4118,7 @@ impl Model {
                 &mut out_v,
                 &mut cav,
                 &mut cai,
-                &self.act.logits.slice(..n * vocab),
+                &self.act.logits.slice(row_offset * vocab..(row_offset + n) * vocab),
                 &pv,
                 &tv,
                 &cv,
@@ -4147,6 +4157,14 @@ impl Model {
         Ok(Some(out))
     }
 
+    /// `rows`/`windows` answer for the batch's own leading `n` rows --
+    /// `act.logits[0..n]` -- not necessarily every row the last forward pass
+    /// produced. A mixed batch that also carried a `Work::Verify` row (or a
+    /// non-final `Prefill` chunk) alongside the sequences this call samples
+    /// leaves more rows in `act.logits` than `n`; the caller is responsible
+    /// for having arranged for exactly those `n` ordinary rows to be the
+    /// batch's own prefix (`Scheduler::step`'s own `plan.sort_by_key` is
+    /// what does that).
     pub fn sample_on_device(
         &mut self,
         rows: &[RowSample],
@@ -4155,7 +4173,7 @@ impl Model {
         let vocab = self.cfg.vocab_size;
         let n = rows.len();
         anyhow::ensure!(n == windows.len(), "{n} rows against {} windows", windows.len());
-        if n == 0 || n != self.logit_rows {
+        if n == 0 || n > self.logit_rows {
             return Ok(None);
         }
         let max_k = rows.iter().map(|r| r.top_k as usize).max().unwrap_or(1);

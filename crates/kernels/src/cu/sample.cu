@@ -83,6 +83,123 @@ __device__ __forceinline__ float samp_penalize(float l, int count, float p,
     return l;
 }
 
+// ---- deterministic, host-round-trip-free sampling (vLLM-style draft) --------
+//
+// Everything above this point draws its randomness from the host: one `f64`
+// a row, uploaded with the batch, from that sequence's own `StdRng`. That is
+// the right choice for the *target* model's own sampling (reproducibility
+// against every earlier version, `sample_rows_f32`'s own doc comment) but it
+// is exactly the design vLLM's real MTP/Eagle draft loop avoids —
+// `vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py`'s own
+// comment: "To avoid CPU-GPU synchronization... we maintain the size of
+// input_ids and hidden_states the same as the target model's." Concretely,
+// vLLM's draft-phase sampling (a) drops repetition penalty/top-k/top-p in
+// favor of temperature-only Gumbel-max — `_copy_request_inputs`'s own
+// comment: "this may slightly degrade the acceptance rate... does not affect
+// the output distribution after rejection sampling" — and (b) draws its
+// Gumbel noise deterministically from `(seed, position, vocab_index)`
+// instead of a host-supplied draw, so a whole multi-step draft round never
+// needs the host to read back a token before feeding the next step.
+//
+// `samp_splitmix64` is not vLLM's own generator (that's a Philox4x32 variant
+// via Triton's `tl.randint`/`tl.rand`) — this needs only the same *shape* of
+// guarantee (deterministic, independent-looking, uniform), not bit-identical
+// output, so a simpler, well-known 64-bit mixer is used instead.
+__device__ __forceinline__ unsigned long long samp_splitmix64(unsigned long long x) {
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+/// A uniform draw in `(0, 1)`, fully determined by `(seed, offset)` — no
+/// state, no host round trip. `-log(-log(u))` below needs `u` strictly
+/// inside `(0, 1)`; taking the top 24 bits of a mixed 64-bit hash and adding
+/// 0.5 before scaling keeps every one of the 2^24 possible outputs strictly
+/// inside that range (never exactly 0 or 1).
+__device__ __forceinline__ float samp_det_uniform(unsigned long long seed,
+                                                  unsigned long long offset) {
+    const unsigned long long h = samp_splitmix64(seed ^ samp_splitmix64(offset));
+    const unsigned int bits = (unsigned int)(h >> 40);
+    return (bits + 0.5f) * (1.0f / 16777216.0f);
+}
+
+/// Gumbel(0,1) noise at `offset`, deterministic given `seed`. Adding this to
+/// a row's logits and taking the argmax is the Gumbel-max trick: the result
+/// is an exact categorical draw from `softmax(logits)`, computed without
+/// ever materializing that distribution.
+__device__ __forceinline__ float samp_gumbel_noise(unsigned long long seed,
+                                                    unsigned long long offset) {
+    const float u = samp_det_uniform(seed, offset);
+    return -logf(-logf(u));
+}
+
+/// One slice's local Gumbel-perturbed argmax: [`argmax_partial_f32`]'s shape
+/// (paired with the same [`argmax_combine_f32`] for the final reduce), but
+/// for the draft-only sampling path above — temperature only, no repetition
+/// penalty, no top-k/top-p, and randomness from `(seed, position,
+/// vocab_index)` rather than a penalty bitset and a host draw.
+///
+/// `temperature[row] <= 0` is greedy: no noise, plain argmax of the raw
+/// logits, matching every other greedy path in this file.
+///
+/// `scaled_logits` receives the temperature-scaled (but not
+/// noise-perturbed) logits this row actually sampled from — the "q" a later
+/// verification pass reads back to compute an acceptance ratio against,
+/// exactly `output_processed_logits` in vLLM's own `gumbel_sample`. Every
+/// real caller needs this written somewhere persistent, so it is not
+/// optional; a caller whose `logits` already lives in a persistent
+/// per-branch buffer it means to reread (this row's own slot in a wider
+/// `draft_logits` buffer) passes that same region as both `logits` and
+/// `scaled_logits` and scales in place.
+extern "C" __global__ void gumbel_argmax_partial_f32(
+    float* __restrict__ pv, int* __restrict__ pi,
+    const float* __restrict__ logits, float* __restrict__ scaled_logits,
+    const float* __restrict__ temperature, const unsigned long long* __restrict__ seed,
+    const long long* __restrict__ position, int vocab, int splits) {
+    extern __shared__ __align__(16) unsigned int smem[];
+    float* rv = (float*)(void*)smem;
+    int* ri = (int*)(void*)(rv + SAMPLE_BLOCK);
+
+    const int s = blockIdx.x;
+    const int row = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int chunk = (vocab + splits - 1) / splits;
+    const int lo = s * chunk;
+    const int hi = min(vocab, lo + chunk);
+
+    const float temp = temperature[row];
+    const bool greedy = temp <= 0.0f;
+    const float inv_t = greedy ? 1.0f : 1.0f / temp;
+    unsigned long long pos_seed = 0ULL;
+    if (!greedy) {
+        const unsigned long long sd = seed[row];
+        const unsigned long long pos = (unsigned long long)position[row];
+        pos_seed = samp_splitmix64(sd ^ samp_splitmix64(pos));
+    }
+    const float* row_logits = logits + (size_t)row * vocab;
+    float* row_scaled = scaled_logits + (size_t)row * vocab;
+
+    float best = -INFINITY;
+    int besti = 0;
+    for (int i = lo + tid; i < hi; i += SAMPLE_BLOCK) {
+        float v = row_logits[i] * inv_t;
+        row_scaled[i] = v;
+        if (!greedy) v += samp_gumbel_noise(pos_seed, (unsigned long long)i);
+        if (samp_better(v, i, best, besti)) {
+            best = v;
+            besti = i;
+        }
+    }
+    rv[tid] = best;
+    ri[tid] = besti;
+    samp_reduce(rv, ri, tid);
+    if (tid == 0) {
+        pv[(size_t)row * splits + s] = rv[0];
+        pi[(size_t)row * splits + s] = ri[0];
+    }
+}
+
 /// The greedy path, split across the device instead of one block a row.
 ///
 /// `sample_rows_f32` gives a row to a block, which at a batch of 32 is 32 blocks
@@ -574,4 +691,107 @@ extern "C" __global__ void sample_rows_topk_f32(
             }
         }
     }
+}
+
+/// A token id, device to device, with no host round trip -- the piece that
+/// makes a GPU-resident draft loop possible at all. Feeding
+/// `gumbel_argmax_partial_f32`'s own `unsigned int` output into `MtpHead::run`'s
+/// `self.ids` (a plain `int` buffer, same reason every other id in this file
+/// is) needs no arithmetic, just a retag: every value here is a vocabulary
+/// index, always non-negative and always well inside `int`'s range, so the
+/// bit pattern a `u32` and an `int` give it are identical.
+extern "C" __global__ void copy_u32_as_i32(int* __restrict__ dst,
+                                           const unsigned int* __restrict__ src,
+                                           int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = (int)src[i];
+}
+
+// ---- vocab-wide log-sum-exp, for the draft-side "q" of an acceptance ratio -
+//
+// The Gumbel-max draft above needs no normalizer -- the argmax is exact
+// regardless of it. But a later verification pass comparing `p(x)/q(x)`
+// against a drawn threshold needs `q(x)` as a real probability, and `q`'s
+// only stored form is the raw (temperature-scaled) logits
+// `gumbel_argmax_partial_f32` wrote to `draft_logits`. `q(x) = exp(logit[x] -
+// logsumexp)`, so this is that reduction: the same slice-then-combine shape
+// as `argmax_partial_f32`/`argmax_combine_f32`, computing (max, sum-of-exp)
+// instead of (value, index).
+extern "C" __global__ void logsumexp_partial_f32(
+    float* __restrict__ p_max, float* __restrict__ p_sumexp,
+    const float* __restrict__ logits, int vocab, int splits) {
+    extern __shared__ __align__(16) unsigned char smem_lse[];
+    float* rmax = (float*)(void*)smem_lse;
+    float* rsum = rmax + SAMPLE_BLOCK;
+
+    const int s = blockIdx.x;
+    const int row = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int chunk = (vocab + splits - 1) / splits;
+    const int lo = s * chunk;
+    const int hi = min(vocab, lo + chunk);
+    const float* row_logits = logits + (size_t)row * vocab;
+
+    float m = -INFINITY;
+    for (int i = lo + tid; i < hi; i += SAMPLE_BLOCK) m = fmaxf(m, row_logits[i]);
+    rmax[tid] = m;
+    for (int st = SAMPLE_BLOCK / 2; st > 0; st >>= 1) {
+        __syncthreads();
+        if (tid < st) rmax[tid] = fmaxf(rmax[tid], rmax[tid + st]);
+    }
+    __syncthreads();
+    const float block_max = rmax[0];
+
+    float acc = 0.0f;
+    for (int i = lo + tid; i < hi; i += SAMPLE_BLOCK) {
+        acc += expf(row_logits[i] - block_max);
+    }
+    rsum[tid] = acc;
+    for (int st = SAMPLE_BLOCK / 2; st > 0; st >>= 1) {
+        __syncthreads();
+        if (tid < st) rsum[tid] += rsum[tid + st];
+    }
+    if (tid == 0) {
+        p_max[(size_t)row * splits + s] = block_max;
+        p_sumexp[(size_t)row * splits + s] = rsum[0];
+    }
+}
+
+/// One block a row over the slice partials -- combines them the way
+/// `logsumexp(x) = max + log(sum(sumexp_i * exp(max_i - max)))` requires:
+/// each slice's sum-of-exp was only ever relative to *its own* local max, so
+/// it has to be rescaled to the global max before the sums can add.
+extern "C" __global__ void logsumexp_combine_f32(
+    float* __restrict__ out, const float* __restrict__ p_max,
+    const float* __restrict__ p_sumexp, int splits) {
+    extern __shared__ __align__(16) unsigned char smem_lsec[];
+    float* rmax = (float*)(void*)smem_lsec;
+    float* rsum = rmax + SAMPLE_BLOCK;
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    float m = -INFINITY;
+    for (int i = tid; i < splits; i += SAMPLE_BLOCK) {
+        m = fmaxf(m, p_max[(size_t)row * splits + i]);
+    }
+    rmax[tid] = m;
+    for (int st = SAMPLE_BLOCK / 2; st > 0; st >>= 1) {
+        __syncthreads();
+        if (tid < st) rmax[tid] = fmaxf(rmax[tid], rmax[tid + st]);
+    }
+    __syncthreads();
+    const float global_max = rmax[0];
+
+    float acc = 0.0f;
+    for (int i = tid; i < splits; i += SAMPLE_BLOCK) {
+        const float mx = p_max[(size_t)row * splits + i];
+        const float se = p_sumexp[(size_t)row * splits + i];
+        acc += se * expf(mx - global_max);
+    }
+    rsum[tid] = acc;
+    for (int st = SAMPLE_BLOCK / 2; st > 0; st >>= 1) {
+        __syncthreads();
+        if (tid < st) rsum[tid] += rsum[tid + st];
+    }
+    if (tid == 0) out[row] = global_max + logf(rsum[0]);
 }

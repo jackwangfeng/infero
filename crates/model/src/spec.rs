@@ -848,7 +848,7 @@ impl Model {
             })
             .collect();
         let win_refs: Vec<&[u32]> = win_owned.iter().map(|w| w.as_slice()).collect();
-        let device_dists = self.survivors_on_device(&row_specs, &win_refs)?;
+        let device_dists = self.survivors_on_device(&row_specs, &win_refs, 0)?;
 
         // The host fallback keeps the whole vocabulary; the device path returns
         // the nucleus, which is what both the acceptance test and the residual
@@ -1002,7 +1002,29 @@ impl Model {
             );
         }
 
+        let row_starts: Vec<usize> = {
+            let mut acc = 0usize;
+            ns.iter()
+                .map(|&n| {
+                    let s = acc;
+                    acc += n;
+                    s
+                })
+                .collect()
+        };
+        // Read before `forward_batch_rows` appends this round's candidates:
+        // `finish_verify_batch` needs each sequence's length as it stood
+        // *before* this verify pass, to place `DraftFeed.positions`
+        // correctly, and `pool.len` grows the moment the forward pass runs.
         let len_befores: Vec<usize> = items.iter().map(|it| pool.len(it.seq)).collect();
+
+        // Each item's own slot, armed at its own row's start in this call's
+        // flat batch -- `BatchItem`s below are built in the same order, so
+        // the running offset here matches where `forward_batch_rows` will
+        // actually place each item's rows.
+        for ((it, &n), &rs) in items.iter().zip(&ns).zip(&row_starts) {
+            self.arm_verify(it.seq, n, rs)?;
+        }
         let all_candidates: Vec<Vec<u32>> = items
             .iter()
             .map(|it| {
@@ -1012,18 +1034,6 @@ impl Model {
                 c
             })
             .collect();
-
-        // Each item's own slot, armed at its own row's start in this call's
-        // flat batch -- `BatchItem`s below are built in the same order, so
-        // the running offset here matches where `forward_batch_rows` will
-        // actually place each item's rows.
-        if let Some(r) = self.gdn_rollback.as_mut() {
-            let mut row_start = 0usize;
-            for (it, &n) in items.iter().zip(&ns) {
-                r.arm(it.seq.0, n, row_start)?;
-                row_start += n;
-            }
-        }
         let batch_items: Vec<BatchItem> = items
             .iter()
             .zip(&all_candidates)
@@ -1034,19 +1044,136 @@ impl Model {
             .collect();
         let rows = {
             let r = self.forward_batch_rows(&batch_items, pool, &ns);
-            if let (true, Some(j)) = (r.is_err(), self.gdn_rollback.as_mut()) {
+            if r.is_err() {
                 for it in items {
-                    j.disarm(it.seq.0);
+                    self.disarm_verify(it.seq);
                 }
             }
             r?
         };
         anyhow::ensure!(rows == n_total, "asked for {n_total} logit rows and got {rows}");
 
+        self.finish_verify_batch(items, pool, samplers, histories, &row_starts, &len_befores)
+    }
+
+    /// Arm this sequence's GDN rollback journal for a verify pass whose `n`
+    /// candidates will land at `row_start` in whatever batch a caller is
+    /// about to run — `0` for a call whose forward pass is only this
+    /// sequence's own candidates (every caller before mixed-batch
+    /// scheduling), a real offset for one item in a larger batch that also
+    /// carries other sequences' ordinary prefill/decode rows. Call before
+    /// that batch's `forward_batch_rows`; on a forward error, call
+    /// [`Self::disarm_verify`] for every sequence armed this round rather
+    /// than leaving a stale arm behind.
+    pub fn arm_verify(&mut self, seq: SeqId, n: usize, row_start: usize) -> Result<()> {
+        // Kept as a separate, tiny function (rather than inlining the
+        // `Option` check at each call site) because the caller does not
+        // need to know whether a rollback journal exists at all -- only
+        // that arming happened, or didn't, consistently.
+        if let Some(r) = self.gdn_rollback.as_mut() {
+            r.arm(seq.0, n, row_start)?;
+        }
+        Ok(())
+    }
+
+    pub fn disarm_verify(&mut self, seq: SeqId) {
+        if let Some(r) = self.gdn_rollback.as_mut() {
+            r.disarm(seq.0);
+        }
+    }
+
+    /// [`Self::verify_draft_sampled_batch`], but the forward pass already
+    /// ran -- as part of a batch this call did not itself construct or
+    /// execute, alongside however many other sequences' ordinary
+    /// prefill/decode rows. `row_starts[i]` is where item `i`'s own
+    /// `draft.len() + 1` logit rows begin in that already-completed batch.
+    ///
+    /// **Every item's rows must be contiguous with each other as a whole**
+    /// (`row_starts[i + 1] == row_starts[i] + draft[i].len() + 1`) -- not
+    /// necessarily starting at row 0 (ordinary `Prefill`/`Decode` rows from
+    /// other sequences may sit *before* the first one), but with no gap
+    /// between one item's own rows and the next. `Scheduler::step`'s own
+    /// `plan.sort_by_key` is what guarantees this: every `Verify` row sorts
+    /// after every ordinary one, so the batch's `Verify` rows are always one
+    /// contiguous block at its tail. This is what lets this function keep
+    /// `verify_draft_sampled_batch`'s single fused `survivors_on_device`
+    /// call over every item's rows *together* rather than one call an item
+    /// — the first version of this function tried the latter (call
+    /// `survivors_on_device` once per item, at that item's own offset) and
+    /// it was a real, measured regression, not a safe generalization:
+    /// `survivors_on_device` ends in a device synchronize, so N items meant
+    /// N serial GPU round-trips a round instead of one, and real
+    /// measurement on real concurrent traffic showed that costing far more
+    /// than the flexibility was worth (2 concurrent sequences dropped to
+    /// ~56 tok/s against a ~120-127 tok/s baseline; 16 concurrent dropped to
+    /// ~81 tok/s against ~117). One fused call, one synchronize, is the
+    /// entire reason the earlier fusion work (before mixed-batch scheduling)
+    /// was worth doing in the first place, and this preserves it.
+    ///
+    /// `len_befores[i]` **must** be each item's `pool.len(seq)` from before
+    /// the batch's forward pass ran, not read here: `forward_batch_rows`
+    /// already appended this round's candidates by the time this function
+    /// is called, so reading it now would double-count them in
+    /// `DraftFeed.positions` — a real bug this function's own tests caught
+    /// once already, when it briefly recomputed this internally.
+    pub fn finish_verify_batch(
+        &mut self,
+        items: &[VerifyItem<'_>],
+        pool: &mut KvPool,
+        samplers: &mut [&mut crate::Sampler],
+        histories: &[&[u32]],
+        row_starts: &[usize],
+        len_befores: &[usize],
+    ) -> Result<Vec<SpecOutcome>> {
+        anyhow::ensure!(
+            items.len() == samplers.len()
+                && items.len() == histories.len()
+                && items.len() == row_starts.len()
+                && items.len() == len_befores.len(),
+            "{} items against {} samplers, {} histories, {} row starts and {} lengths",
+            items.len(),
+            samplers.len(),
+            histories.len(),
+            row_starts.len(),
+            len_befores.len()
+        );
+        for s in samplers.iter() {
+            anyhow::ensure!(
+                !s.params().is_greedy(),
+                "a greedy request takes `verify_draft`, whose acceptance rule is \
+                 exact rather than a ratio"
+            );
+        }
+        let ns: Vec<usize> = items.iter().map(|it| it.draft.len() + 1).collect();
+        let n_total: usize = ns.iter().sum();
+        for i in 1..row_starts.len() {
+            anyhow::ensure!(
+                row_starts[i] == row_starts[i - 1] + ns[i - 1],
+                "item {i}'s rows start at {}, but item {}'s own {} rows end at {} -- \
+                 finish_verify_batch's single fused device call needs every item's \
+                 rows contiguous with the next",
+                row_starts[i],
+                i - 1,
+                ns[i - 1],
+                row_starts[i - 1] + ns[i - 1]
+            );
+        }
+        let base = row_starts.first().copied().unwrap_or(0);
+        let all_candidates: Vec<Vec<u32>> = items
+            .iter()
+            .map(|it| {
+                let mut c = Vec::with_capacity(it.draft.len() + 1);
+                c.push(it.pending);
+                c.extend(it.draft.iter().map(|d| d.token));
+                c
+            })
+            .collect();
         let vocab = self.cfg.vocab_size;
+
         // One row spec/window a row, across every item's candidates, in the
-        // same flat order as `batch_items` -- exactly what `survivors_on_device`
-        // needs to answer every item's rows in one device call.
+        // same flat order `row_starts` already promises -- exactly what
+        // `survivors_on_device` needs to answer every item's rows in one
+        // device call, at `base` rather than assuming row 0.
         let mut row_specs: Vec<crate::RowSample> = Vec::with_capacity(n_total);
         let mut win_owned: Vec<Vec<u32>> = Vec::with_capacity(n_total);
         for (i, it) in items.iter().enumerate() {
@@ -1068,8 +1195,8 @@ impl Model {
             }
         }
         let win_refs: Vec<&[u32]> = win_owned.iter().map(|w| w.as_slice()).collect();
-        let device_dists = self.survivors_on_device(&row_specs, &win_refs)?;
-        let logits: Vec<f32> = if device_dists.is_some() {
+        let device_dists = self.survivors_on_device(&row_specs, &win_refs, base)?;
+        let logits_host: Vec<f32> = if device_dists.is_some() {
             Vec::new()
         } else {
             self.logits_host()?.to_vec()
@@ -1091,8 +1218,8 @@ impl Model {
                 let (dist, total): (&[(u32, f32)], f64) = match &device_dists {
                     Some(d) => (&d[row_start + j], 1.0),
                     None => {
-                        let row_idx = row_start + j;
-                        let row = &logits[row_idx * vocab..(row_idx + 1) * vocab];
+                        let row_idx = row_starts[i] + j;
+                        let row = &logits_host[row_idx * vocab..(row_idx + 1) * vocab];
                         let (dd, tt) = sampler.distribution(row, &window);
                         (dd, tt)
                     }
@@ -1123,8 +1250,8 @@ impl Model {
                 let (dist, total): (&[(u32, f32)], f64) = match &device_dists {
                     Some(d) => (&d[row_start + it.draft.len()], 1.0),
                     None => {
-                        let row_idx = row_start + it.draft.len();
-                        let row = &logits[row_idx * vocab..(row_idx + 1) * vocab];
+                        let row_idx = row_starts[i] + it.draft.len();
+                        let row = &logits_host[row_idx * vocab..(row_idx + 1) * vocab];
                         let (dd, tt) = sampler.distribution(row, &window);
                         (dd, tt)
                     }

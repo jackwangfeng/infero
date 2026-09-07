@@ -959,6 +959,185 @@ impl Kernels {
         Ok(())
     }
 
+    /// Draft-only sampling, vLLM-style: temperature-scaled Gumbel-max, no
+    /// repetition penalty, no top-k/top-p, and randomness deterministic from
+    /// `(seed[row], position[row], vocab_index)` rather than a host-supplied
+    /// draw — so a whole multi-step draft round can run without the host
+    /// ever reading a sampled token back before feeding the next step. See
+    /// `gumbel_argmax_partial_f32`'s own doc comment in `sample.cu` for the
+    /// full rationale (this is the counterpart of vLLM's `gumbel_sample`).
+    ///
+    /// `scaled_logits` receives the temperature-scaled logits this call
+    /// actually sampled from, in place — a later verification pass reads
+    /// this back as the draft's full-vocabulary "q" to compute an
+    /// acceptance ratio against, without ever re-deriving it. Every real
+    /// caller (a draft step) needs this written somewhere persistent
+    /// anyway, so it is not optional — pass the same region as `logits` for
+    /// a buffer already meant to be scaled in place.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gumbel_sample_rows(
+        &self,
+        out: &mut ViewMut<'_, u32>,
+        pv: &mut ViewMut<'_, f32>,
+        pi: &mut ViewMut<'_, i32>,
+        logits: &View<'_, f32>,
+        scaled_logits: &mut ViewMut<'_, f32>,
+        temperature: &View<'_, f32>,
+        seed: &View<'_, u64>,
+        position: &View<'_, i64>,
+        n_rows: usize,
+        vocab: usize,
+    ) -> Result<()> {
+        let splits = Self::ARGMAX_SPLITS;
+        anyhow::ensure!(
+            pv.len() >= n_rows * splits && pi.len() >= n_rows * splits,
+            "argmax scratch holds {} of {} slots",
+            pv.len().min(pi.len()),
+            n_rows * splits
+        );
+        let chunk = vocab.div_ceil(splits);
+        // No penalty bitset (unlike `argmax_partial_f32`'s), so shared memory
+        // is just the block's own reduction scratch.
+        let part_shared = Self::SAMPLE_BLOCK * 2 * 4;
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_sample", sample_src(), "gumbel_argmax_partial_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (splits as u32, n_rows as u32, 1),
+            block_dim: (Self::SAMPLE_BLOCK, 1, 1),
+            shared_mem_bytes: part_shared,
+        };
+        let (v, sp) = (vocab as i32, splits as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(&mut *pv)
+            .arg(&mut *pi)
+            .arg(logits)
+            .arg(scaled_logits)
+            .arg(temperature)
+            .arg(seed)
+            .arg(position)
+            .arg(&v)
+            .arg(&sp);
+        self.dev
+            .profile()
+            .time("gumbel_argmax_partial", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("gumbel_argmax_partial")?;
+                Ok(())
+            })?;
+
+        let g = self
+            .dev
+            .kernels()
+            .get("infero_sample", sample_src(), "argmax_combine_f32")?;
+        let cfg2 = LaunchConfig {
+            grid_dim: (n_rows as u32, 1, 1),
+            block_dim: (Self::SAMPLE_BLOCK, 1, 1),
+            shared_mem_bytes: Self::SAMPLE_BLOCK * 2 * 4,
+        };
+        let pvv = pv.as_view();
+        let piv = pi.as_view();
+        let mut b2 = self.dev.stream().launch_builder(&g);
+        b2.arg(out).arg(&pvv).arg(&piv).arg(&sp);
+        self.dev
+            .profile()
+            .time("gumbel_argmax_combine", self.dev.stream(), || {
+                unsafe { b2.launch(cfg2) }.context("gumbel_argmax_combine")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// A token id, device to device, no host round trip — see
+    /// `copy_u32_as_i32`'s own doc comment in `sample.cu`. What lets a
+    /// GPU-resident draft loop feed one step's sampled token into the next
+    /// step's forward pass without the host ever reading it.
+    pub fn copy_u32_as_i32(
+        &self,
+        dst: &mut ViewMut<'_, i32>,
+        src: &View<'_, u32>,
+        n: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_sample", sample_src(), "copy_u32_as_i32")?;
+        let nn = n as i32;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(dst).arg(src).arg(&nn);
+        self.dev
+            .profile()
+            .time("copy_u32_as_i32", self.dev.stream(), || {
+                unsafe { b.launch(elementwise(n as u32)) }.context("copy_u32_as_i32")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// `logsumexp` over each row's whole vocabulary — the normalizer a
+    /// caller needs to turn `gumbel_sample_rows`'s raw `scaled_logits` back
+    /// into a real probability (`q(x) = exp(logit[x] - logsumexp)`), split
+    /// across the device the same way [`Self::sample_rows_greedy`] splits
+    /// its argmax. `pmax`/`psumexp` are `n_rows * ARGMAX_SPLITS` scratch,
+    /// same shape as `sample_rows_greedy`'s `pv`/`pi` (reusable between the
+    /// two: they're never needed at the same time).
+    pub fn logsumexp_rows(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        pmax: &mut ViewMut<'_, f32>,
+        psumexp: &mut ViewMut<'_, f32>,
+        logits: &View<'_, f32>,
+        n_rows: usize,
+        vocab: usize,
+    ) -> Result<()> {
+        let splits = Self::ARGMAX_SPLITS;
+        anyhow::ensure!(
+            pmax.len() >= n_rows * splits && psumexp.len() >= n_rows * splits,
+            "logsumexp scratch holds {} of {} slots",
+            pmax.len().min(psumexp.len()),
+            n_rows * splits
+        );
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_sample", sample_src(), "logsumexp_partial_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (splits as u32, n_rows as u32, 1),
+            block_dim: (Self::SAMPLE_BLOCK, 1, 1),
+            shared_mem_bytes: Self::SAMPLE_BLOCK * 2 * 4,
+        };
+        let (v, sp) = (vocab as i32, splits as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(&mut *pmax).arg(&mut *psumexp).arg(logits).arg(&v).arg(&sp);
+        self.dev
+            .profile()
+            .time("logsumexp_partial", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("logsumexp_partial")?;
+                Ok(())
+            })?;
+
+        let g = self
+            .dev
+            .kernels()
+            .get("infero_sample", sample_src(), "logsumexp_combine_f32")?;
+        let cfg2 = LaunchConfig {
+            grid_dim: (n_rows as u32, 1, 1),
+            block_dim: (Self::SAMPLE_BLOCK, 1, 1),
+            shared_mem_bytes: Self::SAMPLE_BLOCK * 2 * 4,
+        };
+        let pmaxv = pmax.as_view();
+        let psumexpv = psumexp.as_view();
+        let mut b2 = self.dev.stream().launch_builder(&g);
+        b2.arg(out).arg(&pmaxv).arg(&psumexpv).arg(&sp);
+        self.dev
+            .profile()
+            .time("logsumexp_combine", self.dev.stream(), || {
+                unsafe { b2.launch(cfg2) }.context("logsumexp_combine")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     /// Sample one token per row without the logits ever leaving the device.
     ///
     /// `pen_tok` and `pen_cnt` are each row's repetition window as sorted

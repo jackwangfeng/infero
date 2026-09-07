@@ -208,6 +208,42 @@ pub struct MtpHead {
     samp: Option<DraftSampleBufs>,
 }
 
+/// Where [`MtpHead::run`]'s `shifted_ids` come from.
+///
+/// `Host` is every caller before the GPU-resident draft loop: the ids are
+/// already on the host (a fresh prompt's tokens, or a token a caller read
+/// back for some other reason) and get uploaded same as `positions`/
+/// `branch_of` always have. `Device` is what a multi-step draft round newly
+/// takes between its own steps -- the previous step's sampled token, still
+/// sitting in a device buffer [`Kernels::gumbel_sample_rows`] wrote, copied
+/// device-to-device (`copy_u32_as_i32`) instead of read back to the host
+/// and reuploaded. That copy is the entire reason this enum exists: without
+/// it, `run`'s only way to take a token would force a host round trip every
+/// single draft step, which is the exact cost this design removes.
+enum TokenSource<'a> {
+    Host(&'a [u32]),
+    Device(View<'a, u32>),
+}
+
+impl TokenSource<'_> {
+    fn len(&self) -> usize {
+        match self {
+            TokenSource::Host(ids) => ids.len(),
+            TokenSource::Device(ids) => ids.len(),
+        }
+    }
+}
+
+/// One sequence's own share of a [`MtpHead::prime_batch`] call: its own
+/// branch, its own feed, sliced into the exact rows this call primes.
+pub struct PrimeItem<'a> {
+    pub branch: usize,
+    pub shifted_ids: &'a [u32],
+    pub positions: &'a [usize],
+    pub hidden: View<'a, f32>,
+    pub mrope: Option<&'a [i32]>,
+}
+
 impl MtpHead {
     /// `max_tokens` bounds one draft step's rows; `max_seq` the drafter's cache.
     ///
@@ -430,7 +466,15 @@ impl MtpHead {
         // always the right value here -- `step_tree`'s own tree levels pass
         // their own explicit `tail` instead, since a tree can use a
         // different one per level.
-        self.run(kern, embed, shifted_ids, positions, &vec![branch; shifted_ids.len()], self.tail, mrope)
+        self.run(
+            kern,
+            embed,
+            TokenSource::Host(shifted_ids),
+            positions,
+            &vec![branch; shifted_ids.len()],
+            self.tail,
+            mrope,
+        )
     }
 
     /// [`MtpHead::step`] over a feed of any width, in chunks.
@@ -507,6 +551,118 @@ impl MtpHead {
         Ok(last_row)
     }
 
+    /// [`Self::prime`] over several branches' own feeds at once, one `run`
+    /// call instead of one a branch.
+    ///
+    /// This is the batched-multi-sequence-speculation counterpart of
+    /// `prime`: real, measured decode-phase draft cost at real concurrency
+    /// (16 running sequences) showed the sequential per-branch calls this
+    /// replaces costing nearly as much wall time as the now-fused
+    /// verification pass they feed — the "draft is cheap, sequential is
+    /// fine" assumption behind the original one-branch-a-call design holds
+    /// at low concurrency and stops holding once the sequential CPU-GPU
+    /// round-trip count itself scales with concurrency the same way naive
+    /// sequential verification once did.
+    ///
+    /// Unlike `prime`, this does **not** chunk a wide feed: `after_prefill`
+    /// feeds (the first round after a prompt finishes) can be hundreds of
+    /// tokens wide, and mixing "several branches, some needing several
+    /// chunks" into one dispatch decision is not worth the complexity this
+    /// call exists to avoid. A caller whose combined row count would not
+    /// fit is expected to fall back to per-branch `prime` for that round
+    /// (real, rare: one round in a sequence's whole lifetime) — this
+    /// returns an error rather than silently chunking so that fallback
+    /// decision stays the caller's, not a surprise buried in here.
+    ///
+    /// Every row lands in `self.out` in the same order `items` lists them,
+    /// each branch's own rows contiguous (required — see `run`'s own
+    /// per-branch consecutive-position check) but not necessarily starting
+    /// at a fixed offset, so the returned `Vec<usize>` gives each item's own
+    /// last row explicitly rather than making the caller re-derive it.
+    ///
+    /// `mrope` is broadcast to `[p, p, p]` for any item that passed `None`
+    /// — the same broadcast `run` itself does for a single-branch call —
+    /// because `run` takes one combined array for the whole batch and a
+    /// per-item choice between "real triples" and "no triples" cannot
+    /// survive concatenation.
+    pub fn prime_batch(
+        &mut self,
+        kern: &Kernels,
+        embed: &Matrix,
+        items: &[PrimeItem<'_>],
+    ) -> Result<Vec<usize>> {
+        anyhow::ensure!(!items.is_empty(), "priming a batch of no sequences");
+        let d = self.dims.d_model;
+        let total: usize = items.iter().map(|it| it.shifted_ids.len()).sum();
+        anyhow::ensure!(
+            total <= self.max_tokens,
+            "a batch of {total} rows across {} sequences, against the {} \
+             this head was built for -- fall back to per-branch `prime` for \
+             this round",
+            items.len(),
+            self.max_tokens
+        );
+        for it in items {
+            anyhow::ensure!(
+                it.shifted_ids.len() == it.positions.len(),
+                "branch {}: {} shifted ids against {} positions",
+                it.branch,
+                it.shifted_ids.len(),
+                it.positions.len()
+            );
+            anyhow::ensure!(
+                it.hidden.len() >= it.shifted_ids.len() * d,
+                "branch {}: the hidden states hold {} floats, {} rows of {d} needed",
+                it.branch,
+                it.hidden.len(),
+                it.shifted_ids.len(),
+            );
+        }
+
+        let mut shifted_all: Vec<u32> = Vec::with_capacity(total);
+        let mut positions_all: Vec<usize> = Vec::with_capacity(total);
+        let mut branch_of_all: Vec<usize> = Vec::with_capacity(total);
+        let mut mrope_all: Vec<i32> = Vec::with_capacity(total * 3);
+        let mut last_rows: Vec<usize> = Vec::with_capacity(items.len());
+        let mut offset = 0usize;
+        for it in items {
+            let n = it.shifted_ids.len();
+            shifted_all.extend_from_slice(it.shifted_ids);
+            positions_all.extend_from_slice(it.positions);
+            branch_of_all.extend(std::iter::repeat(it.branch).take(n));
+            match it.mrope {
+                Some(m) => {
+                    anyhow::ensure!(
+                        m.len() == 3 * n,
+                        "branch {}: {} mrope entries for {n} rows, expected {}",
+                        it.branch,
+                        m.len(),
+                        3 * n
+                    );
+                    mrope_all.extend_from_slice(m);
+                }
+                None => mrope_all.extend(it.positions.iter().flat_map(|&p| [p as i32; 3])),
+            }
+            self.dev.stream().memcpy_dtod(
+                &it.hidden.slice(..n * d),
+                &mut self.hidden_in.slice_mut(offset * d..(offset + n) * d),
+            )?;
+            offset += n;
+            last_rows.push(offset - 1);
+        }
+
+        self.run(
+            kern,
+            embed,
+            TokenSource::Host(&shifted_all),
+            &positions_all,
+            &branch_of_all,
+            self.tail,
+            Some(&mrope_all),
+        )?;
+        Ok(last_rows)
+    }
+
     /// The same, feeding the head its **own** previous output as the hidden
     /// state.
     ///
@@ -538,7 +694,7 @@ impl MtpHead {
         // `self.tail`, not a literal `0` -- see `step`'s own doc comment for
         // why a mismatched `tail` silently collapses every branch onto the
         // same physical cache slots instead of actually isolating them.
-        self.run(kern, embed, &[drafted], &[position], &[branch], self.tail, None)
+        self.run(kern, embed, TokenSource::Host(&[drafted]), &[position], &[branch], self.tail, None)
     }
 
     /// One draft step's kernels: four small uploads, then eighteen launches.
@@ -607,7 +763,58 @@ impl MtpHead {
             let mut dst = self.hidden_in.slice_mut(i * d..(i + 1) * d);
             self.dev.stream().memcpy_dtod(&src, &mut dst)?;
         }
-        self.run(kern, embed, tokens, positions, branch_of, tail, None)
+        self.run(kern, embed, TokenSource::Host(tokens), positions, branch_of, tail, None)
+    }
+
+    /// [`Self::step_tree`], but `tokens` is a device buffer this same round
+    /// already sampled into (via [`Kernels::gumbel_sample_rows`]) rather
+    /// than a host slice — the piece that lets a whole multi-step
+    /// GPU-resident draft round run without the host reading any of its
+    /// intermediate tokens back. Everything else — the parent-row gather,
+    /// the position/branch bookkeeping — is unchanged and stays on the host,
+    /// since none of it depends on what token was actually drafted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_tree_device(
+        &mut self,
+        kern: &Kernels,
+        embed: &Matrix,
+        tokens: View<'_, u32>,
+        positions: &[usize],
+        src_rows: &[usize],
+        branch_of: &[usize],
+        tail: usize,
+    ) -> Result<()> {
+        let n = tokens.len();
+        anyhow::ensure!(
+            n == positions.len() && n == src_rows.len() && n == branch_of.len(),
+            "{n} tokens against {} positions, {} source rows and {} branches",
+            positions.len(),
+            src_rows.len(),
+            branch_of.len()
+        );
+        anyhow::ensure!(n > 0 && n <= self.max_tokens, "a level of {n} rows");
+        for (i, r) in src_rows.iter().enumerate() {
+            anyhow::ensure!(
+                *r < self.rows,
+                "row {i} continues from row {r}, past the {} the last level \
+                 produced",
+                self.rows
+            );
+        }
+        for b in branch_of {
+            anyhow::ensure!(
+                *b < self.branches,
+                "branch {b} of a head forked {} ways",
+                self.branches
+            );
+        }
+        let d = self.dims.d_model;
+        for (i, r) in src_rows.iter().enumerate() {
+            let src = self.out.slice(r * d..(r + 1) * d);
+            let mut dst = self.hidden_in.slice_mut(i * d..(i + 1) * d);
+            self.dev.stream().memcpy_dtod(&src, &mut dst)?;
+        }
+        self.run(kern, embed, TokenSource::Device(tokens), positions, branch_of, tail, None)
     }
 
     /// Point every branch at the same prefix and its own slots past it.
@@ -700,7 +907,7 @@ impl MtpHead {
         &mut self,
         kern: &Kernels,
         embed: &Matrix,
-        shifted_ids: &[u32],
+        shifted_ids: TokenSource<'_>,
         positions: &[usize],
         branch_of: &[usize],
         tail: usize,
@@ -773,7 +980,20 @@ impl MtpHead {
         );
 
         let stream = self.dev.stream().clone();
-        let ids: Vec<i32> = shifted_ids.iter().map(|t| *t as i32).collect();
+        match shifted_ids {
+            TokenSource::Host(ids) => {
+                let ids: Vec<i32> = ids.iter().map(|t| *t as i32).collect();
+                stream.memcpy_htod(&ids, &mut self.ids.slice_mut(..n))?;
+            }
+            // No host round trip: last step's sampled ids never leave the
+            // device, so this step's input is a device-to-device retag
+            // (`copy_u32_as_i32`'s own doc comment) rather than an upload —
+            // the one thing that makes a multi-step draft loop able to run
+            // without the host reading a token back in between.
+            TokenSource::Device(ids) => {
+                kern.copy_u32_as_i32(&mut self.ids.slice_mut(..n), &ids, n)?;
+            }
+        }
         // Slot equals position: the drafter is one sequence with a cache of its
         // own, so there is no pool to share and no indirection to get wrong.
         let pos: Vec<i32> = positions.iter().map(|p| *p as i32).collect();
@@ -785,7 +1005,6 @@ impl MtpHead {
             .map(|(p, b)| self.slot_of(*b, *p, tail) as i32)
             .collect();
         let seqs: Vec<i32> = branch_of.iter().map(|b| *b as i32).collect();
-        stream.memcpy_htod(&ids, &mut self.ids.slice_mut(..n))?;
         stream.memcpy_htod(&pos, &mut self.positions.slice_mut(..n))?;
         stream.memcpy_htod(&slots, &mut self.slots.slice_mut(..n))?;
         stream.memcpy_htod(&seqs, &mut self.seq_of.slice_mut(..n))?;
@@ -1203,6 +1422,15 @@ impl MtpHead {
         self.branches
     }
 
+    /// The most rows one [`Self::step`]/[`Self::step_tree`]/[`Self::prime_batch`]
+    /// call may cover — what a batched-draft caller checks a combined feed
+    /// width against before committing to [`Self::prime_batch`] over the
+    /// per-branch fallback, since that call rejects rather than chunks an
+    /// oversized batch (see its own doc comment).
+    pub fn max_tokens(&self) -> usize {
+        self.max_tokens
+    }
+
     /// How far branch `branch`'s region of the cache reaches. `0` is the
     /// only branch that exists in the ordinary, non-batched linear-draft
     /// case.
@@ -1572,6 +1800,14 @@ pub struct Drafted {
     pub q: Vec<(u32, f32)>,
 }
 
+/// One sequence's own share of a [`crate::Model::draft_with_head_sampled_batch`]
+/// call.
+pub struct BatchDraftItem<'a> {
+    pub branch: usize,
+    pub feed: &'a crate::spec::DraftFeed,
+    pub history: &'a [u32],
+}
+
 impl crate::Model {
     /// Load the checkpoint's MTP head and keep it beside the text model.
     ///
@@ -1706,6 +1942,15 @@ impl crate::Model {
 
     pub fn mtp_head(&self) -> Option<&MtpHead> {
         self.mtp.as_ref()
+    }
+
+    /// The widest combined feed [`Self::draft_with_head_sampled_batch`] may
+    /// take in one call, or `None` with no head installed. See
+    /// [`MtpHead::max_tokens`] and [`MtpHead::prime_batch`]'s own doc
+    /// comment for why a caller checks this itself rather than letting the
+    /// batch call fail and retrying.
+    pub fn mtp_max_draft_rows(&self) -> Option<usize> {
+        self.mtp.as_ref().map(|h| h.max_tokens())
     }
 
     /// Draft `k` tokens with the head, from the hidden states the last forward
@@ -1964,6 +2209,130 @@ impl crate::Model {
                 row = 0;
                 (token, q) = head.draft_row_sampled(&self.kern, lm, row, sampler, &window)?;
                 drafted.push(Drafted { token, q });
+            }
+            Ok(drafted)
+        })();
+        self.mtp = Some(head);
+        res
+    }
+
+    /// [`Self::draft_with_head_sampled`] over several sequences at once: one
+    /// [`MtpHead::prime_batch`] call for every sequence's own feed, then `k`
+    /// rounds of one shared [`MtpHead::step_tree`] call apiece (each
+    /// sequence continuing its own row from the previous round), instead of
+    /// each sequence running its own fully sequential `prime` + `k - 1`
+    /// `step_from_own_output` calls back to back.
+    ///
+    /// Real, measured motivation: at real concurrency (16 running
+    /// sequences), the per-sequence sequential draft phase this replaces
+    /// cost nearly as much wall time as the (already fused) verification
+    /// phase it feeds — `draft_ms=69.03` against `verify_ms=85.31` in one
+    /// representative round, with a *good* acceptance rate (`accept=2.51`
+    /// of `k=3`), ruling out a low acceptance rate as the cause. The
+    /// original design's comment on `draft_with_head_sampled` called draft
+    /// "cheap, sequential is fine" — true at low concurrency, where the
+    /// GPU sits idle between each sequence's tiny call anyway, and false
+    /// once the sequential *count* of CPU-GPU round-trips itself scales
+    /// with concurrency, exactly the way naive sequential verification
+    /// once did before it was fused (see `verify_draft_sampled_batch`).
+    ///
+    /// Row-count guarded, not chunked: see [`MtpHead::prime_batch`]'s own
+    /// doc comment for why a batch whose combined feed width would not fit
+    /// the head returns an error instead of silently falling back to
+    /// per-sequence chunked priming here — the caller decides what a
+    /// rejected batch does (in practice, `Scheduler::speculative_step`
+    /// retreats the whole round to the sequential per-sequence path for
+    /// this one round, real but rare: once a sequence's whole lifetime, the
+    /// round its own prompt finishes and its first, whole-prompt-wide feed
+    /// arrives).
+    pub fn draft_with_head_sampled_batch(
+        &mut self,
+        k: usize,
+        items: &[BatchDraftItem<'_>],
+        samplers: &mut [&mut crate::Sampler],
+    ) -> anyhow::Result<Vec<Vec<Drafted>>> {
+        anyhow::ensure!(k > 0, "a draft of no tokens");
+        anyhow::ensure!(!items.is_empty(), "a batch draft of no sequences");
+        anyhow::ensure!(
+            items.len() == samplers.len(),
+            "{} sequences against {} samplers",
+            items.len(),
+            samplers.len()
+        );
+        let d = self.cfg.d_model;
+        for it in items {
+            let rows = it.feed.rows.len();
+            anyhow::ensure!(
+                rows == it.feed.positions.len() && rows == it.feed.shifted.len(),
+                "branch {}: {rows} hidden rows against {} positions and {} ids",
+                it.branch,
+                it.feed.positions.len(),
+                it.feed.shifted.len()
+            );
+        }
+        let n = items.len();
+        let mut head = self
+            .mtp
+            .take()
+            .context("this model has no MTP head; call load_mtp_head first")?;
+        let res = (|| -> anyhow::Result<Vec<Vec<Drafted>>> {
+            for it in items {
+                head.truncate(it.branch, it.feed.positions[0]);
+            }
+            let prime_items: Vec<PrimeItem<'_>> = items
+                .iter()
+                .map(|it| {
+                    let base = it.branch * self.mtp_hidden_slot_width * d;
+                    let r = it.feed.rows.clone();
+                    let hidden = self
+                        .mtp_hidden
+                        .as_ref()
+                        .expect("no captured hidden states")
+                        .slice(base + r.start * d..base + r.end * d);
+                    PrimeItem {
+                        branch: it.branch,
+                        shifted_ids: &it.feed.shifted,
+                        positions: &it.feed.positions,
+                        hidden,
+                        mrope: it.feed.mrope.as_deref(),
+                    }
+                })
+                .collect();
+            let mut cur_row = head.prime_batch(&self.kern, &self.w.token_embd, &prime_items)?;
+
+            let lm = self.w.output.as_ref().unwrap_or(&self.w.token_embd);
+            let mut drafted: Vec<Vec<Drafted>> = (0..n).map(|_| Vec::with_capacity(k)).collect();
+            let mut windows: Vec<Vec<u32>> = items.iter().map(|it| it.history.to_vec()).collect();
+            let mut positions: Vec<usize> =
+                items.iter().map(|it| *it.feed.positions.last().unwrap()).collect();
+            let mut cur_token: Vec<u32> = Vec::with_capacity(n);
+            for i in 0..n {
+                let (token, q) =
+                    head.draft_row_sampled(&self.kern, lm, cur_row[i], samplers[i], &windows[i])?;
+                drafted[i].push(Drafted { token, q });
+                cur_token.push(token);
+            }
+            for _ in 1..k {
+                for i in 0..n {
+                    windows[i].push(cur_token[i]);
+                    positions[i] += 1;
+                }
+                let branch_of: Vec<usize> = items.iter().map(|it| it.branch).collect();
+                head.step_tree(
+                    &self.kern,
+                    &self.w.token_embd,
+                    &cur_token,
+                    &positions,
+                    &cur_row,
+                    &branch_of,
+                    head.tail,
+                )?;
+                for i in 0..n {
+                    let (token, q) = head.draft_row_sampled(&self.kern, lm, i, samplers[i], &windows[i])?;
+                    drafted[i].push(Drafted { token, q });
+                    cur_token[i] = token;
+                }
+                cur_row = (0..n).collect();
             }
             Ok(drafted)
         })();
