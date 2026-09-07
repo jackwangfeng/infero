@@ -93,6 +93,39 @@ fn bench_shape(k: &Kernels, k_dim: usize, n_dim: usize, reps: usize) -> Result<(
     Ok(())
 }
 
+fn bench_block_sweep(k: &Kernels, k_dim: usize, n_dim: usize, reps: usize) -> Result<()> {
+    let stream = k.device().stream().clone();
+    let quants = quant_bytes(n_dim * k_dim, 0xE4A3);
+    let scale_n = n_dim / FP8_BLOCK;
+    let scale_k = k_dim / FP8_BLOCK;
+    let scales: Vec<f32> = (0..scale_n * scale_k).map(|i| 0.3 + 0.4 * (i % 5) as f32).collect();
+    let mut w_plain_buf = infero_kernels::fp8::pad_rows(&quants, k_dim, n_dim)?;
+    for s in &scales {
+        w_plain_buf.extend_from_slice(&s.to_le_bytes());
+    }
+    let d_w = stream.clone_htod(&w_plain_buf)?;
+    let x: Vec<f32> = pseudo_random_f32(k_dim, 0xACE0);
+    let d_x = stream.clone_htod(&x)?;
+    let mut d_out = stream.alloc_zeros::<f32>(n_dim)?;
+
+    for block in [64u32, 128, 256, 512, 1024] {
+        for _ in 0..3 {
+            k.mmv_f8_plain_g1_block_debug(&mut d_out.as_view_mut(), &d_w.as_view(), &d_x.as_view(), k_dim, n_dim, block)?;
+        }
+        k.device().synchronize()?;
+        let t0 = Instant::now();
+        for _ in 0..reps {
+            k.mmv_f8_plain_g1_block_debug(&mut d_out.as_view_mut(), &d_w.as_view(), &d_x.as_view(), k_dim, n_dim, block)?;
+        }
+        k.device().synchronize()?;
+        let ms = t0.elapsed().as_secs_f64() * 1000.0 / reps as f64;
+        let bytes = (n_dim * k_dim) as f64;
+        let gbps = bytes / (ms / 1000.0) / 1e9;
+        println!("K={k_dim:6} N={n_dim:6} BLOCK={block:5}  {ms:8.4} ms  {gbps:7.1} GB/s");
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let k = Kernels::new(Device::new(0)?);
     println!("gate/up shape (K=5120 -> N=17408):");
@@ -109,5 +142,10 @@ fn main() -> Result<()> {
     bench_shape(&k, 256, 128, 200)?;
     println!("head-ish shape (K=128 -> N=5120):");
     bench_shape(&k, 128, 5120, 200)?;
+    println!("-- BLOCK sweep (g1's own shipped 256 vs alternatives) --");
+    bench_block_sweep(&k, 5120, 17408, 300)?;
+    bench_block_sweep(&k, 17408, 5120, 300)?;
+    bench_block_sweep(&k, 5120, 5120, 300)?;
+    bench_block_sweep(&k, 5120, 1024, 300)?;
     Ok(())
 }

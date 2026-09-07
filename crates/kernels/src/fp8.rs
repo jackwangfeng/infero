@@ -1245,6 +1245,42 @@ impl Kernels {
         Ok(true)
     }
 
+    /// Diagnostic only: `mmv_f8_plain_g1` with `BLOCK` exposed, to sweep
+    /// occupancy against the shipped 256 -- `ncu` is blocked
+    /// (`ERR_NVGPUCTRPERM`) on this box, so a wall-clock sweep is the only
+    /// tool available. Measured (`examples/mmv_f8_group_bench.rs`'s own
+    /// sweep): 256 is already at or near the best of {64,128,256,512,1024}
+    /// for every shape tried; 1024 is a real, consistent loss everywhere
+    /// (too few resident blocks a SM at that many threads a block); the
+    /// narrow-N floor (~638 GB/s at N=1024) does not move at all between
+    /// 128-512, ruling out block size as its cause. No shipped change
+    /// followed from this -- kept as a real, working occupancy probe for
+    /// whoever next suspects the launch config specifically.
+    pub fn mmv_f8_plain_g1_block_debug(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
+        x: &View<'_, f32>,
+        k: usize,
+        n: usize,
+        block: u32,
+    ) -> Result<()> {
+        let f = self.dev.kernels().get("infero_fp8", fp8_src(), "mmv_f8_plain_g1_f32")?;
+        let cfg = LaunchConfig { grid_dim: (n as u32, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 };
+        let (ki, ni) = (k as i32, n as i32);
+        let scols = k.div_ceil(FP8_BLOCK) as i32;
+        let acc = 0i32;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(w).arg(x).arg(&ki).arg(&ni).arg(&scols).arg(&acc);
+        self.dev
+            .profile()
+            .time("mmv_f8_plain_g1_block_debug", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("mmv_f8_plain_g1_block_debug")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     /// [`Self::mmv_f8_plain_multi8`]'s exact `TOKENS=2` instantiation --
     /// production's own real shape (`--max-seqs 2`). Measured
     /// (`examples/cutlass_smallm_grid_probe.rs`) meaningfully faster than
