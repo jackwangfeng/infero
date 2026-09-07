@@ -232,6 +232,102 @@ fn accumulating_adds_to_the_output_rather_than_replacing_it() -> Result<()> {
     Ok(())
 }
 
+/// `mmv_f8_plain`/`mmv_f8_plain_g1` against plain `[n,k]` row-major quants
+/// (`fp8::pad_rows`, not `repack_rows`) -- the unified layout's own matvec,
+/// which until now had no dedicated oracle test of its own (only an ad-hoc
+/// cross-check against `mmv_f8_block` in `examples/cutlass_vs_block.rs`).
+/// Both kernels share one templated body (`mmv_f8_plain_body<GROUP>`) that
+/// differs only in how many output rows one block covers, so one test
+/// against the real oracle covers both `GROUP` values at once.
+#[test]
+fn the_plain_layout_matvec_matches_the_verified_host_dequantizer_at_both_group_sizes() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+
+    let quants = quant_bytes(N * K, 0xF1a1);
+    let scales: Vec<f32> = (0..scale_grid(K, N))
+        .map(|i| 0.25 * (i as f32 + 1.0) * if i % 2 == 0 { 1.0 } else { 3.0 })
+        .collect();
+    let x = pseudo_random(K, 0xabc);
+
+    let want_m = reference_matrix(&quants, &scales);
+    let want = reference_matvec(&want_m, &x);
+
+    let mut buf = infero_kernels::fp8::pad_rows(&quants, K, N)?;
+    for s in &scales {
+        buf.extend_from_slice(&s.to_le_bytes());
+    }
+    assert_eq!(buf.len(), fp8_bytes(K, N), "the plain-layout packed size");
+    let d_w = stream.clone_htod(&buf)?;
+    let d_x = stream.clone_htod(&x)?;
+
+    // `worst_ratio`, not the floor-less `max_rel_diff` the other matvec
+    // oracle test uses: checked directly against `mmv_f8_block` on this same
+    // data (identical quants/scales/x, only the buffer layout differs) --
+    // both kernels land at the *same* 4.63e-5 `max_rel_diff` from the f64
+    // oracle, ordinary f32 accumulation-order noise over a few hundred terms
+    // that a floor-less relative comparison is too strict for at this
+    // shape/seed, not a defect in either kernel. Same reasoning `worst_ratio`
+    // itself documents above.
+    let mut d_out = stream.alloc_zeros::<f32>(N)?;
+    k.mmv_f8_plain(&mut d_out.as_view_mut(), &d_w.as_view(), &d_x.as_view(), K, N, false)?;
+    k.device().synchronize()?;
+    let got = stream.clone_dtoh(&d_out)?;
+    let (worst, at) = worst_ratio(&got, &want, 1e-5, 1e-6);
+    assert!(worst <= 1.0, "mmv_f8_plain is {worst:.1}x the tolerance at element {at}: {} vs {}", got[at], want[at]);
+
+    let mut d_out_g1 = stream.alloc_zeros::<f32>(N)?;
+    k.mmv_f8_plain_g1(&mut d_out_g1.as_view_mut(), &d_w.as_view(), &d_x.as_view(), K, N, false)?;
+    k.device().synchronize()?;
+    let got_g1 = stream.clone_dtoh(&d_out_g1)?;
+    let (worst_g1, at_g1) = worst_ratio(&got_g1, &want, 1e-5, 1e-6);
+    assert!(
+        worst_g1 <= 1.0,
+        "mmv_f8_plain_g1 is {worst_g1:.1}x the tolerance at element {at_g1}: {} vs {}",
+        got_g1[at_g1],
+        want[at_g1]
+    );
+
+    // The two dispatches must agree exactly, not just each be close to the
+    // oracle -- same math, same accumulation order per row, only the
+    // row-to-block assignment differs.
+    assert_eq!(got, got_g1, "mmv_f8_plain and mmv_f8_plain_g1 must produce identical output");
+    Ok(())
+}
+
+/// `accum` under `mmv_f8_plain_g1` specifically: `the_plain_layout_matvec_...`
+/// above only exercises `accum=false`, and `accum`'s effect is applied by the
+/// same per-thread final store every `GROUP` reduces to, so a `GROUP`-specific
+/// regression here is exactly the kind of thing a shared body function can
+/// still get wrong for one instantiation and not another.
+#[test]
+fn the_plain_layout_g1_matvec_accumulates_into_the_output() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    let quants = quant_bytes(N * K, 0x1234);
+    let scales: Vec<f32> = (0..scale_grid(K, N)).map(|i| 0.5 + i as f32).collect();
+    let x = pseudo_random(K, 0x777);
+    let want = reference_matvec(&reference_matrix(&quants, &scales), &x);
+
+    let mut buf = infero_kernels::fp8::pad_rows(&quants, K, N)?;
+    for s in &scales {
+        buf.extend_from_slice(&s.to_le_bytes());
+    }
+    let d_w = stream.clone_htod(&buf)?;
+    let d_x = stream.clone_htod(&x)?;
+    let seed: Vec<f32> = (0..N).map(|i| i as f32 * 0.1).collect();
+    let mut d_out = stream.clone_htod(&seed)?;
+    k.mmv_f8_plain_g1(&mut d_out.as_view_mut(), &d_w.as_view(), &d_x.as_view(), K, N, true)?;
+    k.device().synchronize()?;
+    let got = stream.clone_dtoh(&d_out)?;
+    let expect: Vec<f32> = want.iter().zip(&seed).map(|(a, b)| a + b).collect();
+    let (worst, at) = worst_ratio(&got, &expect, 1e-5, 1e-6);
+    assert!(worst <= 1.0, "accumulate is {worst:.1}x the tolerance at element {at}: {} vs {}", got[at], expect[at]);
+    let (plain, _) = worst_ratio(&got, &want, 1e-5, 1e-6);
+    assert!(plain > 10.0, "the output equals the non-accumulated answer, so `accum` did nothing");
+    Ok(())
+}
+
 /// The on-device expansion must produce exactly what the host dequantizer does,
 /// because prefill's GEMM reads it and the two paths have to be the same model.
 #[test]

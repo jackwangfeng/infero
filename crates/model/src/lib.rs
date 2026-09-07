@@ -6969,7 +6969,16 @@ impl Model {
             #[cfg(feature = "cutlass")]
             if crate::weights::fp8_unified_layout() {
                 if n_tokens == 1 {
-                    kern.mmv_f8_plain(out, &weights, x, w.k, w.n, false)?;
+                    // `mmv_f8_plain_g1`, not `mmv_f8_plain`: one output row a
+                    // block instead of four. Measured via
+                    // `examples/mmv_f8_group_bench.rs` at this checkpoint's
+                    // real shapes plus edge cases (K/N from 128 to 17408):
+                    // bit-identical output (`max_diff` 0.0) and never slower,
+                    // 1.00x where the four-row grid was already wide enough
+                    // to fill the GPU (gate/up, 4352 blocks) up to 1.75x
+                    // where it wasn't (the smaller shapes, whose four-row
+                    // grid left most of the GPU idle in its own tail wave).
+                    kern.mmv_f8_plain_g1(out, &weights, x, w.k, w.n, false)?;
                     return Ok(());
                 }
                 // `quantize_act_e4m3_cutlass` writes the activation scale

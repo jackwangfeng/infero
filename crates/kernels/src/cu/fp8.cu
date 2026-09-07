@@ -248,23 +248,41 @@ __device__ __forceinline__ void mmv_f8_group_body(
 // rather than keep a second, `repack_rows`d copy of every FP8 weight
 // around just for that kernel. One-token only, the case that matters most
 // (`mmv_f8_block`'s "every plain decode step").
-extern "C" __global__ void mmv_f8_plain_f32(float* __restrict__ out,
+// Templated on `GROUP`, the number of output rows *this block* covers --
+// independent of `FP8_ROW_GROUP`, which is the weight buffer's own physical
+// padding/scale-grid granularity and never changes here. `GROUP` only has
+// to divide 128 (so a block's row-span never straddles a scale-grid row,
+// same constraint `FP8_ROW_GROUP` itself is under -- see its own comment).
+//
+// Why this is templated at all: `n / FP8_ROW_GROUP` blocks is sometimes too
+// few to fill the GPU even once (measured via `examples/cutlass_vs_block.rs`
+// at the 27B's real down-projection shape, K=17408 N=5120: 1280 blocks over
+// 188 SMs at up to 6 resident blocks/SM is one full wave plus a ~13%-full
+// tail wave, and the achieved bandwidth showed it -- 1141 GB/s against
+// 1316 GB/s for the gate/up shape's 4352-block grid, same total bytes
+// moved). A smaller `GROUP` doesn't change how many bytes get read, only how
+// finely the read is split across blocks; `x` (the one token's activation
+// vector) is small enough to sit warm in L2 regardless of how many blocks
+// re-read it, so there is no real reuse being given up.
+template <int GROUP>
+__device__ __forceinline__ void mmv_f8_plain_body(float* __restrict__ out,
                                             const unsigned char* __restrict__ w_plain,
                                             const float* __restrict__ x, int k, int n,
                                             int scale_cols, int accum) {
     const int group = blockIdx.x;
-    const int row0 = group * FP8_ROW_GROUP;
+    const int row0 = group * GROUP;
     if (row0 >= n) return;
-    const int rows = (n - row0 < FP8_ROW_GROUP) ? (n - row0) : FP8_ROW_GROUP;
+    const int rows = (n - row0 < GROUP) ? (n - row0) : GROUP;
     // Same buffer layout as `mmv_f8_block`: quants (padded to a whole
-    // ROW_GROUP of rows) then the scale grid, untransposed, right after.
+    // `FP8_ROW_GROUP` of rows, the buffer's own fixed physical padding, not
+    // this call's `GROUP`) then the scale grid, untransposed, right after.
     const int padded = ((n + FP8_ROW_GROUP - 1) / FP8_ROW_GROUP) * FP8_ROW_GROUP;
     const float* scale_grid = (const float*)(w_plain + (size_t)padded * k);
     const float* srow = scale_grid + (size_t)(row0 / 128) * scale_cols;
 
-    float acc[FP8_ROW_GROUP];
+    float acc[GROUP];
 #pragma unroll
-    for (int r = 0; r < FP8_ROW_GROUP; ++r) acc[r] = 0.0f;
+    for (int r = 0; r < GROUP; ++r) acc[r] = 0.0f;
 
     const int chunks = k / 4;
     for (int c = threadIdx.x; c < chunks; c += blockDim.x) {
@@ -273,7 +291,7 @@ extern "C" __global__ void mmv_f8_plain_f32(float* __restrict__ out,
         const float4 xv4 = *(const float4*)(const void*)(x + i0);
         const float xv[4] = {xv4.x, xv4.y, xv4.z, xv4.w};
 #pragma unroll
-        for (int r = 0; r < FP8_ROW_GROUP; ++r) {
+        for (int r = 0; r < GROUP; ++r) {
             if (r >= rows) break;
             // Four independent 4-byte loads, `k` bytes apart -- the "R runs
             // apart" pattern the file header says lost before. `w_plain` is
@@ -286,12 +304,12 @@ extern "C" __global__ void mmv_f8_plain_f32(float* __restrict__ out,
         }
     }
 
-    __shared__ float partial[32][FP8_ROW_GROUP];
+    __shared__ float partial[32][GROUP];
     const int lane = threadIdx.x % WARP_SIZE;
     const int warp = threadIdx.x / WARP_SIZE;
     const int warps = blockDim.x / WARP_SIZE;
 #pragma unroll
-    for (int r = 0; r < FP8_ROW_GROUP; ++r) {
+    for (int r = 0; r < GROUP; ++r) {
         if (r >= rows) break;
         float v = acc[r];
         for (int off = WARP_SIZE / 2; off > 0; off >>= 1) v += __shfl_down_sync(FULL_MASK, v, off);
@@ -304,6 +322,26 @@ extern "C" __global__ void mmv_f8_plain_f32(float* __restrict__ out,
         float* o = out + row0 + r;
         *o = accum ? *o + sum : sum;
     }
+}
+
+extern "C" __global__ void mmv_f8_plain_f32(float* __restrict__ out,
+                                            const unsigned char* __restrict__ w_plain,
+                                            const float* __restrict__ x, int k, int n,
+                                            int scale_cols, int accum) {
+    mmv_f8_plain_body<FP8_ROW_GROUP>(out, w_plain, x, k, n, scale_cols, accum);
+}
+
+// Same kernel, one output row a block instead of `FP8_ROW_GROUP` -- see
+// `mmv_f8_plain_body`'s own comment for why. Not a replacement for
+// `mmv_f8_plain_f32`: at a wide-enough `n` (the gate/up shape, 4352 blocks
+// already) the extra blocks buy nothing and the dispatch keeps the four-row
+// version there; this exists for the shapes that a `FP8_ROW_GROUP`-wide grid
+// leaves most of the GPU idle in its own tail wave.
+extern "C" __global__ void mmv_f8_plain_g1_f32(float* __restrict__ out,
+                                            const unsigned char* __restrict__ w_plain,
+                                            const float* __restrict__ x, int k, int n,
+                                            int scale_cols, int accum) {
+    mmv_f8_plain_body<1>(out, w_plain, x, k, n, scale_cols, accum);
 }
 
 // The one-token case, which is every plain decode step. A dedicated

@@ -1154,6 +1154,47 @@ impl Kernels {
         Ok(())
     }
 
+    /// [`Self::mmv_f8_plain`], one output row a block instead of `ROW_GROUP` --
+    /// see `mmv_f8_plain_body`'s doc comment in the `.cu` for why: a small
+    /// enough `n` leaves `n / ROW_GROUP` blocks too few to fill the GPU even
+    /// once, and this trades nothing (the read pattern and total bytes moved
+    /// are identical) for `ROW_GROUP` times the block count. Callers choose
+    /// between the two the same way `examples/mmv_f8_group_bench.rs` measured
+    /// them: this one wins where the four-row grid's own tail wave leaves
+    /// most of the GPU idle, the four-row one wins (marginally) where its
+    /// grid was already wide enough that the extra blocks only add overhead.
+    pub fn mmv_f8_plain_g1(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
+        x: &View<'_, f32>,
+        k: usize,
+        n: usize,
+        accum: bool,
+    ) -> Result<()> {
+        debug_assert!(
+            w.len() >= fp8_bytes(k, n),
+            "an [{n}, {k}] FP8 matrix wants {} bytes, the view holds {}",
+            fp8_bytes(k, n),
+            w.len()
+        );
+        let f = self.dev.kernels().get("infero_fp8", fp8_src(), "mmv_f8_plain_g1_f32")?;
+        const BLOCK: u32 = 256;
+        let cfg = LaunchConfig { grid_dim: (n as u32, 1, 1), block_dim: (BLOCK, 1, 1), shared_mem_bytes: 0 };
+        let (ki, ni) = (k as i32, n as i32);
+        let scols = k.div_ceil(FP8_BLOCK) as i32;
+        let acc = i32::from(accum);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(w).arg(x).arg(&ki).arg(&ni).arg(&scols).arg(&acc);
+        self.dev
+            .profile()
+            .time("mmv_f8_plain_g1", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("mmv_f8_plain_g1")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     /// The same product on tensor cores: `mma.m16n8k16`, f16 operands, f32
     /// accumulator.
     ///
