@@ -1253,6 +1253,104 @@ impl Kernels {
         Ok(())
     }
 
+    /// The device-resident draft loop's own top-`k` extraction over
+    /// `gumbel_sample_rows`'s own `scaled_logits` -- reuses
+    /// `sample_topk_partial_f32` unchanged for the candidate stage (an
+    /// empty `pen_len` behaves the same as "no hit" for every row, and
+    /// `scaled_logits` needs no further temperature division), then
+    /// `sample_rows_topk_forced_f32` for the merge instead of
+    /// `sample_rows_topk_f32`: no random draw (the token is already
+    /// chosen), and `forced_id` guarantees the row's actually-drafted
+    /// token survives into the returned `q` even when it falls outside
+    /// the natural top-`k` by value -- see that kernel's own doc comment
+    /// in `sample.cu` for why that can happen and why forcing it in is
+    /// safe. `pen_tok`/`pen_cnt`/`pen_len` still have to be real,
+    /// `n_rows`-sized buffers (the kernel indexes them by row regardless
+    /// of whether any row's own `pen_len` is nonzero) -- callers with
+    /// nothing to penalize pass zeros, not a null/empty view.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_rows_topk_forced(
+        &self,
+        cand_v: &mut ViewMut<'_, f32>,
+        cand_i: &mut ViewMut<'_, i32>,
+        logits: &View<'_, f32>,
+        forced_id: &View<'_, i32>,
+        params: &View<'_, f32>,
+        pen_tok: &View<'_, i32>,
+        pen_cnt: &View<'_, i32>,
+        pen_len: &View<'_, i32>,
+        n_rows: usize,
+        vocab: usize,
+        pen_stride: usize,
+        top_k: usize,
+        survivors: Survivors<'_>,
+    ) -> Result<()> {
+        let cand_k = top_k.max(1);
+        debug_assert!(cand_v.len() >= n_rows * Self::SAMPLE_SPLITS * cand_k);
+        let (v, ps, ck) = (vocab as i32, pen_stride as i32, cand_k as i32);
+        let per = vocab.div_ceil(Self::SAMPLE_SPLITS);
+        let words = per.div_ceil(32);
+        let sh1 = (words * 4 + 256 * 4 * 2) as u32;
+        let f1 = self
+            .dev
+            .kernels()
+            .get("infero_sample", sample_src(), "sample_topk_partial_f32")?;
+        let cfg1 = LaunchConfig {
+            grid_dim: (n_rows as u32, Self::SAMPLE_SPLITS as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: sh1,
+        };
+        let mut b1 = self.dev.stream().launch_builder(&f1);
+        b1.arg(&mut *cand_v)
+            .arg(&mut *cand_i)
+            .arg(logits)
+            .arg(params)
+            .arg(pen_tok)
+            .arg(pen_cnt)
+            .arg(pen_len)
+            .arg(&v)
+            .arg(&ps)
+            .arg(&ck);
+        self.dev
+            .profile()
+            .time("sample_topk_partial", self.dev.stream(), || {
+                unsafe { b1.launch(cfg1) }.context("sample_topk_partial")?;
+                Ok(())
+            })?;
+
+        let f2 = self
+            .dev
+            .kernels()
+            .get("infero_sample", sample_src(), "sample_rows_topk_forced_f32")?;
+        let cfg2 = LaunchConfig {
+            grid_dim: (n_rows as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: (256 * 4 * 4) as u32,
+        };
+        let cv = cand_v.as_view();
+        let ci = cand_i.as_view();
+        let sstride = survivors.stride as i32;
+        let mut b2 = self.dev.stream().launch_builder(&f2);
+        b2.arg(&cv)
+            .arg(&ci)
+            .arg(logits)
+            .arg(forced_id)
+            .arg(params)
+            .arg(&v)
+            .arg(&ck)
+            .arg(survivors.id)
+            .arg(survivors.p)
+            .arg(survivors.len)
+            .arg(&sstride);
+        self.dev
+            .profile()
+            .time("sample_rows_topk_forced", self.dev.stream(), || {
+                unsafe { b2.launch(cfg2) }.context("sample_rows_topk_forced")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     pub fn sample_rows(
         &self,
         out: &mut ViewMut<'_, u32>,

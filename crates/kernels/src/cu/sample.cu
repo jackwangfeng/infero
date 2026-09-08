@@ -693,6 +693,111 @@ extern "C" __global__ void sample_rows_topk_f32(
     }
 }
 
+/// The device-resident draft loop's own top-`k` extraction: merges
+/// `sample_topk_partial_f32`'s per-slice candidates the same way
+/// `sample_rows_topk_f32` does, but over already-scaled logits (no
+/// penalty, no further temperature division, `p.temperature` used only
+/// for the softmax below) and with no random draw -- there is nothing to
+/// sample, the token was already chosen by `gumbel_argmax_partial_f32`'s
+/// own Gumbel-perturbed argmax, which this kernel never sees.
+///
+/// That is exactly why `forced_id` exists. The value scan below finds the
+/// top-`k` by *raw* value, but Gumbel-max samples from the *noised*
+/// distribution -- the whole reason it is not simply "always pick the top
+/// token" -- so the row's actually-drafted token can, and sometimes will,
+/// fall outside this natural top-`k`. `finish_verify_batch`'s acceptance
+/// rule needs the drafted token to carry positive weight in its own `q`
+/// (checked, not assumed: `draft_row_sampled_from_batch`'s own
+/// `q.iter().any(|(t, w)| *t == token && *w > 0.0)` invariant, unchanged
+/// by this kernel and still enforced host-side after this call). If
+/// `forced_id[row]` is not already among the merged top-`k`, its own raw
+/// value can only be *less* than the weakest kept entry (`kv[k-1]`) --
+/// if it were greater, the merge above would already have kept it, since
+/// it scans every real candidate in descending order -- so replacing
+/// `kv[k-1]`/`ki[k-1]` in place, at the cost of one extra global read,
+/// can never raise the row's true maximum (`kv[0]`, used as the softmax's
+/// numerical anchor below) above what the merge already found.
+extern "C" __global__ void sample_rows_topk_forced_f32(
+    const float* __restrict__ cand_v, const int* __restrict__ cand_i,
+    const float* __restrict__ logits, const int* __restrict__ forced_id,
+    const SampleParams* __restrict__ params, int vocab, int cand_k,
+    unsigned int* __restrict__ surv_id, float* __restrict__ surv_p,
+    int* __restrict__ surv_len, int surv_stride) {
+    extern __shared__ __align__(16) unsigned int smem[];
+
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    float* rv = (float*)(void*)smem;
+    int* ri = (int*)(void*)(rv + SAMPLE_BLOCK);
+    float* kv = (float*)(void*)(ri + SAMPLE_BLOCK);
+    int* ki = (int*)(void*)(kv + SAMPLE_BLOCK);
+
+    const SampleParams p = params[row];
+    const int k = min(max(p.top_k, 1), vocab);
+    const int total_cand = SAMPLE_SPLITS * cand_k;
+    const float* cv = cand_v + (size_t)row * total_cand;
+    const int* ci = cand_i + (size_t)row * total_cand;
+
+    float lastv = INFINITY;
+    int lasti = -1;
+    for (int j = 0; j < k; ++j) {
+        float bv = -INFINITY;
+        int bi = 0;
+        bool have = false;
+        for (int i = tid; i < total_cand; i += SAMPLE_BLOCK) {
+            const float v = cv[i];
+            const int id = ci[i];
+            if (id >= vocab) continue;  // padding from a short slice
+            if (j > 0 && !samp_better(lastv, lasti, v, id)) continue;
+            if (!have || samp_better(v, id, bv, bi)) {
+                bv = v;
+                bi = id;
+                have = true;
+            }
+        }
+        rv[tid] = have ? bv : -INFINITY;
+        ri[tid] = have ? bi : 0x7fffffff;
+        samp_reduce(rv, ri, tid);
+        __syncthreads();
+        lastv = rv[0];
+        lasti = ri[0];
+        if (tid == 0) {
+            kv[j] = lastv;
+            ki[j] = lasti;
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        const int forced = forced_id[row];
+        bool found = false;
+        for (int j = 0; j < k; ++j) {
+            if (ki[j] == forced) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            kv[k - 1] = logits[(size_t)row * vocab + forced];
+            ki[k - 1] = forced;
+        }
+        const float inv_t = 1.0f / fmaxf(p.temperature, 1e-5f);
+        const float mx = kv[0];
+        double total = 0.0;
+        for (int j = 0; j < k; ++j) {
+            const double q = exp((double)((kv[j] - mx) * inv_t));
+            kv[j] = (float)q;
+            total += q;
+        }
+        surv_len[row] = k;
+        const double inv = total > 0.0 ? 1.0 / total : 0.0;
+        for (int j = 0; j < k && j < surv_stride; ++j) {
+            surv_id[(size_t)row * surv_stride + j] = (unsigned int)ki[j];
+            surv_p[(size_t)row * surv_stride + j] = (float)((double)kv[j] * inv);
+        }
+    }
+}
+
 /// A token id, device to device, with no host round trip -- the piece that
 /// makes a GPU-resident draft loop possible at all. Feeding
 /// `gumbel_argmax_partial_f32`'s own `unsigned int` output into `MtpHead::run`'s
