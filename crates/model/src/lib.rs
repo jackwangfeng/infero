@@ -2086,6 +2086,20 @@ pub struct Model {
     /// doc comment for why this is a real, separate width per branch rather
     /// than one flat `[0, n_tokens)` region shared by every sequence.
     mtp_hidden_slot_width: usize,
+    /// [`Model::draft_with_head_device_batch`]'s own scratch -- the
+    /// device-resident draft loop's per-step token/scaled-logits history
+    /// plus the final batched top-k extraction's own buffers. A field of
+    /// `Model`, not of `MtpHead`, specifically so a `View` borrowed from it
+    /// can be passed into a `head.step_tree_device(...)` call: `head` is a
+    /// value `self.mtp.take()` already moved out of `self` by the time that
+    /// call happens (the same reason every draft orchestrator does the
+    /// `take`/`self.mtp = Some(head)` dance), so a buffer living on `head`
+    /// itself would conflict with `&mut head`'s own exclusive borrow the
+    /// moment a caller tried to hold a view into it across that call.
+    /// Grows on first use and whenever a wider round needs more, the same
+    /// pattern `Scratch`'s own grow-on-demand fields use; `None` until the
+    /// device-resident draft path runs at least once.
+    device_draft: Option<mtp::DeviceDraftBufs>,
     /// The journal that undoes a rejected candidate's effect on the recurrent
     /// state. Only allocated for a model that has linear-attention blocks.
     gdn_rollback: Option<spec::GdnRollback>,
@@ -2803,6 +2817,7 @@ impl Model {
             mtp: None,
             mtp_hidden: None,
             mtp_hidden_slot_width: 0,
+            device_draft: None,
             gdn_rollback: None,
             vision: None,
             vision_scratch: None,

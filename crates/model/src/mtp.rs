@@ -2756,6 +2756,241 @@ impl crate::Model {
         res
     }
 
+    /// Device-resident version of [`Self::draft_with_head_sampled_batch`]:
+    /// same real shape (one round, `k` draft steps, `n`
+    /// concurrently-drafting sequences), but the `k`-step loop never
+    /// touches the host in between -- see
+    /// `docs/superpowers/specs/2026-09-08-device-resident-draft-loop-design.md`.
+    ///
+    /// Sampling is deterministic temperature-scaled Gumbel-max
+    /// (`Kernels::gumbel_sample_rows`), not `draft_with_head_sampled_batch`'s
+    /// own host-driven repetition-penalty/top-k/top-p categorical draw: no
+    /// repetition penalty, no top-p, and randomness from each sequence's own
+    /// `Sampler::draft_seed()` rather than `next_draw()`. `Drafted`'s own
+    /// shape (`token`, a truncated `q: Vec<(u32,f32)>`) is unchanged, and
+    /// `finish_verify_batch`'s acceptance rule needs no changes to consume
+    /// this function's output -- see `Kernels::sample_rows_topk_forced`'s
+    /// own doc comment for how the truncated `q` stays correct despite the
+    /// underlying sample coming from an unrelated, noised distribution.
+    ///
+    /// Declines (`Ok(None)`) wherever `logits_rows_batch_device` itself
+    /// would at the *first* step (a non-mmvq-compatible vocab head, or
+    /// `d_model` not a multiple of 32) rather than falling back to a
+    /// slower path of its own -- a caller in that position already has
+    /// `draft_with_head_sampled_batch` to fall back to. Declining *mid*-round
+    /// (a shape `logits_rows_batch_device` accepted at step 0 but not at a
+    /// later step) cannot happen: the shape does not change step to step.
+    pub fn draft_with_head_device_batch(
+        &mut self,
+        k: usize,
+        items: &[BatchDraftItem<'_>],
+        samplers: &mut [&mut crate::Sampler],
+    ) -> anyhow::Result<Option<Vec<Vec<Drafted>>>> {
+        anyhow::ensure!(k > 0, "a draft of no tokens");
+        anyhow::ensure!(!items.is_empty(), "a batch draft of no sequences");
+        anyhow::ensure!(
+            items.len() == samplers.len(),
+            "{} sequences against {} samplers",
+            items.len(),
+            samplers.len()
+        );
+        anyhow::ensure!(
+            samplers.iter().all(|s| !s.params().is_greedy()),
+            "device-resident drafting needs a sampling distribution; a \
+             greedy request takes the greedy acceptance rule"
+        );
+        let d = self.cfg.d_model;
+        for it in items {
+            let rows = it.feed.rows.len();
+            anyhow::ensure!(
+                rows == it.feed.positions.len() && rows == it.feed.shifted.len(),
+                "branch {}: {rows} hidden rows against {} positions and {} ids",
+                it.branch,
+                it.feed.positions.len(),
+                it.feed.shifted.len()
+            );
+        }
+        let n = items.len();
+        let mut head = self
+            .mtp
+            .take()
+            .context("this model has no MTP head; call load_mtp_head first")?;
+        let res = (|| -> anyhow::Result<Option<Vec<Vec<Drafted>>>> {
+            for it in items {
+                head.truncate(it.branch, it.feed.positions[0]);
+            }
+            let prime_items: Vec<PrimeItem<'_>> = items
+                .iter()
+                .map(|it| {
+                    let base = it.branch * self.mtp_hidden_slot_width * d;
+                    let r = it.feed.rows.clone();
+                    let hidden = self
+                        .mtp_hidden
+                        .as_ref()
+                        .expect("no captured hidden states")
+                        .slice(base + r.start * d..base + r.end * d);
+                    PrimeItem {
+                        branch: it.branch,
+                        shifted_ids: &it.feed.shifted,
+                        positions: &it.feed.positions,
+                        hidden,
+                        mrope: it.feed.mrope.as_deref(),
+                    }
+                })
+                .collect();
+            let mut cur_row = head.prime_batch(&self.kern, &self.w.token_embd, &prime_items)?;
+
+            let lm = self
+                .w
+                .output_draft_q4
+                .as_ref()
+                .or(self.w.output.as_ref())
+                .unwrap_or(&self.w.token_embd);
+            if !head.logits_rows_batch_device(&self.kern, lm, &cur_row)? {
+                return Ok(None);
+            }
+
+            let vocab = lm.n;
+            let mut positions: Vec<usize> =
+                items.iter().map(|it| *it.feed.positions.last().unwrap()).collect();
+            let branch_of: Vec<usize> = items.iter().map(|it| it.branch).collect();
+            let top_k = samplers.iter().map(|s| s.params().top_k.max(1)).max().unwrap_or(1);
+
+            if !DeviceDraftBufs::fits(&self.device_draft, k, n, vocab, top_k) {
+                self.device_draft = Some(DeviceDraftBufs::new(&self.dev, k, n, vocab, top_k)?);
+            }
+            let bufs = self.device_draft.as_mut().unwrap();
+            let stream = self.dev.stream().clone();
+
+            // Fixed for the whole round: uploaded once, not once a step.
+            let seeds: Vec<u64> = samplers.iter().map(|s| s.draft_seed()).collect();
+            let temps: Vec<f32> = samplers.iter().map(|s| s.params().temperature).collect();
+            stream.memcpy_htod(&seeds, &mut bufs.seed.slice_mut(..n))?;
+            stream.memcpy_htod(&temps, &mut bufs.temperature.slice_mut(..n))?;
+
+            for step in 0..k {
+                if step > 0 {
+                    for p in positions.iter_mut() {
+                        *p += 1;
+                    }
+                    let src_rows: Vec<usize> = (0..n).collect();
+                    let prev_tokens = bufs.token_buf.slice((step - 1) * n..step * n);
+                    head.step_tree_device(
+                        &self.kern,
+                        &self.w.token_embd,
+                        prev_tokens,
+                        &positions,
+                        &src_rows,
+                        &branch_of,
+                        head.tail,
+                    )?;
+                    cur_row = (0..n).collect();
+                    let ran = head.logits_rows_batch_device(&self.kern, lm, &cur_row)?;
+                    anyhow::ensure!(
+                        ran,
+                        "logits_rows_batch_device declined at step {step} after \
+                         accepting this exact shape at step 0 -- the vocab head \
+                         and d_model do not change mid-round, so this should be \
+                         unreachable"
+                    );
+                }
+                // Position is the only one of (seed, temperature, position)
+                // that changes step to step, and that change is pure host
+                // bookkeeping (a fixed `+1`), not anything read back from the
+                // device -- so re-uploading it here is not the round trip
+                // this design removes.
+                let pos_i64: Vec<i64> = positions.iter().map(|p| *p as i64).collect();
+                stream.memcpy_htod(&pos_i64, &mut bufs.position.slice_mut(..n))?;
+
+                let logits = head.draft_batch.as_ref().unwrap().logits.slice(..n * vocab);
+                let mut token_slice = bufs.token_buf.slice_mut(step * n..(step + 1) * n);
+                let mut scaled_slice =
+                    bufs.scaled_logits.slice_mut(step * n * vocab..(step + 1) * n * vocab);
+                self.kern.gumbel_sample_rows(
+                    &mut token_slice,
+                    &mut bufs.pv.slice_mut(..n * Kernels::ARGMAX_SPLITS),
+                    &mut bufs.pi.slice_mut(..n * Kernels::ARGMAX_SPLITS),
+                    &logits,
+                    &mut scaled_slice,
+                    &bufs.temperature.slice(..n),
+                    &bufs.seed.slice(..n),
+                    &bufs.position.slice(..n),
+                    n,
+                    vocab,
+                )?;
+            }
+
+            // One readback for the whole round: every step's own tokens,
+            // then one batched forced-top-k extraction over all `k*n` rows
+            // at once -- this is the design's whole point, so it happens
+            // exactly once here and nowhere inside the loop above.
+            let total_rows = k * n;
+            self.kern.copy_u32_as_i32(
+                &mut bufs.forced_id.slice_mut(..total_rows),
+                &bufs.token_buf.slice(..total_rows),
+                total_rows,
+            )?;
+            let mut final_params = vec![0f32; total_rows * 4];
+            for p in final_params.chunks_mut(4) {
+                p[0] = 1.0; // temperature: scaled_logits is already scaled
+                p[1] = 1.0; // top_p: keep all top_k, nothing left to trim
+                p[2] = f32::from_bits(top_k as u32);
+                p[3] = 1.0; // rep_penalty: no-op (pen_len is zero anyway)
+            }
+            stream.memcpy_htod(&final_params, &mut bufs.final_params.slice_mut(..total_rows * 4))?;
+
+            self.kern.sample_rows_topk_forced(
+                &mut bufs.cand_v.slice_mut(..total_rows * Kernels::SAMPLE_SPLITS * top_k),
+                &mut bufs.cand_i.slice_mut(..total_rows * Kernels::SAMPLE_SPLITS * top_k),
+                &bufs.scaled_logits.slice(..total_rows * vocab),
+                &bufs.forced_id.slice(..total_rows),
+                &bufs.final_params.slice(..total_rows * 4),
+                &bufs.pen_tok.slice(..total_rows),
+                &bufs.pen_cnt.slice(..total_rows),
+                &bufs.pen_len.slice(..total_rows),
+                total_rows,
+                vocab,
+                1,
+                top_k,
+                infero_kernels::Survivors {
+                    id: &mut bufs.surv_id.slice_mut(..total_rows * top_k),
+                    p: &mut bufs.surv_p.slice_mut(..total_rows * top_k),
+                    len: &mut bufs.surv_len.slice_mut(..total_rows),
+                    stride: top_k,
+                },
+            )?;
+
+            let tokens_host = stream.clone_dtoh(&bufs.token_buf.slice(..total_rows))?;
+            let surv_id_host = stream.clone_dtoh(&bufs.surv_id.slice(..total_rows * top_k))?;
+            let surv_p_host = stream.clone_dtoh(&bufs.surv_p.slice(..total_rows * top_k))?;
+            let surv_len_host = stream.clone_dtoh(&bufs.surv_len.slice(..total_rows))?;
+            self.dev.synchronize()?;
+
+            let mut drafted: Vec<Vec<Drafted>> = (0..n).map(|_| Vec::with_capacity(k)).collect();
+            for step in 0..k {
+                for i in 0..n {
+                    let row = step * n + i;
+                    let token = tokens_host[row];
+                    let keep = (surv_len_host[row].max(0) as usize).min(top_k);
+                    let q: Vec<(u32, f32)> = surv_id_host[row * top_k..row * top_k + keep]
+                        .iter()
+                        .copied()
+                        .zip(surv_p_host[row * top_k..row * top_k + keep].iter().copied())
+                        .collect();
+                    anyhow::ensure!(
+                        q.iter().any(|(t, w)| *t == token && *w > 0.0),
+                        "step {step} seq {i}: drafted {token}, which carries no \
+                         weight in its own distribution"
+                    );
+                    drafted[i].push(Drafted { token, q });
+                }
+            }
+            Ok(Some(drafted))
+        })();
+        self.mtp = Some(head);
+        res
+    }
+
     pub fn draft_with_head(
         &mut self,
         k: usize,
@@ -2983,6 +3218,109 @@ struct DraftSampleBufsBatch {
     stride: usize,
     /// Candidate/survivor capacity a row.
     top_k: usize,
+}
+
+/// [`crate::Model::draft_with_head_device_batch`]'s own scratch. Lives on
+/// `Model` (see that field's own doc comment for why, not `MtpHead`) and
+/// grows to the widest `(k, n, vocab, top_k)` shape seen so far, the same
+/// pattern `DraftSampleBufsBatch`/`DraftBatchBufs` already use.
+///
+/// `token_buf`/`scaled_logits` are laid out `[step, row]`-major (step
+/// outermost): step `s`'s whole `n`-row slice is contiguous, which is what
+/// lets `draft_with_head_device_batch` pass `token_buf`'s slice for step
+/// `s-1` straight into `step_tree_device`'s own `tokens: View<u32>` with no
+/// copy, and what lets the final extraction treat all `k*n` accumulated
+/// rows as one flat batch.
+pub(crate) struct DeviceDraftBufs {
+    /// `[k, n]`, this round's own Gumbel-sampled token per step per
+    /// sequence -- what `step_tree_device` feeds forward, and (after the
+    /// one round-ending readback) what becomes `Drafted::token`.
+    token_buf: Buf<u32>,
+    /// `[k, n]`, `token_buf` re-tagged as `i32` -- `sample_rows_topk_forced`'s
+    /// own `forced_id` parameter wants the same bit pattern
+    /// `copy_u32_as_i32` already relies on elsewhere in this file.
+    forced_id: Buf<i32>,
+    /// `[k, n, vocab]` -- every step's own temperature-scaled logits
+    /// (`gumbel_sample_rows`'s own `scaled_logits` output), kept around
+    /// rather than read back per step so the whole round's worth can be
+    /// reduced into `Drafted::q` in one final batched call.
+    scaled_logits: Buf<f32>,
+    /// `[n * Kernels::ARGMAX_SPLITS]` each -- `gumbel_sample_rows`'s own
+    /// per-step argmax-reduction scratch. Reused across steps (only ever
+    /// needed one step at a time, unlike `token_buf`/`scaled_logits`).
+    pv: Buf<f32>,
+    pi: Buf<i32>,
+    /// `[n]` each, uploaded once at round start (temperature/seed) or once
+    /// a step (position, since it is the only one of the three that
+    /// changes step to step and that change is pure host bookkeeping, not
+    /// something read back from the device).
+    seed: Buf<u64>,
+    temperature: Buf<f32>,
+    position: Buf<i64>,
+    /// `[k*n*Kernels::SAMPLE_SPLITS*top_k]` each -- `sample_rows_topk_forced`'s
+    /// own candidate-stage scratch, sized for the whole round's `k*n` rows
+    /// in one call rather than once a step.
+    cand_v: Buf<f32>,
+    cand_i: Buf<i32>,
+    /// `[k*n*top_k]`/`[k*n]` -- the final extraction's own survivor output,
+    /// read back once and reshaped into every step's own `Drafted::q`.
+    surv_id: Buf<u32>,
+    surv_p: Buf<f32>,
+    surv_len: Buf<i32>,
+    /// `[k*n*4]` -- the final extraction's own per-row `SampleParams`
+    /// (temperature=1, top_p=1, top_k, rep_penalty=1 for every row: the
+    /// input is already scaled, already chosen, and has nothing left to
+    /// penalize). Rebuilt every round rather than cached, since `top_k`
+    /// can change between rounds; the buffer itself is reused.
+    final_params: Buf<f32>,
+    /// `[k*n]` each, permanently zero -- `sample_rows_topk_forced` reuses
+    /// `sample_topk_partial_f32` unchanged, which indexes a penalty window
+    /// per row regardless of whether it is ever nonzero; a real, `k*n`-sized
+    /// all-zero buffer is what "no penalty" means to that kernel, not a
+    /// null/empty one (see `Kernels::sample_rows_topk_forced`'s own doc
+    /// comment).
+    pen_tok: Buf<i32>,
+    pen_cnt: Buf<i32>,
+    pen_len: Buf<i32>,
+    /// The `(k, n, vocab, top_k)` this allocation covers.
+    k: usize,
+    n: usize,
+    vocab: usize,
+    top_k: usize,
+}
+
+impl DeviceDraftBufs {
+    fn fits(existing: &Option<Self>, k: usize, n: usize, vocab: usize, top_k: usize) -> bool {
+        matches!(existing, Some(b) if b.k >= k && b.n >= n && b.vocab >= vocab && b.top_k >= top_k)
+    }
+
+    fn new(dev: &Device, k: usize, n: usize, vocab: usize, top_k: usize) -> Result<Self> {
+        let stream = dev.stream();
+        let total = k * n;
+        Ok(Self {
+            token_buf: stream.alloc_zeros::<u32>(total)?,
+            forced_id: stream.alloc_zeros::<i32>(total)?,
+            scaled_logits: stream.alloc_zeros::<f32>(total * vocab)?,
+            pv: stream.alloc_zeros::<f32>(n * Kernels::ARGMAX_SPLITS)?,
+            pi: stream.alloc_zeros::<i32>(n * Kernels::ARGMAX_SPLITS)?,
+            seed: stream.alloc_zeros::<u64>(n)?,
+            temperature: stream.alloc_zeros::<f32>(n)?,
+            position: stream.alloc_zeros::<i64>(n)?,
+            cand_v: stream.alloc_zeros::<f32>(total * Kernels::SAMPLE_SPLITS * top_k)?,
+            cand_i: stream.alloc_zeros::<i32>(total * Kernels::SAMPLE_SPLITS * top_k)?,
+            surv_id: stream.alloc_zeros::<u32>(total * top_k)?,
+            surv_p: stream.alloc_zeros::<f32>(total * top_k)?,
+            surv_len: stream.alloc_zeros::<i32>(total)?,
+            final_params: stream.alloc_zeros::<f32>(total * 4)?,
+            pen_tok: stream.alloc_zeros::<i32>(total)?,
+            pen_cnt: stream.alloc_zeros::<i32>(total)?,
+            pen_len: stream.alloc_zeros::<i32>(total)?,
+            k,
+            n,
+            vocab,
+            top_k,
+        })
+    }
 }
 
 /// [`MtpHead::logits_rows_batch_device`]'s own scratch, grown to the widest
