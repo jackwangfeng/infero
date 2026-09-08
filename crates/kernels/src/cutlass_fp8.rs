@@ -16,12 +16,42 @@ use crate::{Kernels, fp8_src};
 
 /// [`Kernels::mma_e4m3_cutlass_sfa_f32out`]'s crossover, in tokens, between
 /// the small-M tile (`fp8_bw_gemm.cu`'s `small_m` namespace, `<64,128,128>`)
-/// and the plain, prefill-tuned tile (`<128,128,128>`). Provisional pending a
-/// real sweep on `bw`'s SM120 hardware (`examples/cutlass_small_m_sweep.rs`
-/// once it exists) -- 64 because that is the small tile's own M, past which
-/// it needs a second M-tile iteration the wide tile would not, not because
-/// 64 is measured as the actual crossover.
+/// and the plain, prefill-tuned tile (`<128,128,128>`). 64 because that is
+/// the small tile's own M, past which it needs a second M-tile iteration the
+/// wide tile would not -- confirmed still the right crossover for `small_m`
+/// itself by the same real sweep that measured [`SWAP_AB_MAX_TOKENS`]
+/// below (`examples/swap_ab_vs_small_m_bench.rs`, real qwen38-27b-fp8 FFN
+/// gate-projection shape, K=5120 N=17408, `bw`'s SM120 hardware): `small_m`
+/// still clearly beats the plain tile at 48 and 64 tokens (0.027ms vs
+/// 0.043ms, ~1.6x), so this threshold itself did not move.
 const SMALL_M_MAX_TOKENS: usize = 64;
+
+/// Crossover, in tokens, between the operand-swapped small-M tile
+/// (`small_m_swap`, `<128,32,128>`) and the plain (non-swapped) small-M tile
+/// (`small_m`, `<64,128,128>`) -- both cover `n_tokens <= SMALL_M_MAX_TOKENS`,
+/// this decides which of the two. Real, measured (not vLLM's own `M <= 64`
+/// threshold, which this hardware/kernel does NOT share -- see below),
+/// via `examples/swap_ab_vs_small_m_bench.rs` on `bw`'s SM120 hardware at
+/// the real qwen38-27b-fp8 FFN gate-projection shape (K=5120, N=17408):
+///
+/// ```text
+/// tokens   small_m(ms)   swap(ms)   swap/small_m
+///      1        0.0536     0.0349          0.650
+///      8        0.0513     0.0308          0.600
+///     16        0.0451     0.0267          0.591   <- real batch=16 decode shape
+///     24        0.0431     0.0247          0.573
+///     32        0.0268     0.0226          0.844
+///     48        0.0268     0.0423          1.580   <- swap now LOSES
+///     64        0.0272     0.0415          1.522
+/// ```
+///
+/// vLLM's own real dispatch (`sm120_blockwise_fp8_config_swapab`,
+/// `cutlass_gemm_blockwise_sm120_fp8_dispatch`) swaps for the whole
+/// `M <= 64` range -- the measurement above shows infero's own kernel does
+/// NOT share that crossover: swap wins clearly through 32 tokens and loses
+/// badly at 48 and past it. 32 is the highest measured point still a real
+/// win (1.19x), not an extrapolation past what was actually timed.
+const SWAP_AB_MAX_TOKENS: usize = 32;
 
 /// A [`crate::WeightType::F8E4M3`] matrix's precomputed CUTLASS-side state:
 /// the scale grid transposed from `[n/128,k/128]` to `[k/128,n/128]`, and --
@@ -270,6 +300,27 @@ mod ffi {
         pub fn infero_cutlass_fp8_bw_gemm_f32out_small_m_workspace(m: i32, n: i32, k: i32) -> usize;
         #[allow(clippy::too_many_arguments)]
         pub fn infero_cutlass_fp8_bw_gemm_f32out_small_m(
+            a: *const c_void,
+            b: *const c_void,
+            sfa: *const f32,
+            sfb: *const f32,
+            d: *mut f32,
+            workspace: *mut c_void,
+            m: i32,
+            n: i32,
+            k: i32,
+            accum: i32,
+            stream: cudarc::driver::sys::CUstream,
+        ) -> i32;
+
+        // SM120 only, operand-swapped small-M tile (`<128,32,128>`, weight
+        // and activation swapped into the mainloop's A/B slots) -- see
+        // `fp8_bw_gemm.cu`'s `small_m_swap` namespace comment for why this
+        // exists (verified against vLLM's own real dispatch source, not
+        // guessed) and why it is SM120-only for the same reason `small_m` is.
+        pub fn infero_cutlass_fp8_bw_gemm_f32out_small_m_swap_workspace(m: i32, n: i32, k: i32) -> usize;
+        #[allow(clippy::too_many_arguments)]
+        pub fn infero_cutlass_fp8_bw_gemm_f32out_small_m_swap(
             a: *const c_void,
             b: *const c_void,
             sfa: *const f32,
@@ -597,7 +648,6 @@ impl Kernels {
         };
         debug_assert!(sfa_t.len() >= (k / FP8_BLOCK) * n_tokens);
         debug_assert!(out.len() >= n_tokens * n);
-        let stream = self.dev.stream();
 
         // Three real, distinctly-compiled kernel bodies (see `fp8_bw_gemm.cu`'s
         // `sm90`/`sm100` namespaces, `62edc2f`) share this exact signature --
@@ -626,19 +676,115 @@ impl Kernels {
             GemmArchTier::Sm100 => {
                 (ffi::infero_cutlass_fp8_bw_gemm_f32out_workspace_sm100, ffi::infero_cutlass_fp8_bw_gemm_f32out_sm100)
             }
-            // The small-M tile (`<64,128,128>`, `fp8_bw_gemm.cu`'s `small_m`
-            // namespace) is SM120-only -- no SM90/SM100 hardware to verify a
-            // second small-M body against, same reason the plain vs sm90/
-            // sm100 split above stops at "real, compiled, one is execution-
-            // verified." `SMALL_M_MAX_TOKENS` is provisional pending a real
-            // crossover sweep on `bw` (this file's own `mma_e4m3_gemm.rs`
-            // tests exercise correctness at both sides of it, not the
-            // threshold's own value).
+            // Operand-swapped small-M tile (`<128,32,128>`, `fp8_bw_gemm.cu`'s
+            // `small_m_swap` namespace) -- the technique is vLLM's own real
+            // choice at this quantization scheme (verified against vLLM's
+            // current GitHub source, 2026-09-08, not guessed; see that
+            // namespace's own comment), but the THRESHOLD is not: vLLM swaps
+            // for the whole `M <= 64` range, while a real sweep on this
+            // hardware/kernel (`examples/swap_ab_vs_small_m_bench.rs`, see
+            // `SWAP_AB_MAX_TOKENS`'s own doc comment for the numbers) shows
+            // swap loses badly past 32 tokens here -- do not widen this past
+            // `SWAP_AB_MAX_TOKENS` without a fresh measurement backing it.
+            GemmArchTier::Sm120 if n_tokens <= SWAP_AB_MAX_TOKENS => (
+                ffi::infero_cutlass_fp8_bw_gemm_f32out_small_m_swap_workspace,
+                ffi::infero_cutlass_fp8_bw_gemm_f32out_small_m_swap,
+            ),
+            // Plain (non-swapped) small-M tile (`<64,128,128>`) -- still a
+            // real, measured win over the wide default tile through
+            // `SMALL_M_MAX_TOKENS` (see that constant's own doc comment for
+            // the numbers), just no longer the best choice below
+            // `SWAP_AB_MAX_TOKENS` where swap wins instead.
             GemmArchTier::Sm120 if n_tokens <= SMALL_M_MAX_TOKENS => {
                 (ffi::infero_cutlass_fp8_bw_gemm_f32out_small_m_workspace, ffi::infero_cutlass_fp8_bw_gemm_f32out_small_m)
             }
             GemmArchTier::Sm120 => (ffi::infero_cutlass_fp8_bw_gemm_f32out_workspace, ffi::infero_cutlass_fp8_bw_gemm_f32out),
         };
+        self.mma_e4m3_cutlass_sfa_f32out_with(workspace_fn, gemm_fn, out, w, cw, xq, sfa_t, k, n, n_tokens, accum)?;
+        Ok(true)
+    }
+
+    /// Benchmarking-only entry point: bypasses [`Self::mma_e4m3_cutlass_sfa_f32out`]'s
+    /// own `SMALL_M_MAX_TOKENS`-keyed dispatch and forces one specific SM120
+    /// kernel body, so a probe can time the small-M tile against the
+    /// operand-swapped one head to head at the same real shape without
+    /// rebuilding the crate twice. Not meant for any call site outside
+    /// `examples/`; the real dispatch above is what production code path
+    /// uses. Panics (via the underlying `unsafe extern "C"` call) rather than
+    /// falling back if `caps` is not SM120 -- a probe caller is expected to
+    /// have already checked that itself, the way `gemm_vs_vllm_probe.rs`
+    /// does.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mma_e4m3_cutlass_sfa_f32out_bench(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
+        cw: &CutlassWeight,
+        xq: &View<'_, u8>,
+        sfa_t: &View<'_, f32>,
+        k: usize,
+        n: usize,
+        n_tokens: usize,
+        accum: bool,
+        tile: BenchTile,
+    ) -> Result<()> {
+        #[allow(clippy::type_complexity)]
+        let (workspace_fn, gemm_fn): (
+            unsafe extern "C" fn(i32, i32, i32) -> usize,
+            unsafe extern "C" fn(
+                *const std::ffi::c_void,
+                *const std::ffi::c_void,
+                *const f32,
+                *const f32,
+                *mut f32,
+                *mut std::ffi::c_void,
+                i32,
+                i32,
+                i32,
+                i32,
+                cudarc::driver::sys::CUstream,
+            ) -> i32,
+        ) = match tile {
+            BenchTile::SmallM => {
+                (ffi::infero_cutlass_fp8_bw_gemm_f32out_small_m_workspace, ffi::infero_cutlass_fp8_bw_gemm_f32out_small_m)
+            }
+            BenchTile::SmallMSwap => (
+                ffi::infero_cutlass_fp8_bw_gemm_f32out_small_m_swap_workspace,
+                ffi::infero_cutlass_fp8_bw_gemm_f32out_small_m_swap,
+            ),
+            BenchTile::Default => (ffi::infero_cutlass_fp8_bw_gemm_f32out_workspace, ffi::infero_cutlass_fp8_bw_gemm_f32out),
+        };
+        self.mma_e4m3_cutlass_sfa_f32out_with(workspace_fn, gemm_fn, out, w, cw, xq, sfa_t, k, n, n_tokens, accum)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mma_e4m3_cutlass_sfa_f32out_with(
+        &self,
+        #[allow(clippy::type_complexity)] workspace_fn: unsafe extern "C" fn(i32, i32, i32) -> usize,
+        #[allow(clippy::type_complexity)] gemm_fn: unsafe extern "C" fn(
+            *const std::ffi::c_void,
+            *const std::ffi::c_void,
+            *const f32,
+            *const f32,
+            *mut f32,
+            *mut std::ffi::c_void,
+            i32,
+            i32,
+            i32,
+            i32,
+            cudarc::driver::sys::CUstream,
+        ) -> i32,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
+        cw: &CutlassWeight,
+        xq: &View<'_, u8>,
+        sfa_t: &View<'_, f32>,
+        k: usize,
+        n: usize,
+        n_tokens: usize,
+        accum: bool,
+    ) -> Result<()> {
+        let stream = self.dev.stream();
         let ws_bytes = unsafe { workspace_fn(n_tokens as i32, n as i32, k as i32) };
 
         CUTLASS_WORKSPACE.with(stream, ws_bytes.max(1), |ws_view| {
@@ -676,7 +822,15 @@ impl Kernels {
             drop((_ra, _rb, _rsfa, _rsfb, _rd, _rws));
             anyhow::ensure!(status == 0, "CUTLASS f32-output GEMM returned status {status}");
             Ok(())
-        })?;
-        Ok(true)
+        })
     }
+}
+
+/// Which SM120 tile [`Kernels::mma_e4m3_cutlass_sfa_f32out_bench`] forces --
+/// benchmarking-only, see that method's own doc comment.
+#[derive(Clone, Copy, Debug)]
+pub enum BenchTile {
+    SmallM,
+    SmallMSwap,
+    Default,
 }

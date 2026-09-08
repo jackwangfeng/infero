@@ -260,6 +260,174 @@ using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 using StrideD = typename Gemm::GemmKernel::StrideD;
 }  // namespace small_m
 
+// Small-M, operand-swapped instantiation. `small_m` above (`<64,128,128>`)
+// still wastes M at n_tokens=16 (16 real rows in a 64-wide tile is 25%
+// utilization on that axis) -- CUTLASS's own schedule-level floors already
+// rule out a narrower *non-swapped* tile here (see `small_m`'s own comment:
+// Cooperative requires Tile M >= 128, and a 32-wide epilogue tile failed to
+// compile under `EpilogueTileAuto`). vLLM does not solve this with a
+// narrower tile either -- it swaps which operand plays the GEMM's "A" role,
+// so the *weight*'s (thousands-wide) dimension becomes the tiled/parallel
+// axis and the real batch width becomes a narrow N=32 tile instead.
+// Verified against vLLM's own real, current GitHub source (not recalled from
+// training data): `csrc/libtorch_stable/quantization/w8a8/cutlass/c3x/
+// scaled_mm_blockwise_sm120_fp8_dispatch.cuh`, fetched via `gh api` against
+// `vllm-project/vllm`'s main branch 2026-09-08 --
+// `sm120_blockwise_fp8_config_swapab` (`TileShape<128,32,128>`,
+// `ScaleGranularity(128,1,128)`, `KernelTmaWarpSpecializedBlockwiseCooperativeSm120`),
+// selected by `cutlass_gemm_blockwise_sm120_fp8_dispatch`'s own
+// `bool swap_ab = (M <= 64);` -- the exact same block-scaled scheme this
+// file uses (`ScaleGranularityN=128`), not a different quantization family,
+// so this is a real apples-to-apples match, not a guess.
+//
+// `LayoutTranspose` (real, in this file's own vendored CUTLASS 4.8,
+// `cutlass/layout/matrix.h:1332`) is what lets the epilogue write into the
+// SAME `[m,n]` row-major `d` buffer every other entry point in this file
+// uses -- confirmed by reading `cutlass_gemm_caller_blockwise` in the same
+// vLLM source file: `a_stride`/`b_stride` are always computed from each
+// buffer's own real physical shape (`a` is always `[m,k]`, `b` is always
+// `[n,k]`) regardless of the swap; the swap only changes which buffer/stride
+// pair is handed to the mainloop's "A" vs "B" slot, and which of
+// `Sm120BlockwiseScaleConfig`'s `majorSFA`/`majorSFB` template args is `K`
+// vs `MN` (`cutlass/detail/blockwise_scale_layout.hpp:282`, confirmed to
+// take exactly these two `UMMA::Major` params by reading that header
+// directly, not assumed).
+namespace small_m_swap {
+constexpr int ScaleGranularityM = 128;
+constexpr int ScaleGranularityN = 1;
+// `Major::MN` for BOTH (the same defaults the file-level, non-swapped
+// `ScaleConfig` above uses), NOT vLLM's own `Major::K, Major::MN` --
+// verified by working out `tile_atom_to_shape_SFA`/`SFB`'s real physical
+// layout (`cutlass/detail/blockwise_scale_layout.hpp`) against what this
+// file's `sfa`/`sfb` buffers actually contain, not by assuming vLLM's choice
+// carries over. vLLM's `Major::K` reflects *vLLM's own* weight-scale buffer
+// convention (apparently stored token-block-fast already); this file's `sfb`
+// is deliberately pre-transposed at weight-load time to `[K/128,N/128]`
+// row-major (N-block fast -- see this file's own header comment), and
+// `Major::MN` is what makes `tile_atom_to_shape_SFA` (with the swapped
+// problem's "M" = the real weight-N axis) read that exact physical layout:
+// working through the stride formula, `Major::MN` gives offset =
+// m_block + k_block*ceil_div(M,128), i.e. m_block(=n_block) fast, matching
+// `sfb` exactly; `Major::K` would want k_block fast instead, the wrong way
+// around for this file's buffers. Found by getting this wrong first (a real
+// test failure, `the_f32out_gemm_matches_the_bf16_path`, not assumed
+// correct) and re-deriving from the physical layout math rather than
+// guessing again.
+using ScaleConfig = cutlass::detail::Sm120BlockwiseScaleConfig<ScaleGranularityM, ScaleGranularityN, ScaleGranularityK>;
+using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+
+using LayoutA_Transpose = typename cutlass::layout::LayoutTranspose<LayoutA>::type;
+using LayoutB_Transpose = typename cutlass::layout::LayoutTranspose<LayoutB>::type;
+
+using ElementC = float;
+using LayoutC = cutlass::layout::RowMajor;
+using LayoutC_Transpose = typename cutlass::layout::LayoutTranspose<LayoutC>::type;
+constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+using ElementD = ElementC;
+using LayoutD_Transpose = LayoutC_Transpose;
+using AlignmentD = std::integral_constant<int, AlignmentC>;
+
+using MmaTileShape = Shape<_128, _32, _128>;
+using SwapClusterShape = Shape<_1, _1, _1>;
+
+// The Collective builders' "A"/"B" here are the *kernel's own* operand
+// roles, already swapped: element/layout A is `ElementB`/`LayoutB_Transpose`
+// (the weight), element/layout B is `ElementA`/`LayoutA_Transpose` (the
+// activation) -- matching vLLM's `cutlass_3x_gemm_fp8_blockwise<..., true>`
+// with its `ElementA_=InType` (there, always the activation type, same
+// `float_e4m3_t` as the weight in this file so the element type itself does
+// not change) and its own conditional `LayoutA/LayoutB` swap.
+using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+    cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, MmaTileShape, SwapClusterShape,
+    cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementCompute, ElementC,
+    LayoutC_Transpose, AlignmentC, ElementD, LayoutC_Transpose, AlignmentD::value,
+    cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+
+using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+    cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, ElementB, cute::tuple<LayoutB_Transpose, LayoutSFA>,
+    AlignmentB, ElementA, cute::tuple<LayoutA_Transpose, LayoutSFB>, AlignmentA, ElementAccumulator, MmaTileShape,
+    SwapClusterShape,
+    cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+    cutlass::gemm::KernelTmaWarpSpecializedBlockwiseCooperativeSm120>::CollectiveOp;
+
+using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop,
+                                                         CollectiveEpilogue, void>;
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+using StrideA = typename Gemm::GemmKernel::StrideA;
+using StrideB = typename Gemm::GemmKernel::StrideB;
+using StrideD = typename Gemm::GemmKernel::StrideD;
+}  // namespace small_m_swap
+
+// Same external contract as `infero_cutlass_fp8_bw_gemm_f32out_small_m` --
+// `a`/`sfa` are still the activation, `b`/`sfb` still the weight, `m`/`n`/`k`
+// mean what they always do here, `d` is still `[m,n]` row-major. The swap is
+// entirely internal: `a_stride`/`b_stride` are computed from each buffer's
+// own real physical shape exactly as every other entry point in this file
+// computes them (not swapped), only *which* pointer/stride pair lands in the
+// mainloop's first vs. second operand slot is swapped, mirroring vLLM's own
+// `cutlass_gemm_caller_blockwise` (`w8a8/cutlass/c3x/
+// scaled_mm_blockwise_sm120_fp8_dispatch.cuh`) line for line.
+extern "C" size_t infero_cutlass_fp8_bw_gemm_f32out_small_m_swap_workspace(int m, int n, int k) {
+  // `a_stride`/`b_stride`: exactly like every other entry point in this
+  // file, computed from each buffer's own real physical shape (`a` is
+  // `[m,k]`, `b` is `[n,k]`) using the kernel's declared `StrideA`/`StrideB`
+  // types. The swap happens ONLY below, in which pointer+stride pair is
+  // handed to the mainloop's first ("A") vs second ("B") operand slot --
+  // mirroring vLLM's own `cutlass_gemm_caller_blockwise` field-for-field
+  // (`mainloop_args.dA = b_stride; mainloop_args.dB = a_stride;` in its own
+  // `swap_ab` branch): the mainloop's "A" slot pairs the weight *pointer*
+  // with the stride computed from `b`'s own shape, not `a`'s.
+  auto a_stride = cutlass::make_cute_packed_stride(small_m_swap::StrideA{}, cute::make_shape(m, k, 1));
+  auto b_stride = cutlass::make_cute_packed_stride(small_m_swap::StrideB{}, cute::make_shape(n, k, 1));
+  auto stride_D = cutlass::make_cute_packed_stride(small_m_swap::StrideD{}, cute::make_shape(n, m, 1));
+  auto layout_SFA = small_m_swap::ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(n, m, k, 1));
+  auto layout_SFB = small_m_swap::ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(n, m, k, 1));
+  typename small_m_swap::Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {n, m, k, 1},
+      {nullptr, b_stride, nullptr, a_stride, nullptr, layout_SFA, nullptr, layout_SFB},
+      {{}, nullptr, stride_D, nullptr, stride_D}};
+  return small_m_swap::Gemm::get_workspace_size(arguments);
+}
+
+extern "C" int32_t infero_cutlass_fp8_bw_gemm_f32out_small_m_swap(const void* a, const void* b, const float* sfa,
+                                                                    const float* sfb, float* d, void* workspace,
+                                                                    int m, int n, int k, int accum,
+                                                                    cudaStream_t stream) {
+  auto a_stride = cutlass::make_cute_packed_stride(small_m_swap::StrideA{}, cute::make_shape(m, k, 1));
+  auto b_stride = cutlass::make_cute_packed_stride(small_m_swap::StrideB{}, cute::make_shape(n, k, 1));
+  auto stride_D = cutlass::make_cute_packed_stride(small_m_swap::StrideD{}, cute::make_shape(n, m, 1));
+  auto layout_SFA = small_m_swap::ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(n, m, k, 1));
+  auto layout_SFB = small_m_swap::ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(n, m, k, 1));
+
+  // Swapped: the mainloop's first operand slot ("A") gets the weight
+  // pointer (`b`) paired with `b_stride` (computed from `b`'s own `[n,k]`
+  // shape), the second ("B") gets the activation pointer (`a`) paired with
+  // `a_stride` (from `a`'s own `[m,k]` shape) -- matching vLLM's own
+  // `mainloop_args.dA = b_stride; mainloop_args.dB = a_stride;` exactly.
+  // `ElementA` and `ElementB` are both `cutlass::float_e4m3_t` in this file,
+  // so there is no element-type mismatch to reconcile, only which
+  // buffer/stride pair lands in which slot.
+  typename small_m_swap::Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {n, m, k, 1},
+      {static_cast<const ElementB*>(b), b_stride, static_cast<const ElementA*>(a), a_stride, sfb, layout_SFA, sfa,
+       layout_SFB},
+      {{}, d, stride_D, d, stride_D}};
+  arguments.epilogue.thread.alpha = 1.0f;
+  arguments.epilogue.thread.beta = accum ? 1.0f : 0.0f;
+
+  small_m_swap::Gemm gemm;
+  auto status = gemm.can_implement(arguments);
+  if (status != cutlass::Status::kSuccess) return static_cast<int32_t>(status);
+  status = gemm.initialize(arguments, workspace, stream);
+  if (status != cutlass::Status::kSuccess) return static_cast<int32_t>(status);
+  status = gemm.run(arguments, workspace, stream);
+  return static_cast<int32_t>(status);
+}
+
 extern "C" size_t infero_cutlass_fp8_bw_gemm_f32out_small_m_workspace(int m, int n, int k) {
   auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
   auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
