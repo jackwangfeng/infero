@@ -912,7 +912,31 @@ impl Scheduler {
                 .filter(|(i, _)| pre_idxs.contains(i))
                 .map(|(_, r)| &mut r.sampler)
                 .collect();
-            let drafts = self.model.draft_with_head_sampled_batch(k, &items, &mut samplers)?;
+            // Device-resident draft loop (see docs/superpowers/specs/
+            // 2026-09-08-device-resident-draft-loop-design.md): k host
+            // round-trips a round down to 1, real-validated (full test
+            // suite, real determinism) -- but a real end-to-end A/B at
+            // both dual-stream and batch=16 found a real net LOSS at
+            // both (Gumbel-max's own real accept-rate cost, from
+            // dropping repetition-penalty/top-p, outweighed the
+            // host-sync savings at every shape actually measured). Off
+            // by default and not recommended; `INFERO_DRAFT_DEVICE_
+            // RESIDENT=1` exists to re-measure without a rebuild, not
+            // as a real alternative to reach for. Falls back to the
+            // host-sync path unchanged whenever it declines (a
+            // non-mmvq-compatible vocab head, or `d_model` not a
+            // multiple of 32) or the flag is unset.
+            static DEVICE_RESIDENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let device_resident = *DEVICE_RESIDENT
+                .get_or_init(|| std::env::var_os("INFERO_DRAFT_DEVICE_RESIDENT").is_some());
+            let drafts = if device_resident {
+                match self.model.draft_with_head_device_batch(k, &items, &mut samplers)? {
+                    Some(d) => d,
+                    None => self.model.draft_with_head_sampled_batch(k, &items, &mut samplers)?,
+                }
+            } else {
+                self.model.draft_with_head_sampled_batch(k, &items, &mut samplers)?
+            };
             drop(items);
             drop(samplers);
             for (p, draft) in pre.into_iter().zip(drafts) {
