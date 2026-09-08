@@ -72,6 +72,14 @@ enum Storage {
     /// In the owning layer's host blob, at this byte offset. The same offset
     /// addresses it inside the staging buffer once the layer is transferred.
     Streamed { offset: usize },
+    /// VRAM was released after this matrix's bytes were folded into a fused
+    /// sibling (e.g. `gate`/`up` into `w_gate_up` under `INFERO_FUSE_FFN`) --
+    /// the forward pass never reads a matrix that has one, only the fused
+    /// copy, so keeping this one resident too would be pure waste. The
+    /// struct itself (`k`/`n`/`ty`/`n_bytes`) stays valid for whatever still
+    /// reads its shape; only [`Matrix::view`] on this variant is a caller
+    /// bug, and fails loudly rather than dereferencing freed memory.
+    Freed,
 }
 
 /// Holds a lazily-built [`infero_kernels::CutlassWeight`] for a resident
@@ -153,7 +161,25 @@ impl Matrix {
                 );
                 Ok(stage.slice(*offset..offset + self.n_bytes))
             }
+            Storage::Freed => anyhow::bail!(
+                "a {}x{} matrix's VRAM was freed after being folded into a fused copy \
+                 (see `Storage::Freed`'s own doc comment) -- reading it directly is a caller \
+                 bug, not a runtime condition to recover from",
+                self.n,
+                self.k
+            ),
         }
+    }
+
+    /// Drops this matrix's own VRAM and replaces it with [`Storage::Freed`],
+    /// keeping `k`/`n`/`ty`/`n_bytes` valid. Only for a matrix whose bytes
+    /// were just folded into a fused sibling (`dense_ffn`'s `w_gate`/`w_up`
+    /// once `w_gate_up` exists) -- calling this on one still read elsewhere
+    /// turns every future read into the loud error `view` raises for
+    /// `Storage::Freed`, not silent corruption, but it is still a caller
+    /// bug to avoid, not a safety net to lean on.
+    fn free_after_fusion(&mut self) {
+        self.storage = Storage::Freed;
     }
 }
 
@@ -221,6 +247,10 @@ impl Experts {
                 );
                 Ok(stage.slice(*offset..end))
             }
+            // `Storage::Freed` only ever comes from `Matrix::free_after_fusion`
+            // (`dense_ffn`'s own `w_gate`/`w_up` handling); no expert block is
+            // ever freed this way today, but the match has to be exhaustive.
+            Storage::Freed => anyhow::bail!("an expert block's VRAM was freed -- this should never happen"),
         }
     }
 
@@ -2455,9 +2485,9 @@ pub fn load_awq(
     tracing::info!(prefix = layer_prefix, "decoder layers");
 
     let dense_ffn = |p: &str, total: &mut usize| -> Result<DenseFfn> {
-        let (w_gate, gate_bytes, gate_ty, gate_k, gate_n) =
+        let (mut w_gate, gate_bytes, gate_ty, gate_k, gate_n) =
             projection_with_bytes(&format!("{p}.mlp.gate_proj"), total)?;
-        let (w_up, up_bytes, up_ty, up_k, up_n) =
+        let (mut w_up, up_bytes, up_ty, up_k, up_n) =
             projection_with_bytes(&format!("{p}.mlp.up_proj"), total)?;
         let __t_stack = std::time::Instant::now();
         let a = (gate_bytes.as_slice(), gate_ty, gate_k, gate_n);
@@ -2469,6 +2499,23 @@ pub fn load_awq(
             Some(m) => Some(m),
             None => stacked_fp8_2(a, b, total)?,
         };
+        // The forward pass (`Model::feed_forward`) never reads `w_gate`/
+        // `w_up` individually once `w_gate_up` exists (its dispatch takes
+        // the fused branch first and never falls through to the ones that
+        // do) -- so once fusion succeeds, the two individual VRAM copies are
+        // pure waste: gate+up's own bytes counted three times over instead
+        // of once. This is *why* production had `INFERO_FUSE_FFN=0` (see
+        // project memory): the auto-decision's cost estimate never priced
+        // this real 2x-over-count for FP8 checkpoints, so it always said
+        // "yes" even when the box could not actually afford three copies.
+        // Freeing the redundant two here is what makes fusion net *neutral*
+        // on VRAM (one fused copy replaces two originals) instead of net
+        // *worse* (three copies for the price of one).
+        if w_gate_up.is_some() {
+            *total = total.saturating_sub(w_gate.n_bytes).saturating_sub(w_up.n_bytes);
+            w_gate.free_after_fusion();
+            w_up.free_after_fusion();
+        }
         STACK_NS.fetch_add(__t_stack.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let w_down = projection(&format!("{p}.mlp.down_proj"), total)?;
         Ok(DenseFfn { w_gate, w_up, w_gate_up, w_down })
