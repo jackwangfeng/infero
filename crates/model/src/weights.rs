@@ -500,6 +500,19 @@ pub struct Weights {
     /// separate change from proving the split one is faster. 532 MiB on an 8B
     /// model, so it is gated on there being room.
     pub output_split: Option<Matrix>,
+    /// The same matrix, quantized to [`WeightType::Q4G128`] instead of
+    /// `output`'s own `Q8_0` -- for the MTP draft loop's own vocab
+    /// projection specifically, not the text model's real forward pass or
+    /// verification (both keep reading `output`/`output_split` at full 8-bit
+    /// precision; only draft sampling's own acceptance rate is at stake here,
+    /// exactly like drafting at a lower temperature-scaled distribution
+    /// already is). Real motivation: `mmvq_batch`'s own vocab-projection
+    /// read is a confirmed, bandwidth-bound ~1.8ms of the draft loop's own
+    /// ~4.5ms round cost (see `project_infero_perf_gap.md`'s 2026-09-08
+    /// entries) -- halving those bytes halves that specific cost. Only the
+    /// AWQ loader builds it, same reasoning as `output_split`; `None` means
+    /// the draft path falls back to `output`/`output_split` unchanged.
+    pub output_draft_q4: Option<Matrix>,
     /// Per-dimension RoPE frequency divisors, `d_head / 2` of them. All ones
     /// unless the file carries `rope_freqs.weight`.
     pub rope_freqs: Vector,
@@ -1118,6 +1131,9 @@ impl Weights {
             // A GGUF file's vocab projection comes in whatever the file chose;
             // the split layout is only for the one infero quantizes itself.
             output_split: None,
+            // Same reasoning: only the AWQ loader builds a draft-only Q4G128
+            // copy of the vocab head.
+            output_draft_q4: None,
             rope_freqs,
             mrope_axis,
             device_bytes,
@@ -2386,6 +2402,32 @@ pub fn load_awq(
         }
         _ => None,
     };
+    // A second, more aggressively quantized copy of the same matrix for the
+    // MTP draft loop's own vocab projection only -- see `output_draft_q4`'s
+    // own doc comment. Same gate as `output_split` (only when the real copy
+    // is Q8_0, i.e. not tied embeddings and not kept at F16 by
+    // `INFERO_LM_HEAD=f16`): drafting is not meaningful without a head to
+    // draft with, and there is nothing here to quantize differently from
+    // `token_embd` when the projection just reuses it.
+    //
+    // `INFERO_DRAFT_VOCAB_Q4=0` skips this (the draft path falls back to the
+    // existing `output`/`output_split`, unchanged) -- the A/B this exists to
+    // let someone run without a rebuild.
+    let output_draft_q4 = if std::env::var_os("INFERO_DRAFT_VOCAB_Q4").as_deref() == Some(std::ffi::OsStr::new("0")) {
+        None
+    } else {
+        match &output {
+            Some(o) if o.ty == WeightType::Q8_0 => {
+                let h = w.tensor("lm_head.weight")?;
+                let (n, k) = (h.shape[0], h.shape[1]);
+                let q = infero_kernels::awq::quantize_f16_to_q4g128(h.to_f16()?.as_ref(), k)
+                    .context("quantizing lm_head, draft-only Q4G128")?;
+                tracing::info!(mib = q.len() >> 20, "draft-only vocab projection quantized to Q4G128");
+                Some(upload(&q, WeightType::Q4G128, k, n, &mut device_bytes)?)
+            }
+            _ => None,
+        }
+    };
     device_bytes += freq_factors.len() * 4;
     let rope_freqs = dev.stream().clone_htod(freq_factors)?;
     let mrope_axis = dev
@@ -2795,6 +2837,7 @@ pub fn load_awq(
         output_norm,
         output,
         output_split,
+        output_draft_q4,
         rope_freqs,
         mrope_axis,
         device_bytes,

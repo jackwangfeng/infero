@@ -2368,7 +2368,19 @@ impl crate::Model {
             head.truncate(0, positions[0]);
             let root_row =
                 head.prime(&self.kern, &self.w.token_embd, shifted_ids, positions, &hidden, feed.mrope.as_deref(), 0)?;
-            let lm = self.w.output.as_ref().unwrap_or(&self.w.token_embd);
+            // The draft-only, more aggressively quantized Q4G128 copy when
+            // one was built (`output_draft_q4`'s own doc comment) -- falls
+            // back to the real `output`/`token_embd` unchanged when there
+            // isn't one (a GGUF checkpoint, tied embeddings, or
+            // `INFERO_DRAFT_VOCAB_Q4=0`). Verification never reads this: it
+            // stays on `Model::matmul_pre`'s own dispatch over `output`, at
+            // full precision.
+            let lm = self
+                .w
+                .output_draft_q4
+                .as_ref()
+                .or(self.w.output.as_ref())
+                .unwrap_or(&self.w.token_embd);
             let base = positions[rows - 1] + 1;
             // Every lane shares the prefix and owns `depth` slots past it, which
             // is as far as any branch reaches.
@@ -2542,7 +2554,19 @@ impl crate::Model {
                 feed.mrope.as_deref(),
                 branch,
             )?;
-            let lm = self.w.output.as_ref().unwrap_or(&self.w.token_embd);
+            // The draft-only, more aggressively quantized Q4G128 copy when
+            // one was built (`output_draft_q4`'s own doc comment) -- falls
+            // back to the real `output`/`token_embd` unchanged when there
+            // isn't one (a GGUF checkpoint, tied embeddings, or
+            // `INFERO_DRAFT_VOCAB_Q4=0`). Verification never reads this: it
+            // stays on `Model::matmul_pre`'s own dispatch over `output`, at
+            // full precision.
+            let lm = self
+                .w
+                .output_draft_q4
+                .as_ref()
+                .or(self.w.output.as_ref())
+                .unwrap_or(&self.w.token_embd);
             let mut drafted = Vec::with_capacity(k);
             // The window the repetition penalty reads, extended per draft.
             let mut window: Vec<u32> = history.to_vec();
@@ -2648,7 +2672,19 @@ impl crate::Model {
                 .collect();
             let mut cur_row = head.prime_batch(&self.kern, &self.w.token_embd, &prime_items)?;
 
-            let lm = self.w.output.as_ref().unwrap_or(&self.w.token_embd);
+            // The draft-only, more aggressively quantized Q4G128 copy when
+            // one was built (`output_draft_q4`'s own doc comment) -- falls
+            // back to the real `output`/`token_embd` unchanged when there
+            // isn't one (a GGUF checkpoint, tied embeddings, or
+            // `INFERO_DRAFT_VOCAB_Q4=0`). Verification never reads this: it
+            // stays on `Model::matmul_pre`'s own dispatch over `output`, at
+            // full precision.
+            let lm = self
+                .w
+                .output_draft_q4
+                .as_ref()
+                .or(self.w.output.as_ref())
+                .unwrap_or(&self.w.token_embd);
             let mut drafted: Vec<Vec<Drafted>> = (0..n).map(|_| Vec::with_capacity(k)).collect();
             let mut windows: Vec<Vec<u32>> = items.iter().map(|it| it.history.to_vec()).collect();
             let mut positions: Vec<usize> =
@@ -2756,7 +2792,19 @@ impl crate::Model {
             head.truncate(0, positions[0]);
             let mut row =
                 head.prime(&self.kern, &self.w.token_embd, shifted_ids, positions, &hidden, feed.mrope.as_deref(), 0)?;
-            let lm = self.w.output.as_ref().unwrap_or(&self.w.token_embd);
+            // The draft-only, more aggressively quantized Q4G128 copy when
+            // one was built (`output_draft_q4`'s own doc comment) -- falls
+            // back to the real `output`/`token_embd` unchanged when there
+            // isn't one (a GGUF checkpoint, tied embeddings, or
+            // `INFERO_DRAFT_VOCAB_Q4=0`). Verification never reads this: it
+            // stays on `Model::matmul_pre`'s own dispatch over `output`, at
+            // full precision.
+            let lm = self
+                .w
+                .output_draft_q4
+                .as_ref()
+                .or(self.w.output.as_ref())
+                .unwrap_or(&self.w.token_embd);
             let mut drafted = Vec::with_capacity(k);
             let mut position = positions[rows - 1];
             let mut token = head.draft_row(&self.kern, lm, row)?;

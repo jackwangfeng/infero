@@ -138,6 +138,7 @@ fn synthetic_model(dev: &Device, cfg: &Config, rng: &Rng) -> Result<Model> {
         output_norm: vec_at(d, 1.0, 0.1)?,
         output: Some(m(d, vocab, 0.5)?),
         output_split: None,
+        output_draft_q4: None,
         rope_freqs: dev.stream().clone_htod(&vec![1.0f32; cfg.rotary_dim / 2])?,
         mrope_axis: dev.stream().clone_htod(&mrope_axis)?,
         device_bytes: 0,
