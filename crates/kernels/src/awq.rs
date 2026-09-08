@@ -411,3 +411,82 @@ pub fn quantize_f16_to_q8_0(src: &[half::f16], k: usize) -> Result<Vec<u8>> {
     });
     Ok(out)
 }
+
+/// Quantize a plain F16 tensor straight into [`WeightType::Q4G128`]'s own
+/// byte layout — a from-scratch encode, not a repack of an already-quantized
+/// AWQ tensor the way [`AwqTensor::repack`] is. Byte-for-byte the same target
+/// format `AwqTensor::fill_rows` produces and `unpack_row` reads: per
+/// `GROUP`-weight (128) block, an `f16` scale then an `f16` "stored offset",
+/// then 64 bytes of nibble-packed 4-bit codes (`byte[i]` holds weight `i`'s
+/// code in its low nibble and weight `i + 64`'s in its high one).
+///
+/// Per-block affine (asymmetric) quantization, not `quantize_f16_to_q8_0`'s
+/// own symmetric absmax scheme: `AwqTensor`'s own repacked format already
+/// carries a zero point (`{scale, scale * zero}`), and a from-scratch encode
+/// fits real weight distributions (rarely centered on zero) better by using
+/// it than by giving up a bit of the 4-bit range to a symmetric scheme that
+/// does not need one. Unlike AWQ's own `zero` (a real 4-bit code, because it
+/// came from an existing quantized checkpoint), nothing here requires the
+/// zero point to be an integer — only that `code * scale - stored` decodes
+/// back to something close to the original weight, which holds for any real
+/// number substituted in place of a rounded code. So the group's own minimum
+/// is stored directly as `stored = -min`, with no intermediate rounding step
+/// AWQ's own scheme needed for a different reason (its zero point had to
+/// survive a 4-bit round trip through an *existing* file format; this one
+/// does not exist until this function writes it).
+pub fn quantize_f16_to_q4g128(src: &[half::f16], k: usize) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        k.is_multiple_of(GROUP),
+        "row length {k} is not a multiple of the {GROUP}-weight group"
+    );
+    anyhow::ensure!(
+        src.len().is_multiple_of(k),
+        "{} values do not divide into rows of {k}",
+        src.len()
+    );
+    let rows = src.len() / k;
+    let blocks_per_row = k / GROUP;
+    let row_bytes = blocks_per_row * BLOCK_BYTES;
+    let mut out = vec![0u8; rows * row_bytes];
+
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(rows.max(1));
+    let per = rows.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (t, chunk) in out.chunks_mut(per * row_bytes).enumerate() {
+            let src = &src[t * per * k..];
+            scope.spawn(move || {
+                for r in 0..(chunk.len() / row_bytes) {
+                    let row = &src[r * k..(r + 1) * k];
+                    for b in 0..blocks_per_row {
+                        let g = &row[b * GROUP..(b + 1) * GROUP];
+                        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+                        for v in g {
+                            let x = f32::from(*v);
+                            lo = lo.min(x);
+                            hi = hi.max(x);
+                        }
+                        // A flat block (every weight identical, `hi == lo`)
+                        // has no range to code: scale 0, every code stays 0,
+                        // and the stored offset alone reproduces the value.
+                        let scale = if hi > lo { (hi - lo) / 15.0 } else { 0.0 };
+                        let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+                        let off = r * row_bytes + b * BLOCK_BYTES;
+                        let dst = &mut chunk[off..off + BLOCK_BYTES];
+                        dst[..2].copy_from_slice(&half::f16::from_f32(scale).to_le_bytes());
+                        dst[2..4].copy_from_slice(&half::f16::from_f32(-lo).to_le_bytes());
+                        for i in 0..64 {
+                            let lo_code =
+                                ((f32::from(g[i]) - lo) * inv).round().clamp(0.0, 15.0) as u8;
+                            let hi_code =
+                                ((f32::from(g[i + 64]) - lo) * inv).round().clamp(0.0, 15.0) as u8;
+                            dst[4 + i] = lo_code | (hi_code << 4);
+                        }
+                    }
+                }
+            });
+        }
+    });
+    Ok(out)
+}
