@@ -3870,6 +3870,18 @@ impl Model {
             d,
             rms_eps,
         )?;
+        // `INFERO_PROBE=<n_layers>` (one past the last real decoder layer,
+        // never used by any per-layer probe call above -- collision-free by
+        // construction) captures EXACTLY the real activation vector the
+        // lm_head dispatch chain below reads (`self.act.xb`, the same slice
+        // every branch of that chain consumes), for a real, independent
+        // ground-truth cross-check: `INFERO_PROBE_DUMP=<dir>` writes it to
+        // `<dir>/eng.lmhead_input.f32`, so it can be fed into a from-scratch
+        // (non-infero) NumPy matmul against an independently-decoded real
+        // lm_head weight, bypassing infero's own CUTLASS GEMM/activation
+        // quantizer entirely. Added for the NVFP4 garbage-output
+        // investigation; see task8-lmhead-rootcause-report.md's addendum.
+        probe(&self.kern, n_layers, "lmhead_input", &self.act.xb.slice(..n_logit_rows * d));
         // The batched path prefers the split layout when the loader built one:
         // same values, same order, but a row's quants are contiguous so the tile
         // loader reads sixteen bytes at a time instead of two. See
