@@ -6339,6 +6339,21 @@ impl Model {
             )?;
         }
 
+        // `INFERO_PROBE=<layer>` captures EXACTLY the real activation `wo`
+        // (o_proj, an F8E4M3 target under this checkpoint's broadcast-scale
+        // loader fix) reads next, on BOTH branches below (the fused
+        // `mmvq_add` residual path and the generic `matmul_pre` one) --
+        // placed after the optional output-gate above (the real input those
+        // branches read is the gated value, not the raw one) and before
+        // either branch's own quantize/matmul call. Same convention as every
+        // other `probe()` call here: only the ONE layer `INFERO_PROBE`
+        // selects actually writes, to `<dir>/eng.o_proj_in.f32` (pick the
+        // layer via `INFERO_PROBE=<layer>`) -- for an independent, non-infero
+        // ground-truth cross-check against the real checkpoint's `wo` weight
+        // bytes, the same technique used for lm_head. See
+        // task8-lmhead-rootcause-report.md's addendum for the full design.
+        probe(&self.kern, layer, "o_proj_in", &self.act.attn.slice(..n * da));
+
         // Straight into the residual stream: this projection's result is only
         // ever added to it, and the mat-vec can do that itself.
         //
