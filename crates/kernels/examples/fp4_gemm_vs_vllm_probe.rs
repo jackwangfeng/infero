@@ -70,14 +70,34 @@ fn main() -> Result<()> {
     let xs_len = M * blocks;
     let mut d_xq = stream.alloc_zeros::<u8>(xq_len)?;
     let mut d_xs = stream.alloc_zeros::<u8>(xs_len)?;
-    k.quantize_act_e2m1_cutlass(
-        &mut d_xq.as_view_mut(),
-        &mut d_xs.as_view_mut(),
-        &d_x.as_view(),
-        1.0 / input_scale,
-        K,
-        M,
-    )?;
+    for _ in 0..3 {
+        k.quantize_act_e2m1_cutlass(
+            &mut d_xq.as_view_mut(),
+            &mut d_xs.as_view_mut(),
+            &d_x.as_view(),
+            1.0 / input_scale,
+            K,
+            M,
+        )?;
+    }
+    k.device().synchronize()?;
+    let qreps = 20;
+    let qt0 = std::time::Instant::now();
+    for _ in 0..qreps {
+        k.quantize_act_e2m1_cutlass(
+            &mut d_xq.as_view_mut(),
+            &mut d_xs.as_view_mut(),
+            &d_x.as_view(),
+            1.0 / input_scale,
+            K,
+            M,
+        )?;
+    }
+    k.device().synchronize()?;
+    println!(
+        "quantize_act_e2m1_cutlass M={M} K={K}: {:.4} ms/call ({qreps} reps, clean host timing)",
+        qt0.elapsed().as_secs_f64() * 1000.0 / qreps as f64
+    );
 
     let mut d_out = stream.alloc_zeros::<f32>(M * N)?;
 
