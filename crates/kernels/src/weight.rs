@@ -66,7 +66,7 @@ pub enum WeightType {
 }
 
 impl WeightType {
-    pub const ALL: [WeightType; 13] = [
+    pub const ALL: [WeightType; 12] = [
         WeightType::F32,
         WeightType::F16,
         WeightType::Q4_0,
@@ -79,7 +79,6 @@ impl WeightType {
         WeightType::Q4G128,
         WeightType::Q4G128T,
         WeightType::Q8_0S,
-        WeightType::F4E2M1,
     ];
 
     pub fn from_ggml(t: GgmlType) -> Result<Self> {
