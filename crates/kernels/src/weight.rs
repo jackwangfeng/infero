@@ -45,10 +45,28 @@ pub enum WeightType {
     /// grid is why `n_bytes` must come from the buffer rather than from
     /// `k * n / block_size * type_size`.
     F8E4M3,
+    /// NVFP4 (e2m1, 2-exponent/1-mantissa 4-bit float) with a two-level block
+    /// scale, the encoding NVIDIA ModelOpt ships (verified against
+    /// RadixArk/Qwen3.8-27B-NVFP4's real safetensors header, 2026-09-10).
+    ///
+    /// Laid out as `n * k / 2` packed quant bytes (two e2m1 values per byte --
+    /// verify the real nibble packing order against a real ModelOpt/CUTLASS
+    /// reference before assuming low-then-high; Task 2's host reference is
+    /// where this gets pinned down for real, not here), followed by the
+    /// block-scale grid as f8_e4m3, `n * k.div_ceil(16)` entries row-major
+    /// (one scale per 16-element run along k -- UNLIKE F8E4M3's 128x128 grid),
+    /// followed by two f32 scalars: the per-tensor weight correction
+    /// (`weight_scale_2`) and the per-tensor activation quantization scale
+    /// (`input_scale`). `block_size` is 16 (the k-direction scale
+    /// granularity); `n_bytes` must come from the buffer, not computed from
+    /// `k * n / block_size * type_size`, for the same reason `F8E4M3`'s own
+    /// doc comment already gives -- the trailing scalars aren't part of that
+    /// formula.
+    F4E2M1,
 }
 
 impl WeightType {
-    pub const ALL: [WeightType; 12] = [
+    pub const ALL: [WeightType; 13] = [
         WeightType::F32,
         WeightType::F16,
         WeightType::Q4_0,
@@ -61,6 +79,7 @@ impl WeightType {
         WeightType::Q4G128,
         WeightType::Q4G128T,
         WeightType::Q8_0S,
+        WeightType::F4E2M1,
     ];
 
     pub fn from_ggml(t: GgmlType) -> Result<Self> {
@@ -87,6 +106,7 @@ impl WeightType {
             WeightType::F32 => "f32",
             WeightType::F16 => "f16",
             WeightType::F8E4M3 => "f8_block",
+            WeightType::F4E2M1 => "f4e2m1",
             WeightType::Q4_0 => "q4_0",
             WeightType::Q4_1 => "q4_1",
             WeightType::Q5_0 => "q5_0",
@@ -103,6 +123,7 @@ impl WeightType {
     pub const fn block_size(self) -> usize {
         match self {
             WeightType::F32 | WeightType::F16 | WeightType::F8E4M3 => 1,
+            WeightType::F4E2M1 => 16,
             WeightType::Q4_0
             | WeightType::Q4_1
             | WeightType::Q5_0
@@ -119,6 +140,7 @@ impl WeightType {
             WeightType::F32 => 4,
             WeightType::F16 => 2,
             WeightType::F8E4M3 => 1,
+            WeightType::F4E2M1 => 8,
             WeightType::Q4_0 => 18,
             WeightType::Q4_1 => 20,
             WeightType::Q5_0 => 22,
@@ -170,6 +192,7 @@ impl std::fmt::Display for WeightType {
             WeightType::F32 => "F32",
             WeightType::F16 => "F16",
             WeightType::F8E4M3 => "F8_E4M3",
+            WeightType::F4E2M1 => "F4_E2M1",
             WeightType::Q4_0 => "Q4_0",
             WeightType::Q4_1 => "Q4_1",
             WeightType::Q5_0 => "Q5_0",
@@ -228,6 +251,16 @@ mod tests {
                 );
                 continue;
             }
+            // F4E2M1 has no ggml counterpart, and — unlike every other type here —
+            // its `type_size` deliberately does not describe the whole layout: a
+            // matrix carries a trailing scale grid whose size depends on both
+            // dimensions, plus two trailing f32 scalars, so `k * n * type_size`
+            // undercounts it. Skip the usual comparison, like F8E4M3.
+            if w == WeightType::F4E2M1 {
+                assert_eq!(w.block_size(), 16, "block size is 16 for k-direction scale");
+                assert_eq!(w.type_size(), 8);
+                continue;
+            }
             let g = match w {
                 WeightType::F32 => GgmlType::F32,
                 WeightType::F16 => GgmlType::F16,
@@ -241,7 +274,8 @@ mod tests {
                 WeightType::Q4G128
                 | WeightType::Q4G128T
                 | WeightType::Q8_0S
-                | WeightType::F8E4M3 => unreachable!("handled above"),
+                | WeightType::F8E4M3
+                | WeightType::F4E2M1 => unreachable!("handled above"),
             };
             assert_eq!(w.block_size(), g.block_size(), "{w}");
             assert_eq!(w.type_size(), g.type_size(), "{w}");
