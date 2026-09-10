@@ -44,6 +44,31 @@ __device__ __forceinline__ float e4m3_to_f32(unsigned int b) {
     return __int_as_float(sign | ((unsigned int)(exp + 120) << 23) | (man << 20));
 }
 
+// The inverse conversion, f32 -> f8_e4m3, via the paired hardware converter
+// (one scalar through it, both lanes fed the same value: `cvt.rn.satfinite.
+// e4m3x2.f32` takes two `f32`s and packs two e4m3 results into one 16-bit
+// register; feeding it the same float twice makes both output bytes
+// identical, which sidesteps needing to know which one the instruction calls
+// "low" -- either is the answer, and duplicating the work is cheaper than a
+// shuffle to pair two different lanes' values for a quantizer this far from
+// the kernel's own bottleneck). Needs sm_89+ (Ada/Hopper/Blackwell); returns
+// 0 on older architectures where the instruction doesn't exist. Shared here
+// (moved from `fp8.cu`, which originally hand-rolled its own copy) so
+// `fp4.cu`'s own activation quantizer can reuse it rather than duplicate it
+// a second time.
+__device__ __forceinline__ unsigned char f32_to_e4m3(float f) {
+#if __CUDA_ARCH__ >= 890
+    unsigned short packed;
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;"
+        : "=h"(packed)
+        : "f"(f), "f"(f));
+    return (unsigned char)(packed & 0xFFu);
+#else
+    (void)f;
+    return 0;
+#endif
+}
+
 __device__ __forceinline__ float warp_reduce_sum(float v) {
 #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {

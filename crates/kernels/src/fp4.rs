@@ -24,6 +24,10 @@ use crate::{Kernels, fp4_src};
 /// Threads a block for [`Kernels::dequant_f4e2m1`]'s k-dimension tiling.
 const FP4_DEQUANT_BLOCK: u32 = 256;
 
+/// Threads a block for [`Kernels::quantize_act_e2m1_cutlass`]'s
+/// block-of-16 tiling (one thread per 16-element block, not per element).
+const FP4_QUANT_BLOCK: u32 = 256;
+
 /// Number of e2m1 elements covered by one block scale, per NVFP4's two-level
 /// (per-16-block f8_e4m3 scale, then a per-tensor f32 `weight_scale_2`) scheme.
 pub const F4E2M1_BLOCK: usize = 16;
@@ -100,6 +104,131 @@ pub fn dequant_f4e2m1_row(packed: &[u8], scale: &[f32], scale2: f32, k: usize) -
     out
 }
 
+/// Host-side round-to-nearest f32 -> f8_e4m3 encoder, for test/reference use
+/// only (the real device path is `f32_to_e4m3` in `common.cuh`'s hardware
+/// `cvt.rn.satfinite.e4m3x2.f32` instruction, sm_89+ only).
+///
+/// Brute-forces every non-NaN byte through the already-verified decode
+/// oracle (`infero_safetensors::e4m3_value`, cross-checked in Task 1/2's own
+/// work) and keeps whichever decodes closest to `f`, rather than hand-rolling
+/// encode bit arithmetic a second time. This also reproduces the hardware
+/// instruction's `satfinite` saturation for free: any `f` outside e4m3's
+/// range is simply closest to one of the two extreme finite codes (+-448).
+///
+/// Exists because this crate's own dev sandbox GPU (an RTX A4000, sm_86)
+/// cannot run the real hardware conversion at all -- `Device::caps().fp8`
+/// is `false` below sm_89 (`crates/cuda/src/backend.rs`), the same gate
+/// `quantize_act_e4m3_f32`'s own tests already skip under
+/// (`tests/quantize_act_e4m3.rs`) -- so [`quantize_act_e2m1_row`] below
+/// needs a portable stand-in to be checkable with real numbers on hardware
+/// that can't run [`Kernels::quantize_act_e2m1_cutlass`]'s actual kernel.
+fn f32_to_e4m3_host(f: f32) -> u8 {
+    let mut best_byte = 0u8;
+    let mut best_diff = f32::INFINITY;
+    for b in 0u16..256 {
+        if b == 0x7F || b == 0xFF {
+            continue; // the two NaN patterns
+        }
+        let v = infero_safetensors::e4m3_value(b as u8);
+        let d = (f - v).abs();
+        if d < best_diff {
+            best_diff = d;
+            best_byte = b as u8;
+        }
+    }
+    best_byte
+}
+
+/// Host-side reference for the real NVFP4 activation quantizer -- the
+/// inverse direction of [`dequant_f4e2m1_row`]. Given one row of `k` f32
+/// activations and the checkpoint's static per-tensor `global_scale`,
+/// produces packed e2m1 bytes and per-16-block f8_e4m3 scale bytes, per
+/// vLLM's own real reference quantizer (`cast_to_fp4` / `ref_nvfp4_quant`,
+/// real installed vLLM 0.27.1 source, `vllm/model_executor/layers/
+/// quantization/utils/nvfp4_emulation_utils.py`) -- NOT a plain "divide by
+/// the checkpoint's static scale": a real per-16-block dynamic scale is
+/// computed from the data itself, using `global_scale` only as an input to
+/// that computation, mirroring [`Kernels::quantize_act_e2m1_cutlass`]'s
+/// device kernel (`cu/fp4.cu`'s `quantize_act_e2m1_f32`) step for step, with
+/// [`f32_to_e4m3_host`] standing in for that kernel's hardware
+/// `f32_to_e4m3` call, since this crate's own dev sandbox cannot run it
+/// (see that function's own doc comment).
+///
+/// Per block: `vec_max` = max(|x_i|) over the block; `scale_f32 =
+/// clamp(global_scale * vec_max / 6.0, -448, 448)`, quantized to f8_e4m3
+/// (the LOSSY requantized value is what both the returned scale byte and
+/// the following `output_scale` computation use); `output_scale = 0` if
+/// that requantized scale is `0`, else `global_scale / scale_q`. Each
+/// element is then `scaled = x_i * output_scale`, clamped to `[-6, 6]`, and
+/// rounded to the e2m1 ladder via `cast_to_fp4`'s own asymmetric `<=`/`<`
+/// threshold table (copied verbatim, not renormalized).
+///
+/// Returns `(packed, scale_bytes)`: `packed` has `k.div_ceil(2)` bytes (the
+/// same low-nibble-is-even-index convention [`dequant_f4e2m1_row`] expects),
+/// `scale_bytes` has `k.div_ceil(F4E2M1_BLOCK)` raw f8_e4m3 bytes.
+pub fn quantize_act_e2m1_row(x: &[f32], global_scale: f32, k: usize) -> (Vec<u8>, Vec<u8>) {
+    let blocks = k.div_ceil(F4E2M1_BLOCK);
+    let mut packed = vec![0u8; k.div_ceil(2)];
+    let mut scale_bytes = vec![0u8; blocks];
+
+    for block in 0..blocks {
+        let base = block * F4E2M1_BLOCK;
+        let n_in_block = F4E2M1_BLOCK.min(k - base);
+
+        let vec_max = x[base..base + n_in_block]
+            .iter()
+            .fold(0.0f32, |m, &v| m.max(v.abs()));
+
+        let scale_f32 = (global_scale * vec_max / 6.0).clamp(-448.0, 448.0);
+        let scale_byte = f32_to_e4m3_host(scale_f32);
+        scale_bytes[block] = scale_byte;
+        let scale_q = infero_safetensors::e4m3_value(scale_byte);
+
+        let output_scale = if scale_q == 0.0 {
+            0.0
+        } else {
+            global_scale / scale_q
+        };
+
+        for i in 0..n_in_block {
+            let idx = base + i;
+            let scaled = x[idx] * output_scale;
+            let clipped = scaled.clamp(-6.0, 6.0);
+            let mag = clipped.abs();
+
+            // `cast_to_fp4`'s own asymmetric threshold table, copied
+            // verbatim -- see this function's own doc comment.
+            let mag_code: u8 = if mag <= 0.25 {
+                0
+            } else if mag < 0.75 {
+                1
+            } else if mag <= 1.25 {
+                2
+            } else if mag < 1.75 {
+                3
+            } else if mag <= 2.5 {
+                4
+            } else if mag < 3.5 {
+                5
+            } else if mag <= 5.0 {
+                6
+            } else {
+                7
+            };
+            let sign_bit: u8 = if clipped < 0.0 { 0x08 } else { 0x00 };
+            let code = mag_code | sign_bit;
+
+            let byte_idx = idx / 2;
+            if idx % 2 == 0 {
+                packed[byte_idx] = (packed[byte_idx] & 0xF0) | code;
+            } else {
+                packed[byte_idx] = (packed[byte_idx] & 0x0F) | (code << 4);
+            }
+        }
+    }
+    (packed, scale_bytes)
+}
+
 impl Kernels {
     /// Dequantizes an `n x k` NVFP4 (e2m1) matrix on-device, into `out`
     /// (`n * k` f32 elements, row-major -- matching [`dequant_f4e2m1_row`]'s
@@ -153,6 +282,81 @@ impl Kernels {
             .profile()
             .time("dequant_f4e2m1", self.dev.stream(), || {
                 unsafe { b.launch(cfg) }.context("dequant_f4e2m1")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// Quantizes an `n_tokens x k` f32 activation matrix to packed NVFP4
+    /// (e2m1) bytes plus a real per-16-block dynamic f8_e4m3 scale, per
+    /// vLLM's own NVFP4 reference quantizer (`cast_to_fp4` /
+    /// `ref_nvfp4_quant`, real installed vLLM 0.27.1 source) -- NOT a plain
+    /// "divide by the checkpoint's static scale" op. `input_scale` is the
+    /// checkpoint's static per-tensor scale, used as `ref_nvfp4_quant`'s own
+    /// `global_scale` input to the real per-block scale computation.
+    ///
+    /// `xq` gets `n_tokens` rows of `k.div_ceil(2)` packed bytes each (same
+    /// low-nibble-is-even-index convention as [`Kernels::dequant_f4e2m1`]'s
+    /// `w`). `xq_scale` gets `n_tokens` rows of `k.div_ceil(F4E2M1_BLOCK)`
+    /// f8_e4m3 scale bytes each, row-major -- the SAME linear layout
+    /// `dequant_f4e2m1`'s own `scale` argument consumes (deliberately not
+    /// the transposed/padded layout `quantize_act_e4m3_cutlass_f32`'s
+    /// `sfa_t` uses for its own, different, CUTLASS SFA convention; see
+    /// `cu/fp4.cu`'s doc comment for why that transform is out of scope
+    /// here). `x` holds `n_tokens` rows of `k` f32 elements each.
+    pub fn quantize_act_e2m1_cutlass(
+        &self,
+        xq: &mut ViewMut<'_, u8>,
+        xq_scale: &mut ViewMut<'_, u8>,
+        x: &View<'_, f32>,
+        input_scale: f32,
+        k: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        let blocks_per_row = k.div_ceil(F4E2M1_BLOCK);
+        debug_assert!(
+            xq.len() >= n_tokens * k.div_ceil(2),
+            "quantize output holds {} packed bytes, need {}",
+            xq.len(),
+            n_tokens * k.div_ceil(2)
+        );
+        debug_assert!(
+            xq_scale.len() >= n_tokens * blocks_per_row,
+            "quantize scale output holds {} bytes, need {}",
+            xq_scale.len(),
+            n_tokens * blocks_per_row
+        );
+        debug_assert!(
+            x.len() >= n_tokens * k,
+            "quantize input holds {} elements, need {}",
+            x.len(),
+            n_tokens * k
+        );
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_fp4", fp4_src(), "quantize_act_e2m1_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                n_tokens as u32,
+                (blocks_per_row as u32).div_ceil(FP4_QUANT_BLOCK).max(1),
+                1,
+            ),
+            block_dim: (FP4_QUANT_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (ki, ni) = (k as i32, n_tokens as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(xq)
+            .arg(xq_scale)
+            .arg(x)
+            .arg(&input_scale)
+            .arg(&ki)
+            .arg(&ni);
+        self.dev
+            .profile()
+            .time("quantize_act_e2m1_cutlass", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("quantize_act_e2m1_cutlass")?;
                 Ok(())
             })?;
         Ok(())

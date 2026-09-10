@@ -579,25 +579,9 @@ extern "C" __global__ void fp8_repack_rows(unsigned char* __restrict__ dst,
 // the activation side to carry.
 #define QUANT_GROUP 128
 
-// One scalar through the paired hardware converter, both lanes fed the same
-// value. `cvt.rn.satfinite.e4m3x2.f32` takes two `f32`s and packs two e4m3
-// results into one 16-bit register; feeding it the same float twice makes
-// both output bytes identical, which sidesteps needing to know which one the
-// instruction calls "low" — either is the answer, and duplicating the work is
-// cheaper than a shuffle to pair two different lanes' values for a quantizer
-// this far from the kernel's own bottleneck.
-__device__ __forceinline__ unsigned char f32_to_e4m3(float f) {
-#if __CUDA_ARCH__ >= 890
-    unsigned short packed;
-    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;"
-        : "=h"(packed)
-        : "f"(f), "f"(f));
-    return (unsigned char)(packed & 0xFFu);
-#else
-    (void)f;
-    return 0;
-#endif
-}
+// `f32_to_e4m3` (the paired-hardware-converter activation quantizer) now
+// lives in `common.cuh`, shared with `fp4.cu`'s own activation quantizer --
+// see that file's doc comment for the conversion's own details.
 
 // One block per (token, 128-wide k-group): `QUANT_GROUP` threads read their
 // element, an amax reduction picks the group's scale, and every thread writes
