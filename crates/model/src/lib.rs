@@ -2516,12 +2516,30 @@ impl Model {
         // but OOMs a real `--ctx 65536` server on `attn_prefill`'s partial-
         // reduction scratch, which scales with the chunk; 8192 does not.
         const CUTLASS_BATCH_TOKENS: usize = 8192;
-        let fp8_ceiling = if w.dominant_type() != infero_kernels::WeightType::F8E4M3 {
-            None
-        } else if weights::fp8_unified_layout() {
-            Some(CUTLASS_BATCH_TOKENS)
-        } else {
-            Some(infero_kernels::fp8::MMA_MAX_TOKENS_FP8)
+        // `WeightType::F4E2M1` (NVFP4) shares this exact GQA/`d_head`
+        // shape's own real attention cost with F8E4M3 checkpoints on this
+        // GPU class (both quantization formats sit on top of the same
+        // text-model architecture) and its own FFN GEMM is CUTLASS-based
+        // too (`mma_e2m1_cutlass_sfa_f32out`, no legacy interleaved-layout
+        // decline the way `mma_e4m3_block` has) -- so it gets the same real
+        // `CUTLASS_BATCH_TOKENS` value this comment's own vLLM-derived
+        // reasoning already justifies for this GPU class, not the small
+        // `MAX_BATCH_TOKENS` floor a `None` here would otherwise leave it
+        // at. Real measurement (`.superpowers/sdd/` NVFP4 investigation,
+        // now folded into [[project_infero_perf_gap]]): without this, NVFP4
+        // checkpoints never clear `FlashAttn2Ffi::supports()`'s own
+        // `FA2_ROW_THRESHOLD=4096` (real `batch_tokens` stayed at 1024-2048)
+        // and silently fall back to the slower `decoupled6` kernel for
+        // every real request -- not because `flash_attn2` performs badly on
+        // this shape (a real, warmed-up, repeated benchmark found it
+        // 1.2-2.7x FASTER, matching FP8 production's own real, already-
+        // shipped use of this exact backend), purely a missing dispatch-
+        // eligibility bump.
+        let fp8_ceiling = match w.dominant_type() {
+            infero_kernels::WeightType::F4E2M1 => Some(CUTLASS_BATCH_TOKENS),
+            infero_kernels::WeightType::F8E4M3 if weights::fp8_unified_layout() => Some(CUTLASS_BATCH_TOKENS),
+            infero_kernels::WeightType::F8E4M3 => Some(infero_kernels::fp8::MMA_MAX_TOKENS_FP8),
+            _ => None,
         };
         let batch_tokens =
             batch_tokens_for(cfg.n_heads, max_seq, max_logit_rows, needs_scores, fp8_ceiling);
