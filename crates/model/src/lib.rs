@@ -5338,7 +5338,24 @@ impl Model {
         {
             let stream = self.kern.device().stream();
             let width = if packed_qkv { fused_w } else { da };
-            let row = stream.clone_dtoh(&self.act.gate.slice(..width.max(d)))?;
+            // Real bug found during the NVFP4/F8E4M3 garbage-output
+            // investigation: this unconditionally read `self.act.gate`,
+            // which only holds Q in the PACKED branch (`packed_qkv`) --
+            // when unpacked, the real `qk_norm` call two lines above
+            // normalizes `self.act.q` in place, and `self.act.gate` is an
+            // unrelated scratch buffer (FFN gate/up staging, or the
+            // attention output gate) that happened to hold whatever a
+            // DIFFERENT, earlier operation last wrote there. Every
+            // `packed=false` reading this probe ever produced was RMS of
+            // stale, unrelated data divided by `q_norm.weight` -- real
+            // numbers, but not a measurement of `qk_norm`'s own layout at
+            // all. See task8-lmhead-rootcause-report.md's addendum for the
+            // real investigation this was found during.
+            let row = if packed_qkv {
+                stream.clone_dtoh(&self.act.gate.slice(..width.max(d)))?
+            } else {
+                stream.clone_dtoh(&self.act.q.slice(..width.max(d)))?
+            };
             let w = stream.clone_dtoh(&qn.as_view())?;
             self.kern.device().synchronize()?;
             let rms: Vec<f32> = (0..cfg.n_heads.min(4))
@@ -5389,7 +5406,14 @@ impl Model {
         {
             let stream = self.kern.device().stream();
             let (base, span) = if packed_qkv { (da, fused_w) } else { (0, kv_dim) };
-            let row = stream.clone_dtoh(&self.act.gate.slice(..span))?;
+            // Same real bug as the Q probe above, same fix: `self.act.gate`
+            // only holds K in the packed branch; unpacked, the real
+            // normalization is on `self.act.k`.
+            let row = if packed_qkv {
+                stream.clone_dtoh(&self.act.gate.slice(..span))?
+            } else {
+                stream.clone_dtoh(&self.act.k.slice(..span))?
+            };
             let w = stream.clone_dtoh(&kn.as_view())?;
             self.kern.device().synchronize()?;
             let rms: Vec<f32> = (0..cfg.n_kv_heads.min(4))
