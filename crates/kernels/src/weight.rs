@@ -49,10 +49,11 @@ pub enum WeightType {
     /// scale, the encoding NVIDIA ModelOpt ships (verified against
     /// RadixArk/Qwen3.8-27B-NVFP4's real safetensors header, 2026-09-10).
     ///
-    /// Laid out as `n * k / 2` packed quant bytes (two e2m1 values per byte --
-    /// verify the real nibble packing order against a real ModelOpt/CUTLASS
-    /// reference before assuming low-then-high; Task 2's host reference is
-    /// where this gets pinned down for real, not here), followed by the
+    /// Laid out as `n * k / 2` packed quant bytes (two e2m1 values per byte,
+    /// LOW-then-HIGH: element `2i` lives in byte `i`'s low nibble, `2i+1` in
+    /// its high nibble -- confirmed against real ModelOpt/CUTLASS reference
+    /// unpacking, see [`crate::fp4::e2m1_value`] and
+    /// [`crate::fp4::dequant_f4e2m1_row`]), followed by the
     /// block-scale grid as f8_e4m3, `n * k.div_ceil(16)` entries row-major
     /// (one scale per 16-element run along k -- UNLIKE F8E4M3's 128x128 grid),
     /// followed by two f32 scalars: the per-tensor weight correction

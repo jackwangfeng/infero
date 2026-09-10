@@ -4,14 +4,30 @@
 //! `INFERO_PROBE_DUMP=<dir>`, `crates/model/src/lib.rs`'s
 //! `Model::linear_attention`), rather than synthetic data.
 //!
-//! Every matmul in this checkpoint's forward pass (`lm_head`, regular
-//! attention's `o_proj`, GDN's `in_proj_qz` fusion, GDN's `out_proj`) has
-//! now been independently ground-truth-checked and confirmed correct given
-//! its own real input -- yet real vLLM inference on the exact same
-//! checkpoint produces coherent output while infero's does not (a real,
-//! systematic bias toward low-vocab-id digit tokens, not random noise).
-//! The one real, non-matmul computation in the whole 64-layer pipeline no
-//! check has touched yet is the gated-delta-rule recurrence itself.
+//! **CORRECTION (whole-branch code review, after this file was written):**
+//! the claim this comment originally made -- that every matmul in this
+//! checkpoint's forward pass had been ground-truth-checked -- was WRONG,
+//! and the gap is exactly what let the real bug hide. Only `lm_head`,
+//! regular attention's `o_proj`, and GDN's own `in_proj_qz`/`out_proj` were
+//! ever checked this way -- every one of them an F8E4M3 (or, for `lm_head`,
+//! the one NVFP4 tensor whose `input_scale` happens to be large enough to
+//! avoid the bug) matmul. The FFN's `gate_proj`/`up_proj`/`down_proj` --
+//! this checkpoint's OTHER real NVFP4 tensors, and the ones whose real,
+//! calibrated `input_scale` was small enough to trigger it -- were never
+//! independently ground-truth-checked against real captured activations.
+//! The real bug (see `crates/kernels/src/cutlass_fp4.rs`'s "CORRECTION 2"
+//! doc comment) was a quantizer `global_scale` convention error that zeroed
+//! every FFN activation block in all 64 layers -- invisible to this file's
+//! own GDN check (upstream of the FFN in each layer) and to the `o_proj`/
+//! `lm_head` checks (F8E4M3, or the one NVFP4 tensor that survives), which
+//! is exactly why "everything else checks out" here did not mean the bug
+//! wasn't real. This file's own GDN check remains valid on its own terms
+//! (the recurrence itself was never the bug); the surrounding claim about
+//! full matmul coverage was the error.
+//!
+//! The gated-delta-rule recurrence is the one real, non-matmul computation
+//! in the whole 64-layer pipeline this repo's checks ever specifically
+//! targeted.
 //!
 //! Rather than writing a NEW, unvalidated reimplementation of that
 //! recurrence (a real risk: a bug in a fresh reimplementation would prove
