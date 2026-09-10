@@ -4750,6 +4750,17 @@ impl Model {
             heads,
             stride,
         )?;
+        // Cheap sanity dump, not a ground-truth recompute: `beta` should sit
+        // in `(0, 1)` (`sigmoid`) and `g` should be `<= 0` (`-exp(A_log) *
+        // softplus(...)`, always non-positive) and not so large in magnitude
+        // that `exp(g)` (the recurrence's real per-step retention factor)
+        // underflows to ~0 every step -- which would silently wipe out all
+        // cross-token memory and produce exactly a "lost context, regresses
+        // to a corpus-frequency prior" symptom. Added for the F8E4M3/GDN
+        // signal-degradation investigation; see
+        // task8-lmhead-rootcause-report.md's addendum.
+        probe(&self.kern, layer, "gdn_beta", &acts.beta.slice(..n * heads));
+        probe(&self.kern, layer, "gdn_g", &acts.g.slice(..n * heads));
 
         // q and k are normalized where they lie, inside the packed row.
         self.kern.gdn_qk_l2norm(
@@ -4762,6 +4773,11 @@ impl Model {
             key_dim,
             1e-6,
         )?;
+        // `q`/`k` (the front `key_dim` columns, `k` starting at `key_dim`) are
+        // meant to be unit-norm per head after this call; `v` (columns
+        // `[2*key_dim, width)`) is untouched, so a probe of the whole packed
+        // row is only meaningful over its first `2*key_dim` columns.
+        probe(&self.kern, layer, "gdn_qk_normed", &acts.qkv_conv.slice(..n * width));
 
         // The journal, recorded here and not a line earlier or later. What the
         // recurrence is about to consume is the packed row *after* the
@@ -4853,6 +4869,14 @@ impl Model {
         // of scope here rather than at the end of the function keeps the journal
         // available to the rest of the block.
         let _ = staged;
+        // Raw recurrence output, before any further normalization/gating --
+        // the one thing in this whole block no ground-truth check has
+        // touched yet (every matmul either side of it is now confirmed
+        // correct given its own real input). A degenerate (near-zero, or
+        // saturated) RMS here, especially relative to `gdn_qk_normed`'s,
+        // would point at the recurrence/gating itself rather than any
+        // matmul.
+        probe(&self.kern, layer, "gdn_core", &acts.core.slice(..n * val_dim));
 
         // Normalize each head's output, then gate it with silu(z). This order
         // matters and the other one runs; `gdn_gated_rmsnorm` says why. `qkv` is
@@ -4867,6 +4891,11 @@ impl Model {
             la.value_head_dim,
             eps,
         )?;
+        // Real, exact input `out_proj` (F8E4M3, never independently checked
+        // -- unlike `in_proj_qz`, this GDN-side output projection is
+        // analogous to regular attention's already-confirmed-clean `o_proj`
+        // but has not itself been ground-truth tested) reads.
+        probe(&self.kern, layer, "gdn_out_proj_in", &acts.qkv.slice(..n * val_dim));
 
         Self::matmul_pre(
             &self.kern,
@@ -4881,6 +4910,7 @@ impl Model {
             None,
             false,
         )?;
+        probe(&self.kern, layer, "gdn_out_proj_out", &proj.slice(..n * d));
         // `out_proj` is row-parallel (contracts over `val_dim`, this rank's
         // own head shard) -- `proj` is only this rank's partial sum until
         // every rank's slice is summed in.
