@@ -310,7 +310,8 @@ impl Kernels {
             CUTLASS_FP4_WORKSPACE.with(stream, ws_bytes.max(1), |ws_view| {
                 let (a_ptr, _ra) = xq.device_ptr(stream);
                 let (b_ptr, _rb) = w.device_ptr(stream);
-                let (sfa_ptr, _rsfa) = sfa_swizzled.as_view().device_ptr(stream);
+                let sfa_swizzled_view = sfa_swizzled.as_view();
+                let (sfa_ptr, _rsfa) = sfa_swizzled_view.device_ptr(stream);
                 let (sfb_ptr, _rsfb) = cw.scale_sfb.device_ptr(stream);
                 let (d_ptr, _rd) = out.device_ptr_mut(stream);
                 let (ws_ptr, _rws) = ws_view.device_ptr_mut(stream);
