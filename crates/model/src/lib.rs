@@ -7307,6 +7307,26 @@ impl Model {
             return Ok(());
         }
 
+        // Same real type, no `cutlass` feature: there is no non-CUTLASS
+        // NVFP4 kernel at all (see the branch above's own comment), so a
+        // build without that feature has nothing that can read this
+        // matrix's real physical layout. Without this guard, an `F4E2M1`
+        // matrix reaching here would silently fall into the `int_x`/`mmq_ok`
+        // chain below, none of which recognize this type -- an unrecognized
+        // `WeightType` is exactly the kind of "misinterpret the bytes"
+        // failure this project's own convention is to loud-fail on instead
+        // (the same reasoning behind the `ensure!(ran, ...)` above), so this
+        // rejects the matrix explicitly rather than letting it fall through.
+        #[cfg(not(feature = "cutlass"))]
+        if w.ty == infero_kernels::WeightType::F4E2M1 {
+            anyhow::bail!(
+                "matrix {}x{} is WeightType::F4E2M1 (NVFP4), which requires the `cutlass` \
+                 feature -- this build was compiled without it",
+                w.n,
+                w.k
+            );
+        }
+
         let int_x = use_mmvq && Kernels::has_mmvq(w.ty) && w.k.is_multiple_of(32);
         // Whether *this matrix* gets the tensor-core GEMM, not just its type:
         // Q4_K rows that are not a multiple of 256 have the type but not the
