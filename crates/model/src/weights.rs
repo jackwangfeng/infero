@@ -1454,6 +1454,55 @@ fn norm_offset(arch: &str, name: &str) -> f32 {
     }
 }
 
+/// An F8E4M3 projection's scale grid: `ceil(n/128) * ceil(k/128)` `f32`
+/// entries, one a 128x128 block of the `[n, k]` matrix, in the layout
+/// `infero_kernels::fp8::scale_grid` sizes and every FP8 kernel reads.
+///
+/// Tries the real per-block `<prefix>.weight_scale_inv` tensor first — this is
+/// production's own existing checkpoint format (`BF16`, shape
+/// `[ceil(n/128), ceil(k/128)]`) and is completely unchanged by the fallback
+/// below: when it is present, this returns exactly what the inline
+/// `w.tensor(...weight_scale_inv...).to_f32()` call it replaces already did.
+///
+/// Falls back to `<prefix>.weight_scale` — a different, much simpler scheme a
+/// checkpoint mixing NVFP4 FFN weights with 8-bit-quantized everything-else
+/// (e.g. `RadixArk/Qwen3.8-27B-NVFP4`) uses for its non-FP4 8-bit tensors: a
+/// single `F32` scalar, no block grid. That one real value is broadcast into
+/// a `scale_grid(k, n)`-length vector so every block scales by the same
+/// factor, and the rest of the F8E4M3 storage/dispatch path — which only
+/// knows how to read a full grid — proceeds unmodified.
+///
+/// `<prefix>.input_scale`, this fallback's sibling tensor, is deliberately
+/// never read here: every existing F8E4M3 activation-quantization kernel
+/// (`quantize_act_e4m3_cutlass`/`quantize_act_e4m3_cutlass_f32` in
+/// `crates/kernels/src/cu/fp8.cu`) already computes its own dynamic, per-call
+/// scale from the real activation data (`amax / 448.0`), and no static
+/// per-tensor input scale is read anywhere in the existing F8E4M3
+/// loading/dispatch path either — this checkpoint's `input_scale` simply has
+/// no consumer here, by design, not oversight.
+fn f8e4m3_scale_grid(
+    w: &infero_safetensors::Shards,
+    prefix: &str,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>> {
+    let want = infero_kernels::fp8::scale_grid(k, n);
+    if let Some(t) = w.get(&format!("{prefix}.weight_scale_inv")) {
+        return t.to_f32();
+    }
+    let t = w
+        .tensor(&format!("{prefix}.weight_scale"))
+        .with_context(|| format!("{prefix} is FP8 but has no scale grid"))?;
+    anyhow::ensure!(
+        t.n_elements() == 1,
+        "{prefix}.weight_scale has {} elements ({:?}), expected a single scalar",
+        t.n_elements(),
+        t.shape
+    );
+    let scalar = t.to_f32().with_context(|| format!("{prefix}.weight_scale"))?[0];
+    Ok(vec![scalar; want])
+}
+
 /// Load the multi-token-prediction head, if the checkpoint has one.
 ///
 /// Returns `None` when neither the config nor the tensors mention a head, and
@@ -1565,12 +1614,9 @@ pub fn load_mtp(
             // mat-vec. A draft step reads the head once, so its bytes are its
             // cost: 5.12 ms measured against a 2.0 ms byte bound, and half of
             // those bytes did not need to exist.
-            let scales_t = w
-                .tensor(&format!("{name}.weight_scale_inv"))
-                .with_context(|| {
-                    format!("{name}.weight is FP8, which is meaningless without its block scales")
-                })?;
-            let scales = scales_t.to_f32()?;
+            let scales = f8e4m3_scale_grid(w, name, k, n).with_context(|| {
+                format!("{name}.weight is FP8, which is meaningless without its block scales")
+            })?;
             let want = infero_kernels::fp8::scale_grid(k, n);
             anyhow::ensure!(
                 scales.len() == want,
@@ -2052,10 +2098,7 @@ pub fn load_awq(
                 // layout `WeightType::F8E4M3` documents and both FP8 kernels
                 // read. A `Matrix` stays a single allocation, so the offload
                 // blob path and `Matrix::view` need no special case.
-                let scales_t = w
-                    .tensor(&format!("{prefix}.weight_scale_inv"))
-                    .with_context(|| format!("{prefix} is FP8 but has no scale grid"))?;
-                let full_scales = scales_t.to_f32()?;
+                let full_scales = f8e4m3_scale_grid(w, prefix, full_k, full_n)?;
                 let full_want = infero_kernels::fp8::scale_grid(full_k, full_n);
                 anyhow::ensure!(
                     full_scales.len() == full_want,
@@ -2286,10 +2329,7 @@ pub fn load_awq(
             "{prefix}: multi-segment sharding is only implemented for FP8 here"
         );
         let (full_n, k) = (t.shape[0], t.shape[1]);
-        let scales_t = w
-            .tensor(&format!("{prefix}.weight_scale_inv"))
-            .with_context(|| format!("{prefix} is FP8 but has no scale grid"))?;
-        let full_scales = scales_t.to_f32()?;
+        let full_scales = f8e4m3_scale_grid(w, prefix, k, full_n)?;
         let k_blocks = k.div_ceil(infero_kernels::fp8::FP8_BLOCK);
         let full_want = infero_kernels::fp8::scale_grid(k, full_n);
         anyhow::ensure!(
@@ -3827,4 +3867,129 @@ pub fn load_mtp_gguf(dev: &Device, f: &Gguf, cfg: &Config) -> Result<Option<MtpW
         "MTP head loaded from sidecar"
     );
     Ok(Some(w))
+}
+
+#[cfg(test)]
+mod scale_grid_fallback_tests {
+    //! `f8e4m3_scale_grid`'s two real behaviours (Task 8's checkpoint-load
+    //! blocker fix, discovered loading `RadixArk/Qwen3.8-27B-NVFP4` on `bw`):
+    //! production's existing per-block `.weight_scale_inv` grid is read
+    //! completely unchanged when present, and a checkpoint that instead ships
+    //! only a scalar `.weight_scale` (this NVFP4 checkpoint's own scheme for
+    //! its non-FP4 8-bit tensors) gets that one value broadcast into a full
+    //! `scale_grid(k, n)`-length grid. Both fixtures are synthetic and tiny —
+    //! see `crates/model/tests/qwen35_mtp_device.rs`'s `write_safetensors` for
+    //! the established pattern this mirrors — so this needs no GPU and no
+    //! real checkpoint.
+
+    use super::f8e4m3_scale_grid;
+
+    /// Write a one-file safetensors checkpoint. Mirrors
+    /// `qwen35_mtp_device.rs`'s helper of the same name.
+    fn write_safetensors(path: &std::path::Path, tensors: &[(&str, &str, Vec<usize>, Vec<u8>)]) {
+        let mut header = serde_json::Map::new();
+        let mut payload = Vec::new();
+        for (name, dtype, shape, bytes) in tensors {
+            while !payload.len().is_multiple_of(8) {
+                payload.push(0);
+            }
+            let start = payload.len();
+            payload.extend_from_slice(bytes);
+            header.insert(
+                (*name).to_string(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [start, payload.len()],
+                }),
+            );
+        }
+        let mut head = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        while !head.len().is_multiple_of(8) {
+            head.push(b' ');
+        }
+        let mut out = (head.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(&head);
+        out.extend_from_slice(&payload);
+        std::fs::write(path, out).unwrap();
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "infero-f8e4m3-scale-grid-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("creating temp dir");
+        dir
+    }
+
+    #[test]
+    fn weight_scale_inv_is_read_verbatim_when_present() {
+        // `k=300, n=200` -> a 3x2 block grid (ceil(200/128)=2, ceil(300/128)=3),
+        // deliberately not a round multiple of 128 so this also exercises
+        // `div_ceil`, not just the common case.
+        let (k, n) = (300usize, 200usize);
+        let want_len = infero_kernels::fp8::scale_grid(k, n);
+        assert_eq!(want_len, 6);
+        let grid: Vec<f32> = (0..want_len).map(|i| i as f32 * 0.5 + 1.0).collect();
+        let dir = temp_dir("inv-present");
+        write_safetensors(
+            &dir.join("m.safetensors"),
+            &[(
+                "t.weight_scale_inv",
+                "F32",
+                vec![want_len],
+                grid.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            )],
+        );
+        let shards = infero_safetensors::Shards::open_dir(&dir).unwrap();
+        let got = f8e4m3_scale_grid(&shards, "t", k, n).expect("reading the grid");
+        assert_eq!(got, grid, "a present weight_scale_inv must be read unchanged");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn weight_scale_scalar_is_broadcast_when_weight_scale_inv_is_absent() {
+        let (k, n) = (300usize, 200usize);
+        let want_len = infero_kernels::fp8::scale_grid(k, n);
+        let scalar = 0.015625f32; // an exact f32 value, so equality is exact
+        let dir = temp_dir("scalar-fallback");
+        write_safetensors(
+            &dir.join("m.safetensors"),
+            // No `t.weight_scale_inv` at all -- only the scalar sibling.
+            &[("t.weight_scale", "F32", vec![], scalar.to_le_bytes().to_vec())],
+        );
+        let shards = infero_safetensors::Shards::open_dir(&dir).unwrap();
+        let got = f8e4m3_scale_grid(&shards, "t", k, n).expect("broadcasting the scalar");
+        assert_eq!(got.len(), want_len, "must have exactly scale_grid(k, n) entries");
+        assert!(
+            got.iter().all(|&v| v == scalar),
+            "every entry must equal the real input scalar, got {got:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn neither_tensor_present_is_a_loud_failure() {
+        let (k, n) = (300usize, 200usize);
+        let dir = temp_dir("neither-present");
+        // A file with some unrelated tensor, so the directory is a valid
+        // (non-empty) safetensors checkpoint but has neither scale tensor.
+        write_safetensors(
+            &dir.join("m.safetensors"),
+            &[("unrelated", "F32", vec![1], 1.0f32.to_le_bytes().to_vec())],
+        );
+        let shards = infero_safetensors::Shards::open_dir(&dir).unwrap();
+        let err = f8e4m3_scale_grid(&shards, "t", k, n)
+            .expect_err("neither weight_scale_inv nor weight_scale exists -- must error, not default");
+        assert!(
+            format!("{err:#}").contains("scale grid"),
+            "error should explain the missing scale grid, got: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
