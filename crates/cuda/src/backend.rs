@@ -53,6 +53,8 @@ pub struct Caps {
     pub fp8: bool,
     /// `cp.async.bulk.tensor`. sm_90 and later.
     pub tma: bool,
+    /// `cutlass_fp4.rs`: NVFP4 blockscaled tensor-core GEMM. sm_120 and later.
+    pub fp4: bool,
     pub simd_width: u32,
     pub max_threads_per_group: u32,
 }
@@ -64,6 +66,7 @@ impl Device {
             int_tensor_gemm: a >= 80,
             fp8: a >= 89,
             tma: a >= 90,
+            fp4: a >= 120,
             simd_width: 32,
             max_threads_per_group: 1024,
         }

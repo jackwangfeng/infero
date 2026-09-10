@@ -171,3 +171,73 @@ extern "C" __global__ void quantize_act_e2m1_f32(
         xqrow[(base + i) / 2] = byte;
     }
 }
+
+// ---- CUTLASS NVFP4 scale-factor swizzle (`cutlass` feature only, but this
+// kernel itself is plain NVRTC-compiled CUDA C like everything else in this
+// file -- it feeds the AOT `nvcc`-built `cutlass/fp4_bw_gemm.cu`, but is not
+// part of it, the same split `fp8.cu`'s `unrepack_rows_e4m3`/
+// `transpose_scale_b_f32` already use for CUTLASS's FP8 GEMM) ----
+//
+// `dequant_f4e2m1_f32` above and `quantize_act_e2m1_cutlass` (`fp4.rs`) both
+// read/write the block-scale grid in plain `[rows, blocks]` row-major --
+// convenient for a scalar CUDA kernel, but NOT the physical layout CUTLASS's
+// own block-scaled tensor-core MMA requires for its `sfa`/`sfb` operands.
+// That real layout (`cutlass::detail::Sm1xxBlockScaledConfig<16>`, the
+// default `UMMA::Major::K` variant) is a two-level tile:
+//
+//   - Rows are grouped into tiles of 128 (`m_tile = row / 128`); within a
+//     128-row tile, a row's position is `outer_m = row % 32`,
+//     `inner_m = (row / 32) % 4` (SO 32 groups of 4, not 4 groups of 32).
+//   - Scale blocks (each covering 16 raw elements) are grouped into tiles of
+//     4 (`k_tile = block / 4`, `inner_k = block % 4`).
+//   - Byte offset = `(m_tile * num_k_tiles + k_tile) * 512
+//                    + outer_m * 16 + inner_m * 4 + inner_k`.
+//
+// This formula is cross-checked against two independent real sources
+// (fetched via `gh api` this session, not derived from the abstract "NVFP4
+// scale layout" description alone):
+//
+//   1. CUTLASS's own `Sm1xxBlockScaledBasicChunk`/`Sm1xxBlockScaledConfig`
+//      (`include/cutlass/detail/sm100_blockscaled_layout.hpp:48-114`): the
+//      K-major `SfAtom` is a CuTe
+//      `Layout<Shape<Shape<32,4>,Shape<SFVecSize,4>>, Stride<Stride<16,4>,Stride<0,1>>>`
+//      -- working through its coordinate decomposition by hand gives exactly
+//      `outer_m*16 + inner_m*4 + inner_k` for the atom-local offset (max
+//      31*16+3*4+3=511, matching the atom's real 128*4=512-entry size), tiled
+//      row-major across `(m_tile, k_tile)` pairs by `tile_to_shape`.
+//   2. vLLM's own real CUDA repack kernel,
+//      `cvt_quant_to_fp4_get_sf_out_offset` (`csrc/libtorch_stable/
+//      quantization/fp4/nvfp4_utils.cuh:164-200`, real, currently-installed
+//      dispatch that feeds CUTLASS's identical NVFP4 GEMM from the Python
+//      side): its own plain integer arithmetic (`mTileIdx = mIdx >> 7;
+//      outerMIdx = mIdx & 31; innerMIdx = (mIdx >> 5) & 3; kTileIdx = kIdx >>
+//      2; innerKIdx = kIdx & 3; SFOffset = (mTileIdx*numKTiles+kTileIdx)<<9 |
+//      outerMIdx<<4 | innerMIdx<<2 | innerKIdx;`) is bit-for-bit the same
+//      formula, independently confirming source 1's own CuTe layout algebra.
+//
+// The padded extent this kernel's caller must allocate is
+// `rows.div_ceil(128) * blocks.div_ceil(4) * 512` bytes (matches both
+// sources: source 2's own `computeSwizzledSFShape`, `rounded_m =
+// round_up(rows,128)`, `rounded_n = round_up(blocks,4)`, total bytes =
+// `rounded_m * rounded_n`). This kernel's own launch covers exactly that
+// padded `(rows_padded, blocks_padded)` domain -- out-of-range source reads
+// (the real tail of a non-128/non-4 multiple) are written as `0`, so the
+// caller does not need to pre-zero the output buffer.
+extern "C" __global__ void swizzle_sf_e2m1(unsigned char* __restrict__ sf_swizzled,
+                                            const unsigned char* __restrict__ sf_flat, int rows, int blocks) {
+    const int row = blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int block = blockIdx.y;
+    const int num_k_tiles = (blocks + 3) / 4;
+    const int rows_padded = ((rows + 127) / 128) * 128;
+    if (row >= rows_padded) return;
+
+    const unsigned char v = (row < rows && block < blocks) ? sf_flat[(size_t)row * blocks + block] : 0;
+
+    const int m_tile = row >> 7;
+    const int outer_m = row & 31;
+    const int inner_m = (row >> 5) & 3;
+    const int k_tile = block >> 2;
+    const int inner_k = block & 3;
+    const long off = ((long)m_tile * num_k_tiles + k_tile) * 512 + outer_m * 16 + inner_m * 4 + inner_k;
+    sf_swizzled[off] = v;
+}

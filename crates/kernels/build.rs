@@ -74,6 +74,17 @@ fn main() {
             &[&cutlass_include, &cutlass_util],
         );
         archive_and_link(&nvcc, &out_dir, &[obj], "infero_cutlass_fp8");
+
+        // NVFP4 (W4A4) blockscaled GEMM -- SM120 only, matching this plan's
+        // own stated Global Constraint ("SM120 only" for v1), unlike the FP8
+        // GEMM above which also opportunistically compiles SM90/SM100 bodies.
+        // No SM90/SM100 NVFP4 instantiations here: out of this plan's scope,
+        // not attempted.
+        println!("cargo:rerun-if-changed=src/cutlass/fp4_bw_gemm.cu");
+        let src4 = manifest.join("src/cutlass/fp4_bw_gemm.cu");
+        let obj4 = out_dir.join("fp4_bw_gemm.o");
+        aot_compile(&nvcc, &src4, &obj4, &["arch=compute_120a,code=sm_120a"], &[], &[&cutlass_include, &cutlass_util]);
+        archive_and_link(&nvcc, &out_dir, &[obj4], "infero_cutlass_fp4");
     }
 
     if have_flash_attn2 {

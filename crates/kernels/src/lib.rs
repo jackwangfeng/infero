@@ -14,6 +14,10 @@ pub mod awq;
 #[cfg(feature = "nccl")]
 mod cu_vendor;
 #[cfg(feature = "cutlass")]
+pub mod cutlass_fp4;
+#[cfg(feature = "cutlass")]
+pub use cutlass_fp4::CutlassFp4Weight;
+#[cfg(feature = "cutlass")]
 pub mod cutlass_fp8;
 #[cfg(feature = "cutlass")]
 pub use cutlass_fp8::CutlassWeight;
