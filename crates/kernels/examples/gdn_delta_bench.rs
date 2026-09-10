@@ -105,6 +105,7 @@ fn main() -> Result<()> {
 
     for (label, lens) in [
         ("decode, 1 seq", vec![1usize]),
+        ("decode, 16 seqs", vec![1usize; 16]),
         ("decode, 32 seqs", vec![1usize; 32]),
         ("prefill 512, 1 seq", vec![512usize]),
         ("prefill 30552, 1 seq", vec![30552usize]),
