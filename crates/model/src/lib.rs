@@ -4632,6 +4632,17 @@ impl Model {
                 n,
             )?;
         }
+        // Unconditional (unlike the two probes above): `acts.qkv`/`acts.z`
+        // hold the real, final split-apart values here regardless of
+        // whether `in_proj_qz` fusion is active for this layer -- via
+        // `split2` just above when fused, or written directly by the
+        // `None` branch's own two `matmul_pre` calls when not. Lets the
+        // ground-truth cross-check run either way: against the raw fused
+        // buffer *and* these post-split values when fusion is active (a
+        // free, purely mechanical check of `split2` itself, on top of the
+        // fused matmul), or against these directly when it is not.
+        probe(&self.kern, layer, "gdn_qkv_out", &acts.qkv.slice(..n * width));
+        probe(&self.kern, layer, "gdn_z_out", &acts.z.slice(..n * val_dim));
 
         let (first, ntok, mut recurrent, mut conv) = pool.gdn_parts(ordinal);
         let seqs = infero_kernels::gdn::SeqLayout {
