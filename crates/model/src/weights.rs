@@ -1803,32 +1803,88 @@ fn stacked2_gguf(dev: &Device, f: &Gguf, a: &str, b: &str, total: &mut usize) ->
 /// stays on the existing F8E4M3 path unchanged. A tensor absent from
 /// `quantized_layers` entirely (norms, embeddings) is likewise never a
 /// member -- this function only ever returns real NVFP4 targets.
-pub fn classify_fp4_targets(
-    quant_config_path: &str,
-) -> Result<std::collections::HashSet<String>> {
+///
+/// A second real `hf_quant_config.json` shape exists in the wild, found
+/// while checking whether a genuinely fuller-than-FFN-only NVFP4 export
+/// could be loaded (`AxionML/Qwen3.5-9B-NVFP4`, same `qwen3_5` architecture,
+/// attention AND GDN projections quantized to NVFP4 too, not just the FFN):
+/// a single top-level `quantization.quant_algo == "NVFP4"` (uniform, not
+/// `"MIXED_PRECISION"`) with `quantization.exclude_modules`, a DENYLIST
+/// (mirroring `compressed-tensors`' own parallel `config.json`
+/// `quantization_config.ignore` field the same checkpoint also ships) --
+/// wildcard entries end in `*` and prefix-match (`"model.visual*"`,
+/// `"mtp.layers.0*"`); everything else is an exact tensor name
+/// (`"lm_head"`, one `linear_attn.conv1d` per layer -- a real conv kernel,
+/// never a `Linear` target to begin with, excluded defensively by the
+/// source export anyway). [`Fp4Targets::contains`] is the single place both
+/// shapes resolve to the same real yes/no answer every call site already
+/// asks; see its own doc comment for why a denylist is safe here (the real
+/// call sites only ever query this for actual `Linear`-projection prefixes,
+/// never for norms/embeddings, so "true unless excluded" cannot wrongly
+/// claim a vector).
+pub enum Fp4Targets {
+    /// The `quantized_layers` allowlist shape.
+    Explicit(std::collections::HashSet<String>),
+    /// The uniform-`quant_algo` + `exclude_modules` denylist shape.
+    AllExcept(Vec<String>),
+}
+
+impl Fp4Targets {
+    /// Real NVFP4 membership for one projection prefix, in whichever real
+    /// shape this checkpoint's `hf_quant_config.json` used.
+    pub fn contains(&self, name: &str) -> bool {
+        match self {
+            Fp4Targets::Explicit(set) => set.contains(name),
+            Fp4Targets::AllExcept(patterns) => !patterns.iter().any(|pat| match pat.strip_suffix('*') {
+                Some(prefix) => name.starts_with(prefix),
+                None => name == pat,
+            }),
+        }
+    }
+}
+
+pub fn classify_fp4_targets(quant_config_path: &str) -> Result<Fp4Targets> {
     let text = std::fs::read_to_string(quant_config_path)
         .with_context(|| format!("reading {quant_config_path}"))?;
     let json: serde_json::Value = serde_json::from_str(&text)
         .with_context(|| format!("parsing {quant_config_path}"))?;
-    let layers = json
-        .pointer("/quantization/quantized_layers")
-        .and_then(|v| v.as_object())
-        .with_context(|| {
-            format!("{quant_config_path}: no quantization.quantized_layers object")
-        })?;
-    let mut targets = std::collections::HashSet::new();
-    for (name, entry) in layers {
-        let algo = entry.get("quant_algo").and_then(|v| v.as_str()).with_context(|| {
-            format!(
-                "{quant_config_path}: quantization.quantized_layers.{name} has no \
-                 string quant_algo"
-            )
-        })?;
-        if algo == "NVFP4" {
-            targets.insert(name.clone());
+    let quant = json
+        .pointer("/quantization")
+        .with_context(|| format!("{quant_config_path}: no quantization object"))?;
+
+    if let Some(layers) = quant.get("quantized_layers").and_then(|v| v.as_object()) {
+        let mut targets = std::collections::HashSet::new();
+        for (name, entry) in layers {
+            let algo = entry.get("quant_algo").and_then(|v| v.as_str()).with_context(|| {
+                format!(
+                    "{quant_config_path}: quantization.quantized_layers.{name} has no \
+                     string quant_algo"
+                )
+            })?;
+            if algo == "NVFP4" {
+                targets.insert(name.clone());
+            }
         }
+        return Ok(Fp4Targets::Explicit(targets));
     }
-    Ok(targets)
+
+    let algo = quant.get("quant_algo").and_then(|v| v.as_str()).with_context(|| {
+        format!(
+            "{quant_config_path}: quantization has neither a quantized_layers object nor a \
+             string quant_algo -- unrecognized shape"
+        )
+    })?;
+    anyhow::ensure!(
+        algo == "NVFP4",
+        "{quant_config_path}: quantization.quant_algo is {algo:?}, expected \"NVFP4\" for the \
+         uniform (non-quantized_layers) shape"
+    );
+    let exclude: Vec<String> = quant
+        .get("exclude_modules")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    Ok(Fp4Targets::AllExcept(exclude))
 }
 
 /// Load an AWQ checkpoint, repacking every quantized matrix on the way in.
@@ -1864,13 +1920,13 @@ pub fn load_awq(
     // the exact same F8E4M3/plain-float path it always has for a checkpoint
     // that never opts into NVFP4.
     let quant_config_path = w.dir().join("hf_quant_config.json");
-    let fp4_targets: std::collections::HashSet<String> = if quant_config_path.exists() {
+    let fp4_targets: Fp4Targets = if quant_config_path.exists() {
         let path_str = quant_config_path
             .to_str()
             .with_context(|| format!("{}: not valid UTF-8", quant_config_path.display()))?;
         classify_fp4_targets(path_str)?
     } else {
-        std::collections::HashSet::new()
+        Fp4Targets::Explicit(std::collections::HashSet::new())
     };
 
     let upload = |bytes: &[u8], ty: WeightType, k: usize, n: usize, total: &mut usize| -> Result<Matrix> {

@@ -41,7 +41,10 @@ fn radixark_nvfp4_targets_classified_correctly() {
     assert!(targets.contains("model.language_model.layers.0.mlp.gate_proj"));
     assert!(targets.contains("model.language_model.layers.63.mlp.down_proj"));
     assert!(!targets.contains("model.language_model.layers.0.self_attn.q_proj"));
-    assert_eq!(targets.len(), 193);
+    let weights::Fp4Targets::Explicit(set) = &targets else {
+        panic!("RadixArk's real checkpoint uses the quantized_layers (Explicit) shape");
+    };
+    assert_eq!(set.len(), 193);
 }
 
 /// A tiny, synthetic `hf_quant_config.json`-shaped fixture -- real-shaped
@@ -88,7 +91,10 @@ fn classify_fp4_targets_parses_a_synthetic_config() {
     .expect("writing synthetic config");
 
     let targets = weights::classify_fp4_targets(path.to_str().unwrap()).unwrap();
-    assert_eq!(targets.len(), 4);
+    let weights::Fp4Targets::Explicit(set) = &targets else {
+        panic!("this synthetic fixture uses the quantized_layers (Explicit) shape");
+    };
+    assert_eq!(set.len(), 4);
     assert!(targets.contains("lm_head"));
     assert!(targets.contains("model.language_model.layers.0.mlp.gate_proj"));
     assert!(targets.contains("model.language_model.layers.0.mlp.up_proj"));
@@ -97,6 +103,64 @@ fn classify_fp4_targets_parses_a_synthetic_config() {
     // of the same map -- they must not show up here.
     assert!(!targets.contains("model.language_model.layers.0.self_attn.q_proj"));
     assert!(!targets.contains("model.language_model.layers.0.linear_attn.out_proj"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The second real `hf_quant_config.json` shape found in the wild
+/// (`AxionML/Qwen3.5-9B-NVFP4`, same `qwen3_5` architecture, attention AND
+/// GDN projections quantized to NVFP4 too -- not just the FFN): a uniform
+/// top-level `quantization.quant_algo == "NVFP4"` with
+/// `quantization.exclude_modules`, a wildcard-supporting denylist. Real
+/// shape, copied from the actual file (trimmed to a few representative
+/// entries, not all 25 real `conv1d` exclusions).
+#[test]
+fn classify_fp4_targets_parses_a_synthetic_uniform_denylist_config() {
+    let dir = std::env::temp_dir().join(format!(
+        "infero-fp4-loader-denylist-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("creating temp dir");
+    let path = dir.join("hf_quant_config.json");
+    std::fs::write(
+        &path,
+        r#"{
+            "quantization": {
+                "quant_algo": "NVFP4",
+                "kv_cache_quant_algo": null,
+                "group_size": 16,
+                "exclude_modules": [
+                    "lm_head",
+                    "model.language_model.layers.0.linear_attn.conv1d",
+                    "model.visual*",
+                    "mtp.layers.0*"
+                ]
+            }
+        }"#,
+    )
+    .expect("writing synthetic config");
+
+    let targets = weights::classify_fp4_targets(path.to_str().unwrap()).unwrap();
+    assert!(matches!(targets, weights::Fp4Targets::AllExcept(_)));
+    // Exact-name exclusions.
+    assert!(!targets.contains("lm_head"));
+    assert!(!targets.contains("model.language_model.layers.0.linear_attn.conv1d"));
+    // Wildcard exclusions: any tensor under the prefix.
+    assert!(!targets.contains("model.visual.blocks.0.attn.qkv"));
+    assert!(!targets.contains("mtp.layers.0.mlp.gate_proj"));
+    // Real, un-excluded projections -- attention AND GDN, not just FFN,
+    // which is the whole point of this checkpoint shape existing.
+    assert!(targets.contains("model.language_model.layers.0.mlp.gate_proj"));
+    assert!(targets.contains("model.language_model.layers.0.self_attn.q_proj"));
+    assert!(targets.contains("model.language_model.layers.0.linear_attn.in_proj_qkv"));
+    assert!(targets.contains("model.language_model.layers.0.linear_attn.out_proj"));
+    // A different layer's conv1d isn't in this trimmed exclude list, but a
+    // real conv1d is never queried through this path anyway (loaded via a
+    // separate, non-`fp4_targets`-gated closure) -- not asserted here.
 
     let _ = std::fs::remove_dir_all(&dir);
 }
