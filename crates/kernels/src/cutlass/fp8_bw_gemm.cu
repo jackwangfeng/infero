@@ -200,6 +200,35 @@ using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 using StrideD = typename Gemm::GemmKernel::StrideD;
 }  // namespace f32out
 
+// `f32out`'s own wide `<128,128,128>` tile with its scheduler swapped from
+// the default (`void`, which for `arch::Sm120` resolves to
+// `PersistentTileSchedulerSm100` -- see `tile_scheduler.hpp`'s own selector
+// table) to `cutlass::gemm::StreamKScheduler` -- CUTLASS's own generic
+// scheduler-selector tag, dtype/mainloop-agnostic, that maps `Sm120` onto
+// `PersistentTileSchedulerSm100StreamK` (real, verified directly against
+// this project's own vendored CUTLASS source, `tile_scheduler.hpp` lines
+// ~387-410, not guessed or inferred from a changelog). A prior investigation
+// concluded "no sm120 stream-K scheduler exists in this CUTLASS release" --
+// that was wrong (or at least incomplete): the selector mapping was already
+// present, just never checked because there is no *file* literally named
+// `sm120_tile_scheduler_stream_k.hpp` (sm120 reuses sm100's), and no
+// blockwise-FP8+stream-K *test* exists upstream (only NVFP4/sparse
+// combinations do) -- but `GemmUniversal`'s mainloop/epilogue/scheduler
+// template slots are independent, so nothing prevents plugging this
+// existing scheduler onto our own existing blockwise FP8 mainloop, which is
+// exactly what this instantiation does. Motivation: the wide default tile's
+// own ~28% SM-idle at small M (the batch=16 decode shape) is a real,
+// previously "doubly closed" finding (see project memory) whose only
+// remaining fix was thought to require a newer CUTLASS release or a
+// from-scratch hand-rolled split-K kernel -- if this compiles and is
+// correct, it is neither.
+namespace stream_k {
+using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, f32out::CollectiveMainloop,
+                                                         f32out::CollectiveEpilogue, cutlass::gemm::StreamKScheduler>;
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+using StrideD = typename Gemm::GemmKernel::StrideD;
+}  // namespace stream_k
+
 // Small-M instantiation of the same f32out kernel, for decode-shaped calls
 // (n_tokens in the low tens, not prefill's thousands). `f32out`'s own
 // `CooperativeMmaTileShape_MNK` is `<128,128,128>` -- fixed, chosen for
@@ -360,6 +389,32 @@ using StrideB = typename Gemm::GemmKernel::StrideB;
 using StrideD = typename Gemm::GemmKernel::StrideD;
 }  // namespace small_m_swap
 
+// `small_m_swap`'s own tile/mainloop/epilogue with the scheduler swapped
+// from `void` to `cutlass::gemm::StreamKScheduler` -- same reasoning as the
+// plain `stream_k` namespace above, but applied to the tile production
+// actually dispatches to at n_tokens<=32. Real motivation, not speculative:
+// `swap_ab_occupancy_probe`'s own `ncu` run measured this exact tile at the
+// real gate/up shape (K=5120,N=17408,n_tokens=16) at `Waves Per SM=0.72` --
+// ~28% of this GPU's SMs get zero blocks for the kernel's entire duration,
+// the identical structural shape as the pre-swap_ab wide-tile finding this
+// file's own history already documented, just never re-checked after
+// swap_ab shipped. Swapping A/B changes which axis is tiled but not the
+// total block count (`stream_k`'s own bench above found real headroom at
+// K=17408,N=5120's wide tile -- only 40 blocks there, an even lower wave
+// count than gate/up's 136 -- while gate/up's own wide tile showed no real
+// stream-K benefit at all, a genuinely shape-dependent result, not a
+// scheduler no-op) -- so this is checked per-shape via a real bench, not
+// assumed to help uniformly.
+namespace small_m_swap_stream_k {
+using GemmKernel =
+    cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, small_m_swap::CollectiveMainloop,
+                                          small_m_swap::CollectiveEpilogue, cutlass::gemm::StreamKScheduler>;
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+using StrideA = typename Gemm::GemmKernel::StrideA;
+using StrideB = typename Gemm::GemmKernel::StrideB;
+using StrideD = typename Gemm::GemmKernel::StrideD;
+}  // namespace small_m_swap_stream_k
+
 // Same external contract as `infero_cutlass_fp8_bw_gemm_f32out_small_m` --
 // `a`/`sfa` are still the activation, `b`/`sfb` still the weight, `m`/`n`/`k`
 // mean what they always do here, `d` is still `[m,n]` row-major. The swap is
@@ -420,6 +475,52 @@ extern "C" int32_t infero_cutlass_fp8_bw_gemm_f32out_small_m_swap(const void* a,
   arguments.epilogue.thread.beta = accum ? 1.0f : 0.0f;
 
   small_m_swap::Gemm gemm;
+  auto status = gemm.can_implement(arguments);
+  if (status != cutlass::Status::kSuccess) return static_cast<int32_t>(status);
+  status = gemm.initialize(arguments, workspace, stream);
+  if (status != cutlass::Status::kSuccess) return static_cast<int32_t>(status);
+  status = gemm.run(arguments, workspace, stream);
+  return static_cast<int32_t>(status);
+}
+
+// `small_m_swap_stream_k`'s own entry points -- identical argument
+// construction to `infero_cutlass_fp8_bw_gemm_f32out_small_m_swap` above
+// (same swapped m/n roles, same stride/layout math), only the `Gemm` type
+// differs (`StreamKScheduler` in place of `void`).
+extern "C" size_t infero_cutlass_fp8_bw_gemm_f32out_small_m_swap_stream_k_workspace(int m, int n, int k) {
+  auto a_stride = cutlass::make_cute_packed_stride(small_m_swap_stream_k::StrideA{}, cute::make_shape(m, k, 1));
+  auto b_stride = cutlass::make_cute_packed_stride(small_m_swap_stream_k::StrideB{}, cute::make_shape(n, k, 1));
+  auto stride_D = cutlass::make_cute_packed_stride(small_m_swap_stream_k::StrideD{}, cute::make_shape(n, m, 1));
+  auto layout_SFA = small_m_swap::ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(n, m, k, 1));
+  auto layout_SFB = small_m_swap::ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(n, m, k, 1));
+  typename small_m_swap_stream_k::Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {n, m, k, 1},
+      {nullptr, b_stride, nullptr, a_stride, nullptr, layout_SFA, nullptr, layout_SFB},
+      {{}, nullptr, stride_D, nullptr, stride_D}};
+  return small_m_swap_stream_k::Gemm::get_workspace_size(arguments);
+}
+
+extern "C" int32_t infero_cutlass_fp8_bw_gemm_f32out_small_m_swap_stream_k(const void* a, const void* b,
+                                                                            const float* sfa, const float* sfb,
+                                                                            float* d, void* workspace, int m, int n,
+                                                                            int k, int accum, cudaStream_t stream) {
+  auto a_stride = cutlass::make_cute_packed_stride(small_m_swap_stream_k::StrideA{}, cute::make_shape(m, k, 1));
+  auto b_stride = cutlass::make_cute_packed_stride(small_m_swap_stream_k::StrideB{}, cute::make_shape(n, k, 1));
+  auto stride_D = cutlass::make_cute_packed_stride(small_m_swap_stream_k::StrideD{}, cute::make_shape(n, m, 1));
+  auto layout_SFA = small_m_swap::ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(n, m, k, 1));
+  auto layout_SFB = small_m_swap::ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(n, m, k, 1));
+
+  typename small_m_swap_stream_k::Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {n, m, k, 1},
+      {static_cast<const ElementB*>(b), b_stride, static_cast<const ElementA*>(a), a_stride, sfb, layout_SFA, sfa,
+       layout_SFB},
+      {{}, d, stride_D, d, stride_D}};
+  arguments.epilogue.thread.alpha = 1.0f;
+  arguments.epilogue.thread.beta = accum ? 1.0f : 0.0f;
+
+  small_m_swap_stream_k::Gemm gemm;
   auto status = gemm.can_implement(arguments);
   if (status != cutlass::Status::kSuccess) return static_cast<int32_t>(status);
   status = gemm.initialize(arguments, workspace, stream);
@@ -605,6 +706,53 @@ extern "C" int32_t infero_cutlass_fp8_bw_gemm_f32out(const void* a, const void* 
   arguments.epilogue.thread.beta = accum ? 1.0f : 0.0f;
 
   f32out::Gemm gemm;
+  auto status = gemm.can_implement(arguments);
+  if (status != cutlass::Status::kSuccess) return static_cast<int32_t>(status);
+  status = gemm.initialize(arguments, workspace, stream);
+  if (status != cutlass::Status::kSuccess) return static_cast<int32_t>(status);
+  status = gemm.run(arguments, workspace, stream);
+  return static_cast<int32_t>(status);
+}
+
+// `stream_k` namespace's own entry points -- same wide `<128,128,128>` tile
+// and f32-direct epilogue as `infero_cutlass_fp8_bw_gemm_f32out` above, only
+// the scheduler differs (`StreamKScheduler` vs `void`/persistent). Kept as a
+// distinct pair of functions (not a runtime flag on the existing one) so the
+// existing default entry point is completely unchanged -- same reasoning as
+// the sm90/sm100 variants just below.
+extern "C" size_t infero_cutlass_fp8_bw_gemm_f32out_stream_k_workspace(int m, int n, int k) {
+  auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
+  auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
+  auto stride_D = cutlass::make_cute_packed_stride(stream_k::StrideD{}, cute::make_shape(m, n, 1));
+  auto layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(m, n, k, 1));
+  auto layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, 1));
+  typename stream_k::Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {m, n, k, 1},
+      {nullptr, stride_A, nullptr, stride_B, nullptr, layout_SFA, nullptr, layout_SFB},
+      {{}, nullptr, stride_D, nullptr, stride_D}};
+  return stream_k::Gemm::get_workspace_size(arguments);
+}
+
+extern "C" int32_t infero_cutlass_fp8_bw_gemm_f32out_stream_k(const void* a, const void* b, const float* sfa,
+                                                                const float* sfb, float* d, void* workspace, int m,
+                                                                int n, int k, int accum, cudaStream_t stream) {
+  auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
+  auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
+  auto stride_D = cutlass::make_cute_packed_stride(stream_k::StrideD{}, cute::make_shape(m, n, 1));
+  auto layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(m, n, k, 1));
+  auto layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, 1));
+
+  typename stream_k::Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {m, n, k, 1},
+      {static_cast<const ElementA*>(a), stride_A, static_cast<const ElementB*>(b), stride_B, sfa, layout_SFA, sfb,
+       layout_SFB},
+      {{}, d, stride_D, d, stride_D}};
+  arguments.epilogue.thread.alpha = 1.0f;
+  arguments.epilogue.thread.beta = accum ? 1.0f : 0.0f;
+
+  stream_k::Gemm gemm;
   auto status = gemm.can_implement(arguments);
   if (status != cutlass::Status::kSuccess) return static_cast<int32_t>(status);
   status = gemm.initialize(arguments, workspace, stream);

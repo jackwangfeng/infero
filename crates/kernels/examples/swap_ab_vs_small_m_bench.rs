@@ -127,14 +127,20 @@ fn run_shape(k: &Kernels, kk: usize, n: usize, label: &str) -> Result<()> {
     let cutlass_w = k.prepare_cutlass_weight(&d_w.as_view(), kk, n, false)?;
 
     println!("K={kk} N={n} ({label})");
-    println!("{:>8}  {:>12}  {:>12}  {:>12}  {:>10}  {:>10}", "tokens", "small_m(ms)", "swap(ms)", "default(ms)", "swap/small_m", "swap/default");
+    println!(
+        "{:>8}  {:>12}  {:>12}  {:>12}  {:>12}  {:>14}  {:>10}  {:>10}",
+        "tokens", "small_m(ms)", "swap(ms)", "default(ms)", "stream_k(ms)", "swap_streamk(ms)", "swap/small_m", "swap/default"
+    );
     for n_tokens in [1usize, 2, 4, 8, 16, 24, 32, 48, 64] {
         let reps = if n_tokens <= 16 { 200 } else { 100 };
         let small_m = bench_tile(k, &d_w.as_view(), &cutlass_w, kk, n, n_tokens, BenchTile::SmallM, reps)?;
         let swap = bench_tile(k, &d_w.as_view(), &cutlass_w, kk, n, n_tokens, BenchTile::SmallMSwap, reps)?;
         let default = bench_tile(k, &d_w.as_view(), &cutlass_w, kk, n, n_tokens, BenchTile::Default, reps)?;
+        let stream_k = bench_tile(k, &d_w.as_view(), &cutlass_w, kk, n, n_tokens, BenchTile::StreamK, reps)?;
+        let swap_streamk =
+            bench_tile(k, &d_w.as_view(), &cutlass_w, kk, n, n_tokens, BenchTile::SmallMSwapStreamK, reps)?;
         println!(
-            "{n_tokens:>8}  {small_m:>12.4}  {swap:>12.4}  {default:>12.4}  {:>10.3}  {:>10.3}",
+            "{n_tokens:>8}  {small_m:>12.4}  {swap:>12.4}  {default:>12.4}  {stream_k:>12.4}  {swap_streamk:>14.4}  {:>10.3}  {:>10.3}",
             swap / small_m,
             swap / default
         );
@@ -146,5 +152,8 @@ fn main() -> Result<()> {
     let k = Kernels::new(Device::new(0)?);
     run_shape(&k, 5120, 17408, "real qwen38-27b-fp8 FFN gate/up projection")?;
     run_shape(&k, 17408, 5120, "real qwen38-27b-fp8 FFN down projection -- the transpose")?;
+    run_shape(&k, 5120, 34816, "real qwen38-27b-fp8 fused gate_up (INFERO_FUSE_FFN=1) -- N doubled")?;
+    run_shape(&k, 5120, 1024, "real qwen38-27b-fp8 attention K/V projection -- 8 swap-tiles, most idle-SM headroom")?;
+    run_shape(&k, 5120, 6144, "real qwen38-27b-fp8 GDN in_proj_z -- 48 swap-tiles")?;
     Ok(())
 }

@@ -423,6 +423,212 @@ fn the_f32out_gemm_matches_the_bf16_path() -> Result<()> {
     Ok(())
 }
 
+/// [`infero_kernels::cutlass_fp8::BenchTile::StreamK`] against
+/// [`infero_kernels::cutlass_fp8::BenchTile::Default`] -- same wide
+/// `<128,128,128>` tile, mainloop, and epilogue (see `fp8_bw_gemm.cu`'s
+/// `stream_k` namespace, which is built from `f32out::CollectiveMainloop`/
+/// `CollectiveEpilogue` verbatim), only the tile scheduler differs
+/// (`StreamKScheduler` vs the default persistent one). Stream-K's whole
+/// mechanism is splitting the K dimension across more CTAs than there are
+/// output tiles and reducing their partial sums afterward -- exactly the
+/// kind of change a subtle race or fixup-kernel bug could pass a quick look
+/// and fail a real numeric check, so this compares against the untouched
+/// `Default` tile at both a real production shape (K=5120,N=17408, the FFN
+/// gate/up projection) and a deliberately larger one (K=5120,N=17408 with
+/// more tokens) to exercise more than one wave-count regime.
+#[test]
+fn the_stream_k_gemm_matches_the_default_tile() -> Result<()> {
+    use infero_kernels::cutlass_fp8::BenchTile;
+
+    let k = kernels()?;
+    if !k.device().caps().fp8 {
+        eprintln!("skipping: sm_{} has no native e4m3 mma", k.device().arch());
+        return Ok(());
+    }
+    let stream = k.device().stream().clone();
+
+    const KK: usize = 5120;
+    const NN: usize = 17408;
+
+    let quants = quant_bytes(NN * KK, 0xF32D);
+    let scale_grid_n = NN / FP8_BLOCK;
+    let scale_grid_k = KK / FP8_BLOCK;
+    let scales: Vec<f32> = (0..scale_grid_n * scale_grid_k).map(|i| 0.2 + 0.3 * (i % 7) as f32).collect();
+    let w_buf = packed(&quants, &scales, KK, NN);
+    let d_w = stream.clone_htod(&w_buf)?;
+    let cutlass_w = k.prepare_cutlass_weight(&d_w.as_view(), KK, NN, false)?;
+
+    for n_tokens in [1usize, 2, 8, 16, 17, 32, 64, 96] {
+        let x: Vec<f32> =
+            (0..n_tokens).flat_map(|t| pseudo_random_f32(KK, 0xD00D + t as u64, 3.0 + t as f32)).collect();
+        let d_x = stream.clone_htod(&x)?;
+        let scale_cols = KK / ACT_QUANT_GROUP;
+
+        let mut d_xq = stream.alloc_zeros::<u8>(n_tokens * KK)?;
+        let mut d_sfa_t = stream.alloc_zeros::<f32>(scale_cols * n_tokens)?;
+        k.quantize_act_e4m3_cutlass(
+            &mut d_xq.as_view_mut(),
+            &mut d_sfa_t.as_view_mut(),
+            &d_x.as_view(),
+            KK,
+            n_tokens,
+            n_tokens,
+        )?;
+
+        for accum in [false, true] {
+            let seed_out: Vec<f32> = if accum {
+                pseudo_random_f32(n_tokens * NN, 0xBEEF, 100.0)
+            } else {
+                vec![0.0f32; n_tokens * NN]
+            };
+
+            let mut d_want = stream.clone_htod(&seed_out)?;
+            k.mma_e4m3_cutlass_sfa_f32out_bench(
+                &mut d_want.as_view_mut(),
+                &d_w.as_view(),
+                &cutlass_w,
+                &d_xq.as_view(),
+                &d_sfa_t.as_view(),
+                KK,
+                NN,
+                n_tokens,
+                accum,
+                BenchTile::Default,
+            )?;
+
+            let mut d_got = stream.clone_htod(&seed_out)?;
+            k.mma_e4m3_cutlass_sfa_f32out_bench(
+                &mut d_got.as_view_mut(),
+                &d_w.as_view(),
+                &cutlass_w,
+                &d_xq.as_view(),
+                &d_sfa_t.as_view(),
+                KK,
+                NN,
+                n_tokens,
+                accum,
+                BenchTile::StreamK,
+            )?;
+
+            k.device().synchronize()?;
+            let want = stream.clone_dtoh(&d_want)?;
+            let got = stream.clone_dtoh(&d_got)?;
+            k.device().synchronize()?;
+
+            let (worst, at) = max_rel_diff(&got, &want, 3e-2);
+            assert!(
+                worst <= 1.0,
+                "{n_tokens} tokens, accum={accum}: element {at} is {worst:.1}x the tolerance: \
+                 stream_k {}, default {}",
+                got[at],
+                want[at]
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Same idea as [`the_stream_k_gemm_matches_the_default_tile`] but for the
+/// operand-swapped small-M tile (`SmallMSwapStreamK` vs `SmallMSwap`) --
+/// production's own real dispatch choice at n_tokens<=32, so this is the
+/// variant that actually matters if it ever ships. Checked at both real FFN
+/// shapes: gate/up (K=5120,N=17408, where the wide tile's own stream-K bench
+/// showed no measurable benefit) and down-projection (K=17408,N=5120, where
+/// it showed a real ~2x win) -- the swapped tile's own block count mirrors
+/// whichever of these the wide tile would have used for the same weight
+/// shape, so both are worth checking for correctness even though only one
+/// is expected to show a real speed difference.
+#[test]
+fn the_small_m_swap_stream_k_gemm_matches_small_m_swap() -> Result<()> {
+    use infero_kernels::cutlass_fp8::BenchTile;
+
+    let k = kernels()?;
+    if !k.device().caps().fp8 {
+        eprintln!("skipping: sm_{} has no native e4m3 mma", k.device().arch());
+        return Ok(());
+    }
+    let stream = k.device().stream().clone();
+
+    for (kk, nn) in [(5120usize, 17408usize), (17408, 5120)] {
+        let quants = quant_bytes(nn * kk, 0xF32D);
+        let scale_grid_n = nn / FP8_BLOCK;
+        let scale_grid_k = kk / FP8_BLOCK;
+        let scales: Vec<f32> = (0..scale_grid_n * scale_grid_k).map(|i| 0.2 + 0.3 * (i % 7) as f32).collect();
+        let w_buf = packed(&quants, &scales, kk, nn);
+        let d_w = stream.clone_htod(&w_buf)?;
+        let cutlass_w = k.prepare_cutlass_weight(&d_w.as_view(), kk, nn, false)?;
+
+        for n_tokens in [1usize, 2, 8, 16, 17, 32] {
+            let x: Vec<f32> =
+                (0..n_tokens).flat_map(|t| pseudo_random_f32(kk, 0xD00D + t as u64, 3.0 + t as f32)).collect();
+            let d_x = stream.clone_htod(&x)?;
+            let scale_cols = kk / ACT_QUANT_GROUP;
+
+            let mut d_xq = stream.alloc_zeros::<u8>(n_tokens * kk)?;
+            let mut d_sfa_t = stream.alloc_zeros::<f32>(scale_cols * n_tokens)?;
+            k.quantize_act_e4m3_cutlass(
+                &mut d_xq.as_view_mut(),
+                &mut d_sfa_t.as_view_mut(),
+                &d_x.as_view(),
+                kk,
+                n_tokens,
+                n_tokens,
+            )?;
+
+            for accum in [false, true] {
+                let seed_out: Vec<f32> = if accum {
+                    pseudo_random_f32(n_tokens * nn, 0xBEEF, 100.0)
+                } else {
+                    vec![0.0f32; n_tokens * nn]
+                };
+
+                let mut d_want = stream.clone_htod(&seed_out)?;
+                k.mma_e4m3_cutlass_sfa_f32out_bench(
+                    &mut d_want.as_view_mut(),
+                    &d_w.as_view(),
+                    &cutlass_w,
+                    &d_xq.as_view(),
+                    &d_sfa_t.as_view(),
+                    kk,
+                    nn,
+                    n_tokens,
+                    accum,
+                    BenchTile::SmallMSwap,
+                )?;
+
+                let mut d_got = stream.clone_htod(&seed_out)?;
+                k.mma_e4m3_cutlass_sfa_f32out_bench(
+                    &mut d_got.as_view_mut(),
+                    &d_w.as_view(),
+                    &cutlass_w,
+                    &d_xq.as_view(),
+                    &d_sfa_t.as_view(),
+                    kk,
+                    nn,
+                    n_tokens,
+                    accum,
+                    BenchTile::SmallMSwapStreamK,
+                )?;
+
+                k.device().synchronize()?;
+                let want = stream.clone_dtoh(&d_want)?;
+                let got = stream.clone_dtoh(&d_got)?;
+                k.device().synchronize()?;
+
+                let (worst, at) = max_rel_diff(&got, &want, 3e-2);
+                assert!(
+                    worst <= 1.0,
+                    "K={kk} N={nn} {n_tokens} tokens, accum={accum}: element {at} is {worst:.1}x \
+                     the tolerance: swap_stream_k {}, swap {}",
+                    got[at],
+                    want[at]
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn max_rel_diff(got: &[f32], want: &[f32], rel: f32) -> (f32, usize) {
     let peak = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     let floor = 3e-2 * peak.max(f32::MIN_POSITIVE);

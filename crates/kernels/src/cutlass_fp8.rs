@@ -256,6 +256,27 @@ mod ffi {
             stream: cudarc::driver::sys::CUstream,
         ) -> i32;
 
+        // SM120 only, same wide `<128,128,128>` tile as the plain entry point
+        // above but with CUTLASS's `StreamKScheduler` in place of the default
+        // persistent scheduler -- see `fp8_bw_gemm.cu`'s `stream_k` namespace
+        // comment for why this exists and why the "no sm120 stream-K
+        // scheduler exists" prior verdict was wrong.
+        pub fn infero_cutlass_fp8_bw_gemm_f32out_stream_k_workspace(m: i32, n: i32, k: i32) -> usize;
+        #[allow(clippy::too_many_arguments)]
+        pub fn infero_cutlass_fp8_bw_gemm_f32out_stream_k(
+            a: *const c_void,
+            b: *const c_void,
+            sfa: *const f32,
+            sfb: *const f32,
+            d: *mut f32,
+            workspace: *mut c_void,
+            m: i32,
+            n: i32,
+            k: i32,
+            accum: i32,
+            stream: cudarc::driver::sys::CUstream,
+        ) -> i32;
+
         // Hopper/Blackwell-datacenter kernel bodies (real, distinctly-typed
         // `GemmKernel`s, not the SM120 kernel above recompiled — see
         // `fp8_bw_gemm.cu`'s own `sm90`/`sm100` namespace comment). Same
@@ -300,6 +321,25 @@ mod ffi {
         pub fn infero_cutlass_fp8_bw_gemm_f32out_small_m_workspace(m: i32, n: i32, k: i32) -> usize;
         #[allow(clippy::too_many_arguments)]
         pub fn infero_cutlass_fp8_bw_gemm_f32out_small_m(
+            a: *const c_void,
+            b: *const c_void,
+            sfa: *const f32,
+            sfb: *const f32,
+            d: *mut f32,
+            workspace: *mut c_void,
+            m: i32,
+            n: i32,
+            k: i32,
+            accum: i32,
+            stream: cudarc::driver::sys::CUstream,
+        ) -> i32;
+
+        // Same operand-swapped small-M tile as `_small_m_swap` above, with
+        // `StreamKScheduler` in place of the default scheduler -- see
+        // `fp8_bw_gemm.cu`'s `small_m_swap_stream_k` namespace comment.
+        pub fn infero_cutlass_fp8_bw_gemm_f32out_small_m_swap_stream_k_workspace(m: i32, n: i32, k: i32) -> usize;
+        #[allow(clippy::too_many_arguments)]
+        pub fn infero_cutlass_fp8_bw_gemm_f32out_small_m_swap_stream_k(
             a: *const c_void,
             b: *const c_void,
             sfa: *const f32,
@@ -686,6 +726,25 @@ impl Kernels {
             // `SWAP_AB_MAX_TOKENS`'s own doc comment for the numbers) shows
             // swap loses badly past 32 tokens here -- do not widen this past
             // `SWAP_AB_MAX_TOKENS` without a fresh measurement backing it.
+            // FFN down-projection's own exact shape (K=17408,N=5120) showed a
+            // real, measured ~33% kernel-level win from swapping
+            // `small_m_swap`'s scheduler to `StreamKScheduler`
+            // (`examples/swap_ab_vs_small_m_bench.rs`, `small_m_swap_stream_k`
+            // namespace -- `ncu` found this tile only fills 40 of 188 SMs a
+            // wave, 21%, real idle capacity stream-K's own K-splitting can
+            // redistribute into) -- but a real batch=16 end-to-end A/B (two
+            // samples each side: baseline 573.89/585.70 tok/s vs with this
+            // dispatch wired in, 573.35/586.18 tok/s) found ~0% effect,
+            // indistinguishable from noise: this one projection is too small
+            // a share of a decode step's total kernel time for a 33% win on
+            // it alone to clear the noise floor, the same "real kernel win,
+            // doesn't survive contact with end-to-end" pattern this whole
+            // investigation has hit before (`gemv_f16_ksplit`, `decoupled6`,
+            // etc. -- see project memory). NOT wired in; `small_m_swap_stream_k`
+            // stays real, tested, available infra (correctness- and
+            // memcheck/racecheck-clean, see `cutlass_fp8_gemm.rs`'s
+            // `the_small_m_swap_stream_k_gemm_matches_small_m_swap`), same
+            // status as those earlier kernels.
             GemmArchTier::Sm120 if n_tokens <= SWAP_AB_MAX_TOKENS => (
                 ffi::infero_cutlass_fp8_bw_gemm_f32out_small_m_swap_workspace,
                 ffi::infero_cutlass_fp8_bw_gemm_f32out_small_m_swap,
@@ -753,6 +812,14 @@ impl Kernels {
                 ffi::infero_cutlass_fp8_bw_gemm_f32out_small_m_swap,
             ),
             BenchTile::Default => (ffi::infero_cutlass_fp8_bw_gemm_f32out_workspace, ffi::infero_cutlass_fp8_bw_gemm_f32out),
+            BenchTile::StreamK => (
+                ffi::infero_cutlass_fp8_bw_gemm_f32out_stream_k_workspace,
+                ffi::infero_cutlass_fp8_bw_gemm_f32out_stream_k,
+            ),
+            BenchTile::SmallMSwapStreamK => (
+                ffi::infero_cutlass_fp8_bw_gemm_f32out_small_m_swap_stream_k_workspace,
+                ffi::infero_cutlass_fp8_bw_gemm_f32out_small_m_swap_stream_k,
+            ),
         };
         self.mma_e4m3_cutlass_sfa_f32out_with(workspace_fn, gemm_fn, out, w, cw, xq, sfa_t, k, n, n_tokens, accum)
     }
@@ -833,4 +900,6 @@ pub enum BenchTile {
     SmallM,
     SmallMSwap,
     Default,
+    StreamK,
+    SmallMSwapStreamK,
 }
