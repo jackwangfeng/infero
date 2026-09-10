@@ -91,6 +91,13 @@ type CutlassSlot = std::sync::OnceLock<Option<infero_kernels::CutlassWeight>>;
 #[cfg(not(feature = "cutlass"))]
 type CutlassSlot = ();
 
+/// Same idea as [`CutlassSlot`], for a [`crate::WeightType::F4E2M1`]
+/// matrix's lazily-built [`infero_kernels::CutlassFp4Weight`].
+#[cfg(feature = "cutlass")]
+type CutlassFp4Slot = std::sync::OnceLock<Option<infero_kernels::CutlassFp4Weight>>;
+#[cfg(not(feature = "cutlass"))]
+type CutlassFp4Slot = ();
+
 /// A 2-D weight matrix, still in its GGUF block encoding.
 pub struct Matrix {
     pub ty: WeightType,
@@ -101,6 +108,7 @@ pub struct Matrix {
     pub n_bytes: usize,
     storage: Storage,
     cutlass_weight: CutlassSlot,
+    cutlass_fp4_weight: CutlassFp4Slot,
 }
 
 impl Matrix {
@@ -130,6 +138,55 @@ impl Matrix {
                 kern.prepare_cutlass_weight(&view, self.k, self.n, fp8_unified_layout()).ok()
             })
             .as_ref()
+    }
+
+    /// This matrix's [`infero_kernels::CutlassFp4Weight`], built and cached
+    /// on first use. Only for resident, [`WeightType::F4E2M1`] matrices --
+    /// `None` otherwise, same reasoning as [`Self::cutlass_weight`] (an
+    /// offloaded matrix's bytes live in a per-layer staging buffer a
+    /// different layer's DMA can overwrite between calls, so caching
+    /// anything derived from them would go stale silently).
+    ///
+    /// `WeightType::F4E2M1`'s own device buffer ends with two trailing f32
+    /// scalars the loader wrote (`weight_scale_2` then `input_scale`, both
+    /// little-endian -- see that type's own doc comment). Neither has a
+    /// host-side field on `Matrix`, so this reads both off the buffer's tail
+    /// once, here, at the same lazy-init step that builds the cached
+    /// CUTLASS-side swizzled scale grid: `weight_scale_2` feeds
+    /// [`infero_kernels::Kernels::prepare_cutlass_fp4_weight`]'s own
+    /// `scale2` parameter (applied as the GEMM's `alpha`), and
+    /// `input_scale` is cached on the returned `CutlassFp4Weight` purely as
+    /// a convenient place to hold it -- it is not consumed by the GEMM
+    /// itself, only by `Model::matmul_pre`'s activation-quantize call,
+    /// which reads it back out via
+    /// [`infero_kernels::CutlassFp4Weight::input_scale`].
+    #[cfg(feature = "cutlass")]
+    pub fn cutlass_fp4_weight(&self, kern: &infero_kernels::Kernels) -> Option<&infero_kernels::CutlassFp4Weight> {
+        if self.ty != WeightType::F4E2M1 || !self.is_resident() {
+            return None;
+        }
+        self.cutlass_fp4_weight
+            .get_or_init(|| self.build_cutlass_fp4_weight(kern).ok())
+            .as_ref()
+    }
+
+    /// The fallible body of [`Self::cutlass_fp4_weight`], split out only so
+    /// the `?` operator can be used against `anyhow::Result` inside what is
+    /// otherwise an `Option`-returning `get_or_init` closure (mirroring
+    /// [`Self::cutlass_weight`]'s own `.ok()`-at-the-callsite shape).
+    #[cfg(feature = "cutlass")]
+    fn build_cutlass_fp4_weight(&self, kern: &infero_kernels::Kernels) -> Result<infero_kernels::CutlassFp4Weight> {
+        let view = self.view(None)?;
+        anyhow::ensure!(
+            view.len() >= 8,
+            "F4E2M1 matrix buffer holds {} bytes, too small to hold its own trailing \
+             weight_scale_2/input_scale f32 scalars",
+            view.len()
+        );
+        let tail = kern.device().stream().clone_dtoh(&view.slice(view.len() - 8..view.len()))?;
+        let scale2 = f32::from_le_bytes(tail[0..4].try_into().expect("4 bytes"));
+        let input_scale = f32::from_le_bytes(tail[4..8].try_into().expect("4 bytes"));
+        kern.prepare_cutlass_fp4_weight(&view, self.k, self.n, scale2, input_scale)
     }
 
     /// A device view of this matrix.
@@ -326,6 +383,7 @@ impl Matrix {
             n_bytes: raw.len(),
             storage: Storage::Device(dev.stream().clone_htod(raw)?),
                 cutlass_weight: Default::default(),
+                cutlass_fp4_weight: Default::default(),
         })
     }
 }
@@ -755,6 +813,7 @@ impl Weights {
                                 n_bytes,
                                 storage: Storage::Device(dev.stream().clone_htod(&bytes)?),
                                 cutlass_weight: Default::default(),
+                                cutlass_fp4_weight: Default::default(),
                             })
                         };
                         let upload_value_rows = |name: &str, row_span: usize, total: &mut usize| -> Result<Matrix> {
@@ -777,6 +836,7 @@ impl Weights {
                                 n_bytes,
                                 storage: Storage::Device(dev.stream().clone_htod(&bytes)?),
                                 cutlass_weight: Default::default(),
+                                cutlass_fp4_weight: Default::default(),
                             })
                         };
 
@@ -821,6 +881,7 @@ impl Weights {
                                 n_bytes,
                                 storage: Storage::Device(dev.stream().clone_htod(&bytes)?),
                                 cutlass_weight: Default::default(),
+                                cutlass_fp4_weight: Default::default(),
                             });
                         }
                         // 5, 6, 7: dense FFN gate/up/down -- ordinary
@@ -1529,6 +1590,7 @@ pub fn load_mtp(
                 n_bytes: bytes.len(),
                 storage: Storage::Device(dev.stream().clone_htod(&bytes)?),
                 cutlass_weight: Default::default(),
+                cutlass_fp4_weight: Default::default(),
             });
         }
         // `mtp.fc` lands here — BF16 in this checkpoint. Not a special case in
@@ -1549,6 +1611,7 @@ pub fn load_mtp(
             n_bytes: raw.len(),
             storage: Storage::Device(dev.stream().clone_htod(raw)?),
                 cutlass_weight: Default::default(),
+                cutlass_fp4_weight: Default::default(),
         })
     };
 
@@ -1672,6 +1735,7 @@ fn stacked2_gguf(dev: &Device, f: &Gguf, a: &str, b: &str, total: &mut usize) ->
         n_bytes: bytes.len(),
         storage: Storage::Device(dev.stream().clone_htod(&bytes)?),
                 cutlass_weight: Default::default(),
+                cutlass_fp4_weight: Default::default(),
     }))
 }
 
@@ -1772,6 +1836,7 @@ pub fn load_awq(
             n_bytes: bytes.len(),
             storage,
                 cutlass_weight: Default::default(),
+                cutlass_fp4_weight: Default::default(),
         })
     };
     let arch = cfg.arch.clone();
@@ -3089,6 +3154,7 @@ fn upload_matrix(
         n_bytes,
         storage,
         cutlass_weight: Default::default(),
+        cutlass_fp4_weight: Default::default(),
     })
 }
 
@@ -3251,6 +3317,7 @@ fn upload_matrix_sharded(
         n_bytes,
         storage,
         cutlass_weight: Default::default(),
+        cutlass_fp4_weight: Default::default(),
     })
 }
 
@@ -3292,6 +3359,7 @@ fn pack_layer(dev: &Device, f: &Gguf, names: &[String]) -> Result<(Vec<Matrix>, 
             n_bytes,
             storage: Storage::Streamed { offset },
                 cutlass_weight: Default::default(),
+                cutlass_fp4_weight: Default::default(),
         })
         .collect();
 

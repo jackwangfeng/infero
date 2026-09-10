@@ -120,7 +120,7 @@ fn the_nvfp4_gemm_matches_the_host_reference() -> Result<()> {
     let mut w_buf = w_quants.clone();
     w_buf.extend_from_slice(&w_scale_bytes);
     let d_w = stream.clone_htod(&w_buf)?;
-    let cw = k.prepare_cutlass_fp4_weight(&d_w.as_view(), K, N, WEIGHT_SCALE_2)?;
+    let cw = k.prepare_cutlass_fp4_weight(&d_w.as_view(), K, N, WEIGHT_SCALE_2, INPUT_SCALE)?;
 
     let w_dequant_f64 = dequant_matrix_f64(&w_quants, &w_scale_bytes, WEIGHT_SCALE_2, K, N);
 

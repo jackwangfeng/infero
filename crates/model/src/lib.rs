@@ -1890,6 +1890,17 @@ struct Scratch {
     /// native W8A8 GEMM — `quantize_act_e4m3`'s `xq`/`xs` outputs.
     xq_e4m3: Buf<u8>,
     xs_e4m3: Buf<f32>,
+    /// The activation, dynamically quantized to packed NVFP4 (e2m1) for
+    /// `mma_e2m1_cutlass_sfa_f32out`'s native W4A4 GEMM —
+    /// `quantize_act_e2m1_cutlass`'s `xq`/`xq_scale` outputs. Unlike
+    /// `xs_e4m3`, the scale buffer here is raw `f8_e4m3` bytes, not `f32`
+    /// (see that function's own doc comment), so it is a `Buf<u8>` too. Only
+    /// the CUTLASS NVFP4 dispatch in `matmul_pre` reads these, so they are
+    /// gated the same as that path.
+    #[cfg(feature = "cutlass")]
+    xq_e2m1: Buf<u8>,
+    #[cfg(feature = "cutlass")]
+    xs_e2m1: Buf<u8>,
 }
 
 /// One row's sampling parameters plus its own uniform draw.
@@ -2704,6 +2715,23 @@ impl Model {
                         .max(cfg.d_model)
                         .max(cfg.d_attn())
                         .div_ceil(infero_kernels::fp8::ACT_QUANT_GROUP),
+            )?,
+            // Same width bound as `xq_e4m3`/`xs_e4m3`: whichever activation
+            // feeds the next NVFP4 projection, packed two e2m1 values a byte
+            // (`xq_e2m1`) plus one f8_e4m3 scale byte per
+            // `infero_kernels::fp4::F4E2M1_BLOCK`-element block (`xs_e2m1`).
+            #[cfg(feature = "cutlass")]
+            xq_e2m1: dev
+                .stream()
+                .alloc_zeros::<u8>((batch_tokens * cfg.d_ff.max(cfg.d_model).max(cfg.d_attn())).div_ceil(2))?,
+            #[cfg(feature = "cutlass")]
+            xs_e2m1: dev.stream().alloc_zeros::<u8>(
+                batch_tokens
+                    * cfg
+                        .d_ff
+                        .max(cfg.d_model)
+                        .max(cfg.d_attn())
+                        .div_ceil(infero_kernels::fp4::F4E2M1_BLOCK),
             )?,
         };
 
@@ -7222,6 +7250,61 @@ impl Model {
                 w.k,
                 w.n,
             );
+        }
+
+        // NVFP4 (W4A4): a real, single physical layout
+        // (`WeightType::F4E2M1`'s own doc comment), unrelated to the
+        // F8E4M3 block above and in particular to its own
+        // `fp8_unified_layout()` toggle -- that gate chooses between two
+        // *F8E4M3* physical layouts and has no meaning here, so this is a
+        // separate top-level branch, not nested inside the F8E4M3 one.
+        // There is also no non-CUTLASS fallback kernel for this format
+        // (Task 6's own report flags this gap explicitly), so the whole
+        // branch only exists under the `cutlass` feature and loud-fails,
+        // the same way the F8E4M3 unified path does above, if CUTLASS
+        // declines the shape rather than silently falling through to a
+        // kernel that cannot read this layout.
+        #[cfg(feature = "cutlass")]
+        if w.ty == infero_kernels::WeightType::F4E2M1 {
+            let cw = w
+                .cutlass_fp4_weight(kern)
+                .with_context(|| format!("preparing CUTLASS NVFP4 weight for a {}x{} matrix", w.n, w.k))?;
+            let blocks = w.k.div_ceil(infero_kernels::fp4::F4E2M1_BLOCK);
+            let xq_len = n_tokens * w.k.div_ceil(2);
+            let xs_len = n_tokens * blocks;
+            anyhow::ensure!(
+                scratch.xq_e2m1.len() >= xq_len && scratch.xs_e2m1.len() >= xs_len,
+                "NVFP4 activation quant scratch too small for {n_tokens} tokens at k={}",
+                w.k
+            );
+            kern.quantize_act_e2m1_cutlass(
+                &mut scratch.xq_e2m1.slice_mut(..xq_len),
+                &mut scratch.xs_e2m1.slice_mut(..xs_len),
+                x,
+                cw.input_scale(),
+                w.k,
+                n_tokens,
+            )?;
+            let ran = kern.mma_e2m1_cutlass_sfa_f32out(
+                out,
+                &weights,
+                cw,
+                &scratch.xq_e2m1.slice(..xq_len),
+                &scratch.xs_e2m1.slice(..xs_len),
+                w.k,
+                w.n,
+                n_tokens,
+                false,
+            )?;
+            anyhow::ensure!(
+                ran,
+                "CUTLASS declined a {}x{} matmul at {n_tokens} tokens under the NVFP4 (W4A4) \
+                 layout, which has no other kernel that can read it -- likely k not a multiple \
+                 of 32",
+                w.n,
+                w.k
+            );
+            return Ok(());
         }
 
         let int_x = use_mmvq && Kernels::has_mmvq(w.ty) && w.k.is_multiple_of(32);

@@ -140,8 +140,28 @@ static CUTLASS_FP4_SFA: Scratch = Scratch::new();
 pub struct CutlassFp4Weight {
     scale_sfb: Buf<u8>,
     scale2: f32,
+    /// The checkpoint's `input_scale` scalar -- semantically an
+    /// activation-side value, not consumed by this GEMM at all, but cached
+    /// here anyway (Task 7's own design choice): the caller already has to
+    /// download `weight_scale_2` off this matrix's device buffer's tail to
+    /// build a `CutlassFp4Weight` in the first place, so caching
+    /// `input_scale` alongside it in that same lazy-init step avoids a
+    /// second cache slot (and a second device->host round trip) on
+    /// `Matrix` purely to hold one more `f32`. Read back via
+    /// [`Self::input_scale`] by the forward pass's own
+    /// `quantize_act_e2m1_cutlass` call, which needs it as that kernel's
+    /// `input_scale` argument.
+    input_scale: f32,
     k: usize,
     n: usize,
+}
+
+impl CutlassFp4Weight {
+    /// The checkpoint's `input_scale` scalar (see the field's own doc
+    /// comment for why it lives here rather than on `Matrix`).
+    pub fn input_scale(&self) -> f32 {
+        self.input_scale
+    }
 }
 
 impl Kernels {
@@ -152,10 +172,19 @@ impl Kernels {
     /// [`crate::WeightType::F4E2M1`]'s own layout) `n * k.div_ceil(2)` packed
     /// quant bytes, then `n * k.div_ceil(F4E2M1_BLOCK)` f8_e4m3 block-scale
     /// bytes, then two trailing f32 scalars this function does not read
-    /// (the caller extracts them the same way it already does for
+    /// itself (the caller extracts them the same way it already does for
     /// [`Kernels::dequant_f4e2m1`]'s own `scale2` parameter). `scale2` is
-    /// the checkpoint's `weight_scale_2`.
-    pub fn prepare_cutlass_fp4_weight(&self, w: &View<'_, u8>, k: usize, n: usize, scale2: f32) -> Result<CutlassFp4Weight> {
+    /// the checkpoint's `weight_scale_2`; `input_scale` is cached as-is on
+    /// the returned value (see [`CutlassFp4Weight::input_scale`]'s own doc
+    /// comment).
+    pub fn prepare_cutlass_fp4_weight(
+        &self,
+        w: &View<'_, u8>,
+        k: usize,
+        n: usize,
+        scale2: f32,
+        input_scale: f32,
+    ) -> Result<CutlassFp4Weight> {
         anyhow::ensure!(
             k.is_multiple_of(FP4_GEMM_K_ALIGN),
             "the CUTLASS NVFP4 GEMM's own operand alignment is {FP4_GEMM_K_ALIGN} elements along k; got k={k}"
@@ -177,7 +206,7 @@ impl Kernels {
         launch_swizzle(self, &mut scale_sfb.as_view_mut(), &sf_flat, n, blocks)?;
 
         self.dev.stream().synchronize().context("preparing a CUTLASS NVFP4 weight")?;
-        Ok(CutlassFp4Weight { scale_sfb, scale2, k, n })
+        Ok(CutlassFp4Weight { scale_sfb, scale2, input_scale, k, n })
     }
 }
 
