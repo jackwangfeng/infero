@@ -5400,6 +5400,24 @@ impl Model {
         } else {
             self.act.positions.slice(..n)
         };
+        // `INFERO_PROBE=<layer>` captures the real Q/K BEFORE RoPE modifies
+        // them in place -- rope_qk_partial/rope_qk_packed_partial write
+        // through the same `self.act.q`/`k`(or packed) buffers the later
+        // `attn_q_final`/`attn_k_final`/`attn_qkv_packed` probes read, so
+        // this pair brackets RoPE exactly, for an independent ground-truth
+        // cross-check of RoPE itself (real position 0..n_tokens for this
+        // investigation's single fresh, non-multiturn request; real
+        // rotary_dim/theta/freq_scale from this checkpoint's own config) --
+        // the one real computation applied to Q/K that no check in this
+        // investigation has touched yet. See
+        // task8-lmhead-rootcause-report.md's addendum.
+        probe(&self.kern, layer, "attn_q_prerope", &self.act.q.slice(..n * da));
+        if packed_qkv {
+            probe(&self.kern, layer, "attn_qkv_prerope_packed", &self.act.gate.slice(..n * fused_w));
+        } else {
+            probe(&self.kern, layer, "attn_k_prerope", &self.act.k.slice(..n * kv_dim));
+        }
+
         if packed_qkv {
             let (q, packed) = (&mut self.act.q, &mut self.act.gate);
             self.kern.rope_qk_packed_partial(
