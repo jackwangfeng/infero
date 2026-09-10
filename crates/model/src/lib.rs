@@ -5450,6 +5450,36 @@ impl Model {
         let attn_scale = cfg.attn_scale();
         let (n_heads, n_kv_heads, d_head) = (cfg.n_heads, cfg.n_kv_heads, cfg.d_head);
 
+        // `INFERO_PROBE=<layer>` captures the real, final (post-RoPE) Q/K/V
+        // this layer's attention is about to score, softmax and combine --
+        // regardless of whether Q/K/V stayed packed (`packed_qkv`, one fused
+        // F8E4M3 matmul via `w_qkv`/`stacked3`) or were split apart, unlike
+        // the pre-existing `q_after_rope`/`k_after_rope`/`v` probes a few
+        // lines below, which only fire in the unpacked (`else`) branch. This
+        // is for an independent ground-truth cross-check of the attention
+        // score/softmax/weighted-sum mechanism itself (`Q@K^T`, causal mask,
+        // softmax, `@V`) -- the one real computation in the regular-
+        // attention path this investigation has not yet checked, everything
+        // else (every matmul, GDN's gating/recurrence/norm) now confirmed
+        // correct. See task8-lmhead-rootcause-report.md's addendum.
+        probe(&self.kern, layer, "attn_q_final", &self.act.q.slice(..n * da));
+        if packed_qkv {
+            // K and V are still interleaved inside this row-major, `fused_w`-
+            // strided buffer (row t = `[q(da) | k(kv_dim) | v(kv_dim)]`, per
+            // `store_kv2_packed`'s own `k_off=da`/`v_off=da+kv_dim` a few
+            // lines below) -- `probe()` only takes a plain contiguous view,
+            // so de-interleaving on-device here would need a real gather
+            // kernel for a temporary diagnostic. Dumping the whole packed
+            // row instead and de-interleaving on the host side (the
+            // ground-truth script already needs to know this real layout to
+            // build Q/K/V anyway) is simpler and cannot itself introduce a
+            // slicing bug.
+            probe(&self.kern, layer, "attn_qkv_packed", &self.act.gate.slice(..n * fused_w));
+        } else {
+            probe(&self.kern, layer, "attn_k_final", &self.act.k.slice(..n * kv_dim));
+            probe(&self.kern, layer, "attn_v_final", &self.act.v.slice(..n * kv_dim));
+        }
+
         match self.tq.as_mut() {
             None => {
                 if packed_qkv {
@@ -6381,6 +6411,16 @@ impl Model {
             }
         }
 
+        // Real, raw attention output -- `Q@K^T`, causal mask, softmax, `@V`,
+        // GQA-combined across heads -- captured BEFORE the optional output
+        // gate just below (`o_proj_in`, added in an earlier round of this
+        // same investigation, captures the value AFTER this gate, which
+        // only proves `o_proj` and the gate itself are consistent, not that
+        // attention's own score/softmax/combine math is correct). Pairs
+        // with `attn_q_final`/`attn_k_final`/`attn_v_final`/
+        // `attn_qkv_packed` for an independent ground-truth cross-check.
+        probe(&self.kern, layer, "attn_raw_out", &self.act.attn.slice(..n * da));
+
         // The output gate, applied to the attention output before anything
         // downstream reads it -- both the fast path just below and the
         // generic one after it read `self.act.attn` straight, so gating it
@@ -6393,6 +6433,12 @@ impl Model {
             let ag = attn_gate
                 .as_ref()
                 .context("a gated attention layer with no gate buffer allocated")?;
+            // The real gate value itself (pre-sigmoid), so the ground-truth
+            // script can reproduce `o_proj_in` exactly from `attn_raw_out`
+            // (`attn_raw_out * sigmoid(attn_gate_raw)`) as a free, purely
+            // mechanical cross-check, on top of comparing `attn_raw_out`
+            // against an independent softmax computation.
+            probe(&self.kern, layer, "attn_gate_raw", &ag.slice(..n * da));
             self.kern.sigmoid_gate(
                 &mut attn.slice_mut(..n * da),
                 &ag.slice(..n * da),
