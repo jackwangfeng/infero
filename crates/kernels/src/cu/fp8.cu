@@ -34,29 +34,9 @@
 // bytes are now strided by 16, so a one-row kernel would read them worse than
 // the group does.
 
-// E4M3: sign in bit 7, four exponent bits biased by 7, three mantissa bits. No
-// infinities — 0x7F and 0xFF are the only NaNs, and 0x7E is the largest finite
-// value at 448.
-//
-// Done with bit arithmetic rather than a lookup table: four integer ops beat a
-// shared-memory load per weight, and this kernel is reading a byte per multiply
-// so there is no room for a table access in the inner loop.
-__device__ __forceinline__ float e4m3_to_f32(unsigned int b) {
-    const unsigned int sign = (b & 0x80u) << 24;
-    const int exp = (int)((b >> 3) & 0x0Fu);
-    const unsigned int man = b & 0x07u;
-    if (exp == 0) {
-        // Subnormal: (man / 8) * 2^-6, which is man * 2^-9. Zero when man is 0,
-        // and the sign still has to be carried for -0.
-        const float v = (float)man * (1.0f / 512.0f);
-        return sign ? -v : v;
-    }
-    if (exp == 0x0F && man == 0x07) {
-        return __int_as_float(0x7fc00000);  // the only NaN pattern
-    }
-    // Normal: rebias 7 to 127 and shift the mantissa into f32's field.
-    return __int_as_float(sign | ((unsigned int)(exp + 120) << 23) | (man << 20));
-}
+// `e4m3_to_f32` (the E4M3-to-`f32` bit conversion this file's kernels read a
+// scale through) now lives in `common.cuh`, shared with `fp4.cu`'s block
+// scale decode -- see that file for the format notes.
 
 // Rows interleaved into one group. Must match `fp8::ROW_GROUP`, and must divide
 // 128, or a group would straddle a scale-grid row and one `srow` pointer would

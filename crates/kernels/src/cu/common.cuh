@@ -18,6 +18,32 @@ typedef unsigned int uint32_t;
 #define WARP_SIZE 32
 #define FULL_MASK 0xffffffffu
 
+// E4M3: sign in bit 7, four exponent bits biased by 7, three mantissa bits. No
+// infinities — 0x7F and 0xFF are the only NaNs, and 0x7E is the largest finite
+// value at 448.
+//
+// Done with bit arithmetic rather than a lookup table: four integer ops beat a
+// shared-memory load per weight, which matters on `fp8.cu`'s mat-vec (reading
+// a byte per multiply, no room for a table access in the inner loop) and is
+// free elsewhere. Shared here rather than duplicated in `fp8.cu` and `fp4.cu`,
+// which both need the same f8_e4m3-to-f32 conversion for their block scales.
+__device__ __forceinline__ float e4m3_to_f32(unsigned int b) {
+    const unsigned int sign = (b & 0x80u) << 24;
+    const int exp = (int)((b >> 3) & 0x0Fu);
+    const unsigned int man = b & 0x07u;
+    if (exp == 0) {
+        // Subnormal: (man / 8) * 2^-6, which is man * 2^-9. Zero when man is 0,
+        // and the sign still has to be carried for -0.
+        const float v = (float)man * (1.0f / 512.0f);
+        return sign ? -v : v;
+    }
+    if (exp == 0x0F && man == 0x07) {
+        return __int_as_float(0x7fc00000);  // the only NaN pattern
+    }
+    // Normal: rebias 7 to 127 and shift the mantissa into f32's field.
+    return __int_as_float(sign | ((unsigned int)(exp + 120) << 23) | (man << 20));
+}
+
 __device__ __forceinline__ float warp_reduce_sum(float v) {
 #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {

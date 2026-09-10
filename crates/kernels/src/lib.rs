@@ -75,6 +75,7 @@ const MMQ_CU: &str = include_str!("cu/mmq.cu");
 const SAMPLE_CU: &str = include_str!("cu/sample.cu");
 const GDN_CU: &str = include_str!("cu/gdn.cu");
 const FP8_CU: &str = include_str!("cu/fp8.cu");
+const FP4_CU: &str = include_str!("cu/fp4.cu");
 const VISION_CU: &str = include_str!("cu/vision.cu");
 const MOE_CU: &str = include_str!("cu/moe.cu");
 
@@ -173,6 +174,19 @@ fn fp8_src() -> &'static str {
 }
 #[cfg(not(feature = "cuda"))]
 fn fp8_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| UNIMPLEMENTED_METAL.to_string())
+}
+
+/// The NVFP4 (e2m1) dequant kernel. CUDA-only: there is no Metal counterpart
+/// yet, matching this plan's own single-GPU-first scope for the format.
+#[cfg(feature = "cuda")]
+fn fp4_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| format!("{COMMON_CUH}\n{FP4_CU}"))
+}
+#[cfg(not(feature = "cuda"))]
+fn fp4_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SRC.get_or_init(|| UNIMPLEMENTED_METAL.to_string())
 }

@@ -1,4 +1,5 @@
-//! Host-side reference for NVFP4 (e2m1) dequantization.
+//! Host-side reference for NVFP4 (e2m1) dequantization, and the device-side
+//! kernel checked against it.
 //!
 //! This is the numeric ground truth every later NVFP4 task (the device-side
 //! dequant kernel, the CUTLASS GEMM) gets checked against -- pure Rust, no
@@ -9,6 +10,19 @@
 //! See [`crate::WeightType::F4E2M1`] for the on-disk row layout this
 //! dequantizes (packed quant bytes, then a trailing f8_e4m3 block-scale grid,
 //! then the two f32 per-tensor scalars).
+//!
+//! [`Kernels::dequant_f4e2m1`] below is the device counterpart: it mirrors
+//! [`dequant_f4e2m1_row`]'s own table and index arithmetic exactly (see
+//! `cu/fp4.cu`'s doc comment), so the two are checked against each other
+//! rather than against a second independent reading of the NVFP4 spec.
+
+use anyhow::{Context, Result};
+use infero_gpu::{KernelArg, LaunchConfig, View, ViewMut};
+
+use crate::{Kernels, fp4_src};
+
+/// Threads a block for [`Kernels::dequant_f4e2m1`]'s k-dimension tiling.
+const FP4_DEQUANT_BLOCK: u32 = 256;
 
 /// Number of e2m1 elements covered by one block scale, per NVFP4's two-level
 /// (per-16-block f8_e4m3 scale, then a per-tensor f32 `weight_scale_2`) scheme.
@@ -84,6 +98,65 @@ pub fn dequant_f4e2m1_row(packed: &[u8], scale: &[f32], scale2: f32, k: usize) -
         out.push(e2m1_value(nibble) * scale[block] * scale2);
     }
     out
+}
+
+impl Kernels {
+    /// Dequantizes an `n x k` NVFP4 (e2m1) matrix on-device, into `out`
+    /// (`n * k` f32 elements, row-major -- matching [`dequant_f4e2m1_row`]'s
+    /// per-row convention applied to every row of the matrix at once).
+    ///
+    /// `w` holds `n` rows of `k.div_ceil(2)` packed bytes each; `scale` holds
+    /// `n` rows of `k.div_ceil(F4E2M1_BLOCK)` f8_e4m3 block-scale bytes each;
+    /// `scale2` is the single per-tensor `weight_scale_2` scalar shared by
+    /// the whole matrix. See `cu/fp4.cu`'s doc comment for the exact layout
+    /// and [`crate::WeightType::F4E2M1`] for the on-disk version this mirrors.
+    pub fn dequant_f4e2m1(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
+        scale: &View<'_, u8>,
+        scale2: f32,
+        k: usize,
+        n: usize,
+    ) -> Result<()> {
+        debug_assert!(
+            out.len() >= n * k,
+            "dequant output holds {} elements, need {}",
+            out.len(),
+            n * k
+        );
+        debug_assert!(
+            w.len() >= n * k.div_ceil(2),
+            "dequant input holds {} packed bytes, need {}",
+            w.len(),
+            n * k.div_ceil(2)
+        );
+        debug_assert!(
+            scale.len() >= n * k.div_ceil(F4E2M1_BLOCK),
+            "dequant scale holds {} bytes, need {}",
+            scale.len(),
+            n * k.div_ceil(F4E2M1_BLOCK)
+        );
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_fp4", fp4_src(), "dequant_f4e2m1_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (n as u32, (k as u32).div_ceil(FP4_DEQUANT_BLOCK).max(1), 1),
+            block_dim: (FP4_DEQUANT_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (ki, ni) = (k as i32, n as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(w).arg(scale).arg(&scale2).arg(&ki).arg(&ni);
+        self.dev
+            .profile()
+            .time("dequant_f4e2m1", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("dequant_f4e2m1")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
