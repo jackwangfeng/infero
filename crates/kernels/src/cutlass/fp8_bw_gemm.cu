@@ -714,6 +714,48 @@ extern "C" int32_t infero_cutlass_fp8_bw_gemm_f32out(const void* a, const void* 
   return static_cast<int32_t>(status);
 }
 
+// Bench-only: `f32out::Gemm` (the wide default tile, unchanged) with
+// `TileSchedulerArguments::max_swizzle_size` exposed as a caller-supplied
+// parameter instead of left at its class default (`PersistentTileSchedulerSm100`'s
+// own default is `0`, i.e. no CTA-rasterization swizzle -- verified by
+// reading `sm100_tile_scheduler.hpp` directly). vLLM's own real dispatch
+// (`scaled_mm_blockwise_sm120_fp8.cu`, fetched 2026-09-10) sets this
+// per-call based on whether the weight tensor exceeds this GPU's L2 (its
+// own comment names "RTX PRO 6000 Blackwell / GB202: 96-128 MiB" directly):
+// under L2, keep the default (no swizzle, matches what this file's other
+// entry points already do); over L2, `max_swizzle_size=8`. This file has
+// never set this field at all -- worth checking for the one real shape that
+// exceeds this GPU's L2 (the fused gate/up projection, `INFERO_FUSE_FFN=1`,
+// K=5120,N=34816, ~178 MiB > 96-128 MiB).
+extern "C" int32_t infero_cutlass_fp8_bw_gemm_f32out_swizzle(const void* a, const void* b, const float* sfa,
+                                                              const float* sfb, float* d, void* workspace, int m,
+                                                              int n, int k, int accum, int max_swizzle_size,
+                                                              cudaStream_t stream) {
+  auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
+  auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
+  auto stride_D = cutlass::make_cute_packed_stride(f32out::StrideD{}, cute::make_shape(m, n, 1));
+  auto layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(m, n, k, 1));
+  auto layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, 1));
+
+  typename f32out::Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {m, n, k, 1},
+      {static_cast<const ElementA*>(a), stride_A, static_cast<const ElementB*>(b), stride_B, sfa, layout_SFA, sfb,
+       layout_SFB},
+      {{}, d, stride_D, d, stride_D}};
+  arguments.epilogue.thread.alpha = 1.0f;
+  arguments.epilogue.thread.beta = accum ? 1.0f : 0.0f;
+  arguments.scheduler.max_swizzle_size = max_swizzle_size;
+
+  f32out::Gemm gemm;
+  auto status = gemm.can_implement(arguments);
+  if (status != cutlass::Status::kSuccess) return static_cast<int32_t>(status);
+  status = gemm.initialize(arguments, workspace, stream);
+  if (status != cutlass::Status::kSuccess) return static_cast<int32_t>(status);
+  status = gemm.run(arguments, workspace, stream);
+  return static_cast<int32_t>(status);
+}
+
 // `stream_k` namespace's own entry points -- same wide `<128,128,128>` tile
 // and f32-direct epilogue as `infero_cutlass_fp8_bw_gemm_f32out` above, only
 // the scheduler differs (`StreamKScheduler` vs `void`/persistent). Kept as a

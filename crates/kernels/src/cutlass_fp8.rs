@@ -256,6 +256,27 @@ mod ffi {
             stream: cudarc::driver::sys::CUstream,
         ) -> i32;
 
+        // Bench-only: `f32out`'s wide tile with `max_swizzle_size` exposed
+        // as a real parameter instead of left at the class default -- see
+        // `fp8_bw_gemm.cu`'s own comment on this function for why (vLLM's
+        // real dispatch sets this per-call based on whether the weight
+        // exceeds this GPU's L2, something this file has never done).
+        #[allow(clippy::too_many_arguments)]
+        pub fn infero_cutlass_fp8_bw_gemm_f32out_swizzle(
+            a: *const c_void,
+            b: *const c_void,
+            sfa: *const f32,
+            sfb: *const f32,
+            d: *mut f32,
+            workspace: *mut c_void,
+            m: i32,
+            n: i32,
+            k: i32,
+            accum: i32,
+            max_swizzle_size: i32,
+            stream: cudarc::driver::sys::CUstream,
+        ) -> i32;
+
         // SM120 only, same wide `<128,128,128>` tile as the plain entry point
         // above but with CUTLASS's `StreamKScheduler` in place of the default
         // persistent scheduler -- see `fp8_bw_gemm.cu`'s `stream_k` namespace
@@ -822,6 +843,62 @@ impl Kernels {
             ),
         };
         self.mma_e4m3_cutlass_sfa_f32out_with(workspace_fn, gemm_fn, out, w, cw, xq, sfa_t, k, n, n_tokens, accum)
+    }
+
+    /// Bench-only: the wide default tile (`f32out::Gemm`, unchanged) with
+    /// `max_swizzle_size` exposed as a real, caller-chosen parameter instead
+    /// of the class default (`0`, no CTA-rasterization swizzle). See
+    /// `fp8_bw_gemm.cu`'s `infero_cutlass_fp8_bw_gemm_f32out_swizzle` for why
+    /// this exists: vLLM's own real dispatch sets this per-call based on
+    /// whether the weight exceeds this GPU's L2, something no entry point in
+    /// this file has ever done.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mma_e4m3_cutlass_sfa_f32out_swizzle_bench(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
+        cw: &CutlassWeight,
+        xq: &View<'_, u8>,
+        sfa_t: &View<'_, f32>,
+        k: usize,
+        n: usize,
+        n_tokens: usize,
+        accum: bool,
+        max_swizzle_size: i32,
+    ) -> Result<()> {
+        anyhow::ensure!(cw.k == k && cw.n == n, "CutlassWeight is [{}, {}], called with k={k} n={n}", cw.n, cw.k);
+        let stream = self.dev.stream();
+        let ws_bytes = unsafe { ffi::infero_cutlass_fp8_bw_gemm_f32out_workspace(n_tokens as i32, n as i32, k as i32) };
+        CUTLASS_WORKSPACE.with(stream, ws_bytes.max(1), |ws_view| {
+            let (a_ptr, _ra) = xq.device_ptr(stream);
+            let (b_ptr, _rb) = match &cw.quants {
+                Some(q) => q.device_ptr(stream),
+                None => w.device_ptr(stream),
+            };
+            let (sfa_ptr, _rsfa) = sfa_t.device_ptr(stream);
+            let (sfb_ptr, _rsfb) = cw.scale_t.device_ptr(stream);
+            let (d_ptr, _rd) = out.device_ptr_mut(stream);
+            let (ws_ptr, _rws) = ws_view.device_ptr_mut(stream);
+            let status = unsafe {
+                ffi::infero_cutlass_fp8_bw_gemm_f32out_swizzle(
+                    a_ptr as *const std::ffi::c_void,
+                    b_ptr as *const std::ffi::c_void,
+                    sfa_ptr as *const f32,
+                    sfb_ptr as *const f32,
+                    d_ptr as *mut f32,
+                    ws_ptr as *mut std::ffi::c_void,
+                    n_tokens as i32,
+                    n as i32,
+                    k as i32,
+                    i32::from(accum),
+                    max_swizzle_size,
+                    stream.cu_stream(),
+                )
+            };
+            drop((_ra, _rb, _rsfa, _rsfb, _rd, _rws));
+            anyhow::ensure!(status == 0, "CUTLASS f32-output GEMM (swizzle bench) returned status {status}");
+            Ok(())
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
