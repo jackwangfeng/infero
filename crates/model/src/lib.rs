@@ -4555,6 +4555,16 @@ impl Model {
             .expect("dispatched to the linear path for a layer with no gdn weights");
         let stage = slot.map(|s| &self.offload.as_ref().unwrap().stage[s]);
 
+        // `INFERO_PROBE=<layer>` captures the real, shared activation every
+        // GDN input projection below (`in_proj_qkv`/`in_proj_z` -- fused into
+        // `in_proj_qz` or not -- and `in_proj_a`/`in_proj_b`) reads. Added for
+        // the F8E4M3 broadcast-scale / GDN-fusion investigation; see
+        // task8-lmhead-rootcause-report.md's addendum. Paired with
+        // `"gdn_qz_fused_out"` below (only written when fusion is active) for
+        // an independent ground-truth cross-check of the fused matmul
+        // specifically, mirroring the `o_proj_in`/`o_proj_out` pair.
+        probe(&self.kern, layer, "gdn_in_proj_input", &xb.slice(..n * d));
+
         // The four input projections share the normalized residual. Not grouped
         // into a fused mat-vec: `in_proj_a` and `in_proj_b` are `value_heads`
         // columns wide — 48 against 10240 — and the fusion helper wants
@@ -4603,6 +4613,16 @@ impl Model {
             )?;
         }
         if fused_qz {
+            // Real, raw output of the ONE fused `in_proj_qz` matmul, captured
+            // before `split2` tears it back apart -- the exact tensor an
+            // independent ground-truth recompute (each of `in_proj_qkv`'s and
+            // `in_proj_z`'s own real, UNFUSED checkpoint weight/scale,
+            // concatenated) needs to be compared against, to check whether
+            // fusing two matrices with potentially different real
+            // `weight_scale` values into one F8E4M3 matmul (`GdnWeights::
+            // in_proj_qz`, `crates/model/src/weights.rs`) is computed
+            // correctly.
+            probe(&self.kern, layer, "gdn_qz_fused_out", &acts.qz.slice(..n * (width + val_dim)));
             self.kern.split2(
                 &mut acts.qkv.slice_mut(..n * width),
                 &mut acts.z.slice_mut(..n * val_dim),
