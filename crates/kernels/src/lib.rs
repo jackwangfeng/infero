@@ -19,6 +19,7 @@ pub mod cutlass_fp8;
 pub use cutlass_fp8::CutlassWeight;
 #[cfg(feature = "flash_attn2")]
 pub mod flash_attn2;
+pub mod fp4;
 pub mod fp8;
 #[cfg(feature = "nccl")]
 pub mod tp;
