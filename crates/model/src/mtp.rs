@@ -2177,12 +2177,47 @@ impl crate::Model {
     /// `tail: self.max_seq` (each region as wide as a lone sequence's own
     /// cache always was). Real, req'd VRAM cost: `max_seqs` times what a
     /// single-sequence head cost before this parameter existed.
+    /// Whether the draft loop's own vocabulary projection (whichever of
+    /// `output_draft_q4`/`output`/`token_embd` [`Self::logits_row_device`]'s
+    /// real dispatch would resolve to, matching `run`'s own `.or()` chain)
+    /// is [`WeightType::F4E2M1`] -- speculative decoding's own `matmul`
+    /// (this file's, not `Model::matmul_pre`'s) has no NVFP4 GEMM/mat-vec
+    /// path, only `mmvq`/`F8E4M3`/`F16` arms, so it falls to a bare `gemv`
+    /// that tries a `gemv_f4e2m1` kernel this crate deliberately never
+    /// builds (`WeightType::ALL`'s own exclusion) and fails at request time
+    /// with a kernel-not-found `DriverError` -- a real, previously-shipped
+    /// bug (a default NVFP4 launch has speculative decoding on by default
+    /// and 500s on the first request). Checked here, at head-load time,
+    /// so the operator sees no head installed and a `--help`-discoverable
+    /// reason instead of a confusing per-request 500.
+    fn draft_vocab_is_nvfp4(&self) -> bool {
+        let lm = self
+            .w
+            .output_draft_q4
+            .as_ref()
+            .or(self.w.output.as_ref())
+            .unwrap_or(&self.w.token_embd);
+        if lm.ty == infero_kernels::WeightType::F4E2M1 {
+            tracing::warn!(
+                "not loading an MTP head: the draft loop's own vocabulary projection is \
+                 NVFP4 (F4E2M1), which has no draft-loop matmul path today -- speculative \
+                 decoding stays off for this checkpoint (base generation is unaffected)"
+            );
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn load_mtp_head(
         &mut self,
         dir: impl AsRef<std::path::Path>,
         max_draft_rows: usize,
         max_seqs: usize,
     ) -> anyhow::Result<bool> {
+        if self.draft_vocab_is_nvfp4() {
+            return Ok(false);
+        }
         let shards = infero_safetensors::Shards::open_dir(dir.as_ref())?;
         let Some(w) = crate::weights::load_mtp(&self.dev, &shards, &self.cfg)? else {
             return Ok(false);
@@ -2222,6 +2257,9 @@ impl crate::Model {
         max_draft_rows: usize,
         max_seqs: usize,
     ) -> anyhow::Result<bool> {
+        if self.draft_vocab_is_nvfp4() {
+            return Ok(false);
+        }
         let f = infero_gguf::Gguf::open(path.as_ref())?;
         let Some(w) = crate::weights::load_mtp_gguf(&self.dev, &f, &self.cfg)? else {
             return Ok(false);

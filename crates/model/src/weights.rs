@@ -1980,6 +1980,23 @@ pub fn load_awq(
             "{prefix}.weight: {} bytes for a [{n}, {k_packed}] packed matrix",
             t.data.len()
         );
+        // The CUTLASS NVFP4 GEMM's own real operand alignment
+        // (`infero_kernels::cutlass_fp4::FP4_GEMM_K_ALIGN`, only reachable
+        // under the `cutlass` feature -- there is no non-CUTLASS NVFP4 GEMM
+        // to align for otherwise, see `Model::matmul_pre`'s own loud-fail on
+        // this format when `cutlass` isn't compiled in) -- checked here, at
+        // load time, rather than lazily on the first forward pass
+        // (`prepare_cutlass_fp4_weight`'s own `ensure!`, which an operator
+        // would only hit after the server reports healthy and serves a
+        // request).
+        #[cfg(feature = "cutlass")]
+        anyhow::ensure!(
+            k.is_multiple_of(infero_kernels::cutlass_fp4::FP4_GEMM_K_ALIGN),
+            "{prefix}: k={k} is not a multiple of the CUTLASS NVFP4 GEMM's own \
+             operand alignment ({} elements) -- this checkpoint's NVFP4 export \
+             is unsupported by this build",
+            infero_kernels::cutlass_fp4::FP4_GEMM_K_ALIGN
+        );
         let scale_t = w
             .tensor(&format!("{prefix}.weight_scale"))
             .with_context(|| format!("{prefix} is NVFP4 but has no .weight_scale"))?;
@@ -2011,6 +2028,18 @@ pub fn load_awq(
             "{prefix}.weight_scale_2: expected a single scalar, got {} elements",
             scale2.len()
         );
+        // A zero/non-finite scalar here would otherwise surface as a silent
+        // Inf/NaN in every logit downstream of this matrix (`alpha`'s own
+        // `debug_assert!` in `mma_e2m1_cutlass_sfa_f32out` catches it in a
+        // debug build, but is compiled out of the release binary that
+        // actually serves) -- checked loudly here instead, at load time,
+        // matching the design's own "plausible-looking garbage, not a
+        // crash" bar.
+        anyhow::ensure!(
+            scale2[0].is_finite() && scale2[0] > 0.0,
+            "{prefix}.weight_scale_2 is {} -- expected a finite, positive scalar",
+            scale2[0]
+        );
         let input_scale = w
             .tensor(&format!("{prefix}.input_scale"))
             .with_context(|| format!("{prefix} is NVFP4 but has no .input_scale"))?
@@ -2020,6 +2049,11 @@ pub fn load_awq(
             input_scale.len() == 1,
             "{prefix}.input_scale: expected a single scalar, got {} elements",
             input_scale.len()
+        );
+        anyhow::ensure!(
+            input_scale[0].is_finite() && input_scale[0] > 0.0,
+            "{prefix}.input_scale is {} -- expected a finite, positive scalar",
+            input_scale[0]
         );
         let mut bytes = Vec::with_capacity(t.data.len() + scale_t.data.len() + 8);
         bytes.extend_from_slice(t.data);

@@ -120,7 +120,7 @@ use crate::{Kernels, fp4_src};
 /// `AlignmentA`/`AlignmentB`, 128 bits / 4-bit elements) -- not this format's
 /// own 16-element block size, though 32 is a multiple of it, so any `k`
 /// satisfying this is automatically block-aligned too.
-const FP4_GEMM_K_ALIGN: usize = 32;
+pub const FP4_GEMM_K_ALIGN: usize = 32;
 
 /// Threads a block for [`swizzle_sf_e2m1`]'s row-dimension tiling, matching
 /// `fp4.rs`'s `FP4_DEQUANT_BLOCK`/`FP4_QUANT_BLOCK`.
