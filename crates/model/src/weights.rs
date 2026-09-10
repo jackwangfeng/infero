@@ -165,7 +165,11 @@ impl Matrix {
             return None;
         }
         self.cutlass_fp4_weight
-            .get_or_init(|| self.build_cutlass_fp4_weight(kern).ok())
+            .get_or_init(|| {
+                self.build_cutlass_fp4_weight(kern)
+                    .inspect_err(|e| tracing::warn!(error = %e, "preparing this matrix's CUTLASS NVFP4 weight failed"))
+                    .ok()
+            })
             .as_ref()
     }
 
