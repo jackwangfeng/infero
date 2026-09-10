@@ -2803,6 +2803,29 @@ impl Model {
             gpu_total_mib = total / (1 << 20),
             "model ready"
         );
+        // A real, measured trap: this checkpoint format's own real prefill
+        // throughput depends on `INFERO_ATTN_MMA=1` (gates
+        // `Kernels::prefill_attention`'s tensor-core dispatch -- without it,
+        // every prefill silently falls back to the per-token decode kernel)
+        // and `INFERO_FP8_UNIFIED=1` (this checkpoint's non-NVFP4-targeted
+        // F8E4M3 tensors otherwise take a slower expand-then-dequantize
+        // path). Neither failure mode errors or degrades output quality --
+        // only throughput -- so nothing else here would ever surface it.
+        // Measured cost of missing both (this plan's own SDD ledger,
+        // `.superpowers/sdd/2026-09-10-nvfp4-w4a4-ffn-quantization/
+        // progress.md`): real 7256-token prefill went from 2386.7 tok/s to
+        // 7216.8 tok/s once both were set -- roughly 3x.
+        if infero_kernels::WeightType::F4E2M1 == w.dominant_type()
+            && (std::env::var("INFERO_ATTN_MMA").as_deref() != Ok("1")
+                || std::env::var("INFERO_FP8_UNIFIED").as_deref() != Ok("1"))
+        {
+            tracing::warn!(
+                "NVFP4 checkpoint loaded without INFERO_ATTN_MMA=1 and/or INFERO_FP8_UNIFIED=1 \
+                 set -- real prefill throughput measured ~3x worse without them (attention falls \
+                 back to a per-token kernel, and this checkpoint's non-NVFP4 tensors take a \
+                 slower expand-then-dequantize path); output correctness is unaffected"
+            );
+        }
 
         Ok(Self {
             dev: dev.clone(),
