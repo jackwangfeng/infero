@@ -3724,7 +3724,7 @@ impl Model {
                         // alone. A divergence already present here is a gather
                         // or a token id, not a layer.
                         if layer == 0 {
-                            probe(&self.kern, layer, "embedding", &self.act.x.slice(..d));
+                            probe(&self.kern, layer, "embedding", &self.act.x.slice(..n_tokens * d));
                         }
                         if self.layer_kinds[layer] {
                             self.linear_attention(layer, n_tokens, pool, s, single_seq_slot)?;
@@ -5285,6 +5285,29 @@ impl Model {
         // somewhere else and this path is only taking the blame.
         static NO_QK_NORM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let skip_qk_norm = *NO_QK_NORM.get_or_init(|| std::env::var_os("INFERO_NO_QK_NORM").is_some());
+
+        // `INFERO_PROBE=<layer>` captures the real, RAW (pre-qk_norm) Q/K --
+        // straight off the Q/K/V projection matmul, before `qk_norm` (a
+        // per-head RMSNorm-with-learned-weight, run on both branches below,
+        // in place) touches either. Q and K share one dump in the packed
+        // branch (`qk_norm` modifies `self.act.gate` in place for both, Q's
+        // norm first, so one capture right here is "pre-both" for either).
+        // Pairs with the already-existing `attn_q_prerope`/`attn_k_prerope`/
+        // `attn_qkv_prerope_packed` probes (added for the RoPE check), which
+        // capture the value AFTER qk_norm but before RoPE -- bracketing
+        // `qk_norm` itself for an independent ground-truth cross-check, the
+        // one remaining normalization step in the regular-attention path no
+        // check has touched yet (structurally the same kind of gap
+        // `gdn_gated_rmsnorm` closed for GDN). See
+        // task8-lmhead-rootcause-report.md's addendum.
+        if !skip_qk_norm {
+            if packed_qkv {
+                probe(&self.kern, layer, "attn_qkv_prenorm_packed", &self.act.gate.slice(..n * fused_w));
+            } else {
+                probe(&self.kern, layer, "attn_q_prenorm", &self.act.q.slice(..n * da));
+                probe(&self.kern, layer, "attn_k_prenorm", &self.act.k.slice(..n * kv_dim));
+            }
+        }
 
         if let Some(qn) = l.attn().q_norm.as_ref().filter(|_| !skip_qk_norm) {
             let (buf, stride, len) = if packed_qkv {
