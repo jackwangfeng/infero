@@ -6859,7 +6859,7 @@ impl Model {
                 n * d,
             )?;
         }
-        probe(&self.kern, layer, "after_ffn", &self.act.x.slice(..self.cfg.d_model));
+        probe(&self.kern, layer, "after_ffn", &self.act.x.slice(..n * d));
         Ok(())
     }
 
@@ -7755,12 +7755,47 @@ impl Model {
 /// block. Enough to bisect a block against a second implementation of the same
 /// forward pass -- which is the only way the last two composition bugs were
 /// found, and the only tool that would have found them faster.
+///
+/// `INFERO_PROBE=all` (case-insensitive) instead fires EVERY probe call site
+/// for EVERY layer, so a single run's `tracing` log gets one line per
+/// `(layer, name)` pair -- a cheap, one-command way to scan a coarse health
+/// signal (e.g. `after_ffn`'s RMS) across all layers at once, instead of one
+/// `INFERO_PROBE=<N>` run a layer. Added for the NVFP4/F8E4M3
+/// garbage-output investigation, once every code-path TYPE this project's
+/// probes can reach had already checked out clean at the one or two layers
+/// sampled so far -- the next real question was whether a specific layer's
+/// real data is the anomaly, not the mechanism, and scanning all 64 in one
+/// run is far cheaper than another 64 round trips.
+///
+/// This is real, not free: every probe call site in a layer's forward pass
+/// does a real device-to-host sync in this mode (same cost `INFERO_PROBE=
+/// <N>` already pays once a layer, just paid at every call site of every
+/// layer instead of one) -- acceptable for a one-off diagnostic run (this
+/// already requires `INFERO_NO_GRAPH=1`, so it was never going to be a fast
+/// path), not something to leave on. `INFERO_PROBE_DUMP=<dir>` still works
+/// in this mode too, with the layer folded into the filename
+/// (`eng.<name>.layer<N>.f32`) so 64 layers' dumps of the same probe name
+/// don't overwrite each other the way the single-layer mode's plain
+/// `eng.<name>.f32` name would.
 fn probe(kern: &Kernels, layer: usize, name: &'static str, v: &View<'_, f32>) {
-    static WANT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    let want = WANT.get_or_init(|| {
-        std::env::var("INFERO_PROBE").ok().and_then(|v| v.parse().ok())
+    #[derive(Clone, Copy, PartialEq)]
+    enum ProbeMode {
+        Disabled,
+        OneLayer(usize),
+        AllLayers,
+    }
+    static MODE: std::sync::OnceLock<ProbeMode> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("INFERO_PROBE") {
+        Ok(s) if s.eq_ignore_ascii_case("all") => ProbeMode::AllLayers,
+        Ok(s) => s.parse().map(ProbeMode::OneLayer).unwrap_or(ProbeMode::Disabled),
+        Err(_) => ProbeMode::Disabled,
     });
-    if *want != Some(layer) {
+    let fires = match mode {
+        ProbeMode::Disabled => false,
+        ProbeMode::OneLayer(want) => want == layer,
+        ProbeMode::AllLayers => true,
+    };
+    if !fires {
         return;
     }
     let Ok(row) = kern.device().stream().clone_dtoh(v) else { return };
@@ -7773,8 +7808,13 @@ fn probe(kern: &Kernels, layer: usize, name: &'static str, v: &View<'_, f32>) {
     // through summary statistics. RMS and element zero can both agree while the
     // vectors differ, which is how this cost an hour.
     if let Ok(dir) = std::env::var("INFERO_PROBE_DUMP") {
+        let path = if mode == ProbeMode::AllLayers {
+            format!("{dir}/eng.{name}.layer{layer}.f32")
+        } else {
+            format!("{dir}/eng.{name}.f32")
+        };
         let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let _ = std::fs::write(format!("{dir}/eng.{name}.f32"), bytes);
+        let _ = std::fs::write(path, bytes);
     }
 }
 
