@@ -59,11 +59,31 @@
 //! existing `scale2` parameter, so this adds no new extraction burden), and
 //! [`Kernels::mma_e2m1_cutlass_sfa_f32out`]'s own public signature stays
 //! exactly the shape the brief specifies (no new visible parameter) by
-//! reading it from `cw` internally. `quantize_act_e2m1_cutlass`'s own
-//! `input_scale` needs no equivalent post-multiply: its own doc comment
-//! confirms the activation's per-block scale bytes it writes already fully
-//! absorb that factor (it is consumed as an INPUT to the real per-block
-//! scale computation, not applied a second time afterward).
+//! reading it from `cw` internally.
+//!
+//! **CORRECTION (found during the end-to-end NVFP4 garbage-output
+//! investigation -- real logits ~30-50x too small at every prompt):** the
+//! claim originally written here -- that `quantize_act_e2m1_cutlass`'s own
+//! `input_scale` "needs no equivalent post-multiply" because its per-block
+//! scale bytes "already fully absorb that factor" -- was WRONG. Absorbing
+//! `input_scale` into the per-block scale byte at *encode* time (exactly
+//! what `scale_f32 = input_scale * vec_max / 6` does) is precisely why a
+//! *decode*-time correction is still needed: CUTLASS's native MMA only ever
+//! computes `code * sf_byte_raw`, which mechanically equals `x_true *
+//! input_scale`, not `x_true`. Recovering `x_true` needs one more division
+//! by `input_scale`, on top of (not instead of) `weight_scale_2`'s own
+//! multiply. Cross-checked against vLLM's real, freshly-fetched
+//! `nvfp4_emulation_utils.py::run_nvfp4_emulations` this session: it builds
+//! `x_dq = fp4_val * (scale / input_global_scale)` for activations (a
+//! DIVIDE) alongside a plain `w_dq = fp4_val * scale * weight_global_scale`
+//! for weights (a MULTIPLY, matching `dequant_f4e2m1_row` as-is), then just
+//! `out = x_dq @ w_dq.T` -- working that through algebraically gives
+//! `alpha = weight_global_scale / input_global_scale`, not
+//! `weight_global_scale` alone. [`Kernels::mma_e2m1_cutlass_sfa_f32out`] now
+//! computes `cw.scale2 / cw.input_scale` as `alpha`; see its own doc comment
+//! and the fix commit for the full derivation and the real measured
+//! magnitude match (lm_head's real `input_scale≈0.02167` gives
+//! `1/input_scale≈46.1`, landing squarely inside the observed ~30-50x gap).
 
 use anyhow::{Context, Result};
 use cudarc::driver::{DevicePtr, DevicePtrMut};
@@ -129,28 +149,26 @@ static CUTLASS_FP4_SFA: Scratch = Scratch::new();
 /// A [`crate::WeightType::F4E2M1`] matrix's precomputed CUTLASS-side state:
 /// the weight's own per-block scale grid repacked into CUTLASS's real
 /// swizzled layout (see this module's own doc comment), plus the
-/// checkpoint's `weight_scale_2` scalar, cached here for use as the GEMM's
-/// `alpha` (see this module's doc comment for why that factor cannot be
-/// baked into the per-block scale bytes). `F4E2M1`'s own on-disk quant bytes
-/// need no repack or second copy at all -- unlike `F8E4M3`, that format has
-/// no interleaved-vs-plain distinction
-/// ([`crate::WeightType::F4E2M1`]'s own doc comment: always plain), so
-/// [`Kernels::mma_e2m1_cutlass_sfa_f32out`] reads the weight's own device
-/// buffer directly.
+/// checkpoint's `weight_scale_2` scalar, cached here for use (divided by the
+/// activation's own `input_scale`) as the GEMM's `alpha` -- see this
+/// module's doc comment (the "CORRECTION" paragraph) and
+/// [`Kernels::mma_e2m1_cutlass_sfa_f32out`]'s own doc comment for why BOTH
+/// factors are needed. `F4E2M1`'s own on-disk quant bytes need no repack or
+/// second copy at all -- unlike `F8E4M3`, that format has no
+/// interleaved-vs-plain distinction ([`crate::WeightType::F4E2M1`]'s own doc
+/// comment: always plain), so [`Kernels::mma_e2m1_cutlass_sfa_f32out`] reads
+/// the weight's own device buffer directly.
 pub struct CutlassFp4Weight {
     scale_sfb: Buf<u8>,
     scale2: f32,
-    /// The checkpoint's `input_scale` scalar -- semantically an
-    /// activation-side value, not consumed by this GEMM at all, but cached
-    /// here anyway (Task 7's own design choice): the caller already has to
-    /// download `weight_scale_2` off this matrix's device buffer's tail to
-    /// build a `CutlassFp4Weight` in the first place, so caching
-    /// `input_scale` alongside it in that same lazy-init step avoids a
-    /// second cache slot (and a second device->host round trip) on
-    /// `Matrix` purely to hold one more `f32`. Read back via
-    /// [`Self::input_scale`] by the forward pass's own
-    /// `quantize_act_e2m1_cutlass` call, which needs it as that kernel's
-    /// `input_scale` argument.
+    /// The checkpoint's `input_scale` scalar. Read back both by the forward
+    /// pass's own `quantize_act_e2m1_cutlass` call (which needs it as that
+    /// kernel's own `input_scale` argument) AND, since the fix described in
+    /// this module's own "CORRECTION" doc comment, by
+    /// [`Kernels::mma_e2m1_cutlass_sfa_f32out`] itself, which divides it into
+    /// `scale2` to form the GEMM's real `alpha` -- it is NOT a pure
+    /// activation-side value with no bearing on this GEMM, despite what an
+    /// earlier version of this doc comment claimed.
     input_scale: f32,
     k: usize,
     n: usize,
@@ -286,9 +304,13 @@ impl Kernels {
     ///
     /// `accum` maps to CUTLASS's own `beta` (1.0 to add into `out`'s
     /// existing contents, 0.0 to overwrite), the same convention
-    /// `mma_e4m3_cutlass_sfa_f32out`'s own `accum` uses. `weight_scale_2`
-    /// (`cw`'s own cached `scale2`) is applied as CUTLASS's `alpha` -- see
-    /// this module's doc comment for why.
+    /// `mma_e4m3_cutlass_sfa_f32out`'s own `accum` uses. CUTLASS's own
+    /// `alpha` is `weight_scale_2 / input_scale` (`cw.scale2 /
+    /// cw.input_scale`, computed fresh on every call rather than cached on
+    /// `cw` since `input_scale` is per-activation-quantize-call in spirit
+    /// even though this GEMM's own `cw` happens to be the one place both
+    /// live) -- see this module's own doc comment for the full derivation of
+    /// why BOTH factors are needed, not `weight_scale_2` alone.
     ///
     /// `Ok(false)` (never a wrong answer) if this GPU has no NVFP4 tensor
     /// cores (`!self.dev.caps().fp4`, i.e. below sm_120) or the shape is one
@@ -329,6 +351,44 @@ impl Kernels {
         debug_assert!(xq.len() >= n_tokens * k.div_ceil(2));
         debug_assert!(out.len() >= n_tokens * n);
 
+        // GEMM `alpha`: `weight_scale_2 / input_scale`, NOT `weight_scale_2`
+        // alone -- see this struct's own doc comment (and this module's,
+        // both corrected alongside this fix) for the real derivation. In
+        // short: CUTLASS's native block-scaled MMA can only ever consume the
+        // per-block SF byte via a plain multiply (`code * sf_byte`), and
+        // `quantize_act_e2m1_cutlass`'s own per-block scale byte mechanically
+        // encodes `x_true * input_scale` (its `scale_f32 = input_scale *
+        // vec_max / 6` bakes `input_scale` in at encode time, exactly
+        // mirroring vLLM's real `ref_nvfp4_quant`). So the raw MMA output is
+        // `(x*input_scale) @ (w/weight_scale_2)` -- the weight side per
+        // `CutlassFp4Weight`'s own doc comment and `dequant_f4e2m1_row`'s
+        // validated convention -- and only DIVIDING that raw product by
+        // `input_scale` (equivalently multiplying by `1/input_scale`, on top
+        // of the existing `weight_scale_2` factor) recovers the true dot
+        // product. Cross-checked against vLLM's real, fetched-this-session
+        // `run_nvfp4_emulations` (`nvfp4_emulation_utils.py`): its own
+        // `x_dq = fp4_val * (scale / input_global_scale)` for activations vs.
+        // a plain `w_dq = fp4_val * scale * weight_global_scale` for weights,
+        // then `out = x_dq @ w_dq.T` -- working that through algebraically
+        // gives exactly `alpha = weight_global_scale / input_global_scale`.
+        // The previous `alpha = cw.scale2` (no `input_scale` divide at all)
+        // under-scaled every NVFP4 GEMM's output by a factor of exactly
+        // `input_scale` -- the real, measured root cause of the ~30-50x-too-
+        // small lm_head logits bug (lm_head's real `input_scale≈0.02167`
+        // gives `1/input_scale≈46.1`, matching the observed gap almost
+        // exactly). The same bug silently starved every FFN projection's own
+        // contribution too (`matmul_pre`'s sibling branch, same kernel), just
+        // masked there by the residual stream's unaffected (F8E4M3) attention
+        // contribution rather than visible in a bare RMS probe.
+        let alpha = cw.scale2 / cw.input_scale;
+        debug_assert!(
+            alpha.is_finite(),
+            "NVFP4 GEMM alpha is non-finite (scale2={}, input_scale={}) -- a zero/garbage \
+             input_scale would silently produce Inf/NaN logits instead of a loud failure",
+            cw.scale2,
+            cw.input_scale
+        );
+
         let stream = self.dev.stream();
         let sfa_bytes = swizzled_sf_bytes(n_tokens, blocks);
         let ws_bytes = unsafe { ffi::infero_cutlass_fp4_bw_gemm_f32out_workspace(n_tokens as i32, n as i32, k as i32) };
@@ -360,7 +420,7 @@ impl Kernels {
                                 n_tokens as i32,
                                 n as i32,
                                 k as i32,
-                                cw.scale2,
+                                alpha,
                                 acc,
                                 stream.cu_stream(),
                             )
