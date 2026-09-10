@@ -1675,6 +1675,41 @@ fn stacked2_gguf(dev: &Device, f: &Gguf, a: &str, b: &str, total: &mut usize) ->
     }))
 }
 
+/// Parses a real `hf_quant_config.json`'s NVFP4 target list into the set of
+/// tensor-name prefixes that should load as [`WeightType::F4E2M1`] rather
+/// than [`load_awq`]'s default [`WeightType::F8E4M3`] path.
+///
+/// `RadixArk/Qwen3.8-27B-NVFP4`'s own `config_groups` has two tiers:
+/// `group_1` (4-bit, e2m1) names `lm_head` and every layer's
+/// `mlp.{gate,up,down}_proj` explicitly (193 real entries); `group_0`
+/// (8-bit, F8E4M3 -- everything else: attention, GDN, the embedding) has no
+/// explicit target list of its own, so only `group_1` needs parsing here --
+/// a prefix this function does not return stays on the existing F8E4M3 path
+/// unchanged.
+pub fn classify_fp4_targets(
+    quant_config_path: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let text = std::fs::read_to_string(quant_config_path)
+        .with_context(|| format!("reading {quant_config_path}"))?;
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("parsing {quant_config_path}"))?;
+    let targets = json
+        .pointer("/config_groups/group_1/targets")
+        .and_then(|t| t.as_array())
+        .with_context(|| {
+            format!("{quant_config_path}: no config_groups.group_1.targets array")
+        })?;
+    targets
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            v.as_str().map(str::to_string).with_context(|| {
+                format!("{quant_config_path}: config_groups.group_1.targets[{i}] is not a string")
+            })
+        })
+        .collect()
+}
+
 /// Load an AWQ checkpoint, repacking every quantized matrix on the way in.
 ///
 /// Everything stays resident: an AWQ file has no offload story yet, and the
@@ -1699,6 +1734,23 @@ pub fn load_awq(
 
     let started = std::time::Instant::now();
     let mut device_bytes = 0usize;
+
+    // This checkpoint's own real NVFP4 target set, if it has one --
+    // `RadixArk/Qwen3.8-27B-NVFP4` ships a `hf_quant_config.json` beside its
+    // weights; the current production `qwen38-27b-fp8` checkpoint does not.
+    // Empty (not an error) when the file is absent, which is what keeps
+    // every real site below that checks `fp4_targets.contains(..)` taking
+    // the exact same F8E4M3/plain-float path it always has for a checkpoint
+    // that never opts into NVFP4.
+    let quant_config_path = w.dir().join("hf_quant_config.json");
+    let fp4_targets: std::collections::HashSet<String> = if quant_config_path.exists() {
+        let path_str = quant_config_path
+            .to_str()
+            .with_context(|| format!("{}: not valid UTF-8", quant_config_path.display()))?;
+        classify_fp4_targets(path_str)?
+    } else {
+        std::collections::HashSet::new()
+    };
 
     let upload = |bytes: &[u8], ty: WeightType, k: usize, n: usize, total: &mut usize| -> Result<Matrix> {
         *total += bytes.len();
@@ -1782,6 +1834,82 @@ pub fn load_awq(
                 Err(_) => Ok(None),
             }
         };
+    // An NVFP4 target's four real sibling tensors, read and concatenated
+    // into the one buffer `WeightType::F4E2M1`'s doc comment lays out: the
+    // packed quant bytes (already `[n, k/2]` row-major `U8`, so -- unlike
+    // FP8's row-group interleave below -- there is no infero-chosen physical
+    // layout to repack into, just a borrow), the block-scale grid as raw
+    // `F8_E4M3` bytes (also already row-major and contiguous, one scale per
+    // 16-element run), then the two trailing `f32` scalars.
+    let fp4_bytes = |prefix: &str| -> Result<(Vec<u8>, usize, usize)> {
+        let t = w
+            .tensor(&format!("{prefix}.weight"))
+            .with_context(|| format!("{prefix} is an NVFP4 target but has no .weight"))?;
+        anyhow::ensure!(
+            t.dtype == infero_safetensors::Dtype::U8,
+            "{prefix}.weight is {:?}, expected U8 (packed NVFP4 quants)",
+            t.dtype
+        );
+        anyhow::ensure!(
+            t.shape.len() == 2,
+            "{prefix}.weight has shape {:?}, expected a 2-D [n, k/2] packed matrix",
+            t.shape
+        );
+        let (n, k_packed) = (t.shape[0], t.shape[1]);
+        let k = k_packed * 2;
+        anyhow::ensure!(
+            t.data.len() == n * k_packed,
+            "{prefix}.weight: {} bytes for a [{n}, {k_packed}] packed matrix",
+            t.data.len()
+        );
+        let scale_t = w
+            .tensor(&format!("{prefix}.weight_scale"))
+            .with_context(|| format!("{prefix} is NVFP4 but has no .weight_scale"))?;
+        anyhow::ensure!(
+            scale_t.dtype == infero_safetensors::Dtype::F8E4M3,
+            "{prefix}.weight_scale is {:?}, expected F8_E4M3",
+            scale_t.dtype
+        );
+        let k_blocks = k.div_ceil(infero_kernels::fp4::F4E2M1_BLOCK);
+        anyhow::ensure!(
+            scale_t.shape == [n, k_blocks],
+            "{prefix}.weight_scale has shape {:?}, expected [{n}, {k_blocks}] \
+             (one scale per {}-element block)",
+            scale_t.shape,
+            infero_kernels::fp4::F4E2M1_BLOCK
+        );
+        anyhow::ensure!(
+            scale_t.data.len() == n * k_blocks,
+            "{prefix}.weight_scale: {} bytes for a [{n}, {k_blocks}] F8_E4M3 grid",
+            scale_t.data.len()
+        );
+        let scale2 = w
+            .tensor(&format!("{prefix}.weight_scale_2"))
+            .with_context(|| format!("{prefix} is NVFP4 but has no .weight_scale_2"))?
+            .to_f32()
+            .with_context(|| format!("{prefix}.weight_scale_2"))?;
+        anyhow::ensure!(
+            scale2.len() == 1,
+            "{prefix}.weight_scale_2: expected a single scalar, got {} elements",
+            scale2.len()
+        );
+        let input_scale = w
+            .tensor(&format!("{prefix}.input_scale"))
+            .with_context(|| format!("{prefix} is NVFP4 but has no .input_scale"))?
+            .to_f32()
+            .with_context(|| format!("{prefix}.input_scale"))?;
+        anyhow::ensure!(
+            input_scale.len() == 1,
+            "{prefix}.input_scale: expected a single scalar, got {} elements",
+            input_scale.len()
+        );
+        let mut bytes = Vec::with_capacity(t.data.len() + scale_t.data.len() + 8);
+        bytes.extend_from_slice(t.data);
+        bytes.extend_from_slice(scale_t.data);
+        bytes.extend_from_slice(&scale2[0].to_le_bytes());
+        bytes.extend_from_slice(&input_scale[0].to_le_bytes());
+        Ok((bytes, k, n))
+    };
     // A quantized projection's bytes, before they reach the device: AWQ's three
     // tensors in, one packed matrix out. Split from the upload so that
     // projections which are stacked into one matrix — see `fuse_ffn` below —
@@ -1794,6 +1922,22 @@ pub fn load_awq(
     let projection_bytes = |prefix: &str,
                             shard: Option<(ShardAxis, usize, usize)>|
      -> Result<(Vec<u8>, WeightType, usize, usize)> {
+        // NVFP4 targets (this checkpoint's real `hf_quant_config.json`
+        // `group_1` list, computed once into `fp4_targets` above) load
+        // through their own packed-nibble/two-scale layout instead of the
+        // FP8 one below -- checked first, and by exact `prefix` membership
+        // rather than by sniffing `.weight`'s on-disk dtype, so a checkpoint
+        // with no `hf_quant_config.json` (`fp4_targets` empty) takes the
+        // exact same path through the rest of this closure it always has.
+        if fp4_targets.contains(prefix) {
+            anyhow::ensure!(
+                shard.is_none(),
+                "{prefix}: tensor-parallel sharding for an NVFP4 (F4E2M1) weight \
+                 is not implemented yet"
+            );
+            let (bytes, k, n) = fp4_bytes(prefix)?;
+            return Ok((bytes, WeightType::F4E2M1, k, n));
+        }
         // FP8 and plain-float exports name the matrix `{prefix}.weight`; AWQ
         // splits it into qweight/qzeros/scales. Check for the single tensor
         // first, because its absence is the cheap question.
@@ -2362,6 +2506,17 @@ pub fn load_awq(
     let output_norm = vector(&format!("{stem}.norm.weight"), &mut device_bytes)?;
     let output = if cfg.tied_embeddings {
         None
+    } else if fp4_targets.contains("lm_head") {
+        // The vocab projection is itself one of this checkpoint's real
+        // NVFP4 targets -- load it through the same packed-nibble/two-scale
+        // path `dense_ffn`'s gate/up/down use below, instead of the
+        // Q8_0/F16 requantization the F8E4M3/plain-float checkpoints below
+        // go through. `output_split`/`output_draft_q4` (both gated on
+        // `o.ty == WeightType::Q8_0`) naturally stay `None` for this head --
+        // this design has no speculative decoding for the NVFP4 checkpoint
+        // anyway (see the design doc's own Scope).
+        let (bytes, k, n) = fp4_bytes("lm_head")?;
+        Some(upload(&bytes, WeightType::F4E2M1, k, n, &mut device_bytes)?)
     } else {
         let h = w.tensor("lm_head.weight")?;
         let (n, k) = (h.shape[0], h.shape[1]);
