@@ -19,10 +19,13 @@ use infero_model::weights;
 #[test]
 fn radixark_nvfp4_targets_classified_correctly() {
     // Real, exhaustive target list, copied from this session's own real
-    // verification of hf_quant_config.json's group_1 (193 entries: lm_head
-    // + 64 layers x 3 mlp projections). Do not re-derive from a partial
-    // read -- this is the ground truth the loader's classification is
-    // checked against.
+    // verification of hf_quant_config.json's real per-tensor
+    // `quantization.quantized_layers` map (193 entries with
+    // `quant_algo == "NVFP4"`: lm_head + 64 layers x 3 mlp projections; an
+    // earlier pass of this file assumed a `config_groups`/`group_1` shape
+    // that turned out not to match the real on-disk file -- corrected).
+    // Do not re-derive from a partial read -- this is the ground truth the
+    // loader's classification is checked against.
     let quant_config_path = "/home/jeff/models/Qwen3.8-27B-NVFP4/hf_quant_config.json";
     // Skip gracefully if the checkpoint isn't present on this machine
     // (it's real, large, and only downloaded to `bw`) -- mirror how this
@@ -59,25 +62,27 @@ fn classify_fp4_targets_parses_a_synthetic_config() {
     ));
     std::fs::create_dir_all(&dir).expect("creating temp dir");
     let path = dir.join("hf_quant_config.json");
+    // Real schema (verified against the actual checkpoint on `bw`, not the
+    // `config_groups`/`group_1` shape an earlier version of this test/loader
+    // wrongly assumed): a flat per-tensor map,
+    // `quantization.quantized_layers.<name>.quant_algo`, `"NVFP4"` or
+    // `"FP8"`.
     std::fs::write(
         &path,
         r#"{
-            "config_groups": {
-                "group_0": {
-                    "targets": [],
-                    "weights": { "num_bits": 8 }
+            "quantization": {
+                "quant_algo": "MIXED_PRECISION",
+                "kv_cache_quant_algo": "FP8",
+                "quantized_layers": {
+                    "lm_head": { "quant_algo": "NVFP4" },
+                    "model.language_model.layers.0.mlp.gate_proj": { "quant_algo": "NVFP4", "group_size": 16 },
+                    "model.language_model.layers.0.mlp.up_proj": { "quant_algo": "NVFP4", "group_size": 16 },
+                    "model.language_model.layers.0.mlp.down_proj": { "quant_algo": "NVFP4", "group_size": 16 },
+                    "model.language_model.layers.0.self_attn.q_proj": { "quant_algo": "FP8" },
+                    "model.language_model.layers.0.linear_attn.out_proj": { "quant_algo": "FP8" }
                 },
-                "group_1": {
-                    "targets": [
-                        "lm_head",
-                        "model.language_model.layers.0.mlp.gate_proj",
-                        "model.language_model.layers.0.mlp.up_proj",
-                        "model.language_model.layers.0.mlp.down_proj"
-                    ],
-                    "weights": { "num_bits": 4 }
-                }
-            },
-            "ignore": ["mtp.layers.0.mlp.down_proj"]
+                "exclude_modules": ["mtp.layers.0.mlp.down_proj"]
+            }
         }"#,
     )
     .expect("writing synthetic config");
@@ -88,9 +93,10 @@ fn classify_fp4_targets_parses_a_synthetic_config() {
     assert!(targets.contains("model.language_model.layers.0.mlp.gate_proj"));
     assert!(targets.contains("model.language_model.layers.0.mlp.up_proj"));
     assert!(targets.contains("model.language_model.layers.0.mlp.down_proj"));
-    // group_0 and the attention projections it implies are not in group_1's
-    // own target list, so they must not show up here.
+    // FP8 entries in quantized_layers are real, present, non-NVFP4 members
+    // of the same map -- they must not show up here.
     assert!(!targets.contains("model.language_model.layers.0.self_attn.q_proj"));
+    assert!(!targets.contains("model.language_model.layers.0.linear_attn.out_proj"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

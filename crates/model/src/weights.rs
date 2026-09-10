@@ -1679,13 +1679,17 @@ fn stacked2_gguf(dev: &Device, f: &Gguf, a: &str, b: &str, total: &mut usize) ->
 /// tensor-name prefixes that should load as [`WeightType::F4E2M1`] rather
 /// than [`load_awq`]'s default [`WeightType::F8E4M3`] path.
 ///
-/// `RadixArk/Qwen3.8-27B-NVFP4`'s own `config_groups` has two tiers:
-/// `group_1` (4-bit, e2m1) names `lm_head` and every layer's
-/// `mlp.{gate,up,down}_proj` explicitly (193 real entries); `group_0`
-/// (8-bit, F8E4M3 -- everything else: attention, GDN, the embedding) has no
-/// explicit target list of its own, so only `group_1` needs parsing here --
-/// a prefix this function does not return stays on the existing F8E4M3 path
-/// unchanged.
+/// The real on-disk schema (`RadixArk/Qwen3.8-27B-NVFP4`, verified directly
+/// against the checkpoint on `bw` -- an earlier `config_groups`/`group_1`
+/// assumption here was wrong and has been corrected) is a flat per-tensor
+/// map: `quantization.quantized_layers.<tensor name>.quant_algo`, one entry
+/// per quantized tensor, `"NVFP4"` or `"FP8"`. `lm_head` and every layer's
+/// `mlp.{gate,up,down}_proj` carry `"NVFP4"` (193 real entries); every
+/// attention/GDN projection this checkpoint quantizes carries `"FP8"`
+/// instead (208 real entries) and is left out of the returned set, so it
+/// stays on the existing F8E4M3 path unchanged. A tensor absent from
+/// `quantized_layers` entirely (norms, embeddings) is likewise never a
+/// member -- this function only ever returns real NVFP4 targets.
 pub fn classify_fp4_targets(
     quant_config_path: &str,
 ) -> Result<std::collections::HashSet<String>> {
@@ -1693,21 +1697,25 @@ pub fn classify_fp4_targets(
         .with_context(|| format!("reading {quant_config_path}"))?;
     let json: serde_json::Value = serde_json::from_str(&text)
         .with_context(|| format!("parsing {quant_config_path}"))?;
-    let targets = json
-        .pointer("/config_groups/group_1/targets")
-        .and_then(|t| t.as_array())
+    let layers = json
+        .pointer("/quantization/quantized_layers")
+        .and_then(|v| v.as_object())
         .with_context(|| {
-            format!("{quant_config_path}: no config_groups.group_1.targets array")
+            format!("{quant_config_path}: no quantization.quantized_layers object")
         })?;
-    targets
-        .iter()
-        .enumerate()
-        .map(|(i, v)| {
-            v.as_str().map(str::to_string).with_context(|| {
-                format!("{quant_config_path}: config_groups.group_1.targets[{i}] is not a string")
-            })
-        })
-        .collect()
+    let mut targets = std::collections::HashSet::new();
+    for (name, entry) in layers {
+        let algo = entry.get("quant_algo").and_then(|v| v.as_str()).with_context(|| {
+            format!(
+                "{quant_config_path}: quantization.quantized_layers.{name} has no \
+                 string quant_algo"
+            )
+        })?;
+        if algo == "NVFP4" {
+            targets.insert(name.clone());
+        }
+    }
+    Ok(targets)
 }
 
 /// Load an AWQ checkpoint, repacking every quantized matrix on the way in.
