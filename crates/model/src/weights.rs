@@ -152,14 +152,13 @@ impl Matrix {
     /// little-endian -- see that type's own doc comment). Neither has a
     /// host-side field on `Matrix`, so this reads both off the buffer's tail
     /// once, here, at the same lazy-init step that builds the cached
-    /// CUTLASS-side swizzled scale grid: `weight_scale_2` feeds
-    /// [`infero_kernels::Kernels::prepare_cutlass_fp4_weight`]'s own
-    /// `scale2` parameter (applied as the GEMM's `alpha`), and
-    /// `input_scale` is cached on the returned `CutlassFp4Weight` purely as
-    /// a convenient place to hold it -- it is not consumed by the GEMM
-    /// itself, only by `Model::matmul_pre`'s activation-quantize call,
-    /// which reads it back out via
-    /// [`infero_kernels::CutlassFp4Weight::input_scale`].
+    /// CUTLASS-side swizzled scale grid. Both scalars feed the GEMM's own
+    /// `alpha` (`weight_scale_2 * input_scale`, computed in
+    /// `mma_e2m1_cutlass_sfa_f32out` -- see that function's "CORRECTION 2"
+    /// doc comment for the full derivation), and `input_scale` is ALSO read
+    /// back out via [`infero_kernels::CutlassFp4Weight::input_scale`] by
+    /// every real call site's activation-quantize call, which needs its
+    /// *reciprocal* as the quantizer's `global_scale` argument.
     #[cfg(feature = "cutlass")]
     pub fn cutlass_fp4_weight(&self, kern: &infero_kernels::Kernels) -> Option<&infero_kernels::CutlassFp4Weight> {
         if self.ty != WeightType::F4E2M1 || !self.is_resident() {

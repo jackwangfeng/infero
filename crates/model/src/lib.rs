@@ -3948,7 +3948,9 @@ impl Model {
                     &mut self.scratch.xq_e2m1.slice_mut(..xq_len),
                     &mut self.scratch.xs_e2m1.slice_mut(..xs_len),
                     &self.act.xb.slice(..n_logit_rows * d),
-                    cw.input_scale(),
+                    // See the sibling call site in `matmul_pre` -- the
+                    // quantizer needs `1/input_scale`, not `input_scale`.
+                    1.0 / cw.input_scale(),
                     d,
                     n_logit_rows,
                 )?;
@@ -7543,7 +7545,12 @@ impl Model {
                 &mut scratch.xq_e2m1.slice_mut(..xq_len),
                 &mut scratch.xs_e2m1.slice_mut(..xs_len),
                 x,
-                cw.input_scale(),
+                // The quantizer's `global_scale` is the RECIPROCAL of the
+                // checkpoint's `input_scale`, not the raw value -- see
+                // `cutlass_fp4.rs`'s "CORRECTION 2" doc comment on
+                // `mma_e2m1_cutlass_sfa_f32out` for the full derivation (the
+                // raw value's role is `alpha`, computed there instead).
+                1.0 / cw.input_scale(),
                 w.k,
                 n_tokens,
             )?;

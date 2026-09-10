@@ -134,27 +134,25 @@ fn the_nvfp4_gemm_matches_the_host_reference() -> Result<()> {
         // `quantize_act_e2m1_cutlass`'s device kernel is checked against
         // elsewhere), then dequantized back to f64 for the reference matmul.
         //
-        // CORRECTION (found during the real end-to-end NVFP4 garbage-output
-        // investigation): this used to pass `scale2 = 1.0` here, on the
-        // claim that the activation's own per-block scale bytes already
-        // fully absorb `INPUT_SCALE`. That claim was WRONG, and this
-        // reference was consequently self-consistently wrong in exactly the
-        // same direction as the (then-buggy) GEMM's own `alpha` -- which is
-        // why this test PASSED on real `bw` hardware despite the real bug
-        // being present the whole time. `quantize_act_e2m1_row`'s own
-        // per-block scale byte mechanically encodes `x_true * INPUT_SCALE`
-        // (not `x_true`), so recovering the true activation value needs an
-        // explicit `/ INPUT_SCALE` here, matching the real fix in
-        // `mma_e2m1_cutlass_sfa_f32out` (`alpha = weight_scale_2 /
-        // input_scale`, see that function's own doc comment for the full
-        // derivation, cross-checked against vLLM's real
-        // `run_nvfp4_emulations`).
+        // CORRECTION 2 (whole-branch code review, superseding the
+        // "CORRECTION" this test used to carry): the real call sites
+        // (`Model::matmul_pre`, the lm_head dispatch) pass the quantizer's
+        // `global_scale` argument as `1.0 / cw.input_scale()` -- the
+        // RECIPROCAL of the checkpoint's raw scalar -- not the raw value
+        // itself. `INPUT_SCALE` here plays the role of `cw.input_scale()`
+        // (the raw checkpoint scalar, also fed to `prepare_cutlass_fp4_weight`
+        // below and thus to `alpha`'s own `cw.scale2 * cw.input_scale`
+        // multiply), so the quantizer call must receive `1.0 / INPUT_SCALE`,
+        // and recovering `x_true` from the resulting bytes needs `scale2 ==
+        // 1.0 / (1.0 / INPUT_SCALE) == INPUT_SCALE`. See
+        // `mma_e2m1_cutlass_sfa_f32out`'s own doc comment ("CORRECTION 2")
+        // for the full derivation.
         let mut act_dequant_f64 = Vec::with_capacity(n_tokens * K);
         for t in 0..n_tokens {
             let row = &x[t * K..(t + 1) * K];
-            let (xq_row, xs_row) = quantize_act_e2m1_row(row, INPUT_SCALE, K);
+            let (xq_row, xs_row) = quantize_act_e2m1_row(row, 1.0 / INPUT_SCALE, K);
             let xs_row_f32: Vec<f32> = xs_row.iter().map(|&b| infero_safetensors::e4m3_value(b)).collect();
-            let row_f32 = dequant_f4e2m1_row(&xq_row, &xs_row_f32, 1.0 / INPUT_SCALE, K);
+            let row_f32 = dequant_f4e2m1_row(&xq_row, &xs_row_f32, INPUT_SCALE, K);
             act_dequant_f64.extend(row_f32.iter().map(|&v| v as f64));
         }
 
@@ -192,7 +190,7 @@ fn the_nvfp4_gemm_matches_the_host_reference() -> Result<()> {
                 &mut d_xq.as_view_mut(),
                 &mut d_xq_scale.as_view_mut(),
                 &d_x.as_view(),
-                INPUT_SCALE,
+                1.0 / INPUT_SCALE,
                 K,
                 n_tokens,
             )?;
@@ -314,17 +312,15 @@ fn the_nvfp4_gemm_matches_the_host_reference_at_lmhead_scale() -> Result<()> {
 
         // Same reference-quantization approach as the sibling test: Task 2's
         // own host oracle, dequantized back to f64 for the reference matmul.
-        // `scale2 = 1.0 / INPUT_SCALE`, not `1.0` -- see the sibling test's
-        // own "CORRECTION" comment for why (this test inherited the same
-        // now-fixed error, and passing under the OLD `1.0` value is exactly
-        // why this diagnostic did not catch the real bug when it ran on
-        // `bw`: the reference and the buggy GEMM were wrong in the same way).
+        // Per the sibling test's "CORRECTION 2" comment, the quantizer gets
+        // `1.0 / INPUT_SCALE` and the reference decode recovers `x_true`
+        // with `scale2 = INPUT_SCALE`.
         let mut act_dequant_f64 = Vec::with_capacity(n_tokens * LMHEAD_K);
         for t in 0..n_tokens {
             let row = &x[t * LMHEAD_K..(t + 1) * LMHEAD_K];
-            let (xq_row, xs_row) = quantize_act_e2m1_row(row, INPUT_SCALE, LMHEAD_K);
+            let (xq_row, xs_row) = quantize_act_e2m1_row(row, 1.0 / INPUT_SCALE, LMHEAD_K);
             let xs_row_f32: Vec<f32> = xs_row.iter().map(|&b| infero_safetensors::e4m3_value(b)).collect();
-            let row_f32 = dequant_f4e2m1_row(&xq_row, &xs_row_f32, 1.0 / INPUT_SCALE, LMHEAD_K);
+            let row_f32 = dequant_f4e2m1_row(&xq_row, &xs_row_f32, INPUT_SCALE, LMHEAD_K);
             act_dequant_f64.extend(row_f32.iter().map(|&v| v as f64));
         }
 
@@ -357,7 +353,7 @@ fn the_nvfp4_gemm_matches_the_host_reference_at_lmhead_scale() -> Result<()> {
                 &mut d_xq.as_view_mut(),
                 &mut d_xq_scale.as_view_mut(),
                 &d_x.as_view(),
-                INPUT_SCALE,
+                1.0 / INPUT_SCALE,
                 LMHEAD_K,
                 n_tokens,
             )?;

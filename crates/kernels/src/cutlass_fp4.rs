@@ -61,7 +61,7 @@
 //! exactly the shape the brief specifies (no new visible parameter) by
 //! reading it from `cw` internally.
 //!
-//! **CORRECTION (found during the end-to-end NVFP4 garbage-output
+//! **CORRECTION 1 (found during the end-to-end NVFP4 garbage-output
 //! investigation -- real logits ~30-50x too small at every prompt):** the
 //! claim originally written here -- that `quantize_act_e2m1_cutlass`'s own
 //! `input_scale` "needs no equivalent post-multiply" because its per-block
@@ -70,20 +70,43 @@
 //! what `scale_f32 = input_scale * vec_max / 6` does) is precisely why a
 //! *decode*-time correction is still needed: CUTLASS's native MMA only ever
 //! computes `code * sf_byte_raw`, which mechanically equals `x_true *
-//! input_scale`, not `x_true`. Recovering `x_true` needs one more division
-//! by `input_scale`, on top of (not instead of) `weight_scale_2`'s own
-//! multiply. Cross-checked against vLLM's real, freshly-fetched
-//! `nvfp4_emulation_utils.py::run_nvfp4_emulations` this session: it builds
-//! `x_dq = fp4_val * (scale / input_global_scale)` for activations (a
-//! DIVIDE) alongside a plain `w_dq = fp4_val * scale * weight_global_scale`
-//! for weights (a MULTIPLY, matching `dequant_f4e2m1_row` as-is), then just
-//! `out = x_dq @ w_dq.T` -- working that through algebraically gives
-//! `alpha = weight_global_scale / input_global_scale`, not
-//! `weight_global_scale` alone. [`Kernels::mma_e2m1_cutlass_sfa_f32out`] now
-//! computes `cw.scale2 / cw.input_scale` as `alpha`; see its own doc comment
-//! and the fix commit for the full derivation and the real measured
-//! magnitude match (lm_head's real `input_scale≈0.02167` gives
-//! `1/input_scale≈46.1`, landing squarely inside the observed ~30-50x gap).
+//! input_scale`, not `x_true`. This correction made `alpha` divide by
+//! `input_scale` (`cw.scale2 / cw.input_scale`) -- which fixed lm_head's
+//! visible logit magnitude, but see Correction 2: it was still wrong, and it
+//! left the real bug (an all-zero FFN) in place.
+//!
+//! **CORRECTION 2 (the real fix, found by whole-branch code review): the
+//! quantizer's `global_scale` argument and `alpha`'s formula had each other's
+//! roles.** Real, fetched vLLM source (`modelopt.py`'s `apply_weights`) uses
+//! the checkpoint's single `input_scale` scalar (call it `S`) two different
+//! ways, and Correction 1 conflated them:
+//!
+//!   - `layer.alpha = S * layer.weight_global_scale` -- a **MULTIPLY** by the
+//!     raw `S`, not a divide.
+//!   - `layer.input_global_scale_inv = 1.0 / S` -- the quantizer's own
+//!     `global_scale` argument is `S`'s **reciprocal**, never `S` itself.
+//!
+//! Correction 1 passed the raw `cw.input_scale()` (`S`) as the quantizer's
+//! `global_scale` at both real call sites (`Model::matmul_pre`, the lm_head
+//! dispatch) -- correct for `alpha`'s role, wrong for the quantizer's -- and
+//! then computed `alpha = cw.scale2 / cw.input_scale`, applying `S`'s
+//! reciprocal role a second time on top. The quantizer's own per-block scale
+//! byte is `S_arg * vec_max / 6`; feeding it `S` directly (order `1e-3` on
+//! this checkpoint's real FFN tensors) drives that byte to e4m3's underflow
+//! floor for any block whose `vec_max` is not enormous -- provably, for this
+//! checkpoint's real `gate_proj` (`input_scale≈0.0014`, `amax≈3.763`, below
+//! the `amax<3.969` all-zero threshold this format's math implies): **every
+//! FFN activation block in all 64 layers quantized to exactly zero.** The
+//! FFN sub-layer silently contributed nothing to any forward pass; only
+//! lm_head (`input_scale≈0.02167`, clear of that floor) looked correct,
+//! which is why the garbage-output investigation's lm_head-only ground-truth
+//! checks never caught it. `alpha`'s algebra cannot rescue an operand that
+//! is already zero, which is why Correction 1 alone did not fix generation.
+//! Fixed now: both quantizer call sites pass `1.0 / cw.input_scale()`, and
+//! [`Kernels::mma_e2m1_cutlass_sfa_f32out`] computes `cw.scale2 *
+//! cw.input_scale` (a multiply) as `alpha`. See that function's own doc
+//! comment, and `fp4_quantize_act.rs`'s real-magnitude regression test, for
+//! the rest of the derivation.
 
 use anyhow::{Context, Result};
 use cudarc::driver::{DevicePtr, DevicePtrMut};
@@ -351,36 +374,43 @@ impl Kernels {
         debug_assert!(xq.len() >= n_tokens * k.div_ceil(2));
         debug_assert!(out.len() >= n_tokens * n);
 
-        // GEMM `alpha`: `weight_scale_2 / input_scale`, NOT `weight_scale_2`
-        // alone -- see this struct's own doc comment (and this module's,
-        // both corrected alongside this fix) for the real derivation. In
-        // short: CUTLASS's native block-scaled MMA can only ever consume the
-        // per-block SF byte via a plain multiply (`code * sf_byte`), and
-        // `quantize_act_e2m1_cutlass`'s own per-block scale byte mechanically
-        // encodes `x_true * input_scale` (its `scale_f32 = input_scale *
-        // vec_max / 6` bakes `input_scale` in at encode time, exactly
-        // mirroring vLLM's real `ref_nvfp4_quant`). So the raw MMA output is
-        // `(x*input_scale) @ (w/weight_scale_2)` -- the weight side per
-        // `CutlassFp4Weight`'s own doc comment and `dequant_f4e2m1_row`'s
-        // validated convention -- and only DIVIDING that raw product by
-        // `input_scale` (equivalently multiplying by `1/input_scale`, on top
-        // of the existing `weight_scale_2` factor) recovers the true dot
-        // product. Cross-checked against vLLM's real, fetched-this-session
-        // `run_nvfp4_emulations` (`nvfp4_emulation_utils.py`): its own
-        // `x_dq = fp4_val * (scale / input_global_scale)` for activations vs.
-        // a plain `w_dq = fp4_val * scale * weight_global_scale` for weights,
-        // then `out = x_dq @ w_dq.T` -- working that through algebraically
-        // gives exactly `alpha = weight_global_scale / input_global_scale`.
-        // The previous `alpha = cw.scale2` (no `input_scale` divide at all)
-        // under-scaled every NVFP4 GEMM's output by a factor of exactly
-        // `input_scale` -- the real, measured root cause of the ~30-50x-too-
-        // small lm_head logits bug (lm_head's real `input_scale≈0.02167`
-        // gives `1/input_scale≈46.1`, matching the observed gap almost
-        // exactly). The same bug silently starved every FFN projection's own
-        // contribution too (`matmul_pre`'s sibling branch, same kernel), just
-        // masked there by the residual stream's unaffected (F8E4M3) attention
-        // contribution rather than visible in a bare RMS probe.
-        let alpha = cw.scale2 / cw.input_scale;
+        // GEMM `alpha`: `weight_scale_2 * input_scale` -- a MULTIPLY, not a
+        // divide, and this is the second and final correction to this
+        // formula (the first, `cw.scale2 / cw.input_scale`, was itself
+        // wrong -- see below). Real, fetched vLLM source
+        // (`modelopt.py`'s `apply_weights`) is unambiguous:
+        //
+        //   input_global_scale = layer.input_scale.max()      # == cw.input_scale, the raw checkpoint scalar
+        //   layer.alpha = input_global_scale * layer.weight_global_scale   # MULTIPLY
+        //   layer.input_global_scale_inv = 1.0 / input_global_scale        # fed to the ACTIVATION QUANTIZER, not alpha
+        //
+        // The two scalars vLLM computes from the checkpoint's single
+        // `input_scale` play different roles: `input_global_scale` (the raw
+        // value) feeds `alpha` directly; its reciprocal feeds the quantizer.
+        // The previous version of this fix conflated them -- it left the
+        // quantizer call site (`Model::matmul_pre`, the lm_head dispatch)
+        // passing the raw `cw.input_scale()` as the quantizer's
+        // `global_scale`, correct only for `alpha`'s role, and then divided
+        // by it here too, which is `alpha`'s role applied a second time.
+        // Concretely: `quantize_act_e2m1_cutlass`'s per-block scale byte is
+        // `input_arg * vec_max / 6` where `input_arg` is whatever the caller
+        // passes -- with the caller (wrongly) passing the raw `input_scale`
+        // instead of its reciprocal, every real checkpoint's calibrated
+        // `input_scale` (order `1e-3`) drove that scale byte to e4m3's
+        // underflow floor for any activation block whose `vec_max` wasn't
+        // enormous -- provably: `gate_proj`'s real `input_scale≈0.0014`
+        // (`amax≈3.763`) is below this checkpoint's own zero-everything
+        // threshold of `input_scale < 15.75/16128*... ` i.e. `amax < 3.969`,
+        // so EVERY FFN activation block in all 64 layers quantized to
+        // exactly zero -- the FFN sub-layer contributed nothing, silently,
+        // while lm_head (whose `input_scale≈0.02167` stays well clear of
+        // that floor) looked fine. `alpha`'s own algebra could not rescue
+        // zeroed operands, which is why the first alpha fix alone did not
+        // fix end-to-end generation. See `Model::matmul_pre`'s and the
+        // lm_head dispatch's own call sites (both now pass
+        // `1.0 / cw.input_scale()`), and `fp4_quantize_act.rs`'s new
+        // real-magnitude regression test, for the other half of this fix.
+        let alpha = cw.scale2 * cw.input_scale;
         debug_assert!(
             alpha.is_finite(),
             "NVFP4 GEMM alpha is non-finite (scale2={}, input_scale={}) -- a zero/garbage \

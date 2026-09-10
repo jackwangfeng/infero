@@ -442,18 +442,21 @@ mod tests {
         }
     }
 
-    /// Reproduces the real end-to-end NVFP4 garbage-output bug (see
-    /// `cutlass_fp4.rs`'s own "CORRECTION" doc comment on
-    /// `Kernels::mma_e2m1_cutlass_sfa_f32out`): CUTLASS's native block-scaled
+    /// Reproduces the real end-to-end NVFP4 garbage-output bug, in its final,
+    /// corrected form (see `cutlass_fp4.rs`'s "CORRECTION 2" doc comment on
+    /// `Kernels::mma_e2m1_cutlass_sfa_f32out`). CUTLASS's native block-scaled
     /// MMA can only ever compute `code * sf_byte_raw` (a plain multiply of
-    /// the STORED per-block scale byte), and [`quantize_act_e2m1_row`]
-    /// (mirroring the real on-device `quantize_act_e2m1_f32` kernel exactly)
-    /// bakes `input_scale` into that byte at encode time (`scale_f32 =
-    /// input_scale * vec_max / 6`). So the raw MMA output mechanically
-    /// recovers `x_true * input_scale`, not `x_true` -- the GEMM's `alpha`
-    /// must divide that back out (`weight_scale_2 / input_scale`), on top of
-    /// (not instead of) applying `weight_scale_2` for the weight side
-    /// (`dequant_f4e2m1_row`'s own, separately-validated convention).
+    /// the STORED per-block scale byte). The checkpoint's real call sites
+    /// feed [`quantize_act_e2m1_row`]/the on-device `quantize_act_e2m1_f32`
+    /// kernel the RECIPROCAL of the checkpoint's `input_scale` scalar as
+    /// `global_scale` (not the raw value -- that was the bug: an earlier fix
+    /// pass fed the raw value and then divided `alpha` by it, which is the
+    /// same operation applied twice), so the per-block scale byte mechanically
+    /// bakes in `1/input_scale`, and the raw MMA output for the activation
+    /// side recovers `x_true / input_scale`. Recovering the true dot product
+    /// therefore needs `alpha = weight_scale_2 * input_scale` -- a MULTIPLY,
+    /// matching real, fetched vLLM source (`modelopt.py`'s `layer.alpha =
+    /// input_global_scale * layer.weight_global_scale`) -- not a divide.
     ///
     /// This builds a small synthetic activation + weight pair using
     /// REAL-ORDER-OF-MAGNITUDE scales (the real, measured lm_head values from
@@ -463,13 +466,13 @@ mod tests {
     /// CUTLASS's tensor cores do, via `dequant_f4e2m1_row(..., scale2=1.0,
     /// ...)` to get the "no third factor applied yet" raw product on both
     /// sides -- and checks that only the CORRECTED alpha
-    /// (`weight_scale_2/input_scale`) recovers the true dot product, while
-    /// the OLD, buggy `alpha = weight_scale_2` alone reproduces almost
-    /// exactly the real ~1/input_scale magnitude gap this bug produced on
-    /// real hardware (lm_head's real input_scale ~0.02167 -> ~46.1x, squarely
-    /// inside the observed ~30-50x garbage-output gap).
+    /// (`weight_scale_2 * input_scale`) recovers the true dot product, while
+    /// the earlier, still-wrong `alpha = weight_scale_2 / input_scale`
+    /// (dividing when the raw value is fed to the quantizer, rather than its
+    /// reciprocal) is off by a factor of `1/input_scale^2`, not a subtle
+    /// rounding difference.
     #[test]
-    fn gemm_alpha_must_divide_by_input_scale_not_just_multiply_weight_scale_2() {
+    fn gemm_alpha_must_multiply_by_input_scale_not_divide() {
         let k = 32; // two 16-element blocks, exercises block-index arithmetic too.
 
         // A representative real activation vector: varies per block (not
@@ -481,18 +484,21 @@ mod tests {
                 (t * 0.37).sin() * 2.5 + (t * 0.11).cos() * 0.7
             })
             .collect();
-        // The real, measured lm_head `input_scale` from the bug investigation.
+        // The real, measured lm_head `input_scale` from the bug investigation
+        // -- the checkpoint's raw scalar (`cw.input_scale()`'s value).
         let input_scale = 0.021_670_388_f32;
 
-        let (xq_packed, xq_scale_bytes) = quantize_act_e2m1_row(&x, input_scale, k);
+        // The real call-site convention: the quantizer's `global_scale`
+        // argument is `1.0 / input_scale`, not `input_scale` itself.
+        let (xq_packed, xq_scale_bytes) = quantize_act_e2m1_row(&x, 1.0 / input_scale, k);
         let xq_scale_f32: Vec<f32> = xq_scale_bytes
             .iter()
             .map(|&b| infero_safetensors::e4m3_value(b))
             .collect();
 
         // What CUTLASS's native MMA mechanically computes for the activation
-        // side alone: `code * sf_byte_raw`, no `input_scale` divided out yet
-        // (`dequant_f4e2m1_row` with `scale2 = 1.0` applies no third factor).
+        // side alone: `code * sf_byte_raw`, no third factor applied yet
+        // (`dequant_f4e2m1_row` with `scale2 = 1.0` applies none).
         let raw_a = dequant_f4e2m1_row(&xq_packed, &xq_scale_f32, 1.0, k);
 
         // A synthetic real checkpoint weight row: arbitrary e2m1 codes, two
@@ -536,35 +542,44 @@ mod tests {
             .map(|(&xi, &wi)| (xi as f64 * wi as f64).abs())
             .sum();
 
-        let alpha_fixed = (weight_scale_2 / input_scale) as f64;
-        let alpha_buggy = weight_scale_2 as f64;
+        let alpha_fixed = (weight_scale_2 * input_scale) as f64;
+        let alpha_still_wrong = (weight_scale_2 / input_scale) as f64;
 
         let d_fixed = alpha_fixed * gemm_raw;
-        let d_buggy = alpha_buggy * gemm_raw;
+        let d_still_wrong = alpha_still_wrong * gemm_raw;
 
-        // The FIX: `weight_scale_2 / input_scale` recovers the true dot
+        // The FIX: `weight_scale_2 * input_scale` recovers the true dot
         // product within e2m1's own quantization tolerance (only `x` goes
         // through lossy quantization here; `w_true` is exact by
         // construction).
         let err_fixed = (d_fixed - true_dot).abs() / magnitude;
         assert!(
             err_fixed < 0.35,
-            "fixed alpha (weight_scale_2/input_scale) should recover the true dot \
+            "fixed alpha (weight_scale_2*input_scale) should recover the true dot \
              product within e2m1's own quantization tolerance: got {d_fixed}, want ~{true_dot} \
              (err/magnitude {err_fixed})"
         );
 
-        // The BUG: the OLD alpha (`weight_scale_2` alone, no `input_scale`
-        // divide) under-scales the result by almost exactly `input_scale` --
-        // the real, measured magnitude gap (~1/input_scale, ~46x for
-        // lm_head) the end-to-end garbage-output bug actually produced.
-        let expected_buggy = input_scale as f64 * true_dot;
-        let err_buggy = (d_buggy - expected_buggy).abs() / magnitude;
+        // The EARLIER, STILL-WRONG fix (divide instead of multiply): off by
+        // a factor of `1/input_scale^2`, not a rounding-sized difference --
+        // demonstrating this is a real, distinguishable regression to guard
+        // against, not two formulas that happen to agree at this magnitude.
+        // Same quantization noise as `err_fixed`, just scaled up by the same
+        // `1/input_scale^2` factor as the expected value itself, so the
+        // operand-magnitude tolerance is scaled the same way.
+        let magnitude_scaled = magnitude / (input_scale as f64).powi(2);
+        let expected_still_wrong = true_dot / (input_scale as f64).powi(2);
+        let err_still_wrong = (d_still_wrong - expected_still_wrong).abs() / magnitude_scaled;
         assert!(
-            err_buggy < 0.35 * input_scale as f64,
-            "the buggy alpha's output should be smaller than the true value by \
-             almost exactly a factor of input_scale ({input_scale}): got {d_buggy}, \
-             want ~{expected_buggy} (err/magnitude {err_buggy})"
+            err_still_wrong < 0.35,
+            "the divide-based alpha should reproduce the true dot product scaled by \
+             1/input_scale^2 ({}): got {d_still_wrong}, want ~{expected_still_wrong}",
+            (input_scale as f64).powi(-2)
+        );
+        assert!(
+            (d_still_wrong - true_dot).abs() / magnitude > 10.0,
+            "the divide-based alpha must NOT recover the true dot product -- if it does, \
+             this test's own math no longer distinguishes the two conventions"
         );
     }
 }

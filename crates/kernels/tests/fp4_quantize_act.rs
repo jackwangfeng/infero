@@ -108,14 +108,17 @@ fn quantize_act_e2m1_host_reference_round_trips_within_tolerance() {
     let (n_tokens, kk) = (64usize, 256usize);
     let x = pseudo_random(n_tokens * kk, 0xACE1);
 
-    // `input_scale`: the checkpoint's real static per-tensor NVFP4 scale.
-    // Real NVFP4 checkpoints (ModelOpt-produced) set this so that
-    // `input_scale * max(|activation|) / 6.0` lands near fp8_e4m3's useful
-    // range -- with activations already O(1) here (the pseudo-random
-    // generator's own [-1, 1) range), 1.0 is a plausible, simple stand-in:
-    // it keeps `global_scale * vec_max / 6.0` well inside the [-448, 448]
-    // clamp with plenty of margin, so this test exercises the real
-    // per-block dynamic-scale path rather than the clamp's saturation edge.
+    // `input_scale` here names the quantizer's `global_scale` ARGUMENT, not
+    // the checkpoint's raw `input_scale` scalar -- real call sites must pass
+    // the RECIPROCAL of the checkpoint value (see
+    // `quantize_act_e2m1_host_reference_at_a_real_checkpoints_input_scale`
+    // below, which uses a real checkpoint magnitude and is what actually
+    // guards the convention). `1.0` is self-reciprocal, so this test's own
+    // choice cannot distinguish the two conventions -- it exists only to
+    // exercise the per-block dynamic-scale path away from the clamp's
+    // saturation edge, at a scale that keeps `global_scale * vec_max / 6.0`
+    // well inside `[-448, 448]` with activations already O(1) (the
+    // pseudo-random generator's own [-1, 1) range).
     let input_scale = 1.0f32;
     // Per the round-trip arithmetic: `ref_nvfp4_quant`'s own round-trip
     // identity is `x_dq = fp4_val * (scale / global_scale)`, and
@@ -140,6 +143,70 @@ fn quantize_act_e2m1_host_reference_round_trips_within_tolerance() {
     }
 
     assert_round_trip_within_ladder_tolerance(&x, &got);
+}
+
+/// The real regression test for the `global_scale`/`alpha` convention bug
+/// (whole-branch review, corrected in `cutlass_fp4.rs`'s "CORRECTION 2"):
+/// at this checkpoint's own real, calibrated `input_scale` for
+/// `layers.0.mlp.gate_proj` (`0.0014`, `amax≈3.763`), feeding the RAW
+/// checkpoint value as the quantizer's `global_scale` argument (the bug)
+/// drives every block's e4m3 scale byte to zero -- `amax < 3.969` makes
+/// this true for ANY activation in the block, not a probabilistic
+/// near-miss. Feeding the reciprocal (the fix, matching real call sites in
+/// `crates/model/src/lib.rs`) keeps every scale byte in e4m3's real usable
+/// range and the round trip recovers the original activations within the
+/// same ladder tolerance every other test in this file uses. No GPU
+/// needed -- this is exactly the class of bug layer-by-layer activation
+/// probing on real hardware could not see (every intermediate looks like a
+/// valid, small, all-zero tensor, not an obviously-wrong one).
+#[test]
+fn quantize_act_e2m1_host_reference_at_a_real_checkpoints_input_scale() {
+    let (n_tokens, kk) = (64usize, 256usize);
+    let x = pseudo_random(n_tokens * kk, 0xACE1);
+
+    // The real, measured `input_scale` for this plan's target checkpoint's
+    // `layers.0.mlp.gate_proj` (task8-lmhead-rootcause-report.md).
+    let checkpoint_input_scale = 0.0014f32;
+
+    let quantize_and_dequant = |global_scale: f32| -> (Vec<f32>, bool) {
+        let mut got = Vec::with_capacity(n_tokens * kk);
+        let mut any_zero_scale = false;
+        for row in 0..n_tokens {
+            let xrow = &x[row * kk..(row + 1) * kk];
+            let (packed, scale_bytes) = quantize_act_e2m1_row(xrow, global_scale, kk);
+            any_zero_scale |= scale_bytes.iter().any(|&b| b == 0);
+            let scale_f32: Vec<f32> = scale_bytes
+                .iter()
+                .map(|&b| infero_safetensors::e4m3_value(b))
+                .collect();
+            // Recovering x_true needs `scale2 == 1.0 / global_scale`, same
+            // identity the sibling test above derives.
+            got.extend(dequant_f4e2m1_row(&packed, &scale_f32, 1.0 / global_scale, kk));
+        }
+        (got, any_zero_scale)
+    };
+
+    // The bug: raw `input_scale` fed directly as `global_scale`. Every
+    // block's scale byte underflows to zero -- provable from this
+    // checkpoint's own real `amax`, not just "some blocks are hurt".
+    let (bugged, bugged_any_zero) = quantize_and_dequant(checkpoint_input_scale);
+    assert!(
+        bugged_any_zero,
+        "expected the pre-fix convention to zero every scale byte at this checkpoint's real magnitude"
+    );
+    assert!(
+        bugged.iter().all(|&v| v == 0.0),
+        "expected the pre-fix convention to recover an all-zero activation (the actual, shipped bug)"
+    );
+
+    // The fix: the RECIPROCAL fed as `global_scale`, matching real call
+    // sites (`Model::matmul_pre`, the lm_head dispatch).
+    let (fixed, fixed_any_zero) = quantize_and_dequant(1.0 / checkpoint_input_scale);
+    assert!(
+        !fixed_any_zero,
+        "fixed convention should keep every block's scale byte off the e4m3 underflow floor"
+    );
+    assert_round_trip_within_ladder_tolerance(&x, &fixed);
 }
 
 /// Confirms the device kernel produces the exact same bytes as the host

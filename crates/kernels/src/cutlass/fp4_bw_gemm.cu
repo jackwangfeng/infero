@@ -224,9 +224,12 @@ extern "C" size_t infero_cutlass_fp4_bw_gemm_f32out_workspace(int m, int n, int 
 // `d` is the model's own `out` buffer (f32), read as C too when `accum`
 // (beta=1) -- same "no separate scratch, no separate store/upconvert
 // kernel" contract as `fp8_bw_gemm.cu`'s `infero_cutlass_fp8_bw_gemm_f32out`.
-// `alpha` is the caller-supplied `weight_scale_2` (NVFP4's per-tensor
-// second-level weight scale) -- see this file's own header comment for why
-// that factor has to be applied here rather than folded into `sfb`.
+// `alpha` is the caller-supplied `weight_scale_2 * input_scale` (NVFP4's
+// per-tensor second-level weight scale, times the activation's own
+// per-tensor input scale) -- see this file's own header comment for why
+// `weight_scale_2` has to be applied here rather than folded into `sfb`,
+// and `cutlass_fp4.rs`'s `mma_e2m1_cutlass_sfa_f32out` doc comment
+// ("CORRECTION 2") for why `input_scale` belongs in this product too.
 extern "C" int32_t infero_cutlass_fp4_bw_gemm_f32out(const void* a, const void* b, const void* sfa, const void* sfb,
                                                       float* d, void* workspace, int m, int n, int k, float alpha,
                                                       int accum, cudaStream_t stream) {
