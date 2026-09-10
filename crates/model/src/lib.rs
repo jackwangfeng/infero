@@ -3906,7 +3906,70 @@ impl Model {
         // Asked and answered: this checkpoint's head is Q8_0, 248320 x 5120,
         // and at one row it takes `mmvq` — 885 us for 1.29 GB, which is 1460
         // GB/s and the same rate the FP8 projections get. Nothing to win here.
-        if head_int && n_logit_rows == 1 {
+        // NVFP4 (W4A4) lm_head: `head_int`/`head_mmq` above are both false for
+        // this type (they gate on `has_mmvq`/`has_mmq`, integer-quant-specific
+        // capabilities `F4E2M1` was never added to), so without this branch
+        // every NVFP4 checkpoint's vocab projection falls to the generic
+        // `gemv` path below and tries to JIT a `gemv_f4e2m1` kernel that does
+        // not exist (see `matmul_pre`'s own sibling branch's comment -- there
+        // is no non-CUTLASS kernel for this layout at all). Mirrors that
+        // branch's structure, adapted to this call site's own variable names:
+        // `head`/`d`/`vocab_size`/`n_logit_rows`/`self.act.logits`/
+        // `self.act.xb` in place of `w`/`w.k`/`w.n`/`n_tokens`/`out`/`x`.
+        if head.ty == infero_kernels::WeightType::F4E2M1 {
+            #[cfg(feature = "cutlass")]
+            {
+                let cw = head.cutlass_fp4_weight(&self.kern).with_context(|| {
+                    format!(
+                        "preparing CUTLASS NVFP4 weight for the {}x{} lm_head",
+                        head.n, head.k
+                    )
+                })?;
+                let blocks = d.div_ceil(infero_kernels::fp4::F4E2M1_BLOCK);
+                let xq_len = n_logit_rows * d.div_ceil(2);
+                let xs_len = n_logit_rows * blocks;
+                anyhow::ensure!(
+                    self.scratch.xq_e2m1.len() >= xq_len && self.scratch.xs_e2m1.len() >= xs_len,
+                    "NVFP4 activation quant scratch too small for {n_logit_rows} logit rows at k={d}"
+                );
+                self.kern.quantize_act_e2m1_cutlass(
+                    &mut self.scratch.xq_e2m1.slice_mut(..xq_len),
+                    &mut self.scratch.xs_e2m1.slice_mut(..xs_len),
+                    &self.act.xb.slice(..n_logit_rows * d),
+                    cw.input_scale(),
+                    d,
+                    n_logit_rows,
+                )?;
+                let ran = self.kern.mma_e2m1_cutlass_sfa_f32out(
+                    &mut self.act.logits.slice_mut(..n_logit_rows * vocab_size),
+                    &head.view(None)?,
+                    cw,
+                    &self.scratch.xq_e2m1.slice(..xq_len),
+                    &self.scratch.xs_e2m1.slice(..xs_len),
+                    d,
+                    vocab_size,
+                    n_logit_rows,
+                    false,
+                )?;
+                anyhow::ensure!(
+                    ran,
+                    "CUTLASS declined a {}x{} lm_head matmul at {n_logit_rows} logit rows under \
+                     the NVFP4 (W4A4) layout, which has no other kernel that can read it -- \
+                     likely k not a multiple of 32",
+                    head.n,
+                    head.k
+                );
+            }
+            #[cfg(not(feature = "cutlass"))]
+            {
+                anyhow::bail!(
+                    "lm_head matrix {}x{} is WeightType::F4E2M1 (NVFP4), which requires the \
+                     `cutlass` feature -- this build was compiled without it",
+                    head.n,
+                    head.k
+                );
+            }
+        } else if head_int && n_logit_rows == 1 {
             let bytes = Kernels::q8_1_bytes(d);
             self.kern.quantize_q8_1(
                 &mut self.scratch.q8_1.slice_mut(..bytes),
