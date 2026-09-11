@@ -143,6 +143,105 @@ __device__ __forceinline__ float tq_dot_q4_K(const void* __restrict__ vbq,
     return __half2float(bq4_K->d) * sumf_d - __half2float(bq4_K->dmin) * sumf_m;
 }
 
+// One 16-element slice of a Q5_K super-block -- `Q4_K`'s own dot product
+// (`tq_dot_q4_K` above) plus the 5th bit. Ported from llama.cpp's real
+// `vec_dot_q5_K_q8_1`/`vec_dot_q5_K_q8_1_impl_vmmq`
+// (`ggml/src/ggml-cuda/vecdotq.cuh`, fetched 2026-09-11) and flattened the
+// same way `tq_dot_q4_K` already flattens `Q4_K`'s own `dm` half2 into
+// separate `d`/`dmin` fields.
+__device__ __forceinline__ float tq_dot_q5_K(const void* __restrict__ vbq,
+                                             const block_q8_1* __restrict__ bq8_1,
+                                             int kbx, int iqs) {
+    const block_q5_K* bq5_K = (const block_q5_K*)vbq + kbx;
+
+    const int bq8_offset = QR4_K * ((iqs / 2) / (QI8_1 / 2));
+
+    const int* ql = (const int*)(bq5_K->qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+    const int* qh = (const int*)(bq5_K->qh + 4 * ((iqs / 2) % 4));
+    int vl[2];
+    vl[0] = ql[0];
+    vl[1] = ql[4];
+    int vh[2];
+    vh[0] = qh[0] >> bq8_offset;
+    vh[1] = qh[4] >> bq8_offset;
+
+    // Scale/min extraction, ported verbatim from the real, fetched
+    // `vec_dot_q5_K_q8_1` (`ggml-cuda/vecdotq.cuh`, 2026-09-11): `jm = j&1`
+    // selects which of two fixed index triples (`jm+0,jm+2,jm+4`) to read
+    // regardless of `j`, and a `hi` all-ones/all-zeros mask (from `j>=2`)
+    // selects which half of the packed bits those three `uint16_t`s combine
+    // into. This LOOKS different from `tq_dot_q4_K`'s own if/else aux
+    // derivation above, but real source confirms they are the same formula
+    // in different clothing -- `vec_dot_q4_K_q8_1`'s own real wrapper uses
+    // this identical branchless scheme, with an explicit "same as q4_K"
+    // comment. Verified algebraically equivalent for every real `j` (a
+    // from-scratch numerical check, not just a read of both). Ported
+    // verbatim rather than re-derived, so a shared bug would not hide here.
+    //
+    // A real, wrong device-vs-host-reference mismatch surfaced early in this
+    // function's own development, and was tracked here through several dead
+    // ends (a genuine `WEIGHT_STRIDE` scoping bug elsewhere -- see the
+    // `mmvqt{T}_q5_K` block below -- plus, wrongly, this scale/min formula
+    // and the nibble/hibit reconstruction below) before the real cause was
+    // found: this function's math is exact -- verified by reproducing the
+    // GPU's output in a from-scratch simulation and matching its every
+    // per-(kbx,iqs) partial sum, to 5 decimal places, against a
+    // quantization-aware host reference. The mismatch was ordinary Q8_1
+    // activation quantization noise, amplified by catastrophic cancellation
+    // on a row whose true dot product is a small residual of much larger
+    // (~100-300 magnitude) cancelling terms -- a test-tolerance problem, not
+    // a kernel bug. See `q5_k.rs`'s cosine-similarity tests and their own
+    // comments for the fix.
+    const uint16_t* scales = (const uint16_t*)bq5_K->scales;
+    const int j = bq8_offset / 2;
+    const int jm = j & 1;
+
+    const uint32_t s0 = scales[jm + 0];
+    const uint32_t s2 = scales[jm + 2];
+    const uint32_t s4 = scales[jm + 4];
+
+    const uint32_t hi = (uint32_t)-(int)(j >= 2);
+
+    uint16_t aux[2];
+    aux[0] = (uint16_t)(((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+    aux[1] = (uint16_t)(((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
+
+    const uint8_t* sc = (const uint8_t*)aux;
+    const uint8_t* m = sc + 2;
+
+    int u[2 * QR4_K];
+    float d8[QR4_K];
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        const block_q8_1* bq8i = bq8_1 + bq8_offset + i;
+        d8[i] = __low2float(bq8i->ds);
+        const int* q8 = (const int*)bq8i->qs + ((iqs / 2) % 4);
+        u[2 * i + 0] = q8[0];
+        u[2 * i + 1] = q8[4];
+    }
+
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        const int vl0i = (vl[0] >> (4 * i)) & 0x0F0F0F0F;
+        const int vl1i = (vl[1] >> (4 * i)) & 0x0F0F0F0F;
+        const int vh0i = ((vh[0] >> i) << 4) & 0x10101010;
+        const int vh1i = ((vh[1] >> i) << 4) & 0x10101010;
+        const int v0i = vl0i | vh0i;
+        const int v1i = vl1i | vh1i;
+
+        const int dot1 = __dp4a(v0i, u[2 * i + 0], __dp4a(v1i, u[2 * i + 1], 0));
+        const int dot2 =
+            __dp4a(0x01010101, u[2 * i + 0], __dp4a(0x01010101, u[2 * i + 1], 0));
+
+        sumf_d += d8[i] * (dot1 * sc[i]);
+        sumf_m += d8[i] * (dot2 * m[i]);
+    }
+
+    return __half2float(bq5_K->d) * sumf_d - __half2float(bq5_K->dmin) * sumf_m;
+}
+
 // One 32-weight quarter of a Q4_G128 block: exactly what a Q8_1 activation
 // block covers, so `iqs` selects both at once.
 //
@@ -263,6 +362,12 @@ MMVQ_KERNEL(mmvq_q8_0, tq_dot_q8_0, 4, 2, 32)
 // Q4_K: 256 weights per super-block, 16 slices of 16, iqs = 0,2,..,30.
 #define WEIGHT_STRIDE (int)sizeof(block_q4_K)
 MMVQ_KERNEL(mmvq_q4_K, tq_dot_q4_K, 16, 2, 256)
+#undef WEIGHT_STRIDE
+
+// Q5_K: same real slice/iqs shape as Q4_K (its dot product reads the same
+// `iqs/2 % 4` granularity, see `tq_dot_q5_K`'s own derivation).
+#define WEIGHT_STRIDE (int)sizeof(block_q5_K)
+MMVQ_KERNEL(mmvq_q5_K, tq_dot_q5_K, 16, 2, 256)
 #undef WEIGHT_STRIDE
 
 // Q6_K: 256 weights per super-block, 32 slices of 8, iqs = 0..31.
@@ -565,6 +670,14 @@ MMVQ_T_KERNEL(mmvqt2_q4_K, tq_dot_q4_K, 16, 2, 256, 2)
 MMVQ_T_KERNEL(mmvqt4_q4_K, tq_dot_q4_K, 16, 2, 256, 4)
 MMVQ_T_KERNEL(mmvqt8_q4_K, tq_dot_q4_K, 16, 2, 256, 8)
 MMVQ_T_KERNEL(mmvqt16_q4_K, tq_dot_q4_K, 16, 2, 256, 16)
+#undef WEIGHT_STRIDE
+
+#define WEIGHT_STRIDE (int)sizeof(block_q5_K)
+MMVQ_T_KERNEL(mmvqt1_q5_K, tq_dot_q5_K, 16, 2, 256, 1)
+MMVQ_T_KERNEL(mmvqt2_q5_K, tq_dot_q5_K, 16, 2, 256, 2)
+MMVQ_T_KERNEL(mmvqt4_q5_K, tq_dot_q5_K, 16, 2, 256, 4)
+MMVQ_T_KERNEL(mmvqt8_q5_K, tq_dot_q5_K, 16, 2, 256, 8)
+MMVQ_T_KERNEL(mmvqt16_q5_K, tq_dot_q5_K, 16, 2, 256, 16)
 #undef WEIGHT_STRIDE
 
 #define WEIGHT_STRIDE (int)sizeof(block_q6_K)

@@ -5581,6 +5581,7 @@ impl Kernels {
             ty,
             WeightType::Q8_0
                 | WeightType::Q4K
+                | WeightType::Q5K
                 | WeightType::Q6K
                 | WeightType::Q4G128
                 | WeightType::Q4G128T
@@ -5670,7 +5671,7 @@ impl Kernels {
         let f = self.dev.kernels().get("infero_mmvq", mmvq_src(), &name)?;
         let slices = match ty {
             WeightType::Q8_0 => k / 8,
-            WeightType::Q4K => k / 16,
+            WeightType::Q4K | WeightType::Q5K => k / 16,
             WeightType::Q6K => k / 8,
             // One 32-weight quarter of a group per thread.
             WeightType::Q4G128 | WeightType::Q4G128T => k / 32,
@@ -7297,7 +7298,7 @@ impl Kernels {
         // One slice per thread, same shape as the float path.
         let slices = match ty {
             WeightType::Q8_0 => k / 8,
-            WeightType::Q4K => k / 16,
+            WeightType::Q4K | WeightType::Q5K => k / 16,
             WeightType::Q6K => k / 8,
             // One 32-weight quarter of a group per thread.
             WeightType::Q4G128 | WeightType::Q4G128T => k / 32,

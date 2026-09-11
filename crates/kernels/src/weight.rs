@@ -18,6 +18,14 @@ pub enum WeightType {
     Q5_1,
     Q8_0,
     Q4K,
+    /// `Q4_K` (same 256-element super-block, same 6-bit scale/min encoding)
+    /// with a 5th bit per weight tacked on via a separate `qh` array --
+    /// llama.cpp's own `Q4_K_M`/`Q4_K_L` quantizations use this for a
+    /// checkpoint's "more sensitive" tensors (e.g. `attn_k`/`attn_v`) rather
+    /// than quantizing every tensor at the same width. See
+    /// `crates/kernels/src/cu/common.cuh`'s `block_q5_K` doc comment for the
+    /// verified-against-real-source bit layout.
+    Q5K,
     Q6K,
     /// Four bits with an `f16` scale and zero point every 128 weights, laid out
     /// one output row at a time. This is what an AWQ checkpoint is repacked
@@ -67,7 +75,7 @@ pub enum WeightType {
 }
 
 impl WeightType {
-    pub const ALL: [WeightType; 12] = [
+    pub const ALL: [WeightType; 13] = [
         WeightType::F32,
         WeightType::F16,
         WeightType::Q4_0,
@@ -76,6 +84,7 @@ impl WeightType {
         WeightType::Q5_1,
         WeightType::Q8_0,
         WeightType::Q4K,
+        WeightType::Q5K,
         WeightType::Q6K,
         WeightType::Q4G128,
         WeightType::Q4G128T,
@@ -92,10 +101,11 @@ impl WeightType {
             GgmlType::Q5_1 => WeightType::Q5_1,
             GgmlType::Q8_0 => WeightType::Q8_0,
             GgmlType::Q4K => WeightType::Q4K,
+            GgmlType::Q5K => WeightType::Q5K,
             GgmlType::Q6K => WeightType::Q6K,
             other => bail!(
                 "weight type {other} is not implemented; supported: \
-                 F32, F16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q6_K"
+                 F32, F16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K"
             ),
         })
     }
@@ -114,6 +124,7 @@ impl WeightType {
             WeightType::Q8_0 => "q8_0",
             WeightType::Q8_0S => "q8_0s",
             WeightType::Q4K => "q4_K",
+            WeightType::Q5K => "q5_K",
             WeightType::Q6K => "q6_K",
             WeightType::Q4G128 => "q4_g128",
             WeightType::Q4G128T => "q4_g128t",
@@ -130,7 +141,7 @@ impl WeightType {
             | WeightType::Q5_1
             | WeightType::Q8_0
             | WeightType::Q8_0S => 32,
-            WeightType::Q4K | WeightType::Q6K => 256,
+            WeightType::Q4K | WeightType::Q5K | WeightType::Q6K => 256,
             WeightType::Q4G128 | WeightType::Q4G128T => 128,
         }
     }
@@ -148,6 +159,7 @@ impl WeightType {
             // Counted as a block for accounting only; the bytes are split.
             WeightType::Q8_0 | WeightType::Q8_0S => 34,
             WeightType::Q4K => 144,
+            WeightType::Q5K => 176,
             WeightType::Q6K => 210,
             // `__half2` of {scale, scale * zero} then 128 nibbles.
             WeightType::Q4G128 | WeightType::Q4G128T => 68,
@@ -170,7 +182,7 @@ impl WeightType {
             // Eight elements per thread.
             WeightType::Q8_0 => k / 8,
             // One 32-element group of a K-quant super-block per thread.
-            WeightType::Q4K => k / 32,
+            WeightType::Q4K | WeightType::Q5K => k / 32,
             // Four elements per thread; see the kernel for why so fine.
             WeightType::Q6K => k / 4,
             // One 32-element quarter of a group per thread, as for Q4_K.
@@ -200,6 +212,7 @@ impl std::fmt::Display for WeightType {
             WeightType::Q8_0 => "Q8_0",
             WeightType::Q8_0S => "Q8_0S",
             WeightType::Q4K => "Q4_K",
+            WeightType::Q5K => "Q5_K",
             WeightType::Q6K => "Q6_K",
             WeightType::Q4G128 => "Q4_G128",
             WeightType::Q4G128T => "Q4_G128T",
@@ -270,6 +283,7 @@ mod tests {
                 WeightType::Q5_1 => GgmlType::Q5_1,
                 WeightType::Q8_0 => GgmlType::Q8_0,
                 WeightType::Q4K => GgmlType::Q4K,
+                WeightType::Q5K => GgmlType::Q5K,
                 WeightType::Q6K => GgmlType::Q6K,
                 WeightType::Q4G128
                 | WeightType::Q4G128T
@@ -285,10 +299,15 @@ mod tests {
 
     #[test]
     fn unsupported_types_are_rejected_by_name() {
-        let err = WeightType::from_ggml(GgmlType::Q5K)
+        // Q5_K was unsupported when this test was written; it has its own
+        // real kernels now (see `common.cuh`'s `block_q5_K`,
+        // `quant.cu`/`mmvq.cu`'s `deq_q5_K`/`tq_dot_q5_K`). Q3_K remains
+        // genuinely unimplemented, so this test still exercises the real
+        // loud-fail path rather than a type that would now succeed.
+        let err = WeightType::from_ggml(GgmlType::Q3K)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("Q5_K"), "{err}");
+        assert!(err.contains("Q3_K"), "{err}");
     }
 
     #[test]

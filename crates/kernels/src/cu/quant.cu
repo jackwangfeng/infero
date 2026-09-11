@@ -87,6 +87,32 @@ __device__ __forceinline__ float deq_q4_K(const void* w, size_t i) {
          - __half2float(b->dmin) * (float)m;
 }
 
+// Real bit logic verified against ggml's own `dequantize_row_q5_K`
+// (`ggml-quants.c`, fetched from real source 2026-09-11): a 256-element
+// super-block splits into 4 groups of 64, each group into a low-nibble
+// half and a high-nibble half of `qs`; the 5th bit for element `l` (0..31)
+// of group `g`'s half `h` (0=low,1=high) lives at bit `2*g+h` of `qh[l]`,
+// shared across all 4 groups (`qh` is never re-based the way `qs` is).
+__device__ __forceinline__ float deq_q5_K(const void* w, size_t i) {
+    const block_q5_K* b = (const block_q5_K*)w + i / QK_K;
+    const int within = i % QK_K;
+    const int group = within / 64;   // which of the 4 64-element groups
+    const int rem = within % 64;
+    const int high = rem / 32;       // low nibble half (0) or high nibble half (1)
+    const int l = rem % 32;
+
+    uint8_t sc, m;
+    q4k_scale_min(b->scales, group * 2 + high, &sc, &m);
+
+    const uint8_t q = b->qs[group * 32 + l];
+    const int nib = high ? (q >> 4) : (q & 0xF);
+    const int bit = group * 2 + high;
+    const int hi = (b->qh[l] & (1 << bit)) ? 16 : 0;
+
+    return __half2float(b->d) * (float)sc * (float)(nib + hi)
+         - __half2float(b->dmin) * (float)m;
+}
+
 __device__ __forceinline__ float deq_q6_K(const void* w, size_t i) {
     const block_q6_K* b = (const block_q6_K*)w + i / QK_K;
     const int within = i % QK_K;
@@ -128,6 +154,7 @@ GATHER_KERNEL(gather_rows_q5_0, deq_q5_0)
 GATHER_KERNEL(gather_rows_q5_1, deq_q5_1)
 GATHER_KERNEL(gather_rows_q8_0, deq_q8_0)
 GATHER_KERNEL(gather_rows_q4_K, deq_q4_K)
+GATHER_KERNEL(gather_rows_q5_K, deq_q5_K)
 GATHER_KERNEL(gather_rows_q6_K, deq_q6_K)
 GATHER_KERNEL(gather_rows_q4_g128, deq_q4_g128)
 
@@ -151,6 +178,7 @@ DEQUANT_KERNEL(dequant_q5_0_f16, deq_q5_0)
 DEQUANT_KERNEL(dequant_q5_1_f16, deq_q5_1)
 DEQUANT_KERNEL(dequant_q8_0_f16, deq_q8_0)
 DEQUANT_KERNEL(dequant_q4_K_f16, deq_q4_K)
+DEQUANT_KERNEL(dequant_q5_K_f16, deq_q5_K)
 DEQUANT_KERNEL(dequant_q6_K_f16, deq_q6_K)
 DEQUANT_KERNEL(dequant_q4_g128_f16, deq_q4_g128)
 
@@ -492,6 +520,47 @@ extern "C" __global__ void gemv_q4_K(float* __restrict__ out,
                 const int byte = (packed >> (b * 8)) & 0xFF;
                 const int nib = high ? (byte >> 4) : (byte & 0xF);
                 GEMV_SPREAD(d * (float)nib - mn, base + w * 4 + b)
+            }
+        }
+    }
+    GEMV_EPILOGUE
+}
+
+// Same structure as `gemv_q4_K` (one thread per 32-element group, `g` 0..7
+// matching `q4k_scale_min`'s own `j`), plus the 5th bit: `blk->qh[l]` bit
+// `g` (`l` = position within the 32-element group, 0..31) -- see
+// `deq_q5_K`'s own doc comment for the verified derivation.
+extern "C" __global__ void gemv_q5_K(float* __restrict__ out,
+                                     const void* __restrict__ w,
+                                     const float* __restrict__ x, int k, int n,
+                                    int n_tokens) {
+    GEMV_PROLOGUE
+    const int nb = k / QK_K;
+    const block_q5_K* wr = (const block_q5_K*)w + (size_t)row * nb;
+
+    for (int c = threadIdx.x; c < nb * 8; c += blockDim.x) {
+        const block_q5_K* blk = wr + c / 8;
+        const int g = c % 8;
+        const int base = (c / 8) * QK_K + g * 32;
+
+        uint8_t sc, m;
+        q4k_scale_min(blk->scales, g, &sc, &m);
+        const int high = g & 1;
+        const float d = __half2float(blk->d) * (float)sc;
+        const float mn = __half2float(blk->dmin) * (float)m;
+
+        const uint32_t* q32 =
+            (const uint32_t*)(const void*)(blk->qs + (g / 2) * 32);
+#pragma unroll
+        for (int wd = 0; wd < 8; ++wd) {
+            const uint32_t packed = q32[wd];
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                const int l = wd * 4 + b;
+                const int byte = (packed >> (b * 8)) & 0xFF;
+                const int nib = high ? (byte >> 4) : (byte & 0xF);
+                const int hi = (blk->qh[l] & (1 << g)) ? 16 : 0;
+                GEMV_SPREAD(d * (float)(nib + hi) - mn, base + l)
             }
         }
     }

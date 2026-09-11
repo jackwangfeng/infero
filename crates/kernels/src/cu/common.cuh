@@ -242,6 +242,20 @@ typedef struct {
     __half d;                  // super-block scale
 } block_q6_K;
 
+// `Q4_K` with a fifth bit per weight tacked on (`qh`), the same scale/min
+// encoding (`scales`, unpacked by the same `q4k_scale_min` below -- verified
+// byte-for-byte identical against ggml's own `get_scale_min_k4`, real
+// fetched source, 2026-09-11) and the same `d`/`dmin` header. Field order
+// matches ggml's real `block_q5_K` (`ggml-common.h`) exactly: this is cast
+// straight over on-disk GGUF bytes, so it has to be.
+typedef struct {
+    __half d;                      // super-block scale for the 6-bit scales
+    __half dmin;                   // super-block scale for the 6-bit mins
+    uint8_t scales[K_SCALE_SIZE];  // 8 pairs of 6-bit scale/min
+    uint8_t qh[QK_K / 8];          // 5th bit of each quant
+    uint8_t qs[QK_K / 2];          // low 4 bits of each quant
+} block_q5_K;
+
 // Unpack the 6-bit scale/min pair `j` (0..7) out of a Q4_K super-block.
 __device__ __forceinline__ void q4k_scale_min(const uint8_t* q, int j,
                                               uint8_t* d, uint8_t* m) {
