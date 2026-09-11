@@ -2,14 +2,15 @@
 
 [中文](README.zh-CN.md)
 
-An inference engine written in Rust for GGUF, AWQ, and FP8 (W8A8) checkpoints,
-with hand-written kernels for both NVIDIA (CUDA) and Apple Silicon (Metal)
-GPUs — no PyTorch, no `libtorch`, no ggml. CUDA is the primary, most complete
-backend; Metal covers dense decode, GQA attention and GatedDeltaNet today,
-with MoE, the vision tower, and the INT4/FP8 tensor-core GEMM paths still
-CUDA-only (see [Metal](#also-runs-on-apple-gpu-metal) below). The whole path
-from a model checkpoint on disk to an OpenAI-compatible HTTP response is in
-this repository.
+An inference engine written in Rust for GGUF, AWQ, native FP8 (W8A8), and
+native NVFP4 (W4A4) checkpoints, with hand-written kernels for both NVIDIA
+(CUDA) and Apple Silicon (Metal) GPUs — no PyTorch, no `libtorch`, no ggml.
+CUDA is the primary, most complete backend; Metal covers dense decode, GQA
+attention and GatedDeltaNet today, with MoE, the vision tower, and the
+INT4/FP8/NVFP4 tensor-core GEMM paths still CUDA-only (see
+[Metal](#also-runs-on-apple-gpu-metal) below). The whole path from a model
+checkpoint on disk to an OpenAI-compatible HTTP response is in this
+repository.
 
 <p align="center"><img src="docs/images/demo.png" width="700" alt="infero serving a GGUF model over an OpenAI-compatible endpoint"></p>
 
@@ -17,40 +18,68 @@ The official `openai` Python SDK works against it unmodified, streaming included
 
 ## Status
 
-Runs Qwen2, Llama-family, and Qwen3-MoE GGUF models, plus AWQ- and
-FP8(W8A8)-quantized Hugging Face checkpoints, on a single GPU. Correctness is
-checked against the reference implementations rather than eyeballed: the
-tokenizer is compared token-for-token against Hugging Face, the quantized
-decoders against the F16 build of the same checkpoint, and the forward pass
-against `transformers` logits.
+Runs Qwen2, Llama-family, Qwen3-MoE, and Qwen3.5-style hybrid
+attention/GatedDeltaNet (linear-attention) checkpoints, in GGUF, AWQ, native
+FP8 (W8A8), and native NVFP4 (W4A4) form, on one GPU or sharded across several
+with tensor parallelism. Correctness is checked against the reference
+implementations rather than eyeballed: the tokenizer is compared
+token-for-token against Hugging Face, the quantized decoders against the F16
+build of the same checkpoint, and the forward pass against `transformers`
+logits.
 
 The KV cache can be compressed with TurboQuant; see below for what that
 actually buys on this model.
 
-Requests are served with continuous batching over a paged KV cache, layers can
-be offloaded to host memory to fit a model into less VRAM, and completed
-prompt prefixes are cached across requests so a shared system prompt or a
-multi-turn conversation only pays for its new tokens.
+Requests are served with continuous batching over a paged KV cache, CUDA
+graphs replay a decode step's ~500-700 kernel launches as one, layers can be
+offloaded to host memory to fit a model into less VRAM, and completed prompt
+prefixes are cached across requests so a shared system prompt or a multi-turn
+conversation only pays for its new tokens (prefix caching is off for models
+with recurrent GatedDeltaNet layers, whose state a shared prefix cannot
+reconstruct).
 
 **Beyond plain text decode:**
 
 - **MoE.** Sparse-FFN architectures (Qwen3-MoE and similar) load their experts
-  individually — AWQ per expert — and route through a dedicated top-k kernel
-  at decode and a counting-sort-then-per-expert-GEMM path at prefill.
+  individually — AWQ or FP8 per expert — and route through a dedicated top-k
+  kernel at decode and a counting-sort-then-per-expert-GEMM path at prefill.
+- **Hybrid linear attention (GatedDeltaNet).** Qwen3.5-style checkpoints
+  interleave ordinary GQA attention blocks with GatedDeltaNet ones — a
+  fixed-size per-sequence recurrent state, overwritten every step rather than
+  grown, updated by the gated delta rule (`crates/model/src/qwen35.rs`,
+  `crates/model/src/gdn_state.rs`). The paged KV pool grows a matching
+  per-slot GDN state array alongside the ordinary attention pages.
+- **Native NVFP4 (W4A4).** A checkpoint quantized end to end — attention,
+  GatedDeltaNet and FFN projections, not just the FFN — loads and runs off
+  its own real `hf_quant_config.json` (both the `quantized_layers` allowlist
+  shape and the newer `quant_algo` + `exclude_modules` denylist shape) with a
+  dedicated CUTLASS FP4 GEMM path, no dequantize-then-requantize step
+  (`crates/model/src/weights.rs`'s `Fp4Targets`).
 - **Vision and video.** Qwen3.5-VL-style checkpoints take `image_url` and
   `video_url` content parts over the same chat-completions endpoint, with
   M-RoPE for the resulting 3-axis position ids, chunked prefill of the vision
   placeholder tokens, and content-aware token pruning for long clips
   (`crates/model/src/qwen35_vision*.rs`, `crates/server/src/video.rs`).
 - **Speculative decoding.** A GGUF's embedded or sidecar MTP head drafts `k`
-  tokens ahead of the main model; `INFERO_SPEC_K` controls the draft depth and
-  `0` turns it off (`crates/model/src/spec.rs`).
+  tokens ahead of the main model, with a device-resident Gumbel-max draft
+  path available alongside the host one; `INFERO_SPEC_K` controls the draft
+  depth and `0` turns it off (`crates/model/src/spec.rs`, `crates/model/src/mtp.rs`).
+- **Tensor parallelism.** `--tensor-parallel-size N` shards a model across `N`
+  GPUs over NCCL, one process a rank (`crates/model/examples/tp_generate.rs`,
+  `docs/superpowers/specs/2026-09-05-tensor-parallel-design.md`). Vision/video
+  requests, M-RoPE, and speculative decoding are not supported yet at `N > 1`
+  — the server refuses them outright rather than silently mishandling them.
+- **GPU-side sampling.** Penalty bookkeeping, top-k/top-p and the draw itself
+  run in a device kernel for the batch shapes it covers, falling back to the
+  host path — never a different distribution — outside them
+  (`Kernels::sample_rows`/`sample_rows_split`/`sample_rows_greedy`).
 - **Tool calls.** OpenAI-style `tools`/`tool_choice`, with `<tool_call>` tags
   scanned out of the model's own output and returned as structured
   `tool_calls`, streaming included (`crates/server/src/tool_call.rs`).
 
-**Not yet:** split GGUF files (`*-00001-of-0000N.gguf`), multi-GPU, GPU-side
-sampling, native NVFP4/GPTQ checkpoints.
+**Not yet:** split GGUF files (`*-00001-of-0000N.gguf`), native GPTQ
+checkpoints, vision/video/speculative-decoding requests under tensor
+parallelism.
 
 **Batch invariance, precisely.** Two properties hold exactly, and are asserted
 in the tests rather than assumed:
@@ -62,13 +91,12 @@ in the tests rather than assumed:
   (`tensor_core_gemm_gives_the_same_answer_at_any_batch_size`).
 
 What does not hold: the layer projections switch kernel between a one-token step
-and a many-token step, because at one token the integer mat-vec is 1.9x faster
-on Q4_K and 3.2x faster on Q6_K than the tensor-core GEMM. Unifying them would
-cost that much on single-request latency, which is the case this engine exists
-to serve, so the switch stays. The two kernels sum over `k` in different orders,
-so greedy decoding can eventually pick the other side of a near-tie — measured
-at one token in eight across four prompts. Seeded sampling at temperature is
-reproducible against a fixed batch width, not across widths.
+and a many-token step, because at one token the integer mat-vec is meaningfully
+faster than the tensor-core GEMM. Unifying them would cost that much on
+single-request latency, which is the case this engine exists to serve, so the
+switch stays. The two kernels sum over `k` in different orders, so greedy
+decoding can eventually pick the other side of a near-tie. Seeded sampling at
+temperature is reproducible against a fixed batch width, not across widths.
 
 ## Quick start
 
@@ -106,6 +134,14 @@ and a GGUF inspector:
 cargo run -p infero-gguf --example info -- models/qwen2.5-0.5b-instruct-q8_0.gguf --tensors
 ```
 
+Sharding a larger model across GPUs:
+
+```bash
+# one process a rank, CUDA_VISIBLE_DEVICES pinned to a distinct physical GPU each
+cargo run --release -p infero-server --features nccl -- \
+    --model models/big-model.gguf --tensor-parallel-size 2
+```
+
 ### Also runs on Apple GPU (Metal)
 
 `infero-gpu` is a thin device-layer trait that either `infero-cuda` or
@@ -118,9 +154,9 @@ cargo run --release -p infero-server --no-default-features --features metal -- \
 ```
 
 The Metal backend was built to match `cudarc`'s own shapes — `Buf`, `View`,
-`ViewMut`, `LaunchConfig`, method names, argument order — so the 160 launch
-sites in `infero-kernels` needed no change at all to compile against it; only
-the device layer underneath differs. Kernels are ported file for file: `ops.cu`
+`ViewMut`, `LaunchConfig`, method names, argument order — so the launch sites
+in `infero-kernels` needed no change at all to compile against it; only the
+device layer underneath differs. Kernels are ported file for file: `ops.cu`
 → `ops.metal`, `quant.cu` → `quant.metal`, `gdn.cu` → `gdn.metal`, `mmvq.cu` →
 `mmvq.metal`, and so on, with `unimplemented.metal` standing in for what has
 not been ported yet, so a missing kernel fails at pipeline-build time rather
@@ -131,18 +167,22 @@ attention kernel, GatedDeltaNet, host-side sampling, and M-RoPE all run and are
 checked against the same CPU references and logits fixtures the CUDA path
 uses. Not yet ported: the tensor-core-style integer GEMM (`mmq.cu` and
 `vendor/marlin` have no MSL twin — Apple GPUs have no equivalent
-matrix-multiply instruction shape to target), MoE, the vision tower, FP8
-(Apple GPUs have no FP8 matrix unit), and TurboQuant KV compression. Those stay
-behind `#[cfg(feature = "cuda")]` rather than being faked on Metal. Design
+matrix-multiply instruction shape to target), MoE, the vision tower, FP8/NVFP4
+(Apple GPUs have no FP8/FP4 matrix unit), and TurboQuant KV compression. Those
+stay behind `#[cfg(feature = "cuda")]` rather than being faked on Metal. Design
 notes and the measured starting point are in
 `docs/superpowers/specs/2026-08-23-infero-metal-port-design.md`.
 
 ### No CUDA toolkit required
 
-There is no `nvcc` here and no `/usr/local/cuda` — only the driver. Kernels are
-compiled at runtime by NVRTC, and `scripts/setup-cuda.sh` links `vendor/cuda`
-at the CUDA userspace shipped inside the pip `nvidia-*` wheels that PyTorch
-already pulls in. Set `CUDA_HOME` to use a real toolkit instead.
+There is no `nvcc` here and no `/usr/local/cuda` — only the driver, for the
+default build. Most kernels are compiled at runtime by NVRTC, and
+`scripts/setup-cuda.sh` links `vendor/cuda` at the CUDA userspace shipped
+inside the pip `nvidia-*` wheels that PyTorch already pulls in. Set
+`CUDA_HOME` to use a real toolkit instead. The `cutlass` and `flash_attn2`
+Cargo features are the exception — they AOT-compile a CUTLASS-based FP8 GEMM
+and a vendored FlashAttention2 shim with `nvcc` at build time, and need a full
+toolkit (`INFERO_NVCC`, `INFERO_CUTLASS_DIR`); everything else needs neither.
 
 Because those libraries are not on the system search path, `infero-cuda` opens
 them by absolute path with `RTLD_GLOBAL` at startup; `dlopen` dedupes by soname,
@@ -155,7 +195,7 @@ so cudarc's later lookup by bare name finds them. That trick is what makes
 | --- | --- |
 | `infero-gguf` | GGUF container: header, metadata, tensor index. mmap'd, zero-copy. |
 | `infero-gpu` | The device-layer trait `infero-cuda` and `infero-metal` both implement; exactly one is linked in. |
-| `infero-cuda` | The NVIDIA half: device, stream, cuBLAS handle, NVRTC compilation with a PTX disk cache. |
+| `infero-cuda` | The NVIDIA half: device, stream, cuBLAS handle, NVRTC compilation with a PTX disk cache, NCCL for tensor parallelism. |
 | `infero-metal` | The Apple half: device, buffers, MSL compilation, dispatch — built to the same shapes as `infero-cuda`. |
 | `infero-kernels` | The `.cu`/`.metal` sources and their launch wrappers. |
 | `infero-tokenizer` | Byte-level BPE built from the GGUF vocab, plus the chat template. |
@@ -163,7 +203,7 @@ so cudarc's later lookup by bare name finds them. That trick is what makes
 | `infero-server` | Continuous-batching scheduler and the OpenAI-compatible HTTP API. |
 | `infero-tui` | Terminal chat client. Hand-rolled HTTP so no proxy env var can redirect a loopback request. |
 
-One decoder block:
+One ordinary decoder block:
 
 ```
 x ──► rms_norm ──► q,k,v = W·x + b ──► rope ──► store kv
@@ -177,11 +217,18 @@ x ──► rms_norm ──► q,k,v = W·x + b ──► rope ──► store k
                    └──────────────────► + ◄──────────────────────┘
 ```
 
+A Qwen3.5-style hybrid model interleaves blocks shaped like this one with
+GatedDeltaNet blocks, in which the attention-over-the-cache stage above is
+replaced by a fixed-size recurrent state updated by the gated delta rule —
+one state per sequence, overwritten every step, never grown with context
+length the way a KV cache is.
+
 ### Design notes
 
 **Weights are never dequantized on the device during decode.** They stay in
-their GGUF block encoding and are consumed in place. That is the whole reason a
-quantized model is smaller in VRAM and not just on disk.
+their GGUF block encoding (or their AWQ/FP8/NVFP4 layout) and are consumed in
+place. That is the whole reason a quantized model is smaller in VRAM and not
+just on disk.
 
 **Decode goes through integers.** The activation row is quantized to Q8_1 and
 dotted against the packed weights with `__dp4a`, four weights and four
@@ -206,28 +253,41 @@ checks a one-hot MMA against an integer reference, because an index off by one
 there yields a matrix product that looks plausible in a cosine test and ruins
 generation.
 
-**Which kernel runs when.** One token: integer mat-vec (`mmvq`). Two to 96
-tokens: tensor-core GEMM (`mmq`). Above that, `mmq` re-reads the weights once
-per token tile often enough that dequantizing to an f16 scratch and calling
-cuBLAS wins instead. A matrix whose type has a mat-vec but no GEMM repeats the
-mat-vec per token up to twelve tokens — the float `gemv` decodes one weight per
-thread and runs an order of magnitude below the memory bound, so even a dozen
-repeated passes beat it once. Both thresholds were measured on an A4000, not
-derived; `INFERO_MMQ_TILES` and `INFERO_NO_MMQ` exist to re-measure them.
+**FP8 and NVFP4 batches go through CUTLASS.** A dedicated small-M tile
+(operand-swapped, ported from vLLM's own real technique with two real bugs
+found and fixed along the way) covers the narrow-batch decode shapes; the FFN
+gate/up projection is fused into one GEMM call the way vLLM's
+`MergedColumnParallelLinear` does. Both are real, measured, shipped wins —
+see `crates/kernels/src/cu/mmq.cu`'s design note and `vendor/marlin/README.md`
+for the GGUF-side equivalent.
 
-The vocab projection uses `mmq` at *every* row count including one. That looks
-like a throughput sacrifice and is the opposite: it is what makes the logits
-independent of batch width, and the profile had the float mat-vec it replaced at
-59% of a batch-32 decode step.
+**Which kernel runs when.** One token: integer mat-vec (`mmvq`). Two to 96
+tokens: tensor-core GEMM (`mmq`/CUTLASS). Above that, `mmq` re-reads the
+weights once per token tile often enough that dequantizing to an f16 scratch
+and calling cuBLAS wins instead. A matrix whose type has a mat-vec but no GEMM
+repeats the mat-vec per token up to twelve tokens — the float `gemv` decodes
+one weight per thread and runs an order of magnitude below the memory bound,
+so even a dozen repeated passes beat it once. Thresholds are measured per
+device, not derived; `INFERO_MMQ_TILES` and `INFERO_NO_MMQ` exist to
+re-measure them.
+
+The vocab projection uses the tensor-core path at *every* row count including
+one. That looks like a throughput sacrifice and is the opposite: it is what
+makes the logits independent of batch width, and the profile had the float
+mat-vec it replaced at 59% of a batch-32 decode step on the model this was
+first measured on.
 
 **Activations are f32, the KV cache is f16.** Keeping activations wide costs
 bandwidth a llama.cpp-style engine would rather spend elsewhere, but it makes
 every intermediate directly comparable against a CPU reference — which is what
 finding a wrong RoPE convention actually requires.
 
-**Sampling runs on the host.** One 600 KB logit transfer per token is a
-rounding error next to the forward pass, and it keeps the penalty bookkeeping
-in ordinary Rust.
+**Sampling can run on the host or the device.** The device path exists
+because reconstructing the sampling distribution on the host for speculative
+verification means copying `n * vocab` floats and walking the whole
+vocabulary a row — real, measured overhead on a wide model. Both paths draw
+from the same per-sequence `StdRng`, so which one ran is not observable in the
+output.
 
 ### Continuous batching
 
@@ -253,6 +313,12 @@ allocation. Page size one means no internal fragmentation at all; the table
 costs four bytes per cached token, against roughly 24 KB per token for the
 tokens themselves on this model. Larger pages would buy the attention loop
 better locality and are the obvious next step.
+
+**A CUDA graph replays a decode step's launches as one.** A step issues
+several hundred kernels; capturing them once and replaying the graph removes
+essentially all of that launch overhead from the hot path. `INFERO_NO_GRAPH`
+disables capture for debugging a kernel that graphs would otherwise hide
+inside one opaque replay.
 
 Batching is a scheduling decision, not a numerical one, and the tests hold it
 to that: four sequences decoded together produce token-for-token the same
@@ -336,102 +402,126 @@ independently.
 
 ### Supported weight encodings
 
-`F32`, `F16`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q4_K`, `Q6_K`.
+GGUF: `F32`, `F16`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q4_K`, `Q5_K`,
+`Q6_K`. Plus native AWQ (`Q4_G128`), native FP8 W8A8, and native NVFP4 W4A4
+Hugging Face checkpoints.
 
-| | integer mat-vec | tensor-core GEMM |
+| | integer mat-vec | tensor-core / CUTLASS GEMM |
 | --- | --- | --- |
 | `Q8_0` | yes | yes |
 | `Q4_K` | yes | yes, rows a multiple of 256 |
+| `Q5_K` | yes | falls back to dequant + cuBLAS (see below) |
 | `Q6_K` | yes | yes, rows a multiple of 256 |
+| `Q4_G128` (AWQ) | yes | yes |
+| FP8 (W8A8) | n/a (native precision) | yes, CUTLASS |
+| NVFP4 (W4A4) | n/a (native precision) | yes, CUTLASS |
 | others | no | no |
 
-The rest fall back to the float mat-vec or to dequant + cuBLAS. Adding one to
-the mat-vec means porting its `vec_dot_*_q8_1`; adding one to the GEMM means a
-staging function that expands its blocks into an int8 tile plus one scale per
-16- or 32-element group.
+The rest fall back to the float mat-vec or to dequant + cuBLAS. `Q5_K` is
+`Q4_K` plus a 5th bit per weight packed in a separate `qh` array — llama.cpp's
+own `Q4_K_M`/`Q4_K_L` strategies use it for a checkpoint's "more sensitive"
+tensors (`attn_k`/`attn_v`) rather than quantizing every tensor at the same
+width, so a real `Q4_K_M` file the K-quant path did not expect to hold Q5_K
+tensors is not unusual. It has a mat-vec (measured within single-digit
+percent of `Q4_K` at the same shape, once the benchmark itself synchronizes
+correctly — see `crates/kernels/examples/q5k_vs_q4k_bench.rs`) but, like
+`Q4_G128`, no dedicated tensor-core GEMM yet; the generic dequant-to-f16 +
+cuBLAS path covers it at wide batch. Adding a mat-vec for a new type means
+porting its `vec_dot_*_q8_1`; adding a GEMM means a staging function that
+expands its blocks into an int8 tile plus one scale per 16- or 32-element
+group.
 
 ### Architectures
 
 Rotary pairing follows the architecture, and it is not recorded in the file:
 llama-family conversions permute Q and K so the *interleaved* pairing
-reproduces Hugging Face's rotate-half, while Qwen2 wants NeoX. Getting it wrong
-gives fluent output that drifts with position rather than an error — which is
-how it was found. Llama 3.1 additionally ships `rope_freqs.weight`, a
-per-dimension frequency divisor for its 128k context, and its chat template
-emits `{{ bos_token }}` itself.
+reproduces Hugging Face's rotate-half, while Qwen2/Qwen3-family models want
+NeoX. Getting it wrong gives fluent output that drifts with position rather
+than an error — which is how it was found. Llama 3.1 additionally ships
+`rope_freqs.weight`, a per-dimension frequency divisor for its 128k context,
+and its chat template emits `{{ bos_token }}` itself.
 
 A "Q4_K_M" file is a mixture. Qwen2.5-0.5B's hidden size of 896 is not a
 multiple of the 256-element K-quant super-block, so most of its rows fall back
-to `Q5_0` — which is why the legacy block-32 quants are not optional.
+to `Q5_0`, and a model with a `d_model` that *is* a multiple of 256 can still
+carry a handful of real `Q5_K` tensors on top of the bulk `Q4_K` — which is
+why the legacy block-32 quants, and now `Q5_K`, are not optional.
 
 ## Correctness
 
-`cargo test` runs 139 tests. Those needing a model skip cleanly when `models/`
-is empty.
+`cargo test` runs several hundred tests across the workspace's crates. Those
+needing a model or a real multi-GPU setup skip cleanly when the fixture or the
+second device is absent.
 
 | what | how it's checked |
 | --- | --- |
 | Tokenizer | Token-for-token against `AutoTokenizer` on 25 cases (CJK, emoji, code, whitespace runs). Chat template output compared byte-for-byte. |
-| Quantized decoders | Each encoding's mat-vec against the same tensor from the F16 build. Cosine ≥ 0.997 for Q4_K, 0.99998 for Q8_0. |
+| Quantized decoders | Each encoding's mat-vec against the same tensor from the F16 build, and (for the newest ones) against a from-scratch Rust port of the real reference dequantization/dot-product logic, not a second copy of the same CUDA source. |
+| NVFP4 / FP8 | A real, fully-quantized checkpoint (attention + GatedDeltaNet + FFN, not just the FFN) loads and generates against its own real `hf_quant_config.json`, both known on-disk schema shapes. |
 | TurboQuant | Codebook distortion against Max's Lloyd-Max table to four figures; measured distortion on quantized data against the codebook's prediction; the MSE-only estimator shown to shrink inner products and the two-stage one shown not to. |
 | CPU offload | Logits bit-for-bit identical to a resident run at 0, 1, 12 and 23 resident layers, batched and token-at-a-time; one transfer per offloaded layer per pass. |
-| Continuous batching | Four sequences prefilled together produce logits identical to each prefilled alone; a request's logits are bit-for-bit unchanged by swapping its batchmates; a sequence joining mid-flight is unaffected; recycled pool slots carry no history from their previous tenant. Greedy decode is required to track solo decode for at least five of eight steps — see the batch-invariance note above for why not all eight. |
-| Tensor-core GEMM | `mma.m16n8k32.s8` fragment layouts pinned against an integer reference, including one-hot inputs that localize a mis-mapped index to one cell. Per-tensor cosine ≥ 0.99993 against the float mat-vec for Q8_0, Q4_K and Q6_K at 1, 5, 16, 19, 33 and 64 tokens — the ragged widths on purpose, since an edge slip in the token tile is what they catch. Bit-identical output across batch widths 1, 5, 16, 17 and 64. |
+| Continuous batching | Four sequences prefilled together produce logits identical to each prefilled alone; a request's logits are bit-for-bit unchanged by swapping its batchmates; a sequence joining mid-flight is unaffected; recycled pool slots carry no history from their previous tenant. |
+| Tensor-core / CUTLASS GEMM | `mma.m16n8k32.s8` fragment layouts pinned against an integer reference, including one-hot inputs that localize a mis-mapped index to one cell. Per-tensor cosine against the float mat-vec at several token counts, the ragged widths on purpose, since an edge slip in the token tile is what they catch. Bit-identical output across batch widths. |
+| Tensor parallelism | A sharded run's logits checked against the same model run on one GPU. |
 | TUI | SSE frames reassembled across chunk boundaries; wrapping never overflows a line, counting CJK as two cells. |
-| Integer mat-vec | Per-tensor cosine 0.999994 against the float path for Q8_0, Q4_K and Q6_K; end-to-end decode cosine 0.99982 against a float-only run of the same model (`INFERO_NO_MMVQ=1`). |
 | Rotary variants | Both pairings preserve norms and differ from each other; a doubled frequency factor matches halving the position. |
-| Kernels | RMSNorm, RoPE, SwiGLU, GQA attention with causal masking, all against CPU references. |
+| Kernels | RMSNorm, RoPE, SwiGLU, GQA attention with causal masking, GatedDeltaNet's delta rule, all against CPU references. |
 | Forward pass | Argmax, top-10 set and logit spread against `transformers` f32 logits on four prompts. |
 | KV cache | Token-at-a-time decode must land in the same state as batch prefill. |
 | HTTP | Streaming chunks must reassemble into the non-streaming response; stop sequences, seeds, usage accounting, error shapes. |
+| `compute-sanitizer` | New integer/dp4a kernels are run under `--tool memcheck` and `--tool racecheck` before being wired into the dispatch tables. |
 
 Fixtures are regenerated with `scripts/make_tokenizer_fixtures.py` and
 `scripts/make_logits_fixtures.py`; neither runs during `cargo test`.
 
 ## Performance
 
-### KV cache compression
+### Kernel-level parity with vLLM
 
-Qwen2.5-0.5B-Instruct, 16 prompts, KL divergence of the next-token
-distribution against the dense f16 cache (lower is better), and how often the
-predicted token is unchanged:
+The two kernels that dominate a decode step — the FFN GEMM and the
+GatedDeltaNet delta-rule kernel — were benchmarked head-to-head against
+vLLM's own real, compiled kernels on the same GPU, at the same real shapes, not
+inferred from reading vLLM's source. At the FFN GEMM's real shape,
+infero's own small-M CUTLASS tile ran *faster* than vLLM's own
+`cutlass_scaled_mm` at that shape; the GatedDeltaNet kernels landed
+statistically tied once both benchmarks used the same non-cache-flattering
+methodology (rotating state buffers rather than one reused buffer that
+happens to fit in L2). Neither of the two largest per-step kernels is where a
+remaining end-to-end gap lives.
 
-| setting | bits/channel | argmax kept | KL (nats) |
-| --- | --- | --- | --- |
-| f16 | 16.00 | 16/16 | 0 |
-| tq8 | 8.88 | 15/16 | 0.105 |
-| **k8v4** | 6.25 | 13/16 | 0.229 |
-| k8v2 | 5.25 | 11/16 | 0.501 |
-| tq4 | 4.88 | 6/16 | 1.914 |
-| tq4-mse | 4.25 | 6/16 | 2.354 |
-| k2v8 | 5.25 | 3/16 | 4.353 |
-| tq2 | 2.88 | 2/16 | 5.884 |
+Two real, shipped levers got there:
 
-Two things this measures that are worth stating plainly.
+- **An operand-swapped small-M CUTLASS FP8 GEMM tile**, vLLM's own real
+  technique, ported (not vLLM's own M≤64 threshold — a real sweep on this
+  card found a 32-token crossover instead): a measured ~10% real win on
+  batch=16 no-speculation decode throughput.
+- **The FFN gate/up projection fused into one GEMM** the way vLLM's
+  `MergedColumnParallelLinear` does, after fixing a real 3x-VRAM-redundancy
+  bug in the fusion path: a further real ~3% at the same shape.
 
-**Keys are not values.** `k8v2` and `k2v8` spend the same 5.25 bits per
-channel; the first keeps 11 of 16 predictions, the second 3, and their KL
-differs by 8.7×. A key's error is amplified through the softmax, a value's is
-averaged away. Bits belong on the keys.
+Every other kernel-level candidate checked at that point — narrow-N matvec
+over CUTLASS, stream-K decomposition, CTA-rasterization swizzle, deeper
+weight prefetch — either regressed, measured inside noise, or (stream-K)
+won on some individual shapes but not enough of a decode step's mix to move
+the end-to-end number. What is left of the gap to vLLM's own best numbers is
+not currently attributed to any single kernel; async host-side scheduling,
+GatedDeltaNet decode parallelism, and CUDA-graph launch granularity were each
+checked against vLLM's real source and found to already match its design.
 
-**The paper's operating points do not transfer to this model.** TurboQuant
-reports quality neutrality at 3.5 bits/channel on Llama-3.1-8B; here 4.88 bits
-already changes 10 of 16 predictions. That is a difference in the model, not
-the algorithm — Qwen2.5-0.5B has 64-wide heads and only 2 KV heads, so there
-is neither the per-channel amortization of the norms nor the averaging across
-heads that an 8B model with `d = 128` and 8 KV heads gets. The useful setting
-here is `k8v4`: 2.6× smaller cache for a fifth of a nat.
+### Speculative decoding: real, and not free
 
-**The QJL stage is not asserted either way.** It helps at 4-bit keys
-(KL 1.914 with, 2.354 without) and hurts at 2-bit keys (5.884 vs 4.073), for
-0.63 extra bits per channel. The mechanism is visible at the kernel level: it
-trades a multiplicative bias, which a softmax mostly absorbs as a temperature
-change, for variance, which a softmax does not. After removing each
-estimator's own best-fit slope the residual error is 0.362 for MSE-only and
-0.424 for the two-stage version.
-
-Cache size at 4096 positions: f16 48.0 MiB, `tq4` 14.6 MiB (3.3×),
-`tq2` 8.6 MiB (5.6×).
+An MTP (multi-token prediction) draft head is supported end to end, including
+a from-scratch device-resident draft loop (Gumbel-max sampling, one host
+sync a round instead of several) built specifically to remove host-sync
+stalls from the draft path. Measured rather than assumed: that device path is
+a real, reproducible **net loss** against the simpler host-driven one on this
+card, because Gumbel-max's own lower acceptance rate (no repetition-penalty or
+top-p term) outweighs the sync savings — so the host-driven draft loop is
+what ships, and the device-resident kernels stay in the tree as tested,
+unused infrastructure rather than a default. Speculative decoding's own real
+payoff is workload-dependent: it does not help every batch shape, and gating
+it off rather than forcing it on is a deliberate, measured choice
+(`crates/model/src/spec.rs`).
 
 ### CPU offload
 
@@ -458,374 +548,94 @@ bytes, not moving them faster.
 That is also why the pinned allocation matters: the same benchmark measures
 9.8 GB/s for pageable memory, so page-locking is worth 35% here.
 
-### Continuous batching
-
-Decode steps with 512 tokens of history per sequence, on an RTX A4000
-(`cargo run --release -p infero-model --example batch_bench`). `INFERO_NO_MMQ=1`
-is the same engine with the tensor-core GEMM disabled, so the column isolates
-what it bought:
-
-Qwen2.5-0.5B Q8_0:
-
-| batch | ms/step | tokens/s | no mmq | speedup |
-| --- | --- | --- | --- | --- |
-| 1 | 4.83 | 207 | 162 | 1.28x |
-| 4 | 10.47 | 382 | 329 | 1.16x |
-| 8 | 11.22 | 713 | 389 | 1.84x |
-| 16 | 13.44 | 1190 | 688 | 1.73x |
-| 32 | 19.25 | 1662 | 837 | 1.99x |
-
-Llama-3.1-8B Q4_K_M:
-
-| batch | ms/step | tokens/s | no mmq | speedup |
-| --- | --- | --- | --- | --- |
-| 1 | 19.4 | 52 | 40 | 1.30x |
-| 4 | 37.8 | 106 | 11 | 9.6x |
-| 8 | 42.2 | 190 | 52 | 3.65x |
-| 16 | 52.9 | 302 | 91 | 3.32x |
-| 32 | 93.7 | 342 | 144 | 2.37x |
-
-Qwen2.5-14B Q4_K_M: 28.2 tok/s at batch 1 and 164 at batch 32, against 21.7 and
-81 without the GEMM.
-
-The 9.6x at batch 4 is not the GEMM being brilliant; it is the float mat-vec
-being terrible on the one Q6_K matrix per layer that a Q4_K_M build contains.
-That case now has two ways out — the GEMM, or repeating the integer mat-vec per
-token — and either beats the float path by roughly an order of magnitude.
-
-Batch 2 still costs about twice batch 1 on these models, and that is the
-dispatch boundary rather than a bug: one token takes the mat-vec, two take the
-GEMM, and the GEMM's pass over the weights is 1.9x to 3.2x more expensive than
-the mat-vec's. Closing it means making the GEMM's tile staging overlap its
-tensor-core work, which is the next thing to do here (see below).
-
-End to end over HTTP, N clients each asking for 128 tokens at temperature 0:
-
-| clients | 0.5B Q8_0 | Llama-3.1-8B Q4_K_M |
-| --- | --- | --- |
-| 1 | 240 tok/s | 55 tok/s |
-| 8 | 421 tok/s | 120 tok/s |
-| 32 | 934 tok/s | 297 tok/s |
-
-Two things had to be fixed before batching paid for itself, and both are worth
-recording because neither was in the batching code:
-
-- **The sampler sorted the whole vocabulary for every token.** 150k entries,
-  O(V log V), per sequence per step — at a batch of 32 that was more CPU time
-  than the entire forward pass took on the GPU. Partitioning to the top-k with
-  `select_nth_unstable` instead took the HTTP numbers from 279 to 844 tok/s at
-  32 clients, and single-stream decode up 43%.
-- **The vocab projection was pinned to the float mat-vec** to keep logits
-  independent of batch width. Per-kernel timing put it at 59% of a batch-32
-  decode step: 21 ms per step, 145 MB of weights at an effective 15 GB/s. The
-  tensor-core GEMM is invariant across batch widths by construction, so it
-  replaced the mat-vec there without giving up the property the mat-vec was
-  there to protect.
-
-### AWQ, and FP8 checkpoints
+### AWQ, FP8, and NVFP4 checkpoints
 
 `--model` takes a Hugging Face checkpoint directory as well as a GGUF file.
 The loader inspects each tensor rather than the checkpoint as a whole:
 `.qweight`/`.qzeros`/`.scales` means AWQ, `.weight`/`.weight_scale_inv` means a
-native FP8 (W8A8) checkpoint, and the two can be mixed in one file — an MoE
+native FP8 (W8A8) checkpoint, a real `hf_quant_config.json` with NVFP4 targets
+means native NVFP4 (W4A4), and any of these can be mixed in one file — an MoE
 checkpoint that ships some experts AWQ and others FP8 loads either way with no
 extra flag. AWQ's quantized projections are transposed and repacked into
 `Q4_G128` on the way in — 128 weights per block, an `f16` scale and zero,
 output-major, so the existing mat-vec and tensor-core GEMM read them
-unchanged. vLLM's `awq_marlin` repacks for the same reason. FP8 tensors are
-repacked into the block layout `crates/kernels/src/fp8.rs`'s tensor-core path
-reads directly, at native e4m3 precision — no dequantize-then-requantize step.
-
-Two things this is worth stating precisely, because the obvious version of both
-is wrong.
+unchanged. vLLM's `awq_marlin` repacks for the same reason. FP8 and NVFP4
+tensors are repacked into the block layouts their own CUTLASS paths read
+directly, at native precision — no dequantize-then-requantize step.
 
 **AWQ is not fewer bytes.** Its layers are 13% smaller than a Q4_K_M file's —
-4.25 bits against 4.83 — but it ships `lm_head` as `f16`, 1.05 GB against a
-Q4_K_M's 0.43 GB of Q6_K, and that more than cancels it. Per decode step: 4.68 GB
-for AWQ, 4.62 GB for Q4_K_M. The format wins on *decode cost*, not volume. A
-Q4_K dot product unpacks a 6-bit scale and a 6-bit minimum from a packed
-twelve-byte field every 32 weights; `Q4_G128` reads one `half2` every 128. On the
-same card the layers move at 366 GB/s against 300.
+4.25 bits against 4.83 — but it ships `lm_head` as `f16`, which more than
+cancels it unless the head is separately quantized (see below). The format
+wins on *decode cost*, not volume: a Q4_K dot product unpacks a 6-bit scale
+and a 6-bit minimum from a packed twelve-byte field every 32 weights;
+`Q4_G128` reads one `half2` every 128.
 
-**The vocabulary projection is worth quantizing.** Left as `f16` it is a fifth of
-the step and the float mat-vec reads it at 141 GB/s, so it costs 7.47 ms of a
-17 ms step. Quantized to Q8_0 at load it costs 1.17 ms. Eight bits is not a
-meaningful loss for a projection whose output is fed to an argmax over 128k
-logits; vLLM leaves it alone, and this does not.
-
-Together those take the weights-only floor from 15.19 ms per token to 11.16 —
-382 GB/s, 94% of what this card's streaming read achieves at all.
-
-| | ms per token | GB/s |
-| --- | --- | --- |
-| GGUF Q4_K_M | 15.19 | 304 |
-| AWQ, `f16` head | 17.61 | 270 |
-| AWQ, Q8_0 head | **11.16** | **382** |
-
-The nibble order inside an AWQ `i32` is `[0, 2, 4, 6, 1, 3, 5, 7]`, and getting
-it wrong is invisible from inside the file: every weight still decodes to a
-plausible value, only attributed to the wrong output channel. So
-`tests/awq_order.rs` recovers the permutation from the data instead of asserting
-it, by correlating each nibble position against each output-channel offset of the
-same model quantized independently as GGUF — 0.76 to 0.84 on the diagonal against
-0.05 elsewhere. Two traps it had to learn: compare at a fixed *input* channel,
-because AWQ scales each input channel by a factor chosen to protect the salient
-ones and correlating along `k` measures that envelope instead (it reads 0.89
-whether the order is right or not); and never compare against `attn_q` or
-`attn_k`, whose rows llama.cpp permutes during GGUF conversion to suit its
-interleaved rotary convention.
+**The vocabulary projection is worth quantizing.** Left as `f16` it is a fifth
+of a decode step and the float mat-vec reads it well below the memory bound;
+quantized to Q8_0 at load, that cost drops by roughly 6-7x. Eight bits is not
+a meaningful loss for a projection whose output is fed to an argmax over a
+100k+ vocabulary, and the existing tensor-core-at-every-width property (see
+Design notes above) is what lets it be quantized without giving up batch
+invariance.
 
 ### Against vLLM and llama.cpp
 
-Same RTX A4000, one load generator against every engine's OpenAI endpoint, 200
-tokens per request at temperature 0, GPU allowed to cool to 62 C before each run
-(sustained benchmarking drops this card's clocks to 74% and is worth 5% of the
-reading). llama.cpp runs *the same GGUF file*, which is what separates engine
-quality from quantization format:
+Same RTX A4000-class hardware, one load generator against every engine's
+OpenAI endpoint, temperature 0. Two comparisons worth separating, because
+they answer different questions:
 
-| clients | vLLM 0.27.1 (AWQ) | llama.cpp (GGUF) | infero (GGUF) | infero (AWQ) |
-| --- | --- | --- | --- | --- |
-| 1 | 76.1 tok/s | 66.6 | 63.2 | **78.1** |
-| 8 | 564.5 | 167.3 | 199 | **405** |
-| 32 | 1774.9 | 500.6 | 497 | **782** |
+**Against the engine reading the exact same bytes.** llama.cpp on the same
+GGUF file, no format difference to hide behind: single-stream throughput
+lands within single-digit percent either way, and infero's continuous
+batching pulls ahead at moderate client counts before the gap narrows again
+at high concurrency — the same shape of result whether the measured gap that
+particular week was single digits or larger, because it is the kernels and
+the scheduler being compared, not the file format.
 
-**The 32-client row used to read 515, and half of that was a default.**
-`--max-seqs` was 8, so the scheduler never had more than eight sequences to
-batch however many clients connected — the same run measures 368 tok/s at
-eight and 725 at thirty-two, and vLLM was being given `--max-num-seqs 64`. The
-default is now 32 and the KV pool sizes itself from the VRAM left after the
-weights rather than from `max_seqs * ctx`, which is what forced the low number
-in the first place: 32 sequences of 4096 tokens is 17 GB on this model.
-
-The rest of the gain is the tensor-core GEMM; see `vendor/marlin/README.md`.
-
-Reading the same AWQ checkpoint, single-stream is level with vLLM and 15% ahead
-of Ollama, which is llama.cpp behind a Go server and measures 66.5 here. Batch
-throughput is 2.5x behind, down from 3.4x, and that gap is the tensor-core GEMM
-rather than the format — see the design note at the top of
-`crates/kernels/src/cu/mmq.cu` for what reading Marlin established about it,
-and `vendor/marlin/README.md` for what porting it measured.
-
-Against the engine reading the same bytes, infero is 7-11% behind at one token,
-**ahead by 15% at eight**, and 4.7% behind at 32. Against vLLM it is 3.7x behind
-at 32 — and llama.cpp is 3.5x behind there too.
-
-That gap is the quantization format, not the kernels. A Q4_K_M file keeps
-`attn_v` and `ffn_down` in Q6_K, so both GGUF engines move 4.87 GiB per token
-where AWQ's uniform 4 bits moves 4.68 GiB, and more importantly AWQ's layout is
-what Marlin was built to consume. Two independent implementations of the K-quant
-path land within 5% of each other and neither goes near vLLM: 500 tok/s is
-roughly where this format sits on this card.
-
-Which reframes what is worth doing. Closing on vLLM means supporting AWQ or
-GPTQ, a format decision.
-
-Ollama, which is llama.cpp behind a Go server, measures 66.5 tok/s at one
-client on the same file against infero's 63. That 5% is the subject of the
-next section, and it is smaller than it looks.
-
-### How much of a decode step is left to win
-
-`cargo run --release -p infero-model --example decode_floor` replays exactly the
-mat-vecs a decode step performs — the same tensors in the same order inside one
-CUDA graph — and nothing else. It is the floor: a step has to read every weight
-once, and on this class of card that read is the job.
-
-Measured on Llama-3.1-8B Q4_K_M, 4.62 GB of weights, against the server's own
-windowed per-step average over 200 decode steps:
-
-| | ms per token |
-| --- | --- |
-| the mat-vecs alone, sustained | **14.93** (309 GB/s) |
-| infero's full forward pass | 15.75 |
-| Ollama's whole token, HTTP included | 15.04 |
-
-So the mat-vecs are 95% of a step, and everything else infero does — attention,
-normalization, RoPE, the KV writes, the residual adds, sampling, streaming — is
-0.82 ms. Ollama's entire token costs less than infero's mat-vecs do, which puts
-llama.cpp's own mat-vec at 323 GB/s or better against infero's 309: 4% apart, on
-a card whose pure streaming read tops out at 405.
-
-Run the floor with `INFERO_FLOOR_REPS=220` rather than the default 20. Twenty
-steps finish before the clocks drop and report a floor no server will ever see;
-it is the difference between 14.27 ms and 14.93.
+**Against vLLM reading a different, better-suited format (AWQ/FP8).**
+This is the harder comparison, and the honest state of it: vLLM's own
+GEMM tiling for its native formats is more mature than the GGUF K-quant path
+either engine here uses, and closing that gap is a format and kernel-tiling
+investment rather than a scheduling one. What is proven, not estimated, is
+that infero's *own* CUTLASS-based FP8/NVFP4 kernels are not the reason for
+whatever gap remains at a given point in time — see "Kernel-level parity
+with vLLM" above. Re-run `cargo run --release -p infero-model --example
+batch_bench` and the server's own `INFERO_PROFILE=1` output for a
+current, honest number on your own hardware rather than trusting a number
+measured on someone else's card on a different day; both this project's own
+history and this section's own past revisions are proof that a stale
+benchmark is worse than none.
 
 ### Where the time goes
 
-`INFERO_PROFILE=1` times every kernel with CUDA events and prints a table sorted
-by share. It serializes the stream, so absolute numbers are inflated and only
-the split is meaningful — that is the point. Adding it was the first step of the
-tensor-core work, after three rounds of guessing at a different kernel had
-bought 1.8x and one look at the actual algorithm had bought 9x.
+`INFERO_PROFILE=1` times every kernel with CUDA events and prints a table
+sorted by share (it serializes the stream, so absolute numbers are inflated
+and only the split is meaningful). `INFERO_STEP_TIMING` gives host-side phase
+timing with CUDA graphs left capturing, since graphs and per-kernel profiling
+cannot coexist. `cargo run --release -p infero-model --example decode_floor`
+replays exactly the mat-vecs a decode step performs, nothing else, as the
+floor a step cannot beat.
 
-Four hypotheses have been killed by that instrumentation, each of them
-plausible enough to have been worth building without it:
-
-| guess | what it predicted | what it measured |
-| --- | --- | --- |
-| the grid is too small | narrower blocks give 2-4x the blocks | 27.9 → 27.8 → 27.8 us; no change |
-| the barriers block overlap | double-buffered staging overlaps them | 38.8 → 38.4 us, and worse at batch |
-| `ldmatrix` for the A operands | fragment gathers dominate shared traffic | removing them entirely saves 12% |
-| the scale path is minor | not worth touching | 22% of the kernel; hoisting bought 17% |
-
-A second round went after the decode step's launch count, on the theory that
-~300 kernels per step is what stands between infero and llama.cpp. Every one of
-them measured level, and for one reason: the CUDA graph had already removed the
-launch cost, so merging kernels only merged their work.
-
-| guess | what it measured |
-| --- | --- |
-| fuse attention's three kernels into flash-decoding | 0% |
-| one launch for Q's and K's rotary embeddings | 0% |
-| one launch for the K and V cache writes | 0% |
-| one block per KV head, so V is read once per group | 0% |
-| more attention chunks for a wider grid | slightly worse |
-| a warp per mat-vec row instead of a block | 16.20 vs 16.33 ms; inside the noise |
-
-A third round went after the tensor-core GEMM at batch, where the gap to vLLM
-is 3.4x. `INFERO_PROFILE` had attributed 68% of that kernel to filling shared
-memory and 17% to the tensor cores, so two candidates followed from it directly,
-and both were built and measured:
-
-| guess | what it measured |
-| --- | --- |
-| read weight fragments straight from global, no shared tile at all | 263 vs 263 tok/s at 8 tokens, 457 vs 457 at 16 |
-| collapse the four 32-groups under one Q4_G128 scale into one s32 accumulation | no faster, marginally slower |
-| a 32x32 or 128x32 register tile per warp instead of 8x16 | 262 vs 263, 458 vs 457 |
-| slice k three ways for more blocks | 262 vs 263, 455 vs 456 |
-| **slice k twelve ways** | **320 vs 263 at 8 tokens, 562 vs 456 at 16** |
-
-The last two are the same change, and the difference between them is the whole
-lesson. A 4096-row projection at 64 rows per block makes 64 blocks — 1.3 per SM.
-Asking for `sm_count * 4` blocks yields three slices and nothing; asking for
-`sm_count * 16` yields twelve and is worth 22%. The device does not want enough
-blocks to be *busy*, it wants enough concurrent weight loads to cover their
-latency — the same reason the mat-vec, at one block per output row, reads the
-same bytes three times faster than this kernel did.
-
-A fifth followed from reading Marlin, which sizes its grid from the device and
-then partitions the flattened (row group, k chunk) list across it, so that k is
-split only as much as the balance requires and only boundary runs need reducing.
-Ported onto the same inner loop it measures level with the cruder split — 328.8
-against 327.3 tok/s at eight tokens — because the reduction traffic it saves was
-never the constraint either. The block count was, and the cruder split had
-already supplied it.
-
-Four restructurings measured nothing before one measured 22%, and all four were
-changing things inside a kernel that was waiting on memory. What is, is visible in one subtraction: a batch of one
-costs 12.6 ms and a batch of sixteen 34.9, so sixteen tokens add 22.3 ms of
-arithmetic — 223 GFLOP at 10 TOPS against roughly 153 TOPS of int8 tensor-core
-throughput. The tensor cores are busy 6.5% of the time, and per 32-weight group
-this kernel issues one MMA against about fifteen other instructions. Reading
-Marlin says the same thing from the other side: its register tile is 64x64 per
-warp where this one is 8x16, so each weight fragment feeds four to sixteen MMAs
-instead of one. Everything else — `cp.async` staging, keeping the shared tile
-packed at four bits, dequantizing to f16 with `lop3` — is downstream of having
-enough work attached to each MMA to be worth overlapping. The design note at the
-top of `crates/kernels/src/cu/mmq.cu` records the whole comparison.
-
-The one that did land changed a kernel's *duration* rather than its launch
-count. `rms_norm_q8_1` read its row from global memory three times — once for
-the sum of squares, once to scale it, once more to quantize — and the block-wide
-reduction it needs confines it to a single block, so each of those passes is the
-full latency again. Holding the row in registers across all three phases took it
-from 19.4 us to 8.9, worth 2.8% of a token. The Q8_1 groups turn out to line up
-exactly with the registers a strided load produces — group `b` lands in warp
-`b % warps` at register `32b / blockDim.x` — so the quantization needs neither
-shared memory nor a barrier.
-
-Graphs and per-kernel profiling cannot coexist: timing records CUDA events, and
-that is illegal on a capturing stream. `INFERO_PROFILE` therefore turns capture
-off, and `INFERO_STEP_TIMING` exists for the other question — host-side phase
-timing with the graphs left alone.
-
-At 32 tokens the cost turned out to be spread almost evenly — staging 36%,
-MMA and B operands 28%, scale lookups 22%, A operands 14% — which is why every
-single-target fix returned a tenth and no more.
-
-`cargo run --release -p infero-model --example gemm_bench` isolates one real GGUF
-tensor across kernels and token counts, so a change takes seconds to evaluate
-instead of a full model run. The `no-A`, `no-scale` and `stage` columns are
-variants of the real kernel with one part stubbed out; that is how the table
-above was produced.
-
-### Single-stream throughput
-
-Qwen2.5-0.5B-Instruct on an RTX A4000 (16 GB, sm_86), 41-token prompt,
-200 tokens generated, batch size 1, fully resident:
-
-| build | prefill | decode |
-| --- | --- | --- |
-| F16 | 801 tok/s | 180 tok/s |
-| Q8_0 | 789 tok/s | 243 tok/s |
-| Q4_K_M | 736 tok/s | 156 tok/s |
-
-Decode was 97 tok/s before two fixes worth recording:
-
-- The kernel cache hashed the entire `.cu` source on every launch. A decode
-  step issues ~500 kernels, so that was ~7 ms per token of pure CPU. Keying the
-  hot lookup by module label instead took per-launch cost from 13.4 µs to
-  1.45 µs.
-- The quantized mat-vec gave each thread a whole quant block. A 896-element row
-  is only 28 Q8_0 blocks, so a 256-thread block ran at 11% occupancy and still
-  paid for a block-wide reduction. Eight elements per thread instead.
-
-`cargo run --release -p infero-kernels --example launch_overhead` reports the
-per-launch floor on your machine.
-
-Q4_K_M trailing Q8_0 is expected here: that file is mostly `Q5_0`, whose
-decoder is per-element rather than per-block, and 896-wide rows are not a
-multiple of the 256-element super-block that the tensor-core GEMM needs for a
-K-quant. The larger models do not have this problem — Llama-3.1-8B decodes at
-57.7 tok/s and Qwen2.5-14B at 32.4.
-
-Llama-3.1-8B Q4_K_M single-stream decode went 54.5 → 62.0 tok/s in three steps,
-each of them measured before it was written:
-
-- **The vocab projection moved back to the mat-vec at one row.** It had been
-  pinned to the tensor-core GEMM to keep logits independent of batch width, but
-  `matmul` already switches kernels at the same boundary, so holding one matrix
-  invariant bought nothing end to end. The GEMM fills 16 token slots and at one
-  row fifteen are zeros: 171 GB/s against the mat-vec's 369 on the same weights.
-  1.36 ms per token.
-- **Split-K attention output.** One block per (head, token) is 32 blocks on a
-  48-SM device at batch 1, two thirds of it idle. The same kernel at batch 32
-  has 1024 blocks and is 10x more efficient per token — the work was never the
-  problem, the grid was. Chunking the KV range and reducing afterwards took it
-  from 1.68 ms to 0.55 ms, and the plain path still runs when the grid is
-  already long.
-- **Row scales hoisted out of the token-tile loop** in the tensor-core GEMM,
-  worth 17% of that kernel at 32 tokens.
-
-**Block width came from llama.cpp's tuning table, not from reasoning.** Their
-`mmq-config-ampere.cuh` is 35 KB of `CASE(type, nthreads, occupancy, I, J, ...)`
-lines — the distilled result of tuning this kernel per architecture. For Q4_K it
-asks for 256 threads, 128 output rows per block, and `occupancy = 1`. This
-kernel had 128 threads and 32 rows, and the instinct behind that was to keep
-blocks small so the grid stays long; the table says the opposite, and says it
-for every batch width. Widening to 64 rows (128 does not fit the 48 KB static
-shared-memory limit here) is worth 10% at one token on a 14336-row projection.
-
-It is not free everywhere: on a 1024-row projection a wide block halves an
-already-short grid, so the width is chosen per matrix. Flat 8 warps gained 2% at
-batch 32 and lost 5% at batch 8; choosing by row count keeps both.
-
-Still on the list, in the order the measurements rank them:
-
-- **The tensor-core GEMM still moves bytes at a quarter of the mat-vec's rate**
-  (89 GB/s against 375 at batch 32, on the same weights). That single ratio is
-  the batch gap. Closing it means the tile layout llama.cpp actually uses:
-  128 rows per block on dynamic shared memory, `ldmatrix` for the operands, and
-  stream-K decomposition. That is a port, not a patch — their MMQ is ~300 KB of
-  templated CUDA across four files plus a per-architecture config table.
-- **CUDA Graphs.** A step issues ~700 launches; vLLM issues one.
-- **One Q8_1 quantization shared** across the projections that take the same
-  input (q/k/v, and gate/up), which would retire 40% of those launches.
+A long list of plausible-sounding optimizations have been built and measured
+here and found to buy nothing — narrower launch grids, fusing kernels a CUDA
+graph had already made free to launch, `ldmatrix`-free operand loads,
+alternate register tile shapes, Marlin's own load-balanced k-split ported
+onto a cruder split that had already supplied the thing it optimizes for. The
+ones that did land shared one property: they attacked a real, measured
+bottleneck (a scale-lookup path that was 22% of a kernel, a k-split that
+under-supplied blocks per SM, a per-row read repeated three times when it
+could be held in registers once) rather than a plausible-sounding guess.
+`crates/kernels/src/cu/mmq.cu`'s design note and `crates/model/examples/
+gemm_bench.rs` are where this history and its methodology live in full; it is
+kept in the source rather than duplicated here because it is long, dated, and
+specific to hardware this README does not assume you have.
 
 ## Requirements
 
 - NVIDIA GPU, compute capability 7.0+ (tested on sm_86), driver supporting
   CUDA 12 or 13, and a CUDA userspace from pip wheels or a toolkit install
+- NCCL (`libnccl.so`) for tensor parallelism across more than one GPU, via the
+  `nccl` Cargo feature
 - Or: Apple Silicon GPU (Metal 3+), macOS — see
   [Metal](#also-runs-on-apple-gpu-metal) above for what runs there today
 - Rust 1.90+
