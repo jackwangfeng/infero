@@ -43,7 +43,9 @@ pub fn router(engine: Arc<Engine>, auth: AuthConfig) -> Router {
     let mut protected = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/completions", post(completions));
+        .route("/v1/completions", post(completions))
+        .route("/v1/embeddings", post(embeddings))
+        .route("/v1/rerank", post(rerank));
 
     // Added in the order that puts rate-limiting outermost (it runs first,
     // rejecting a flood before an invalid key is even checked) and API-key
@@ -134,6 +136,7 @@ async fn health(State(engine): State<Arc<Engine>>) -> impl IntoResponse {
         "status": "ok",
         "prefix_cache": prefix_cache,
         "model": engine.info.id,
+        "model_version": engine.info.model_version,
         "path": engine.info.path,
         "quantization": engine.info.quant,
         "weights_mib": engine.info.weights_mib,
@@ -187,6 +190,114 @@ async fn metrics(State(engine): State<Arc<Engine>>) -> impl IntoResponse {
         [("content-type", "text/plain; version=0.0.4")],
         crate::metrics::render(&engine),
     )
+}
+
+/// `docs/keel-integration.md`'s "1. `/v1/embeddings`" section: last-token
+/// pooling over a prefill-only pass that stops at `output_norm`, server-side
+/// L2 normalization, and a batch of independent texts rather than a client
+/// looping single ones. Tokenizing happens here (CPU-only, same reasoning as
+/// `chat_completions`'s vision decode) rather than on the worker thread,
+/// which only ever sees token ids.
+async fn embeddings(
+    State(engine): State<Arc<Engine>>,
+    Json(req): Json<EmbeddingsRequest>,
+) -> Result<Response, ApiError> {
+    if req.texts.is_empty() {
+        return Err(ApiError::bad_request("texts must not be empty"));
+    }
+    if req.texts.len() > infero_model::embed::MAX_BATCH {
+        return Err(ApiError::bad_request(format!(
+            "{} texts exceeds the {}-text batch cap; do not loop single texts through this \
+             endpoint",
+            req.texts.len(),
+            infero_model::embed::MAX_BATCH
+        )));
+    }
+
+    let token_lists: Vec<Vec<u32>> = req
+        .texts
+        .iter()
+        .map(|text| engine.tokenizer().encode(text, None, true))
+        .collect();
+    if let Some(i) = token_lists.iter().position(Vec::is_empty) {
+        return Err(ApiError::bad_request(format!("text {i} tokenized to nothing")));
+    }
+
+    let embeddings = engine.embed(token_lists).await?;
+    let dim = embeddings[0].len();
+    Ok(Json(EmbeddingsResponse {
+        embeddings,
+        dim,
+        model: engine.info.id.clone(),
+        model_version: engine.info.model_version.clone(),
+    })
+    .into_response())
+}
+
+/// `docs/keel-integration.md`'s "3. `/v1/rerank`" section: Qwen3-Reranker's
+/// own real recipe (fixed instruction prompt, read the "yes"/"no" logits at
+/// the position right after it), not a BERT-style cross-encoder -- see
+/// `infero_model::rerank`'s own module doc for why that substitution is
+/// real rather than a workaround.
+async fn rerank(
+    State(engine): State<Arc<Engine>>,
+    Json(req): Json<RerankRequest>,
+) -> Result<Response, ApiError> {
+    if req.documents.is_empty() {
+        return Err(ApiError::bad_request("documents must not be empty"));
+    }
+    if req.documents.len() > infero_model::rerank::MAX_BATCH {
+        return Err(ApiError::bad_request(format!(
+            "{} documents exceeds the {}-document batch cap",
+            req.documents.len(),
+            infero_model::rerank::MAX_BATCH
+        )));
+    }
+
+    let tokenizer = engine.tokenizer();
+    // `true`: these are fixed, hardcoded constants (not user input), and the
+    // literal `<|im_start|>`/`<|im_end|>` markup in them has to resolve to
+    // real special-token ids for the prompt to match what the model card's
+    // own recipe tokenizes. The query/document text below stays on the
+    // `false` path for the opposite reason: it is user-controlled, and a
+    // caller should not be able to smuggle a fake special token into the
+    // prompt by putting `<|im_start|>` in a product description.
+    let prefix_tokens = tokenizer.encode(infero_model::rerank::PREFIX, Some(false), true);
+    let suffix_tokens = tokenizer.encode(infero_model::rerank::SUFFIX, Some(false), true);
+    let instruction = req.instruction.as_deref().unwrap_or(infero_model::rerank::DEFAULT_INSTRUCTION);
+    let bodies: Vec<Vec<u32>> = req
+        .documents
+        .iter()
+        .map(|doc| {
+            let body = infero_model::rerank::format_pair(instruction, &req.query, doc);
+            tokenizer.encode(&body, Some(false), false)
+        })
+        .collect();
+    if let Some(i) = bodies.iter().position(Vec::is_empty) {
+        return Err(ApiError::bad_request(format!("document {i} tokenized to nothing")));
+    }
+
+    let yes = tokenizer.encode("yes", Some(false), false);
+    let no = tokenizer.encode("no", Some(false), false);
+    if yes.len() != 1 || no.len() != 1 {
+        return Err(ApiError::internal(format!(
+            "this tokenizer does not encode \"yes\"/\"no\" as single tokens ({} / {} tokens) -- \
+             Qwen3-Reranker's own scoring recipe does not apply to this checkpoint",
+            yes.len(),
+            no.len()
+        )));
+    }
+
+    let scores = engine.rerank(prefix_tokens, bodies, suffix_tokens, yes[0], no[0]).await?;
+    let mut results: Vec<RerankResult> = scores
+        .into_iter()
+        .enumerate()
+        .map(|(index, score)| RerankResult { index, score })
+        .collect();
+    results.sort_by(|a, b| b.score.total_cmp(&a.score));
+    results.truncate(req.top_k.unwrap_or(results.len()));
+
+    Ok(Json(RerankResponse { results }).into_response())
 }
 
 async fn models(State(engine): State<Arc<Engine>>) -> impl IntoResponse {
@@ -284,6 +395,71 @@ fn resolve_tools(req: &ChatRequest) -> Result<Option<serde_json::Value>, ApiErro
         .as_ref()
         .filter(|t| !t.is_empty())
         .map(|t| serde_json::Value::Array(t.clone())))
+}
+
+/// `docs/keel-integration.md`'s "2. Schema-constrained decoding" section:
+/// `response_format: {"type": "json_schema", "json_schema": {"schema": {...}}}`
+/// on `/v1/chat/completions` diverts here instead of the normal
+/// continuous-batched, streaming-capable path.
+///
+/// Not streamed -- `infero_model::constrained::generate_json` runs to
+/// completion (masking every step's logits down to what
+/// `infero_model::json_grammar::Cursor` still accepts, over the *whole*
+/// vocabulary, every step -- a real, measured, not-yet-optimized cost) and
+/// returns the whole result at once, unconditionally, even when the request
+/// asked for `stream: true`. A real limitation, not an oversight: streaming
+/// partial JSON the client cannot parse until it closes is not obviously
+/// more useful than waiting for the close in the first place, and this is
+/// the honest state of it rather than a faked SSE wrapper around a
+/// non-streaming call.
+async fn generate_constrained(
+    engine: &Arc<Engine>,
+    prompt_tokens: Vec<u32>,
+    schema_json: &serde_json::Value,
+    max_tokens: usize,
+    params: infero_model::SamplingParams,
+) -> Result<Response, ApiError> {
+    let schema = infero_model::json_grammar::Schema::parse(schema_json)
+        .map_err(|e| ApiError::bad_request(format!("invalid JSON schema: {e:#}")))?;
+    let rid = request_id("req");
+    let prompt_token_count = prompt_tokens.len();
+    engine.metrics.record_received();
+    tracing::info!(
+        request_id = %rid, endpoint = "chat_completions", prompt_tokens = prompt_token_count,
+        constrained = true, "request admitted"
+    );
+
+    let started = std::time::Instant::now();
+    let generated = match engine.generate_json(prompt_tokens, schema, max_tokens, params).await {
+        Ok(v) => v,
+        Err(e) => {
+            engine.metrics.record_error();
+            tracing::warn!(request_id = %rid, error = %format!("{e:#}"), "request failed");
+            return Err(ApiError::from(e));
+        }
+    };
+    let completion_tokens = generated.len();
+    engine.metrics.record_ok(prompt_token_count, completion_tokens);
+    tracing::info!(
+        request_id = %rid, prompt_tokens = prompt_token_count, completion_tokens,
+        latency_ms = started.elapsed().as_millis() as u64, finish_reason = "stop",
+        "request completed"
+    );
+
+    let text = engine.tokenizer().decode(&generated, true);
+    Ok(Json(ChatResponse {
+        id: request_id("chatcmpl"),
+        object: "chat.completion",
+        created: now_secs(),
+        model: engine.info.id.clone(),
+        choices: vec![ChatChoice {
+            index: 0,
+            message: ResponseMessage { role: "assistant", content: Some(text), tool_calls: None },
+            finish_reason: "stop",
+        }],
+        usage: Usage::new(prompt_token_count, completion_tokens),
+    })
+    .into_response())
 }
 
 async fn chat_completions(
@@ -423,6 +599,11 @@ async fn chat_completions(
         .or(req.max_tokens)
         .unwrap_or(512)
         .clamp(1, engine.info.max_seq);
+
+    if let Some(ResponseFormat::JsonSchema { json_schema }) = &req.response_format {
+        return generate_constrained(&engine, tokens, &json_schema.schema, max_tokens, params).await;
+    }
+
     let stop = req.stop.map(StopField::into_vec).unwrap_or_default();
 
     let rid = request_id("req");

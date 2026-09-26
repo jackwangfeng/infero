@@ -1900,6 +1900,15 @@ pub fn classify_fp4_targets(quant_config_path: &str) -> Result<Fp4Targets> {
 /// reads at 141 GB/s against the integer path's 366 — so it is quantized to
 /// Q8_0 on the way in. Eight bits is not a meaningful loss for a projection
 /// whose output is fed to an argmax over 128k logits.
+/// `stem`-and-suffix join for a tensor name, where `stem` may be `""` -- a
+/// checkpoint whose text-model tensors sit at the top level, with no `model.`
+/// (or deeper) wrapper prefix at all. A plain `format!("{stem}.{suffix}")`
+/// would leave a stray leading `.` in that case (`.embed_tokens.weight`,
+/// matching nothing real).
+fn stem_join(stem: &str, suffix: &str) -> String {
+    if stem.is_empty() { suffix.to_string() } else { format!("{stem}.{suffix}") }
+}
+
 pub fn load_awq(
     dev: &Device,
     w: &infero_safetensors::Shards,
@@ -2672,17 +2681,25 @@ pub fn load_awq(
     // The layer prefix below is derived from this rather than probed separately.
     // Probing them independently is how the first attempt at the 27B got the
     // layers right and the embedding wrong, and failed one tensor into the load.
-    let stem = ["model.language_model", "model"]
+    // `""` covers a checkpoint repackaged for the `sentence-transformers`
+    // library rather than left in `AutoModelForCausalLM`'s own layout --
+    // Qwen3-Embedding-0.6B's real, only published checkpoint ships
+    // `embed_tokens.weight`/`layers.0...`/`norm.weight` with no `model.`
+    // prefix at all (confirmed against its real safetensors header, not
+    // assumed), because the sentence-transformers export strips the wrapper
+    // module along with the `lm_head` an embedding model has no use for.
+    let stem = ["model.language_model", "model", ""]
         .into_iter()
-        .find(|s| w.get(&format!("{s}.embed_tokens.weight")).is_some())
+        .find(|s| w.get(&stem_join(s, "embed_tokens.weight")).is_some())
         .context(
-            "found no embedding under `model.embed_tokens.weight` or \
-             `model.language_model.embed_tokens.weight`; the checkpoint's tensor \
-             names are not ones this loader recognises",
+            "found no embedding under `model.embed_tokens.weight`, \
+             `model.language_model.embed_tokens.weight`, or a bare \
+             `embed_tokens.weight`; the checkpoint's tensor names are not ones \
+             this loader recognises",
         )?;
     tracing::info!(stem, "text model tensors");
 
-    let embd = w.tensor(&format!("{stem}.embed_tokens.weight"))?;
+    let embd = w.tensor(&stem_join(stem, "embed_tokens.weight"))?;
     // `to_f16` rather than `embd.data`: this uploaded the mapping's bytes and
     // labelled them `F16`, which reinterprets bf16 bit patterns as halves when
     // the checkpoint stores BF16 — no error, just a wrong number for every
@@ -2709,7 +2726,7 @@ pub fn load_awq(
         embd.shape[0],
         &mut device_bytes,
     )?;
-    let output_norm = vector(&format!("{stem}.norm.weight"), &mut device_bytes)?;
+    let output_norm = vector(&stem_join(stem, "norm.weight"), &mut device_bytes)?;
     let output = if cfg.tied_embeddings {
         None
     } else if fp4_targets.contains("lm_head") {
@@ -2830,7 +2847,7 @@ pub fn load_awq(
     // `model.language_model.layers.0` there and `model.layers.0` everywhere
     // else. Probe rather than branch on the architecture name: the prefix is a
     // property of how the checkpoint was exported, not of the model.
-    let layer_prefix = format!("{stem}.layers");
+    let layer_prefix = stem_join(stem, "layers");
     anyhow::ensure!(
         [
             "input_layernorm.weight",

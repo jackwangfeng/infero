@@ -20,6 +20,10 @@
 
 mod cache;
 pub mod config;
+pub mod constrained;
+pub mod embed;
+pub mod json_grammar;
+pub mod rerank;
 #[cfg(feature = "nccl")]
 pub mod tp;
 pub mod gdn_state;
@@ -2067,6 +2071,10 @@ pub struct Model {
     logits_host: Vec<f32>,
     /// Rows the last forward pass left in `act.logits`.
     logit_rows: usize,
+    /// Host mirror of `act.xb`'s logit rows -- the post-`output_norm`, pre-
+    /// `lm_head` hidden state (see [`Model::hidden_states_host`]), sized like
+    /// `logits_host` but `d_model` wide instead of `vocab_size` wide.
+    hidden_host: Vec<f32>,
     /// Device buffers for [`Model::sample_on_device`], allocated on first use.
     samp: Option<SampleBufs>,
     /// Device-time attribution for a step's three phases; see `PhaseEvents`.
@@ -2808,6 +2816,7 @@ impl Model {
             tracing::warn!("INFERO_NO_MMQ set: batches will use dequant + cuBLAS");
         }
         let logits_host = vec![0.0; max_logit_rows * cfg.vocab_size];
+        let hidden_host = vec![0.0; max_logit_rows * cfg.d_model];
         dev.synchronize()?;
 
         let (free, total) = dev.mem_info()?;
@@ -2883,6 +2892,7 @@ impl Model {
             phase_ev: PhaseEvents::new(&dev)?,
             last_decode_only: false,
             logits_host,
+            hidden_host,
             mtp: None,
             mtp_hidden: None,
             mtp_hidden_slot_width: 0,
@@ -4484,6 +4494,28 @@ impl Model {
         stream.memcpy_dtoh(&self.act.logits.slice(..n), &mut self.logits_host[..n])?;
         self.dev.synchronize()?;
         Ok(&self.logits_host[..n])
+    }
+
+    /// The hidden state the last [`Model::forward_batch_device`] left in
+    /// `act.xb`, on the host -- one `d_model`-wide row per item that asked
+    /// for logits, in the same order `logits_host` would return them.
+    ///
+    /// This is `output_norm(x)`: the exact vector the `lm_head` dispatch
+    /// chain reads (see the `probe(..., "lmhead_input", ...)` call just
+    /// above it), captured *before* that projection runs rather than after,
+    /// for callers that want a representation of the input rather than a
+    /// distribution over the vocabulary -- e.g. an embedding endpoint using
+    /// last-token pooling, which is exactly what `wants_logits`'s per-item
+    /// last-token selection already computes.
+    pub fn hidden_states_host(&mut self) -> Result<&[f32]> {
+        let n = self.logit_rows * self.cfg.d_model;
+        if n == 0 {
+            return Ok(&[]);
+        }
+        let stream = self.dev.stream().clone();
+        stream.memcpy_dtoh(&self.act.xb.slice(..n), &mut self.hidden_host[..n])?;
+        self.dev.synchronize()?;
+        Ok(&self.hidden_host[..n])
     }
 
     /// The forward pass, with the logits brought back to the host.

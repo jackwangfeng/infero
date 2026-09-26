@@ -55,6 +55,35 @@ pub struct ChatRequest {
     /// refused rather than silently treated as `"auto"`.
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+    /// OpenAI's own field name and shape for schema-constrained decoding
+    /// (`docs/keel-integration.md`'s "2. Schema-constrained decoding"
+    /// section). Only `{"type": "json_schema", "json_schema": {"schema":
+    /// {...}}}` diverts to the constrained path
+    /// (`crate::routes::generate_constrained`); a bare `{"type":
+    /// "json_object"}` or `{"type": "text"}` is accepted and ignored, same
+    /// as this module's own "accept the rest, honour what changes
+    /// behaviour" convention.
+    #[serde(default)]
+    pub response_format: Option<ResponseFormat>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseFormat {
+    Text,
+    JsonObject,
+    JsonSchema { json_schema: JsonSchemaSpec },
+}
+
+#[derive(Debug, Deserialize)]
+pub struct JsonSchemaSpec {
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub name: Option<String>,
+    pub schema: serde_json::Value,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub strict: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -465,6 +494,62 @@ pub fn request_id(prefix: &str) -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}-{:016x}{:08x}", now_secs(), n as u32)
+}
+
+/// See `docs/keel-integration.md`'s "The contract between them is two
+/// endpoints" section -- this is that request shape, not OpenAI's
+/// `input`/`data[].embedding` one. `normalize` is accepted (so an existing
+/// caller's request body still parses) but not honoured as a toggle: the
+/// documented bug this endpoint exists partly to avoid repeating is a
+/// `normalize: false` that silently did nothing because the *model's own*
+/// config already normalized regardless of the request, so this server
+/// normalizes unconditionally and asserts the result itself (see
+/// `infero_model::embed::normalize`) rather than making that guarantee
+/// something a request field can turn off.
+#[derive(Debug, Deserialize)]
+pub struct EmbeddingsRequest {
+    #[allow(dead_code)]
+    pub model: Option<String>,
+    pub texts: Vec<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub normalize: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingsResponse {
+    pub embeddings: Vec<Vec<f32>>,
+    pub dim: usize,
+    pub model: String,
+    pub model_version: String,
+}
+
+/// See `docs/keel-integration.md`'s "3. `/v1/rerank`" section for this
+/// request shape. `instruction` is not part of that documented contract --
+/// Qwen3-Reranker's own real recipe takes one, and exposing it costs nothing
+/// a caller that never sets it would notice, since it defaults to the same
+/// instruction the model card itself defaults to
+/// (`infero_model::rerank::DEFAULT_INSTRUCTION`).
+#[derive(Debug, Deserialize)]
+pub struct RerankRequest {
+    #[allow(dead_code)]
+    pub model: Option<String>,
+    pub query: String,
+    pub documents: Vec<String>,
+    pub top_k: Option<usize>,
+    #[serde(default)]
+    pub instruction: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RerankResult {
+    pub index: usize,
+    pub score: f32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RerankResponse {
+    pub results: Vec<RerankResult>,
 }
 
 #[cfg(test)]

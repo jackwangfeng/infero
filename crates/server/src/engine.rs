@@ -96,9 +96,55 @@ pub enum Event {
     Failed(String),
 }
 
+/// One embedding batch call, and where to send its result.
+///
+/// Not a `Request`: there is no streaming, no sampling, and no multi-step
+/// decode loop to enqueue into the scheduler's own batching -- just a
+/// throwaway forward pass this job runs to completion in one go. See
+/// `Worker::run_inner`'s `WorkItem::Embed` arm and
+/// `infero_model::embed::embed_batch`.
+pub struct EmbedJob {
+    pub token_lists: Vec<Vec<u32>>,
+    pub respond: tokio::sync::oneshot::Sender<Result<Vec<Vec<f32>>>>,
+}
+
+/// One rerank batch call, and where to send its result. Same shape as
+/// [`EmbedJob`] and for the same reason: no sampling, no decode loop, one
+/// throwaway forward pass. See `infero_model::rerank::rerank_batch`.
+pub struct RerankJob {
+    pub prefix_tokens: Vec<u32>,
+    pub bodies: Vec<Vec<u32>>,
+    pub suffix_tokens: Vec<u32>,
+    pub token_true_id: u32,
+    pub token_false_id: u32,
+    pub respond: tokio::sync::oneshot::Sender<Result<Vec<f32>>>,
+}
+
+/// One schema-constrained generation call, and where to send its result.
+/// See `infero_model::constrained::generate_json`.
+pub struct ConstrainedJob {
+    pub prompt_tokens: Vec<u32>,
+    pub schema: infero_model::json_grammar::Schema,
+    pub vocab_bytes: Arc<Vec<Vec<u8>>>,
+    pub max_tokens: usize,
+    pub params: infero_model::SamplingParams,
+    pub respond: tokio::sync::oneshot::Sender<Result<Vec<u32>>>,
+}
+
+/// What arrives on the worker thread's one job queue. A single channel
+/// rather than one each keeps the queue's own blocking-wait-when-idle logic
+/// (`Worker::run_inner`) simple: one receiver to block on, not two to
+/// multiplex.
+pub enum WorkItem {
+    Generate(Request),
+    Embed(EmbedJob),
+    Rerank(RerankJob),
+    Constrained(ConstrainedJob),
+}
+
 /// Handle to the worker thread.
 pub struct Engine {
-    jobs: mpsc::UnboundedSender<Request>,
+    jobs: mpsc::UnboundedSender<WorkItem>,
     pub info: ModelInfo,
     /// The operator's ceiling on how many frames a video request may be
     /// sampled down to -- `crate::video::decode_video_data_url`'s
@@ -111,6 +157,11 @@ pub struct Engine {
     /// `routes::chat_completions`) before decode ever starts.
     pub video_target_fps: f64,
     tokenizer: Arc<Tokenizer>,
+    /// Token id -> raw decoded bytes, for every id in the vocabulary. Built
+    /// once, lazily, on the first schema-constrained request
+    /// (`Engine::vocab_bytes`) rather than eagerly at load, since most
+    /// checkpoints this server serves will never take that path.
+    vocab_bytes: std::sync::OnceLock<Arc<Vec<Vec<u8>>>>,
     in_flight: Arc<AtomicU64>,
     served: Arc<AtomicU64>,
     /// `None` when the model carries recurrent state and prefix caching is off;
@@ -147,6 +198,9 @@ pub struct ModelInfo {
     /// Whether this checkpoint has a vision tower, and `/v1/chat/completions`
     /// will accept an `image_url` content part.
     pub has_vision: bool,
+    /// See `derive_model_version`'s own doc comment: a real HF snapshot
+    /// commit sha when `path` resolves to one, `id` otherwise.
+    pub model_version: String,
 }
 
 impl Engine {
@@ -319,8 +373,10 @@ impl Engine {
         let pool_slots = pool.n_slots();
 
         let cfg = model.config().clone();
+        let id = derive_model_id(path, &cfg.name);
+        let model_version = derive_model_version(path, &id);
         let info = ModelInfo {
-            id: derive_model_id(path, &cfg.name),
+            id,
             path: path.to_string(),
             // The GGUF file states its own dominant type; a safetensors
             // checkpoint does not, so ask the loaded weights. The fallback used
@@ -349,6 +405,7 @@ impl Engine {
             max_seqs,
             kv_slots: pool_slots,
             has_vision,
+            model_version,
         };
 
         let (jobs, rx) = mpsc::unbounded_channel();
@@ -431,6 +488,7 @@ impl Engine {
             video_max_frames,
             video_target_fps,
             tokenizer,
+            vocab_bytes: std::sync::OnceLock::new(),
             in_flight,
             served,
             prefix_stats,
@@ -483,9 +541,93 @@ impl Engine {
         req.events = tx;
         self.in_flight.fetch_add(1, Ordering::Relaxed);
         self.jobs
-            .send(req)
+            .send(WorkItem::Generate(req))
             .map_err(|_| anyhow::anyhow!("inference worker has stopped"))?;
         Ok(rx)
+    }
+
+    /// Embed a batch of already-tokenized texts, last-token pooled and
+    /// L2-normalized -- one row per input, in order. See
+    /// `infero_model::embed::embed_batch` for what actually runs on the
+    /// worker thread.
+    pub async fn embed(&self, token_lists: Vec<Vec<u32>>) -> Result<Vec<Vec<f32>>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.jobs
+            .send(WorkItem::Embed(EmbedJob { token_lists, respond: tx }))
+            .map_err(|_| anyhow::anyhow!("inference worker has stopped"))?;
+        rx.await.map_err(|_| anyhow::anyhow!("inference worker dropped the embedding job"))?
+    }
+
+    /// Score a batch of already-tokenized (query, document) pairs. See
+    /// `infero_model::rerank::rerank_batch` for what actually runs on the
+    /// worker thread and `crate::routes::rerank` for how the pieces this
+    /// takes (`prefix_tokens`/`suffix_tokens`/the two token ids) get built.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn rerank(
+        &self,
+        prefix_tokens: Vec<u32>,
+        bodies: Vec<Vec<u32>>,
+        suffix_tokens: Vec<u32>,
+        token_true_id: u32,
+        token_false_id: u32,
+    ) -> Result<Vec<f32>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.jobs
+            .send(WorkItem::Rerank(RerankJob {
+                prefix_tokens,
+                bodies,
+                suffix_tokens,
+                token_true_id,
+                token_false_id,
+                respond: tx,
+            }))
+            .map_err(|_| anyhow::anyhow!("inference worker has stopped"))?;
+        rx.await.map_err(|_| anyhow::anyhow!("inference worker dropped the rerank job"))?
+    }
+
+    /// Token id -> raw decoded bytes for every id in this model's
+    /// vocabulary, built on first use and shared by every constrained
+    /// request after that (see `infero_model::constrained::generate_json`'s
+    /// own doc comment for why this table exists at all).
+    pub fn vocab_bytes(&self) -> Arc<Vec<Vec<u8>>> {
+        self.vocab_bytes
+            .get_or_init(|| {
+                let mut buf = Vec::new();
+                let table: Vec<Vec<u8>> = (0..self.tokenizer.vocab_size() as u32)
+                    .map(|id| {
+                        buf.clear();
+                        self.tokenizer.token_bytes(id, &mut buf);
+                        buf.clone()
+                    })
+                    .collect();
+                Arc::new(table)
+            })
+            .clone()
+    }
+
+    /// Generate token ids constrained to a JSON schema. See
+    /// `infero_model::constrained::generate_json` for the actual decode
+    /// loop this runs on the worker thread.
+    pub async fn generate_json(
+        &self,
+        prompt_tokens: Vec<u32>,
+        schema: infero_model::json_grammar::Schema,
+        max_tokens: usize,
+        params: infero_model::SamplingParams,
+    ) -> Result<Vec<u32>> {
+        let vocab_bytes = self.vocab_bytes();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.jobs
+            .send(WorkItem::Constrained(ConstrainedJob {
+                prompt_tokens,
+                schema,
+                vocab_bytes,
+                max_tokens,
+                params,
+                respond: tx,
+            }))
+            .map_err(|_| anyhow::anyhow!("inference worker has stopped"))?;
+        rx.await.map_err(|_| anyhow::anyhow!("inference worker dropped the constrained job"))?
     }
 }
 
@@ -518,7 +660,7 @@ struct Worker {
 }
 
 impl Worker {
-    fn run(mut self, jobs: mpsc::UnboundedReceiver<Request>) {
+    fn run(mut self, jobs: mpsc::UnboundedReceiver<WorkItem>) {
         // `worker_stopped` flips exactly once, whichever way `run_inner`
         // returns (normal shutdown or a panic unwind past this point would
         // both leave it `false` -- a panic already aborts the process in
@@ -528,21 +670,63 @@ impl Worker {
         self.metrics.worker_stopped.store(true, Ordering::Relaxed);
     }
 
-    fn run_inner(&mut self, mut jobs: mpsc::UnboundedReceiver<Request>) {
+    /// `Generate` joins the scheduler's own batching, same as always.
+    /// `Embed` runs to completion right here instead: it needs no sampling
+    /// and no multi-step decode loop, just one forward pass through its own
+    /// throwaway `KvPool`, so routing it through `enqueue`/`step` would only
+    /// have to special-case its way back out of machinery built for
+    /// generation. This does block any `Generate` request already queued
+    /// behind it for the duration of the embedding batch's forward pass --
+    /// acceptable today because nothing yet sends both kinds of job at once
+    /// (see `docs/keel-integration.md`'s own sequencing), not because the
+    /// cost is free.
+    fn dispatch(&mut self, item: WorkItem) {
+        match item {
+            WorkItem::Generate(req) => self.scheduler.enqueue(req),
+            WorkItem::Embed(job) => {
+                let result = infero_model::embed::embed_batch(self.scheduler.model_mut(), &job.token_lists);
+                let _ = job.respond.send(result);
+            }
+            WorkItem::Rerank(job) => {
+                let result = infero_model::rerank::rerank_batch(
+                    self.scheduler.model_mut(),
+                    &job.prefix_tokens,
+                    &job.bodies,
+                    &job.suffix_tokens,
+                    job.token_true_id,
+                    job.token_false_id,
+                );
+                let _ = job.respond.send(result);
+            }
+            WorkItem::Constrained(job) => {
+                let result = infero_model::constrained::generate_json(
+                    self.scheduler.model_mut(),
+                    &job.vocab_bytes,
+                    &job.prompt_tokens,
+                    job.schema,
+                    job.max_tokens,
+                    job.params,
+                );
+                let _ = job.respond.send(result);
+            }
+        }
+    }
+
+    fn run_inner(&mut self, mut jobs: mpsc::UnboundedReceiver<WorkItem>) {
         loop {
             // With nothing in flight there is no reason to spin; block until a
             // request shows up.
             if self.scheduler.is_idle() {
                 match jobs.blocking_recv() {
-                    Some(req) => self.scheduler.enqueue(req),
+                    Some(item) => self.dispatch(item),
                     None => break,
                 }
             }
             // Take everything else that is already queued, so a burst of
             // requests joins the same batch rather than trickling in one step
             // at a time.
-            while let Ok(req) = jobs.try_recv() {
-                self.scheduler.enqueue(req);
+            while let Ok(item) = jobs.try_recv() {
+                self.dispatch(item);
             }
 
             let before = self.scheduler.in_flight();
@@ -580,4 +764,89 @@ fn derive_model_id(path: &str, name: &str) -> String {
         .map(|s| s.to_string_lossy().into_owned())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| name.to_string())
+}
+
+/// The HF-cache snapshot commit sha embedded in a checkpoint's own path, when
+/// it has one.
+///
+/// `snapshot_download`/`from_pretrained` resolve a download into
+/// `~/.cache/huggingface/hub/models--org--repo/snapshots/<sha>/...`, and the
+/// directory (or file inside it) `--model` then points at carries that `sha`
+/// as a path component right after a literal `snapshots` one. `None` for
+/// anything else -- a bare GGUF file, or a directory placed by hand rather
+/// than resolved from the HF cache -- since there is no real version signal
+/// to invent for those; see `derive_model_version`'s own fallback.
+fn hf_snapshot_sha(path: &str) -> Option<String> {
+    let path = std::path::Path::new(path);
+    let mut components = path.components().peekable();
+    while let Some(c) = components.next() {
+        if c.as_os_str() == "snapshots"
+            && let Some(sha) = components.peek()
+        {
+            let sha = sha.as_os_str().to_string_lossy();
+            if sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Some(sha.into_owned());
+            }
+        }
+    }
+    None
+}
+
+/// What changed between two loads of "the same" model, as far as a caller
+/// like Keel can tell without re-reading the weights itself.
+///
+/// A real HF snapshot sha when the path resolves to one (see
+/// `hf_snapshot_sha`); otherwise `id` itself, which is weaker -- two
+/// differently-quantized files that happen to share a name would collide --
+/// but still real and still better than reporting nothing, since `id` does
+/// change whenever `--model` points somewhere new.
+fn derive_model_version(path: &str, id: &str) -> String {
+    hf_snapshot_sha(path).unwrap_or_else(|| id.to_string())
+}
+
+#[cfg(test)]
+mod model_version_tests {
+    use super::*;
+
+    #[test]
+    fn a_real_hf_cache_layout_yields_its_snapshot_sha() {
+        let path = "/home/user/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B/\
+                    snapshots/c54f2e6e80b1d7b234f14a2cf556e4a90da0e5f4/model.safetensors";
+        assert_eq!(
+            hf_snapshot_sha(path).as_deref(),
+            Some("c54f2e6e80b1d7b234f14a2cf556e4a90da0e5f4")
+        );
+        assert_eq!(
+            derive_model_version(path, "ignored-fallback"),
+            "c54f2e6e80b1d7b234f14a2cf556e4a90da0e5f4"
+        );
+    }
+
+    #[test]
+    fn a_plain_directory_or_file_falls_back_to_id() {
+        for path in [
+            "/mnt/data/tuili-models/Qwen3-Embedding-0.6B",
+            "models/qwen2.5-0.5b-instruct-q8_0.gguf",
+            "/home/jeff/models/qwen38-27b-q4km-gguf/Qwen3.8-27B-Q4_K_M.gguf",
+        ] {
+            assert_eq!(hf_snapshot_sha(path), None, "{path}");
+            assert_eq!(derive_model_version(path, "some-id"), "some-id", "{path}");
+        }
+    }
+
+    #[test]
+    fn a_snapshots_component_with_no_following_segment_is_not_mistaken_for_one() {
+        // `snapshots` as the path's own last component, no sha after it --
+        // the real layout always has one more segment.
+        assert_eq!(hf_snapshot_sha("/some/path/snapshots"), None);
+    }
+
+    #[test]
+    fn a_short_or_non_hex_segment_after_snapshots_is_not_mistaken_for_a_sha() {
+        // Real commit shas are 40 hex characters (or a 7+ char short form);
+        // a directory that merely happens to be named "snapshots" followed
+        // by something else should not be misread as a version signal.
+        assert_eq!(hf_snapshot_sha("/some/path/snapshots/not-a-sha!/model.safetensors"), None);
+        assert_eq!(hf_snapshot_sha("/some/path/snapshots/abc/model.safetensors"), None);
+    }
 }

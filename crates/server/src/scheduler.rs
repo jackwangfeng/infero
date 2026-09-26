@@ -2284,6 +2284,17 @@ impl Scheduler {
     pub fn model(&self) -> &Model {
         &self.model
     }
+
+    /// For a caller with its own throwaway `KvPool` and no sequence in this
+    /// scheduler's own one -- `crate::engine::Worker`'s embedding job, which
+    /// runs to completion between steps on the same single worker thread
+    /// this scheduler's own generation steps run on, so there is never a
+    /// concurrent call into the model to race with. Anything that queues
+    /// through [`Scheduler::enqueue`]/[`Scheduler::step`] instead of calling
+    /// this directly.
+    pub fn model_mut(&mut self) -> &mut Model {
+        &mut self.model
+    }
 }
 
 /// Build the pool a scheduler needs.
