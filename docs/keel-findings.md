@@ -189,3 +189,9 @@ Worth recording, since the list above reads bleaker than the experience was.
    downstream database right now.
 3. **§3**, a weight fingerprint for non-HF-cache layouts.
 4. **§4 and §5**, documentation.
+
+Separate from this list, and larger than any of it: **a CPU backend**, which
+`keel-integration.md` §4 now argues for. That document originally said one was
+explicitly *not* required; the switch is what changed the answer, and the
+reasoning is recorded there rather than here because it is a feature request,
+not a defect.

@@ -303,6 +303,70 @@ Test coverage: `crates/model/tests/rerank.rs`, gated on
 
 ---
 
+## 4. A CPU backend — was "not required", now the one thing left
+
+**This section used to say the opposite, and it is worth recording why it
+flipped rather than quietly editing it.**
+
+The original argument was: Keel's CI runs on GPU-less runners, but that is
+solved on Keel's side — a deterministic stand-in behind a build tag
+(`keel_fake_embedder`) sits in the default gates, and a separate real-engine job
+runs the genuine article without blocking PRs. So infero could stay GPU-only and
+still be adopted.
+
+Two things happened after the switch actually landed.
+
+**The separate real-engine job does not exist any more.** It was deleted rather
+than left as `continue-on-error` or pinned to a self-hosted label that nobody
+runs: a job that is permanently queued or permanently skipped looks, in the
+checks list, like it is still guarding something. So the three acceptance
+criteria (normalization verified by reading back from Postgres, semantic margin
+above a floor, a dead engine raising rather than zero-filling) now run **only
+when a human runs them**, on a machine with an NVIDIA GPU. That is a real
+regression in coverage and Keel's CI file says so in plain words.
+
+**And the fallback argument does not survive contact with users.** Keel is about
+to go public. The stand-in covers *Keel's own tests*; it does nothing for a
+person who clones the repository on a laptop. For them, no GPU means no
+`KEEL_EMBED_ENDPOINT`, which means search degrades to keyword-only — which works,
+is deliberate, and has an executor, but it is also the single headline feature
+of the milestone being switched off for most of the audience.
+
+Keel briefly considered keeping its old Python/CPU service alive as a second leg
+behind a configuration switch. That was rejected: two engines means two vector
+spaces, two sets of model metadata in `product_text_vectors`, and a second code
+path that nothing exercises. **One engine, with a CPU backend, is the smaller
+system.**
+
+### What "CPU backend" has to mean here, concretely
+
+Not fast — *correct and present*. The bar is the one Keel already measures:
+
+- **Same numbers as the GPU path**, within floating-point noise. The three
+  acceptance criteria are the test: normalization to 1.0, the semantic margin
+  above 0.10, and errors that are errors. If CPU and CUDA disagree on the margin,
+  the CPU path is not a backend, it is a second model.
+- **The same `model` and `model_version` strings.** Keel keys staleness off them.
+  A CPU run that reports a different model id would invalidate every stored
+  vector.
+- Speed is explicitly not a requirement. The service it replaced took 62 ms per
+  text on CPU and that was acceptable for a single-machine deployment; anything
+  in that neighbourhood is fine. Batch throughput matters even less — the
+  index-side batch of 64 can take seconds.
+
+### What it unlocks on Keel's side
+
+- CI gets its executor back. The three criteria go from "a human runs them on a
+  GPU box" to a job that goes red on a PR.
+- Deployment shape A in Keel's architecture document — "runs on one machine,
+  no GPU" — becomes true with semantic search intact, instead of true only with
+  search degraded.
+- `services/inference/` gets deleted. It is already unreachable (the client pins
+  infero's path, model name and pooling sentinel as constants) and it is the last
+  reason anyone would keep it.
+
+---
+
 ## What Keel will hold it to
 
 The Python service had to pass these before it was allowed into the index path.
@@ -343,23 +407,36 @@ server responded".
 
 ---
 
-## What is explicitly *not* required
-
-**A CPU backend.** Keel's CI has to run the whole chain on GPU-less runners, but
-that is already solved on Keel's side: a deterministic stand-in behind a build tag
-(`keel_fake_embedder`) sits in the default gates, and the real-engine job runs
-separately without blocking PRs. infero can stay GPU-only (CUDA + Metal) and still
-be adopted.
-
----
-
 ## Where this sits on Keel's roadmap
 
-M3–M6 need embeddings and reranking — encoder work, cheaply served by an
-off-the-shelf process. From M7 the direction changes: conversational shopping
-(M7), the schema-constrained `generate` endpoint (M9), and Text-to-SQL (M10) all
-need **LLM generation**, which is what infero is.
+**This section predicted M7 and was wrong; the switch happened at M4.** Left
+here corrected rather than deleted, because the reason it was wrong is the
+useful part.
 
-So the natural sequencing is: keep the Python service through M6, adopt infero at
-M7, and add `/v1/embeddings` at the same time — by then the LLM path has to use it
-anyway, and wiring two endpoints in one pass beats wiring one twice.
+The prediction was: M3–M6 need embeddings and reranking, which an off-the-shelf
+encoder process serves cheaply; the direction only changes from M7, where
+conversational shopping, the schema-constrained `generate` endpoint (M9) and
+Text-to-SQL (M10) all need real LLM generation — which is what infero is. So
+keep the Python service through M6 and adopt infero at M7, wiring both endpoints
+in one pass.
+
+What that reasoning missed is that **"cheaply served" was doing a lot of work.**
+The Python service was 62 ms per text on CPU against 7.6 ms here, a 75-second
+cold start against 1, and a 1.39 GB image. None of that is fatal on its own. But
+Keel's own latency budget for the search path is 15 ms, and the Python leg did
+not fit inside it — so the thing being deferred to M7 was not "a nicer engine",
+it was "the milestone's headline feature meeting its own stated budget".
+
+Actual state, as of Keel's M4:
+
+| | |
+|---|---|
+| `/v1/embeddings` | **in production use.** Every product vector in Keel's database came out of infero. |
+| `/v1/rerank` | implemented and confirmed working, **not yet consumed** — Keel wires it at M5. |
+| schema-constrained `generate` | implemented, **not yet consumed** — Keel needs it from M9 (attribute extraction, review attribution). |
+| CPU backend | **not implemented; now the blocking item.** See §4. |
+
+So the sequencing that actually held was the reverse of the prediction: the
+encoder work drove adoption, and the LLM work it was supposed to wait for is
+still ahead. The remaining gap is not a capability — it is that the engine only
+runs where there is a GPU.
