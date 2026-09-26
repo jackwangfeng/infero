@@ -1,0 +1,31 @@
+[package]
+name = "infero-cpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The CPU half of the device layer, for the "just make a small dense decoder
+# run somewhere with no GPU" case -- not a performance target, and not
+# feature-complete with the CUDA/Metal backends. See this crate's own lib.rs
+# doc comment for exactly what that means and does not mean.
+#
+# Shaped like the subset of `cudarc` `infero-kernels` uses, the same way
+# `infero-metal` is: same method names, same argument order, same
+# `LaunchConfig` field names, so the 160-odd launch sites in that crate
+# compile against this backend without a line of change. Unlike Metal, this
+# backend does not itself know what any kernel *means* -- "device" memory
+# here is just a `Vec<u8>`, so there is no shader language to compile and no
+# separate kernel cache to build. `Function::launch` instead calls back into
+# a dispatcher `infero-kernels` registers once, by kernel name -- see
+# `crates/kernels/src/cpu/mod.rs`'s own doc comment for why the numerical
+# code has to live there and not here.
+
+[dependencies]
+anyhow.workspace = true
+memmap2.workspace = true
+half.workspace = true
+libc = "0.2"
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

@@ -4,6 +4,7 @@ members = [
     "crates/gguf",
     "crates/safetensors",
     "crates/cuda",
+    "crates/cpu",
     "crates/gpu",
     "crates/metal",
     "crates/kernels",
@@ -23,6 +24,7 @@ license = "Apache-2.0"
 infero-gguf = { path = "crates/gguf" }
 infero-safetensors = { path = "crates/safetensors" }
 infero-cuda = { path = "crates/cuda", default-features = false }
+infero-cpu = { path = "crates/cpu" }
 infero-metal = { path = "crates/metal" }
 infero-gpu = { path = "crates/gpu", default-features = false }
 infero-kernels = { path = "crates/kernels", default-features = false }

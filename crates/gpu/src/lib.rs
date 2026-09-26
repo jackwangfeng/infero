@@ -12,13 +12,17 @@
 //! different question, so they stay behind `#[cfg(feature = "cuda")]` at their
 //! call sites rather than being faked here.
 
-#[cfg(all(feature = "cuda", feature = "metal"))]
+#[cfg(any(
+    all(feature = "cuda", feature = "metal"),
+    all(feature = "cuda", feature = "cpu"),
+    all(feature = "metal", feature = "cpu")
+))]
 compile_error!(
-    "infero-gpu takes exactly one backend: build with --features cuda-13 or --features metal"
+    "infero-gpu takes exactly one backend: build with --features cuda-13, --features metal, or --features cpu"
 );
 
-#[cfg(not(any(feature = "cuda", feature = "metal")))]
-compile_error!("infero-gpu needs a backend: --features cuda-13 or --features metal");
+#[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
+compile_error!("infero-gpu needs a backend: --features cuda-13, --features metal, or --features cpu");
 
 #[cfg(feature = "cuda")]
 pub use infero_cuda::backend::*;
@@ -26,5 +30,14 @@ pub use infero_cuda::backend::*;
 #[cfg(feature = "metal")]
 pub use infero_metal::backend::*;
 
+#[cfg(feature = "cpu")]
+pub use infero_cpu::backend::*;
+
 /// Which backend was compiled in, for the one or two places that log it.
-pub const BACKEND: &str = if cfg!(feature = "metal") { "metal" } else { "cuda" };
+pub const BACKEND: &str = if cfg!(feature = "metal") {
+    "metal"
+} else if cfg!(feature = "cpu") {
+    "cpu"
+} else {
+    "cuda"
+};

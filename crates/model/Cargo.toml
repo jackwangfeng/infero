@@ -34,6 +34,7 @@ cuda = ["dep:infero-cuda", "dep:cudarc", "infero-kernels/cuda", "infero-gpu/cuda
 cuda-13 = ["cuda", "infero-kernels/cuda-13", "infero-cuda/cuda-13", "cudarc/cuda-13010", "infero-gpu/cuda-13"]
 cuda-12 = ["cuda", "infero-kernels/cuda-12", "infero-cuda/cuda-12", "cudarc/cuda-12080", "infero-gpu/cuda-12"]
 metal = ["infero-kernels/metal", "infero-gpu/metal"]
+cpu = ["infero-kernels/cpu", "infero-gpu/cpu"]
 cutlass = ["infero-kernels/cutlass"]
 flash_attn2 = ["infero-kernels/flash_attn2"]
 nccl = ["infero-kernels/nccl"]

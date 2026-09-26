@@ -21,6 +21,8 @@ pub use cutlass_fp4::CutlassFp4Weight;
 pub mod cutlass_fp8;
 #[cfg(feature = "cutlass")]
 pub use cutlass_fp8::CutlassWeight;
+#[cfg(feature = "cpu")]
+mod cpu;
 #[cfg(feature = "flash_attn2")]
 pub mod flash_attn2;
 pub mod fp4;
@@ -368,6 +370,8 @@ fn rms_fits(d: usize) -> bool {
 
 impl Kernels {
     pub fn new(dev: Device) -> Self {
+        #[cfg(feature = "cpu")]
+        infero_cpu::set_dispatcher(cpu::dispatch);
         let caps = attn_backend::HardwareCaps::probe(&dev);
         Self {
             dev,
@@ -7598,6 +7602,7 @@ impl Kernels {
         // is, and why speculation cannot be rescued this way -- and wins from
         // eight, by 1.8x to 2.2x. `INFERO_MMA_MIN` moves the line.
         let mma = !cfg!(feature = "cuda")
+            && !cfg!(feature = "cpu")
             && ty == WeightType::Q4K
             && n_tokens >= mma_min()
             && n as u32 >= 8;
@@ -7639,7 +7644,11 @@ impl Kernels {
         // loses to the single-tile `gemv_mma_q8_0` below 24 tokens
         // (0.75-0.92x, mostly-empty tile) and wins from 24 up
         // (1.14-1.62x). `INFERO_Q8_0_COOP_MIN` moves the line.
-        if !cfg!(feature = "cuda") && ty == WeightType::Q8_0 && n_tokens >= 8 && n as u32 >= 32 {
+        // Metal's simdgroup-matrix co-op kernels: no CPU equivalent, and not
+        // worth one -- this backend isn't a performance target, so a CPU
+        // build stays on the plain `gemv_{suffix}` path below instead of
+        // needing its own MMA-shaped kernel names registered.
+        if !cfg!(feature = "cuda") && !cfg!(feature = "cpu") && ty == WeightType::Q8_0 && n_tokens >= 8 && n as u32 >= 32 {
             let coop_min: usize = std::env::var("INFERO_Q8_0_COOP_MIN")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -7650,7 +7659,7 @@ impl Kernels {
             }
             return self.gemv_mma_q8(out, w, x, k, n, n_tokens);
         }
-        if !cfg!(feature = "cuda") && ty == WeightType::Q8_0 && n_tokens >= 8 && n as u32 >= 8 {
+        if !cfg!(feature = "cuda") && !cfg!(feature = "cpu") && ty == WeightType::Q8_0 && n_tokens >= 8 && n as u32 >= 8 {
             return self.gemv_mma_q8(out, w, x, k, n, n_tokens);
         }
         let name = if rows > 1 {

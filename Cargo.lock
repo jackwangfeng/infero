@@ -999,6 +999,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "infero-cpu"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "half",
+ "libc",
+ "memmap2",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "infero-cuda"
 version = "0.1.0"
 dependencies = [
@@ -1026,6 +1037,7 @@ dependencies = [
 name = "infero-gpu"
 version = "0.1.0"
 dependencies = [
+ "infero-cpu",
  "infero-cuda",
  "infero-metal",
 ]
@@ -1037,6 +1049,7 @@ dependencies = [
  "anyhow",
  "cudarc",
  "half",
+ "infero-cpu",
  "infero-cuda",
  "infero-gguf",
  "infero-gpu",

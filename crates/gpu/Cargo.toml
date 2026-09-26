@@ -16,6 +16,7 @@ license.workspace = true
 [dependencies]
 infero-cuda = { workspace = true, optional = true }
 infero-metal = { workspace = true, optional = true }
+infero-cpu = { workspace = true, optional = true }
 
 [features]
 default = ["cuda-13"]
@@ -23,3 +24,4 @@ cuda-13 = ["cuda", "infero-cuda/cuda-13"]
 cuda-12 = ["cuda", "infero-cuda/cuda-12"]
 cuda = ["dep:infero-cuda"]
 metal = ["dep:infero-metal"]
+cpu = ["dep:infero-cpu"]
