@@ -12,6 +12,22 @@
 #     -v /mnt/data/tuili-models/Qwen3-Embedding-0.6B:/models/Qwen3-Embedding-0.6B:ro \
 #     -e INFERO_CPU_THREADS=8 \
 #     infero:cpu --model /models/Qwen3-Embedding-0.6B --ctx 2048 --max-seqs 32
+#
+# The mounted directory's own name matters, not just its contents: infero
+# derives the `model`/`model_version` strings it reports (and that Keel keys
+# staleness off) from the last path component of `--model` (its `file_stem`,
+# i.e. everything before the LAST `.` -- "Qwen3-Embedding-0.6B" becomes
+# "Qwen3-Embedding-0"). Mount it at `/models/Qwen3-Embedding-0.6B` as above,
+# not renamed to something like `/models/model` -- a renamed mount reports a
+# different model id than the GPU backend serving the same checkpoint,
+# invalidating every vector a caller already stored under the real one.
+#
+# `--host` is baked into `ENTRYPOINT` below rather than `CMD`: `docker run
+# IMAGE --model ... --ctx ... --max-seqs ...` (extra args after the image
+# name) replaces `CMD` entirely, not just appends to it, so a `--host` living
+# in `CMD` would silently disappear -- the process would then fall back to
+# clap's own default, `127.0.0.1:8080`, unreachable from outside the
+# container and on the wrong port besides.
 
 FROM rust:1.90-slim-bookworm AS builder
 WORKDIR /build
@@ -40,5 +56,4 @@ EXPOSE 8081
 HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=3 \
     CMD curl -f http://127.0.0.1:8081/health/ready || exit 1
 
-ENTRYPOINT ["/usr/local/bin/infero"]
-CMD ["--host", "0.0.0.0:8081"]
+ENTRYPOINT ["/usr/local/bin/infero", "--host", "0.0.0.0:8081"]
