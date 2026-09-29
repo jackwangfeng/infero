@@ -384,6 +384,36 @@ impl Kernels {
         &self.dev
     }
 
+    /// Decodes a resident weight matrix's raw bytes to f32, once -- the
+    /// building block behind `infero-model`'s persistent per-`Matrix` cache
+    /// (`Matrix::cpu_f32_weight`; see that method's own doc comment for why
+    /// a persistent cache exists at all).
+    #[cfg(feature = "cpu")]
+    pub fn cpu_decode_weight_f32(&self, bytes: &[u8], n_elements: usize, wt: WeightType) -> Result<Vec<f32>> {
+        cpu::decode_weight_f32(bytes, n_elements, wt)
+    }
+
+    /// `out[t,row] = dot(w_f32[row,:], x[t,:])`, straight from an
+    /// already-decoded, persistently-cached weight matrix -- no per-call
+    /// decode, no `WeightType` dispatch at all. Delegates entirely to
+    /// `infero_cpu::gemv_f32_cached` (which picks a plain per-row loop at
+    /// `n_tokens == 1` or the `gemm` crate's microkernel above that, mirroring
+    /// `cpu::gemv`'s own split): this method only exists to give
+    /// `infero-model`'s call site (gated the same way) a name that doesn't
+    /// require depending on `infero-cpu` directly.
+    #[cfg(feature = "cpu")]
+    pub fn cpu_gemv_f32_cached(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        w_f32: &[f32],
+        x: &View<'_, f32>,
+        k: usize,
+        n: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        infero_cpu::gemv_f32_cached(out, w_f32, x, k, n, n_tokens)
+    }
+
     /// Compile every kernel now instead of on first use, so the first token
     /// isn't charged for NVRTC.
     pub fn warm_up(&self) -> Result<()> {

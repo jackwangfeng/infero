@@ -34,5 +34,6 @@ mod profile;
 
 pub use buffer::{Buf, CopyDst, CopySrc, Elem, View, ViewMut};
 pub use device::{Caps, Device, Stream};
+pub use gemm::{gemm_f32, gemv_f32_cached};
 pub use launch::{Arg, Dispatch, Function, KernelArg, LaunchBuilder, LaunchConfig, Modules, NullBuffer, set_dispatcher};
 pub use profile::{Entry, Profile};

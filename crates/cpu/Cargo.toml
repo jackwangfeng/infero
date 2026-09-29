@@ -26,6 +26,8 @@ anyhow.workspace = true
 memmap2.workspace = true
 half.workspace = true
 libc = "0.2"
+rayon = "1"
+gemm = { version = "0.19.0", default-features = false, features = ["std", "rayon"] }
 
 [dev-dependencies]
 tracing-subscriber.workspace = true

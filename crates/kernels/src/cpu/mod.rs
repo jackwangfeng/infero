@@ -18,13 +18,18 @@
 //! symbol, only a missing case.
 //!
 //! This is not a performance target (see `infero-cpu`'s own top-level doc
-//! comment): every loop below is a plain sequential Rust loop, not
-//! `rayon`-parallelized, matching the "straightforward loops" fallback the
-//! design explicitly allows.
+//! comment): every loop below is a plain sequential Rust loop. The one
+//! exception is [`gemv`], `rayon`-parallelized over its output-row dimension
+//! -- every FFN/QKVO projection routes through it, so leaving it
+//! single-threaded pins the whole decode step to one of the host's cores
+//! regardless of `--max-seqs` or core count (see Keel's latency requirement
+//! in `docs/keel-integration.md`, which a single core cannot meet on this
+//! model size).
 
 use anyhow::{Result, bail};
 use half::f16;
 use infero_cpu::{Arg, LaunchConfig};
+use rayon::prelude::*;
 
 // ---- byte-level weight decoding ------------------------------------------
 //
@@ -95,6 +100,15 @@ impl Ty {
             "f32" => Some(Ty::F32),
             "f16" => Some(Ty::F16),
             "q8_0" => Some(Ty::Q8_0),
+            _ => None,
+        }
+    }
+
+    fn from_weight_type(wt: crate::WeightType) -> Option<Self> {
+        match wt {
+            crate::WeightType::F32 => Some(Ty::F32),
+            crate::WeightType::F16 => Some(Ty::F16),
+            crate::WeightType::Q8_0 => Some(Ty::Q8_0),
             _ => None,
         }
     }
@@ -554,45 +568,66 @@ fn attn_decode_fused(
     scale: f32,
     n_tokens: usize,
 ) {
+    // `decode_attention()` (this kernel's own gate, in `infero-kernels/src/lib.rs`)
+    // doesn't actually require `n_tokens == 1` -- its name is about the KV
+    // cache shape, not the query width -- so this is also the CPU backend's
+    // only prefill attention path, not just its decode-step one (there is no
+    // CPU `attn_prefill_ws4`/`attn_flash`/tile kernel for a multi-token run
+    // to fall to instead). Every `(head, token)` pair is independent (reads
+    // its own `q` row, writes its own `out` slice), which is what lets this
+    // split across cores; the original serial version's single shared
+    // `scores` buffer, reused across every pair in sequence, made that
+    // impossible without also giving each task its own copy, which the
+    // `vec![0f32; len]` below is. For a real prefill this is a genuine
+    // per-core win, not a with_min_len-style scheduling fix: unlike a gemv
+    // row, a (head, token) pair's own work (`O(kv_len * d_head)`) isn't tiny,
+    // and prefill's causal `kv_len` growing with `t` means this cost is
+    // `O(n_tokens^2)` while every other per-request cost here is `O(n_tokens)`
+    // -- serial, it increasingly dominates wall time as a query gets longer,
+    // which is exactly the effect a longer-than-linear query/latency curve
+    // on this backend traced back to.
     let group = n_heads / n_kv_heads;
-    let mut scores = vec![0.0f32; kv_len];
-    for h in 0..n_heads {
+    let threads = rayon::current_num_threads().max(1);
+    let total = n_tokens * n_heads;
+    let min_len = (total / threads).max(1);
+    // `out` is `[n_tokens, n_heads, d_head]` (t-major, matching the serial
+    // version's own indexing), so chunks of `d_head` in order are exactly
+    // the `(t, h)` pairs in `t * n_heads + h` order.
+    out[..total * d_head].par_chunks_mut(d_head).with_min_len(min_len).enumerate().for_each(|(idx, o)| {
+        let (t, h) = (idx / n_heads, idx % n_heads);
         let kv_head = h / group;
-        for t in 0..n_tokens {
-            let last = positions[t] as usize;
-            let len = (last + 1).min(kv_len);
-            let table = &slot_table[seq_of[t] as usize * table_stride..];
-            let qr = &q[(t * n_heads + h) * d_head..(t * n_heads + h + 1) * d_head];
+        let last = positions[t] as usize;
+        let len = (last + 1).min(kv_len);
+        let table = &slot_table[seq_of[t] as usize * table_stride..];
+        let qr = &q[(t * n_heads + h) * d_head..(t * n_heads + h + 1) * d_head];
 
-            let mut m = f32::NEG_INFINITY;
-            for j in 0..len {
-                let slot = table[j] as usize;
-                let kr = &k_cache[(kv_head * n_slots + slot) * d_head..(kv_head * n_slots + slot + 1) * d_head];
-                let dot: f32 = qr.iter().zip(kr).map(|(a, b)| a * b.to_f32()).sum();
-                let s = dot * scale;
-                scores[j] = s;
-                m = m.max(s);
-            }
-            let mut sum = 0.0f32;
-            for j in 0..len {
-                let e = (scores[j] - m).exp();
-                scores[j] = e;
-                sum += e;
-            }
-            let inv = sum.recip();
+        let mut scores = vec![0.0f32; len];
+        let mut m = f32::NEG_INFINITY;
+        for j in 0..len {
+            let slot = table[j] as usize;
+            let kr = &k_cache[(kv_head * n_slots + slot) * d_head..(kv_head * n_slots + slot + 1) * d_head];
+            let dot: f32 = qr.iter().zip(kr).map(|(a, b)| a * b.to_f32()).sum();
+            let s = dot * scale;
+            scores[j] = s;
+            m = m.max(s);
+        }
+        let mut sum = 0.0f32;
+        for v in scores.iter_mut() {
+            *v = (*v - m).exp();
+            sum += *v;
+        }
+        let inv = sum.recip();
 
-            let o = &mut out[(t * n_heads + h) * d_head..(t * n_heads + h + 1) * d_head];
-            o.fill(0.0);
-            for j in 0..len {
-                let slot = table[j] as usize;
-                let vr = &v_cache[(kv_head * n_slots + slot) * d_head..(kv_head * n_slots + slot + 1) * d_head];
-                let w = scores[j] * inv;
-                for i in 0..d_head {
-                    o[i] += w * vr[i].to_f32();
-                }
+        o.fill(0.0);
+        for j in 0..len {
+            let slot = table[j] as usize;
+            let vr = &v_cache[(kv_head * n_slots + slot) * d_head..(kv_head * n_slots + slot + 1) * d_head];
+            let w = scores[j] * inv;
+            for i in 0..d_head {
+                o[i] += w * vr[i].to_f32();
             }
         }
-    }
+    });
 }
 
 // ---- sampling ---------------------------------------------------------------
@@ -1006,19 +1041,87 @@ fn dequant_to_f16(out: &mut [f16], w: &[u8], n_elements: usize, ty: Ty) {
     }
 }
 
+/// Decode a whole weight matrix to f32, once, for [`gemv`]'s `gemm_f32`
+/// path. `Ty::deq` re-matches on `ty` every single element, which -- even
+/// inlined -- leaves a 3-way branch inside what should be a tight
+/// convert-and-store loop; matching once here and running a loop written
+/// for exactly one variant is what let this call stop being the dominant
+/// per-request cost it was (see `gemv`'s own doc comment on this path).
+fn decode_matrix_to_f32(w: &[u8], n_elements: usize, ty: Ty) -> Vec<f32> {
+    let mut out = vec![0f32; n_elements];
+    let threads = rayon::current_num_threads().max(1);
+    let min_len = (n_elements / threads).max(1);
+    match ty {
+        Ty::F32 => out.par_iter_mut().with_min_len(min_len).enumerate().for_each(|(i, o)| *o = deq_f32(w, i)),
+        // Reinterpreting as a proper `&[f16]` and decoding through
+        // `half`'s own `to_f32` (`half::f16` is `#[repr(transparent)]` over
+        // `u16`) is the same shape `gemm_f16_to_f32`'s operand decode
+        // already uses, and it measurably beats going element-by-element
+        // through a byte offset even with the match hoisted out: reading
+        // `w` as bytes and reassembling a `u16` per element, instead of
+        // reading it as `u16`/`f16` in the first place, was still enough to
+        // keep this from vectorizing the way the identical-looking loop in
+        // `gemm_f16_to_f32` does. Falls back to the byte-offset path only
+        // if `w` somehow isn't 2-byte aligned (mmap'd/heap weight buffers
+        // always are in practice, but this is UB to get wrong).
+        Ty::F16 if w.as_ptr() as usize % 2 == 0 && w.len() >= n_elements * 2 => {
+            // SAFETY: alignment and length checked in the guard above; `w`
+            // is borrowed for exactly this call's lifetime, matching every
+            // other reinterpret this backend does of its own weight bytes.
+            let w16: &[f16] = unsafe { std::slice::from_raw_parts(w.as_ptr() as *const f16, n_elements) };
+            out.par_iter_mut().zip(w16.par_iter()).with_min_len(min_len).for_each(|(o, h)| *o = h.to_f32());
+        }
+        Ty::F16 => out.par_iter_mut().with_min_len(min_len).enumerate().for_each(|(i, o)| *o = deq_f16(w, i)),
+        Ty::Q8_0 => out.par_iter_mut().with_min_len(min_len).enumerate().for_each(|(i, o)| *o = deq_q8_0(w, i)),
+    }
+    out
+}
+
+/// [`decode_matrix_to_f32`] with a public, `WeightType`-keyed entry point --
+/// `crate::Kernels::cpu_decode_weight_f32`'s whole body, kept here since
+/// `Ty` (this module's own three-variant subset) is private to it.
+pub(crate) fn decode_weight_f32(bytes: &[u8], n_elements: usize, wt: crate::WeightType) -> anyhow::Result<Vec<f32>> {
+    let ty = Ty::from_weight_type(wt)
+        .ok_or_else(|| anyhow::anyhow!("cpu backend cannot decode weight type {wt}"))?;
+    Ok(decode_matrix_to_f32(bytes, n_elements, ty))
+}
+
 /// `gemv_{f32,f16,q8_0}` (and its `gemv1_*`/`gemv2_*`/`gemv4_*` token-width
 /// aliases, which name the same computation -- see `dispatch`'s own comment
 /// on why those extra names exist): `out[t,row] = dot(w[row,:], x[t,:])`.
 fn gemv(out: &mut [f32], w: &[u8], x: &[f32], k: usize, n: usize, n_tokens: usize, ty: Ty) {
-    for row in 0..n {
-        for t in 0..n_tokens {
+    if n_tokens == 1 {
+        // The true decode-step case: a mat-vec is memory-bandwidth-bound
+        // regardless of implementation (one FMA per weight byte read, full
+        // stop), so there is nothing for a cache-blocked GEMM microkernel to
+        // win here and decoding to a separate f32 buffer first would only
+        // add a second pass over that memory. Fused decode+dot, one row per
+        // core, stays the right shape. `with_min_len` caps rayon's
+        // fork-join tree to about one leaf per core -- an earlier
+        // one-leaf-per-row split left ~86% of cycles in `join_context`
+        // bookkeeping (`perf` on this exact call shape), rivaling the real
+        // work of each (tiny) row.
+        let threads = rayon::current_num_threads().max(1);
+        let min_rows = (n / threads).max(1);
+        out[..n].par_chunks_mut(1).with_min_len(min_rows).enumerate().for_each(|(row, out_row)| {
             let mut acc = 0.0f32;
-            let xr = &x[t * k..t * k + k];
             for i in 0..k {
-                acc += ty.deq(w, row * k + i) * xr[i];
+                acc += ty.deq(w, row * k + i) * x[i];
             }
-            out[t * n + row] = acc;
-        }
+            out_row[0] = acc;
+        });
+    } else {
+        // `embeddings`/prefill's own case (below `gemm_threshold()` tokens --
+        // see `Kernels::gemv`'s doc comment): now enough arithmetic per byte
+        // read (`n_tokens` dot products share each decoded weight row) that
+        // a cache-blocked GEMM microkernel is worth it. Decode the whole
+        // weight matrix to f32 once, then hand the actual product to
+        // `gemm_f32` (see its own doc comment for why that's the `gemm`
+        // crate rather than a hand-rolled loop). `out`'s layout
+        // (`out[t*n+row]`) already matches what `gemm_f32` writes for
+        // `dst(m=n_tokens × n)`, so there's no scatter step to write here.
+        let w_f32 = decode_matrix_to_f32(w, n * k, ty);
+        infero_cpu::gemm_f32(&mut out[..n_tokens * n], &x[..n_tokens * k], &w_f32, n_tokens, k, n);
     }
 }
 

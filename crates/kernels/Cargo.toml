@@ -15,6 +15,7 @@ anyhow.workspace = true
 half.workspace = true
 tracing.workspace = true
 cudarc = { version = "0.19", default-features = false, optional = true, features = ["std", "driver", "nvrtc", "cublas", "f16", "dynamic-loading"] }
+rayon = { version = "1", optional = true }
 
 [dev-dependencies]
 # A dev-dependency on the crate above this one, so that the partial-rope kernel
@@ -32,7 +33,7 @@ cuda = ["dep:infero-cuda", "dep:cudarc", "infero-gpu/cuda"]
 cuda-13 = ["cuda", "infero-cuda/cuda-13", "cudarc/cuda-13010", "infero-gpu/cuda-13"]
 cuda-12 = ["cuda", "infero-cuda/cuda-12", "cudarc/cuda-12080", "infero-gpu/cuda-12"]
 metal = ["infero-gpu/metal"]
-cpu = ["dep:infero-cpu", "infero-gpu/cpu"]
+cpu = ["dep:infero-cpu", "infero-gpu/cpu", "dep:rayon"]
 # AOT-compiles crates/kernels/src/cutlass/fp8_bw_gemm.cu with nvcc and links
 # it in -- needs a full CUDA Toolkit (INFERO_NVCC) and an NVIDIA/cutlass
 # checkout (INFERO_CUTLASS_DIR); see build.rs. Off by default: every other

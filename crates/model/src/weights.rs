@@ -98,6 +98,16 @@ type CutlassFp4Slot = std::sync::OnceLock<Option<infero_kernels::CutlassFp4Weigh
 #[cfg(not(feature = "cutlass"))]
 type CutlassFp4Slot = ();
 
+/// Same idea as [`CutlassSlot`], off the `cpu` feature instead: this
+/// backend's persistent, whole-matrix f32 decode -- see
+/// [`Matrix::cpu_f32_weight`]'s own doc comment for why it exists. `()` (and
+/// so zero bytes) on every other backend, compiled out entirely rather than
+/// merely unused, so a CUDA/Metal build's per-matrix footprint is unchanged.
+#[cfg(feature = "cpu")]
+type CpuF32Slot = std::sync::OnceLock<Option<Vec<f32>>>;
+#[cfg(not(feature = "cpu"))]
+type CpuF32Slot = ();
+
 /// A 2-D weight matrix, still in its GGUF block encoding.
 pub struct Matrix {
     pub ty: WeightType,
@@ -109,6 +119,7 @@ pub struct Matrix {
     storage: Storage,
     cutlass_weight: CutlassSlot,
     cutlass_fp4_weight: CutlassFp4Slot,
+    cpu_f32_weight: CpuF32Slot,
 }
 
 impl Matrix {
@@ -190,6 +201,46 @@ impl Matrix {
         let scale2 = f32::from_le_bytes(tail[0..4].try_into().expect("4 bytes"));
         let input_scale = f32::from_le_bytes(tail[4..8].try_into().expect("4 bytes"));
         kern.prepare_cutlass_fp4_weight(&view, self.k, self.n, scale2, input_scale)
+    }
+
+    /// This matrix's whole weight matrix, decoded to f32 once and cached for
+    /// the process lifetime -- the CPU backend's counterpart to
+    /// [`Self::cutlass_weight`]/[`Self::cutlass_fp4_weight`] above, for the
+    /// same reason those exist (pay a real cost once instead of on every
+    /// request), but for every resident matrix this backend's forward pass
+    /// reads rather than one weight type. Without this, `--features cpu`'s
+    /// own dense-decoder path was re-decoding this matrix's bytes from
+    /// scratch (and re-allocating the buffer to hold them) on every single
+    /// request -- a per-request cost that, for a model this small, rivaled
+    /// or exceeded the request's own actual compute (measured: a real
+    /// embedding request's per-request CPU time barely changed between an
+    /// 8-token and a 40-token query until this cache existed, meaning the
+    /// fixed decode-and-allocate cost dominated whatever the token count
+    /// actually needed).
+    ///
+    /// `None` for an offloaded matrix, same staleness reason
+    /// [`Self::cutlass_weight`] gives for its own resident-only check --
+    /// though in practice the CPU backend never offloads (there is no VRAM
+    /// ceiling to offload away from, so every matrix a CPU-loaded model
+    /// has is resident); the check stays here so that remains true by
+    /// inspection rather than by assumption. `None` also for a weight type
+    /// outside this backend's own supported subset (F32/F16/Q8_0 --
+    /// `infero_kernels::cpu`'s own doc comment), which the forward pass
+    /// itself never produces for a CPU-loaded checkpoint, but which this
+    /// method still declines rather than panics on, matching this backend's
+    /// "fails loudly at the call site that needed it" scope elsewhere.
+    #[cfg(feature = "cpu")]
+    pub fn cpu_f32_weight(&self, kern: &infero_kernels::Kernels) -> Option<&[f32]> {
+        if !self.is_resident() {
+            return None;
+        }
+        self.cpu_f32_weight
+            .get_or_init(|| {
+                let view = self.view(None).ok()?;
+                let bytes = kern.device().stream().clone_dtoh(&view).ok()?;
+                kern.cpu_decode_weight_f32(&bytes, self.elements(), self.ty).ok()
+            })
+            .as_deref()
     }
 
     /// A device view of this matrix.
@@ -387,6 +438,7 @@ impl Matrix {
             storage: Storage::Device(dev.stream().clone_htod(raw)?),
                 cutlass_weight: Default::default(),
                 cutlass_fp4_weight: Default::default(),
+                cpu_f32_weight: Default::default(),
         })
     }
 }
@@ -623,6 +675,52 @@ pub struct Weights {
 }
 
 impl Weights {
+    /// Builds every resident matrix's [`Matrix::cpu_f32_weight`] cache now,
+    /// before the server starts accepting requests, instead of leaving each
+    /// one to build lazily on whatever request happens to touch it first.
+    ///
+    /// The lazy version (this cache's own default, matching
+    /// `cutlass_weight`/`cutlass_fp4_weight`) is the right choice when a
+    /// slow first touch is spread across many different matrices that many
+    /// different call patterns exercise at different times. It is the wrong
+    /// choice here: essentially *every* resident matrix in a dense-decoder
+    /// forward pass is read by essentially *every* request (embedding or
+    /// chat), so "lazy" only means "the first request after every restart
+    /// pays the full per-request decode cost this cache exists to remove" --
+    /// and Keel's own query budget (250ms) is tighter than that first
+    /// request's real cost. Paying it once here, before `Model::from_parts`
+    /// logs "model ready", trades a few extra seconds of startup for every
+    /// request afterward being warm from the first one.
+    #[cfg(feature = "cpu")]
+    pub fn cpu_warm_f32_cache(&self, kern: &infero_kernels::Kernels) {
+        self.token_embd.cpu_f32_weight(kern);
+        for m in [&self.output, &self.output_split, &self.output_draft_q4] {
+            if let Some(m) = m {
+                m.cpu_f32_weight(kern);
+            }
+        }
+        for layer in &self.layers {
+            if let Some(attn) = &layer.attn {
+                for m in [&attn.wq, &attn.wk, &attn.wv, &attn.wo] {
+                    m.cpu_f32_weight(kern);
+                }
+                for m in [&attn.w_qkv, &attn.w_kv] {
+                    if let Some(m) = m {
+                        m.cpu_f32_weight(kern);
+                    }
+                }
+            }
+            if let Some(dense) = &layer.dense {
+                for m in [&dense.w_gate, &dense.w_up, &dense.w_down] {
+                    m.cpu_f32_weight(kern);
+                }
+                if let Some(m) = &dense.w_gate_up {
+                    m.cpu_f32_weight(kern);
+                }
+            }
+        }
+    }
+
     /// Load with the first `n_gpu_layers` blocks resident and the rest
     /// offloaded. Embeddings, the output projection and all norms stay
     /// resident: the vocab projection is touched once per token and the norms
@@ -817,6 +915,7 @@ impl Weights {
                                 storage: Storage::Device(dev.stream().clone_htod(&bytes)?),
                                 cutlass_weight: Default::default(),
                                 cutlass_fp4_weight: Default::default(),
+                cpu_f32_weight: Default::default(),
                             })
                         };
                         let upload_value_rows = |name: &str, row_span: usize, total: &mut usize| -> Result<Matrix> {
@@ -840,6 +939,7 @@ impl Weights {
                                 storage: Storage::Device(dev.stream().clone_htod(&bytes)?),
                                 cutlass_weight: Default::default(),
                                 cutlass_fp4_weight: Default::default(),
+                cpu_f32_weight: Default::default(),
                             })
                         };
 
@@ -885,6 +985,7 @@ impl Weights {
                                 storage: Storage::Device(dev.stream().clone_htod(&bytes)?),
                                 cutlass_weight: Default::default(),
                                 cutlass_fp4_weight: Default::default(),
+                cpu_f32_weight: Default::default(),
                             });
                         }
                         // 5, 6, 7: dense FFN gate/up/down -- ordinary
@@ -1640,6 +1741,7 @@ pub fn load_mtp(
                 storage: Storage::Device(dev.stream().clone_htod(&bytes)?),
                 cutlass_weight: Default::default(),
                 cutlass_fp4_weight: Default::default(),
+                cpu_f32_weight: Default::default(),
             });
         }
         // `mtp.fc` lands here — BF16 in this checkpoint. Not a special case in
@@ -1661,6 +1763,7 @@ pub fn load_mtp(
             storage: Storage::Device(dev.stream().clone_htod(raw)?),
                 cutlass_weight: Default::default(),
                 cutlass_fp4_weight: Default::default(),
+                cpu_f32_weight: Default::default(),
         })
     };
 
@@ -1785,6 +1888,7 @@ fn stacked2_gguf(dev: &Device, f: &Gguf, a: &str, b: &str, total: &mut usize) ->
         storage: Storage::Device(dev.stream().clone_htod(&bytes)?),
                 cutlass_weight: Default::default(),
                 cutlass_fp4_weight: Default::default(),
+                cpu_f32_weight: Default::default(),
     }))
 }
 
@@ -1951,6 +2055,7 @@ pub fn load_awq(
             storage,
                 cutlass_weight: Default::default(),
                 cutlass_fp4_weight: Default::default(),
+                cpu_f32_weight: Default::default(),
         })
     };
     let arch = cfg.arch.clone();
@@ -3305,6 +3410,7 @@ fn upload_matrix(
         storage,
         cutlass_weight: Default::default(),
         cutlass_fp4_weight: Default::default(),
+                cpu_f32_weight: Default::default(),
     })
 }
 
@@ -3468,6 +3574,7 @@ fn upload_matrix_sharded(
         storage,
         cutlass_weight: Default::default(),
         cutlass_fp4_weight: Default::default(),
+                cpu_f32_weight: Default::default(),
     })
 }
 
@@ -3510,6 +3617,7 @@ fn pack_layer(dev: &Device, f: &Gguf, names: &[String]) -> Result<(Vec<Matrix>, 
             storage: Storage::Streamed { offset },
                 cutlass_weight: Default::default(),
                 cutlass_fp4_weight: Default::default(),
+                cpu_f32_weight: Default::default(),
         })
         .collect();
 

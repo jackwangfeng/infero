@@ -2819,6 +2819,20 @@ impl Model {
         let hidden_host = vec![0.0; max_logit_rows * cfg.d_model];
         dev.synchronize()?;
 
+        // Eager on this backend specifically -- see `Weights::cpu_warm_f32_cache`'s
+        // own doc comment for why lazy (this cache's default elsewhere) is the
+        // wrong call here: a cold cache's first-request cost is the exact thing
+        // Keel's query budget can't absorb.
+        #[cfg(feature = "cpu")]
+        let cpu_f32_cache_ms = {
+            let started = std::time::Instant::now();
+            w.cpu_warm_f32_cache(&kern);
+            started.elapsed().as_secs_f64() * 1e3
+        };
+
+        #[cfg(feature = "cpu")]
+        tracing::info!(ms = format!("{cpu_f32_cache_ms:.0}"), "cpu f32 weight cache warmed");
+
         let (free, total) = dev.mem_info()?;
         tracing::info!(
             quant = %w.dominant_type(),
@@ -7849,6 +7863,17 @@ impl Model {
             .and_then(|v| v.parse().ok())
             .filter(|v| *v > 0)
             .unwrap_or(Q8_0_MMA_MAX_DEFAULT);
+        // A persistently-cached f32 decode of this matrix, when the CPU
+        // backend has one (see `Matrix::cpu_f32_weight`'s own doc comment):
+        // always the fast path when it exists, ahead of every threshold
+        // below, since those all exist to pick among ways of re-decoding
+        // this matrix's raw bytes -- a question this cache has already
+        // answered once and for all for the process lifetime.
+        #[cfg(feature = "cpu")]
+        if let Some(w_f32) = w.cpu_f32_weight(kern) {
+            return kern.cpu_gemv_f32_cached(out, w_f32, x, w.k, w.n, n_tokens);
+        }
+
         let use_gemv = if !cfg!(feature = "cuda") && w.ty == infero_kernels::WeightType::Q4K {
             n_tokens <= q4k_mma_max
         } else if !cfg!(feature = "cuda") && w.ty == infero_kernels::WeightType::Q8_0 {
