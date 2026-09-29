@@ -1,0 +1,44 @@
+# CPU-only build of infero-server -- no GPU, no CUDA/Metal toolchain. See
+# docs/keel-integration.md §4 for what this backend does and does not cover
+# (a plain F32/F16/Q8_0 dense decoder; MoE/GDN/vision/tensor-parallel/
+# speculative decoding fail loudly by kernel name rather than silently
+# degrading).
+#
+# Build:
+#   docker build -f Dockerfile.cpu -t infero:cpu .
+#
+# Run (model mounted read-only, not baked into the image):
+#   docker run --rm -p 8081:8081 \
+#     -v /mnt/data/tuili-models/Qwen3-Embedding-0.6B:/models/Qwen3-Embedding-0.6B:ro \
+#     -e INFERO_CPU_THREADS=8 \
+#     infero:cpu --model /models/Qwen3-Embedding-0.6B --ctx 2048 --max-seqs 32
+
+FROM rust:1.90-slim-bookworm AS builder
+WORKDIR /build
+
+# Dependency layer first so an edit to server/model source doesn't invalidate
+# the (much slower) full workspace dependency compile.
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
+RUN cargo build --release -p infero-server --no-default-features --features cpu
+
+FROM debian:bookworm-slim
+# curl only for the HEALTHCHECK below -- everything infero itself needs is
+# statically resolved except libc, which this image already carries.
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/target/release/infero /usr/local/bin/infero
+
+EXPOSE 8081
+
+# `/health/ready` (not just a TCP accept check): the eager f32 weight-cache
+# warm-up (`Weights::cpu_warm_f32_cache`) runs before the listener binds, so
+# by the time this endpoint answers, the first real request is already warm
+# -- not just "the process started". Hardcoded to the default 8081: a `CMD`
+# override to a different `--host` port needs `--health-cmd` overridden to
+# match (`docker run --health-cmd`, or a derived Dockerfile).
+HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=3 \
+    CMD curl -f http://127.0.0.1:8081/health/ready || exit 1
+
+ENTRYPOINT ["/usr/local/bin/infero"]
+CMD ["--host", "0.0.0.0:8081"]
