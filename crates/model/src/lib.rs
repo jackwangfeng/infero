@@ -1709,6 +1709,30 @@ enum GraphSlot {
     Ready(SendGraph),
 }
 
+/// `(pool id, n_tokens, bucketed kv_len, armed slots)` -- see `Model::graphs`'
+/// own doc comment for why every component is load-bearing.
+type GraphKey = (u64, usize, usize, Vec<usize>);
+
+/// Bounds how many distinct decode shapes' graphs `Model::graphs` keeps
+/// resident at once. Without a cap, a long-running process serving varied
+/// real traffic (many distinct KV-length buckets, batch sizes, or armed
+/// speculative slots) pins one captured graph per shape it has ever seen,
+/// forever -- a real, measured VRAM leak (~5-9 MiB per new shape in this
+/// session's own stress test), not just a theoretical one. vLLM's own graph
+/// pool avoids this by keying only on batch size, never on KV length; this
+/// codebase's key is finer-grained (it has to be, see `Model::graphs`), so it
+/// needs its own eviction instead.
+fn graph_cache_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("INFERO_GRAPH_CACHE_CAP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(512)
+    })
+}
+
 /// Device-side activations, allocated once and reused for every forward pass.
 struct Activations {
     /// The residual stream, `[chunk, d_model]`.
@@ -1959,7 +1983,17 @@ pub struct Model {
     /// speculative round on, while the other sequence (whose call did the
     /// capture) is unaffected. Keying on the armed slot itself, not just
     /// whether one is armed, is what a `bool` could never distinguish.
-    graphs: std::collections::HashMap<(u64, usize, usize, Vec<usize>), GraphSlot>,
+    graphs: std::collections::HashMap<GraphKey, GraphSlot>,
+    /// Monotonic tick, bumped once per graphable call and stashed per-key in
+    /// `graph_last_used`. The only reason it exists is to tell `graphs`'
+    /// entries apart by recency once there are more of them than
+    /// `graph_cache_cap()` -- see `evict_oldest_graph`.
+    graph_clock: u64,
+    /// Last-touched tick per `graphs` key, kept in lockstep with it (every
+    /// insert/removal on one is mirrored on the other). A `HashMap` alone has
+    /// no notion of recency, so this is what makes LRU eviction possible
+    /// without threading a linked list through `graphs` itself.
+    graph_last_used: std::collections::HashMap<GraphKey, u64>,
     /// Cleared by `INFERO_NO_GRAPH`, for measuring what the graphs are worth.
     use_graph: bool,
     max_logit_rows: usize,
@@ -2881,6 +2915,8 @@ impl Model {
             use_mmvq,
             use_mmq,
             graphs: std::collections::HashMap::new(),
+            graph_clock: 0,
+            graph_last_used: std::collections::HashMap::new(),
             use_graph,
             max_logit_rows,
             batch_tokens,
@@ -3247,6 +3283,29 @@ impl Model {
         let mut pool = self.new_pool(self.max_seq, 1)?;
         let seq = pool.alloc().context("fresh pool had no sequence rows")?;
         Ok(Session { pool, seq })
+    }
+
+    /// Drops the least-recently-touched entry in `graphs` (and its matching
+    /// `graph_last_used` tick), freeing whatever GPU memory that graph
+    /// pinned. Called once `graphs` grows past `graph_cache_cap()` -- see
+    /// that function's own doc comment for why this exists at all.
+    fn evict_oldest_graph(&mut self) {
+        let Some(oldest) = self
+            .graph_last_used
+            .iter()
+            .min_by_key(|&(_, tick)| *tick)
+            .map(|(key, _)| key.clone())
+        else {
+            // `graph_last_used` is empty but `graphs` isn't -- can't happen
+            // given every `graphs` insert is preceded by a `graph_last_used`
+            // one for the same key, but dropping an arbitrary entry is still
+            // better than looping forever if it ever does.
+            let Some(any) = self.graphs.keys().next().cloned() else { return };
+            self.graphs.remove(&any);
+            return;
+        };
+        self.graphs.remove(&oldest);
+        self.graph_last_used.remove(&oldest);
     }
 
     /// Run one sequence's tokens, splitting them across passes if needed.
@@ -3766,6 +3825,15 @@ impl Model {
             && prefill_run.is_none()
             && !layout_dependent_dispatch;
 
+        // Recency bookkeeping for `evict_oldest_graph` -- only for shapes that
+        // actually end up in (or stay in) `graphs`; a non-graphable key would
+        // otherwise grow `graph_last_used` without ever growing `graphs` to
+        // match, which is its own unbounded leak.
+        if graphable {
+            self.graph_clock += 1;
+            self.graph_last_used.insert(key.clone(), self.graph_clock);
+        }
+
         match self.graphs.get(&key) {
             Some(GraphSlot::Ready(g)) if graphable => g.0.launch()?,
             slot => {
@@ -3860,6 +3928,9 @@ impl Model {
                     }
                 }
             }
+        }
+        while self.graphs.len() > graph_cache_cap() {
+            self.evict_oldest_graph();
         }
 
         if let Some(pe) = &self.phase_ev {
