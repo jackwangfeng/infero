@@ -3281,13 +3281,13 @@ pub fn load_awq(
             })
         } else if is_linear {
             let l = format!("{p}.linear_attn");
-            let (in_proj_qkv, qkv_bytes, qkv_ty, qkv_k, qkv_n) =
+            let (mut in_proj_qkv, qkv_bytes, qkv_ty, qkv_k, qkv_n) =
                 projection_with_bytes(&format!("{l}.in_proj_qkv"), &mut device_bytes)?;
-            let (in_proj_z, z_bytes, z_ty, z_k, z_n) =
+            let (mut in_proj_z, z_bytes, z_ty, z_k, z_n) =
                 projection_with_bytes(&format!("{l}.in_proj_z"), &mut device_bytes)?;
-            let (in_proj_a, a_bytes, a_ty, a_k, a_n) =
+            let (mut in_proj_a, a_bytes, a_ty, a_k, a_n) =
                 projection_with_bytes(&format!("{l}.in_proj_a"), &mut device_bytes)?;
-            let (in_proj_b, b_bytes, b_ty, b_k, b_n) =
+            let (mut in_proj_b, b_bytes, b_ty, b_k, b_n) =
                 projection_with_bytes(&format!("{l}.in_proj_b"), &mut device_bytes)?;
             let in_proj_ba = stacked2(
                 (a_bytes.as_slice(), a_ty, a_k, a_n),
@@ -3299,6 +3299,20 @@ pub fn load_awq(
                 (z_bytes.as_slice(), z_ty, z_k, z_n),
                 &mut device_bytes,
             )?;
+            // Same reasoning as `dense_ffn`'s `w_gate`/`w_up` free above: once
+            // fused, the forward pass's `qz`/`gate` dispatch (`Model::forward`)
+            // takes the `Some(fused)` arm unconditionally and never falls
+            // through to read the individual originals again.
+            if in_proj_qz.is_some() {
+                device_bytes = device_bytes.saturating_sub(in_proj_qkv.n_bytes).saturating_sub(in_proj_z.n_bytes);
+                in_proj_qkv.free_after_fusion();
+                in_proj_z.free_after_fusion();
+            }
+            if in_proj_ba.is_some() {
+                device_bytes = device_bytes.saturating_sub(in_proj_a.n_bytes).saturating_sub(in_proj_b.n_bytes);
+                in_proj_a.free_after_fusion();
+                in_proj_b.free_after_fusion();
+            }
             Some(GdnWeights {
                 in_proj_qkv,
                 in_proj_z,
