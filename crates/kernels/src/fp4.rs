@@ -17,6 +17,7 @@
 //! rather than against a second independent reading of the NVFP4 spec.
 
 use anyhow::{Context, Result};
+use half::f16;
 use infero_gpu::{KernelArg, LaunchConfig, View, ViewMut};
 
 use crate::{Kernels, fp4_src};
@@ -357,6 +358,152 @@ impl Kernels {
             .profile()
             .time("quantize_act_e2m1_cutlass", self.dev.stream(), || {
                 unsafe { b.launch(cfg) }.context("quantize_act_e2m1_cutlass")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// Same as [`Self::quantize_act_e2m1_cutlass`], reading `x` as f16
+    /// instead of f32 -- for a caller whose activation is already resident
+    /// in f16 (see `Kernels::silu_mul_f16`), so this quantizer's own read
+    /// doesn't force a redundant f32 round-trip. The per-block max-abs and
+    /// quantization math is unchanged; see `quantize_act_e2m1_f16`'s own doc
+    /// comment in `cu/fp4.cu` for why f32's extra precision was never
+    /// load-bearing here.
+    pub fn quantize_act_e2m1_cutlass_f16(
+        &self,
+        xq: &mut ViewMut<'_, u8>,
+        xq_scale: &mut ViewMut<'_, u8>,
+        x: &View<'_, f16>,
+        input_scale: f32,
+        k: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        let blocks_per_row = k.div_ceil(F4E2M1_BLOCK);
+        debug_assert!(
+            xq.len() >= n_tokens * k.div_ceil(2),
+            "quantize output holds {} packed bytes, need {}",
+            xq.len(),
+            n_tokens * k.div_ceil(2)
+        );
+        debug_assert!(
+            xq_scale.len() >= n_tokens * blocks_per_row,
+            "quantize scale output holds {} bytes, need {}",
+            xq_scale.len(),
+            n_tokens * blocks_per_row
+        );
+        debug_assert!(
+            x.len() >= n_tokens * k,
+            "quantize input holds {} elements, need {}",
+            x.len(),
+            n_tokens * k
+        );
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_fp4", fp4_src(), "quantize_act_e2m1_f16")?;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                n_tokens as u32,
+                (blocks_per_row as u32).div_ceil(FP4_QUANT_BLOCK).max(1),
+                1,
+            ),
+            block_dim: (FP4_QUANT_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (ki, ni) = (k as i32, n_tokens as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(xq)
+            .arg(xq_scale)
+            .arg(x)
+            .arg(&input_scale)
+            .arg(&ki)
+            .arg(&ni);
+        self.dev
+            .profile()
+            .time("quantize_act_e2m1_cutlass_f16", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("quantize_act_e2m1_cutlass_f16")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// Fused SiLU-gate-mul + NVFP4 activation quantizer: computes
+    /// `silu(gate[i]) * up[i]` (the same SwiGLU product
+    /// [`Kernels::silu_mul`]/`silu_mul_f16` compute) and quantizes it
+    /// directly to packed NVFP4, without ever materializing the
+    /// `silu(gate)*up` intermediate in global memory. For exactly one real
+    /// caller: `down_proj`'s NVFP4 quantize step, where that intermediate's
+    /// only consumer is this quantizer -- see `cu/fp4.cu`'s
+    /// `quantize_silu_mul_e2m1_f32` doc comment for the full elimination
+    /// rationale and the FFN byte-accounting pass this supersedes.
+    ///
+    /// `gate`/`up` are `n_tokens` rows of `k` f32 elements each (the raw
+    /// `gate_proj`/`up_proj` GEMM outputs). Output layout (`xq`/`xq_scale`)
+    /// and `input_scale`'s meaning are otherwise identical to
+    /// [`Self::quantize_act_e2m1_cutlass`] -- same real quantize math and
+    /// output format, so down_proj's CUTLASS GEMM consumes it unchanged.
+    pub fn quantize_silu_mul_e2m1_cutlass(
+        &self,
+        xq: &mut ViewMut<'_, u8>,
+        xq_scale: &mut ViewMut<'_, u8>,
+        gate: &View<'_, f32>,
+        up: &View<'_, f32>,
+        input_scale: f32,
+        k: usize,
+        n_tokens: usize,
+    ) -> Result<()> {
+        let blocks_per_row = k.div_ceil(F4E2M1_BLOCK);
+        debug_assert!(
+            xq.len() >= n_tokens * k.div_ceil(2),
+            "quantize output holds {} packed bytes, need {}",
+            xq.len(),
+            n_tokens * k.div_ceil(2)
+        );
+        debug_assert!(
+            xq_scale.len() >= n_tokens * blocks_per_row,
+            "quantize scale output holds {} bytes, need {}",
+            xq_scale.len(),
+            n_tokens * blocks_per_row
+        );
+        debug_assert!(
+            gate.len() >= n_tokens * k,
+            "quantize gate input holds {} elements, need {}",
+            gate.len(),
+            n_tokens * k
+        );
+        debug_assert!(
+            up.len() >= n_tokens * k,
+            "quantize up input holds {} elements, need {}",
+            up.len(),
+            n_tokens * k
+        );
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_fp4", fp4_src(), "quantize_silu_mul_e2m1_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                n_tokens as u32,
+                (blocks_per_row as u32).div_ceil(FP4_QUANT_BLOCK).max(1),
+                1,
+            ),
+            block_dim: (FP4_QUANT_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (ki, ni) = (k as i32, n_tokens as i32);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(xq)
+            .arg(xq_scale)
+            .arg(gate)
+            .arg(up)
+            .arg(&input_scale)
+            .arg(&ki)
+            .arg(&ni);
+        self.dev
+            .profile()
+            .time("quantize_silu_mul_e2m1_cutlass", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("quantize_silu_mul_e2m1_cutlass")?;
                 Ok(())
             })?;
         Ok(())

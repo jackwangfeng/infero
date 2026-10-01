@@ -4770,6 +4770,7 @@ impl Model {
                 self.use_mmq,
                 shared,
                 shared_f16,
+                None,
             )?;
         }
         if fused_qz {
@@ -5069,6 +5070,7 @@ impl Model {
             self.use_mmq,
             None,
             false,
+            None,
         )?;
         probe(&self.kern, layer, "gdn_out_proj_out", &proj.slice(..n * d));
         // `out_proj` is row-parallel (contracts over `val_dim`, this rank's
@@ -5277,6 +5279,7 @@ impl Model {
                 self.use_mmq,
                 shared,
                 shared_f16,
+                None,
             )?;
             // Nothing has to be unpacked: `rope_qk_packed` reads `q` and `k`
             // out of this row and `store_kv2_packed` reads `k` and `v`, so the
@@ -5335,6 +5338,7 @@ impl Model {
                 self.use_mmq,
                 shared,
                 shared_f16,
+                None,
             )?;
             let Activations {
                 q, gate, attn_gate, ..
@@ -5373,6 +5377,7 @@ impl Model {
                 self.use_mmq,
                 shared,
                 shared_f16,
+                None,
             )?;
             let Activations { k, v, gate, .. } = &mut self.act;
             self.kern.split2(
@@ -5412,6 +5417,7 @@ impl Model {
                 self.use_mmq,
                 shared,
                 shared_f16,
+                None,
             )?;
             if let Some(b) = bias {
                 self.kern
@@ -6737,6 +6743,7 @@ impl Model {
             self.use_mmq,
             None,
             attn_f16,
+            None,
         )?;
         // `wo` is row-parallel (contracts over `da`, this rank's own head
         // shard) -- `self.act.proj` is only this rank's partial sum until
@@ -6944,6 +6951,7 @@ impl Model {
                 self.use_mmq,
                 shared,
                 shared_f16,
+                None,
             )?;
             // `down` is the only reader of this product, and above one token it
             // takes f16 — so the f16 copy can be written here, out of the
@@ -7036,6 +7044,7 @@ impl Model {
                     self.use_mmq,
                     shared,
                     shared_f16 || gemm_shared,
+                    None,
                 )?;
                 Self::matmul_pre(
                     &self.kern,
@@ -7049,12 +7058,33 @@ impl Model {
                     self.use_mmq,
                     shared,
                     shared_f16 || gemm_shared,
+                    None,
                 )?;
             }
         }
         // The stacked branch already applied it, over the two halves of one
         // row rather than over two tensors.
-        if stacked.is_none() {
+        // n>1: `down_is_nvfp4` is only ever true alongside `n > 1` (prefill),
+        // which is exactly where `quantize_act_e2m1_cutlass`'s own cost is
+        // real (9.8% of a real 27295-token profile) -- and in that case
+        // `self.act.ffn` is never written at all (see below): `down_proj`'s
+        // CUTLASS GEMM reads the fused kernel's packed NVFP4 output
+        // directly, and `residual_fusable` (the only other reader of
+        // `self.act.ffn`, just below) requires `n_tokens == 1`, so it never
+        // runs when `down_is_nvfp4` does.
+        let down_is_nvfp4 =
+            n > 1 && l.dense().w_down.ty == infero_kernels::WeightType::F4E2M1;
+        // `down_is_nvfp4`: no write here at all. `silu(gate) * up`'s only
+        // consumer in that case is `down_proj`'s NVFP4 quantizer, which
+        // `matmul_pre`'s F4E2M1 branch now computes in one fused kernel
+        // (`Kernels::quantize_silu_mul_e2m1_cutlass`, via
+        // `gate_up_for_fusion` below) straight from `gate`/`up` -- so the
+        // `[n_tokens, d_ff]` intermediate this block used to write (and the
+        // quantizer used to read back) is never materialized at all. This
+        // supersedes the former `silu_mul_f16` + `self.act.ffn_f16` f16-
+        // shadow mechanism, which wrote that intermediate twice (f32 *and*
+        // f16) instead of not writing it.
+        if stacked.is_none() && !down_is_nvfp4 {
             self.kern.silu_mul(
                 &mut self.act.ffn.slice_mut(..n * d_ff),
                 &self.act.gate.slice(..n * d_ff),
@@ -7081,6 +7111,8 @@ impl Model {
             return Ok(());
         }
 
+        let gate_view = self.act.gate.slice(..n * d_ff);
+        let up_view = self.act.up.slice(..n * d_ff);
         Self::matmul_pre(
             &self.kern,
             &mut self.scratch,
@@ -7093,6 +7125,18 @@ impl Model {
             self.use_mmq,
             None,
             ffn_f16,
+            // `stacked.is_some()` means `self.act.gate` holds the
+            // *interleaved* `[n, 2*d_ff]` row the `stacked` branch above
+            // wrote (and `self.act.up` was never written at all in that
+            // case) -- the fused kernel's `gate_view`/`up_view` assume
+            // separate `[n, d_ff]` planes, so it must not be used there.
+            // `self.act.ffn` is already correctly populated by that branch's
+            // own `silu_mul_split`/`_f16` call instead, which the `None`
+            // (unfused) path below reads via `x`. Not reachable today (this
+            // checkpoint's gate/up are F4E2M1, never `stacked`), but a wrong
+            // default here would silently corrupt `down_proj` the moment a
+            // checkpoint combines a stacked gate/up with an NVFP4 down_proj.
+            if down_is_nvfp4 && stacked.is_none() { Some((&gate_view, &up_view)) } else { None },
         )?;
         // `w_down` is row-parallel (contracts over `d_ff`, this rank's own
         // shard of the FFN hidden width) -- same reasoning as `wo`/GDN's
@@ -7171,6 +7215,7 @@ impl Model {
                 self.use_mmq,
                 None,
                 false,
+                None,
             )?;
         }
         {
@@ -7386,7 +7431,7 @@ impl Model {
         use_mmq: bool,
     ) -> Result<()> {
         Self::matmul_pre(
-            kern, scratch, out, w, stage, x, n_tokens, use_mmvq, use_mmq, None, false,
+            kern, scratch, out, w, stage, x, n_tokens, use_mmvq, use_mmq, None, false, None,
         )
     }
 
@@ -7434,6 +7479,18 @@ impl Model {
         use_mmq: bool,
         pre_quantized: Option<usize>,
         pre_f16: bool,
+        // `gate`/`up` for the one caller (NVFP4 down_proj) whose activation
+        // is itself a SwiGLU product (`silu(gate) * up`) that nothing else
+        // ever reads -- lets the F4E2M1 branch below quantize that product
+        // directly via `quantize_silu_mul_e2m1_cutlass`, in one fused
+        // kernel, without `x` (the caller's `self.act.ffn`) ever being
+        // written or read at all. `None` at every other call site; only
+        // meaningful for `WeightType::F4E2M1`. Supersedes the former
+        // `x_f16`/`Kernels::silu_mul_f16`/`self.act.ffn_f16` mechanism,
+        // which wrote a whole `[n_tokens, d_ff]` f16 shadow copy just to
+        // skip a redundant f32 read here -- this skips materializing the
+        // product's f32 copy in the first place.
+        gate_up_for_fusion: Option<(&View<'_, f32>, &View<'_, f32>)>,
     ) -> Result<()> {
         let weights = w.view(stage)?;
 
@@ -7723,19 +7780,32 @@ impl Model {
                 "NVFP4 activation quant scratch too small for {n_tokens} tokens at k={}",
                 w.k
             );
-            kern.quantize_act_e2m1_cutlass(
-                &mut scratch.xq_e2m1.slice_mut(..xq_len),
-                &mut scratch.xs_e2m1.slice_mut(..xs_len),
-                x,
-                // The quantizer's `global_scale` is the RECIPROCAL of the
-                // checkpoint's `input_scale`, not the raw value -- see
-                // `cutlass_fp4.rs`'s "CORRECTION 2" doc comment on
-                // `mma_e2m1_cutlass_sfa_f32out` for the full derivation (the
-                // raw value's role is `alpha`, computed there instead).
-                1.0 / cw.input_scale(),
-                w.k,
-                n_tokens,
-            )?;
+            // The quantizer's `global_scale` is the RECIPROCAL of the
+            // checkpoint's `input_scale`, not the raw value -- see
+            // `cutlass_fp4.rs`'s "CORRECTION 2" doc comment on
+            // `mma_e2m1_cutlass_sfa_f32out` for the full derivation (the raw
+            // value's role is `alpha`, computed there instead).
+            let global_scale = 1.0 / cw.input_scale();
+            if let Some((gate, up)) = gate_up_for_fusion {
+                kern.quantize_silu_mul_e2m1_cutlass(
+                    &mut scratch.xq_e2m1.slice_mut(..xq_len),
+                    &mut scratch.xs_e2m1.slice_mut(..xs_len),
+                    gate,
+                    up,
+                    global_scale,
+                    w.k,
+                    n_tokens,
+                )?;
+            } else {
+                kern.quantize_act_e2m1_cutlass(
+                    &mut scratch.xq_e2m1.slice_mut(..xq_len),
+                    &mut scratch.xs_e2m1.slice_mut(..xs_len),
+                    x,
+                    global_scale,
+                    w.k,
+                    n_tokens,
+                )?;
+            }
             let ran = kern.mma_e2m1_cutlass_sfa_f32out(
                 out,
                 &weights,
@@ -8051,8 +8121,12 @@ impl Model {
             .cutlass_fp4_weight(kern)
             .with_context(|| format!("preparing CUTLASS NVFP4 weight for a {}x{} matrix", w_b.n, w_b.k))?;
         if cw_a.input_scale() != cw_b.input_scale() {
-            Self::matmul_pre(kern, scratch, out_a, w_a, stage, x, n_tokens, use_mmvq, use_mmq, None, false)?;
-            Self::matmul_pre(kern, scratch, out_b, w_b, stage, x, n_tokens, use_mmvq, use_mmq, None, false)?;
+            Self::matmul_pre(
+                kern, scratch, out_a, w_a, stage, x, n_tokens, use_mmvq, use_mmq, None, false, None,
+            )?;
+            Self::matmul_pre(
+                kern, scratch, out_b, w_b, stage, x, n_tokens, use_mmvq, use_mmq, None, false, None,
+            )?;
             return Ok(());
         }
 

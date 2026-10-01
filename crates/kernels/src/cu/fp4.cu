@@ -172,6 +172,180 @@ extern "C" __global__ void quantize_act_e2m1_f32(
     }
 }
 
+// Same as `quantize_act_e2m1_f32`, reading `__half` input instead of `float`
+// -- for a caller whose activation is already resident in f16 (e.g. straight
+// out of a fused SwiGLU that also wrote the f16 copy), so this quantizer's
+// own read doesn't force a redundant f32 round-trip. The per-block max-abs
+// and quantization math is unchanged (see that kernel's own doc comment for
+// why f32's extra precision was never load-bearing here to begin with) --
+// only the two `xrow[...]` reads gain a `__half2float` conversion.
+extern "C" __global__ void quantize_act_e2m1_f16(
+        unsigned char* __restrict__ xq, unsigned char* __restrict__ xq_scale,
+        const __half* __restrict__ x, float global_scale, int k, int n_tokens) {
+    const int tok = blockIdx.x;
+    const int blocks_per_row = (k + F4E2M1_BLOCK - 1) / F4E2M1_BLOCK;
+    const int block = blockIdx.y * (int)blockDim.x + (int)threadIdx.x;
+    if (tok >= n_tokens || block >= blocks_per_row) return;
+
+    const int bytes_per_row = (k + 1) / 2;
+    const __half* xrow = x + (size_t)tok * k;
+    unsigned char* xqrow = xq + (size_t)tok * bytes_per_row;
+    unsigned char* xsrow = xq_scale + (size_t)tok * blocks_per_row;
+
+    const int base = block * F4E2M1_BLOCK;
+    const int n_in_block = min(F4E2M1_BLOCK, k - base);
+
+    float vec_max = 0.0f;
+#pragma unroll
+    for (int i = 0; i < F4E2M1_BLOCK; ++i) {
+        if (i < n_in_block) vec_max = fmaxf(vec_max, fabsf(__half2float(xrow[base + i])));
+    }
+
+    float scale_f32 = global_scale * vec_max * (1.0f / 6.0f);
+    scale_f32 = fminf(fmaxf(scale_f32, -448.0f), 448.0f);
+    const unsigned char scale_byte = f32_to_e4m3(scale_f32);
+    xsrow[block] = scale_byte;
+    const float scale_q = e4m3_to_f32((unsigned int)scale_byte);
+
+    const float output_scale = (scale_q == 0.0f) ? 0.0f : (global_scale / scale_q);
+
+#pragma unroll
+    for (int i = 0; i < F4E2M1_BLOCK; i += 2) {
+        if (i >= n_in_block) break;
+
+        unsigned int codes[2] = {0u, 0u};
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int idx = i + j;
+            if (idx >= n_in_block) continue;
+
+            const float scaled = __half2float(xrow[base + idx]) * output_scale;
+            const float clipped = fminf(fmaxf(scaled, -6.0f), 6.0f);
+            const float mag = fabsf(clipped);
+
+            unsigned int mag_code;
+            if (mag <= 0.25f) mag_code = 0u;
+            else if (mag < 0.75f) mag_code = 1u;
+            else if (mag <= 1.25f) mag_code = 2u;
+            else if (mag < 1.75f) mag_code = 3u;
+            else if (mag <= 2.5f) mag_code = 4u;
+            else if (mag < 3.5f) mag_code = 5u;
+            else if (mag <= 5.0f) mag_code = 6u;
+            else mag_code = 7u;
+
+            const unsigned int sign_bit = (clipped < 0.0f) ? 0x08u : 0x00u;
+            codes[j] = mag_code | sign_bit;
+        }
+
+        const unsigned char byte = (unsigned char)((codes[1] << 4) | codes[0]);
+        xqrow[(base + i) / 2] = byte;
+    }
+}
+
+// ---- fused SiLU-gate-mul + NVFP4 activation quantizer ----
+//
+// Computes `silu(gate[i]) * up[i]` (the same SwiGLU product `silu_mul_f32`/
+// `silu_mul_f16_f32` in `ops.cu` compute) and immediately quantizes it to
+// packed e2m1 + per-block f8_e4m3 scale, WITHOUT ever writing the
+// intermediate `silu(gate)*up` activation to global memory. This exists for
+// exactly one caller: `down_proj`'s NVFP4 quantize step, where the
+// `silu_mul` output's only consumer is this quantizer (see the FFN byte-
+// accounting pass's call-site audit) -- so the two kernels' shared
+// [n_tokens, d_ff] intermediate tensor (today: one dead f32 write in
+// `silu_mul_f16_f32`, one f16 write, one f16 read-back here) can be
+// eliminated entirely: `gate`/`up` are read ONCE per 16-element block,
+// directly into registers, the SwiGLU product is computed from those
+// register values, and the existing two-pass quantize (max-abs, then
+// quantize-and-pack) runs on them exactly as `quantize_act_e2m1_f32` runs on
+// its `x` argument -- same math, same output format, so down_proj's CUTLASS
+// GEMM consumes it completely unchanged. Block/thread layout, the clamp/
+// threshold table and the nibble packing convention are copied verbatim
+// from `quantize_act_e2m1_f32` (see that kernel's own doc comment for why
+// each of those choices is made) -- the only real change is the input: two
+// `gate`/`up` reads per element instead of one `x` read, feeding `silu(g)*u`
+// into the same per-block reduction/quantize passes.
+extern "C" __global__ void quantize_silu_mul_e2m1_f32(
+        unsigned char* __restrict__ xq, unsigned char* __restrict__ xq_scale,
+        const float* __restrict__ gate, const float* __restrict__ up,
+        float global_scale, int k, int n_tokens) {
+    const int tok = blockIdx.x;
+    const int blocks_per_row = (k + F4E2M1_BLOCK - 1) / F4E2M1_BLOCK;
+    const int block = blockIdx.y * (int)blockDim.x + (int)threadIdx.x;
+    if (tok >= n_tokens || block >= blocks_per_row) return;
+
+    const int bytes_per_row = (k + 1) / 2;
+    const float* grow = gate + (size_t)tok * k;
+    const float* urow = up + (size_t)tok * k;
+    unsigned char* xqrow = xq + (size_t)tok * bytes_per_row;
+    unsigned char* xsrow = xq_scale + (size_t)tok * blocks_per_row;
+
+    const int base = block * F4E2M1_BLOCK;
+    const int n_in_block = min(F4E2M1_BLOCK, k - base);
+
+    // Pass 1: compute the SwiGLU product for this block into registers, and
+    // its max-abs, in one pass over the 16 elements (one `gate`/`up` read
+    // each, not re-read in pass 2 below).
+    float x[F4E2M1_BLOCK];
+    float vec_max = 0.0f;
+#pragma unroll
+    for (int i = 0; i < F4E2M1_BLOCK; ++i) {
+        if (i < n_in_block) {
+            const float g = grow[base + i];
+            const float v = (g / (1.0f + __expf(-g))) * urow[base + i];
+            x[i] = v;
+            vec_max = fmaxf(vec_max, fabsf(v));
+        } else {
+            x[i] = 0.0f;
+        }
+    }
+
+    // scale_f32 -> fp8 -> read back the lossy value, same as
+    // `quantize_act_e2m1_f32`.
+    float scale_f32 = global_scale * vec_max * (1.0f / 6.0f);
+    scale_f32 = fminf(fmaxf(scale_f32, -448.0f), 448.0f);
+    const unsigned char scale_byte = f32_to_e4m3(scale_f32);
+    xsrow[block] = scale_byte;
+    const float scale_q = e4m3_to_f32((unsigned int)scale_byte);
+
+    const float output_scale = (scale_q == 0.0f) ? 0.0f : (global_scale / scale_q);
+
+    // Pass 2: quantize the register-resident SwiGLU values and pack two
+    // nibbles per byte -- identical to `quantize_act_e2m1_f32`'s own pass 2,
+    // just reading `x[i]` (a register array) instead of `xrow[base + i]`
+    // (a second global-memory read of the same elements).
+#pragma unroll
+    for (int i = 0; i < F4E2M1_BLOCK; i += 2) {
+        if (i >= n_in_block) break;
+
+        unsigned int codes[2] = {0u, 0u};
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int idx = i + j;
+            if (idx >= n_in_block) continue;
+
+            const float scaled = x[idx] * output_scale;
+            const float clipped = fminf(fmaxf(scaled, -6.0f), 6.0f);
+            const float mag = fabsf(clipped);
+
+            unsigned int mag_code;
+            if (mag <= 0.25f) mag_code = 0u;
+            else if (mag < 0.75f) mag_code = 1u;
+            else if (mag <= 1.25f) mag_code = 2u;
+            else if (mag < 1.75f) mag_code = 3u;
+            else if (mag <= 2.5f) mag_code = 4u;
+            else if (mag < 3.5f) mag_code = 5u;
+            else if (mag <= 5.0f) mag_code = 6u;
+            else mag_code = 7u;
+
+            const unsigned int sign_bit = (clipped < 0.0f) ? 0x08u : 0x00u;
+            codes[j] = mag_code | sign_bit;
+        }
+
+        const unsigned char byte = (unsigned char)((codes[1] << 4) | codes[0]);
+        xqrow[(base + i) / 2] = byte;
+    }
+}
+
 // ---- CUTLASS NVFP4 scale-factor swizzle (`cutlass` feature only, but this
 // kernel itself is plain NVRTC-compiled CUDA C like everything else in this
 // file -- it feeds the AOT `nvcc`-built `cutlass/fp4_bw_gemm.cu`, but is not
