@@ -7001,32 +7001,56 @@ impl Model {
                     n * d,
                 )?;
             }
-            Self::matmul_pre(
-                &self.kern,
-                &mut self.scratch,
-                &mut self.act.gate.slice_mut(..n * d_ff),
-                &l.dense().w_gate,
-                stage,
-                &self.act.xb.slice(..n * d),
-                n,
-                self.use_mmvq,
-                self.use_mmq,
-                shared,
-                shared_f16 || gemm_shared,
-            )?;
-            Self::matmul_pre(
-                &self.kern,
-                &mut self.scratch,
-                &mut self.act.up.slice_mut(..n * d_ff),
-                &l.dense().w_up,
-                stage,
-                &self.act.xb.slice(..n * d),
-                n,
-                self.use_mmvq,
-                self.use_mmq,
-                shared,
-                shared_f16 || gemm_shared,
-            )?;
+            #[cfg(feature = "cutlass")]
+            let ffn_f4e2m1_pair = l.dense().w_gate.ty == infero_kernels::WeightType::F4E2M1
+                && l.dense().w_up.ty == infero_kernels::WeightType::F4E2M1;
+            #[cfg(not(feature = "cutlass"))]
+            let ffn_f4e2m1_pair = false;
+            if ffn_f4e2m1_pair {
+                #[cfg(feature = "cutlass")]
+                Self::matmul_pre_f4e2m1_dedup(
+                    &self.kern,
+                    &mut self.scratch,
+                    &mut self.act.gate.slice_mut(..n * d_ff),
+                    &l.dense().w_gate,
+                    &mut self.act.up.slice_mut(..n * d_ff),
+                    &l.dense().w_up,
+                    stage,
+                    &self.act.xb.slice(..n * d),
+                    n,
+                    self.use_mmvq,
+                    self.use_mmq,
+                )?;
+                #[cfg(not(feature = "cutlass"))]
+                unreachable!("ffn_f4e2m1_pair is always false without the cutlass feature");
+            } else {
+                Self::matmul_pre(
+                    &self.kern,
+                    &mut self.scratch,
+                    &mut self.act.gate.slice_mut(..n * d_ff),
+                    &l.dense().w_gate,
+                    stage,
+                    &self.act.xb.slice(..n * d),
+                    n,
+                    self.use_mmvq,
+                    self.use_mmq,
+                    shared,
+                    shared_f16 || gemm_shared,
+                )?;
+                Self::matmul_pre(
+                    &self.kern,
+                    &mut self.scratch,
+                    &mut self.act.up.slice_mut(..n * d_ff),
+                    &l.dense().w_up,
+                    stage,
+                    &self.act.xb.slice(..n * d),
+                    n,
+                    self.use_mmvq,
+                    self.use_mmq,
+                    shared,
+                    shared_f16 || gemm_shared,
+                )?;
+            }
         }
         // The stacked branch already applied it, over the two halves of one
         // row rather than over two tensors.
@@ -7989,6 +8013,103 @@ impl Model {
             w.k,
             w.n,
         )
+    }
+
+    /// Runs two NVFP4 (`F4E2M1`) projections against the *same* activation
+    /// `x`, quantizing it only once when `w_a`'s and `w_b`'s CUTLASS
+    /// `input_scale`s are bit-identical (checked at runtime, never assumed --
+    /// real for this session's checkpoint's `gate_proj`/`up_proj`, verified
+    /// straight from its own safetensors header, but a different checkpoint
+    /// could genuinely differ). Falls back to two ordinary `matmul_pre` calls
+    /// when they don't match, so this is never wrong, only sometimes not a
+    /// win. Skips one of `quantize_act_e2m1_cutlass`'s two otherwise-
+    /// identical calls -- ~9.8% of a real 27295-token prefill step was spent
+    /// in that kernel before this existed.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(feature = "cutlass")]
+    fn matmul_pre_f4e2m1_dedup(
+        kern: &Kernels,
+        scratch: &mut Scratch,
+        out_a: &mut ViewMut<'_, f32>,
+        w_a: &Matrix,
+        out_b: &mut ViewMut<'_, f32>,
+        w_b: &Matrix,
+        stage: Option<&Buf<u8>>,
+        x: &View<'_, f32>,
+        n_tokens: usize,
+        use_mmvq: bool,
+        use_mmq: bool,
+    ) -> Result<()> {
+        debug_assert_eq!(w_a.ty, infero_kernels::WeightType::F4E2M1);
+        debug_assert_eq!(w_b.ty, infero_kernels::WeightType::F4E2M1);
+        debug_assert_eq!(w_a.k, w_b.k);
+
+        let cw_a = w_a
+            .cutlass_fp4_weight(kern)
+            .with_context(|| format!("preparing CUTLASS NVFP4 weight for a {}x{} matrix", w_a.n, w_a.k))?;
+        let cw_b = w_b
+            .cutlass_fp4_weight(kern)
+            .with_context(|| format!("preparing CUTLASS NVFP4 weight for a {}x{} matrix", w_b.n, w_b.k))?;
+        if cw_a.input_scale() != cw_b.input_scale() {
+            Self::matmul_pre(kern, scratch, out_a, w_a, stage, x, n_tokens, use_mmvq, use_mmq, None, false)?;
+            Self::matmul_pre(kern, scratch, out_b, w_b, stage, x, n_tokens, use_mmvq, use_mmq, None, false)?;
+            return Ok(());
+        }
+
+        let blocks = w_a.k.div_ceil(infero_kernels::fp4::F4E2M1_BLOCK);
+        let xq_len = n_tokens * w_a.k.div_ceil(2);
+        let xs_len = n_tokens * blocks;
+        anyhow::ensure!(
+            scratch.xq_e2m1.len() >= xq_len && scratch.xs_e2m1.len() >= xs_len,
+            "NVFP4 activation quant scratch too small for {n_tokens} tokens at k={}",
+            w_a.k
+        );
+        let global_scale = 1.0 / cw_a.input_scale();
+        kern.quantize_act_e2m1_cutlass(
+            &mut scratch.xq_e2m1.slice_mut(..xq_len),
+            &mut scratch.xs_e2m1.slice_mut(..xs_len),
+            x,
+            global_scale,
+            w_a.k,
+            n_tokens,
+        )?;
+        let weights_a = w_a.view(stage)?;
+        let ran_a = kern.mma_e2m1_cutlass_sfa_f32out(
+            out_a,
+            &weights_a,
+            cw_a,
+            &scratch.xq_e2m1.slice(..xq_len),
+            &scratch.xs_e2m1.slice(..xs_len),
+            w_a.k,
+            w_a.n,
+            n_tokens,
+            false,
+        )?;
+        anyhow::ensure!(
+            ran_a,
+            "CUTLASS declined a {}x{} matmul (dedup path) at {n_tokens} tokens",
+            w_a.n,
+            w_a.k
+        );
+        let weights_b = w_b.view(stage)?;
+        let ran_b = kern.mma_e2m1_cutlass_sfa_f32out(
+            out_b,
+            &weights_b,
+            cw_b,
+            &scratch.xq_e2m1.slice(..xq_len),
+            &scratch.xs_e2m1.slice(..xs_len),
+            w_b.k,
+            w_b.n,
+            n_tokens,
+            false,
+        )?;
+        anyhow::ensure!(
+            ran_b,
+            "CUTLASS declined a {}x{} matmul (dedup path) at {n_tokens} tokens",
+            w_b.n,
+            w_b.k
+        );
+        Ok(())
     }
 }
 
