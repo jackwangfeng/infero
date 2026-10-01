@@ -508,6 +508,102 @@ impl Kernels {
             })?;
         Ok(())
     }
+
+    /// Fuses [`Kernels::rms_norm`]'s register-resident RMS norm with
+    /// [`Self::quantize_act_e2m1_cutlass`]'s own NVFP4 quantize pass, for one
+    /// real caller: `feed_forward`'s plain (unfused, F4E2M1 gate/up) norm
+    /// immediately feeding `matmul_pre_f4e2m1_dedup`'s quantize call. See
+    /// `cu/fp4.cu`'s `rms_norm_quantize_e2m1_f32` doc comment for the real
+    /// design (how the existing register-resident norm's strided layout
+    /// already produces E2M1-block-aligned half-warp groups for free, with no
+    /// data movement).
+    ///
+    /// `out` gets the plain normalized f32 row (same convention as
+    /// [`Kernels::rms_norm`]'s own `out`); `xq`/`xq_scale`/`input_scale`'s
+    /// meaning is otherwise identical to [`Self::quantize_act_e2m1_cutlass`].
+    /// Only defined for `d` that fits the register-resident norm at all (the
+    /// same gate [`Kernels::rms_norm`] itself uses to pick its fused path) --
+    /// this fusion only ever replaces the branch that already goes through
+    /// that path; a caller needing the wider, non-register-resident norm must
+    /// fall back to the unfused two calls.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rms_norm_quantize_e2m1_cutlass(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        xq: &mut ViewMut<'_, u8>,
+        xq_scale: &mut ViewMut<'_, u8>,
+        x: &View<'_, f32>,
+        weight: &View<'_, f32>,
+        input_scale: f32,
+        d: usize,
+        n_tokens: usize,
+        eps: f32,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            crate::rms_fits(d),
+            "fused rms_norm+quantize needs d <= 1024 * {}, got {d}",
+            crate::RMS_REGS
+        );
+        let blocks_per_row = d.div_ceil(F4E2M1_BLOCK);
+        let bytes_per_row = d.div_ceil(2);
+        debug_assert!(
+            out.len() >= n_tokens * d,
+            "fused norm output holds {} elements, need {}",
+            out.len(),
+            n_tokens * d
+        );
+        debug_assert!(
+            x.len() >= n_tokens * d,
+            "fused norm input holds {} elements, need {}",
+            x.len(),
+            n_tokens * d
+        );
+        debug_assert!(
+            weight.len() >= d,
+            "fused norm weight holds {} elements, need {}",
+            weight.len(),
+            d
+        );
+        debug_assert!(
+            xq.len() >= n_tokens * bytes_per_row,
+            "fused quantize output holds {} packed bytes, need {}",
+            xq.len(),
+            n_tokens * bytes_per_row
+        );
+        debug_assert!(
+            xq_scale.len() >= n_tokens * blocks_per_row,
+            "fused quantize scale output holds {} bytes, need {}",
+            xq_scale.len(),
+            n_tokens * blocks_per_row
+        );
+
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_fp4", fp4_src(), "rms_norm_quantize_e2m1_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_tokens as u32, 1, 1),
+            block_dim: (crate::rms_block(d), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (d_i, eps_f) = (d as i32, eps);
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out)
+            .arg(xq)
+            .arg(xq_scale)
+            .arg(x)
+            .arg(weight)
+            .arg(&input_scale)
+            .arg(&d_i)
+            .arg(&eps_f);
+        self.dev
+            .profile()
+            .time("rms_norm_quantize_e2m1_cutlass", self.dev.stream(), || {
+                unsafe { b.launch(cfg) }.context("rms_norm_quantize_e2m1_cutlass")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -346,6 +346,163 @@ extern "C" __global__ void quantize_silu_mul_e2m1_f32(
     }
 }
 
+// ---- fused rms_norm + NVFP4(E2M1) activation quantizer ----
+//
+// Fuses the register-resident RMS norm (`rms_norm_f16_f32`/`rms_norm_q8_1_f32`,
+// `cu/mmvq.cu`) with this file's own `quantize_act_e2m1_f32` per-16-block
+// NVFP4 quantize pass, for one real caller: `feed_forward`'s plain (unfused,
+// F4E2M1 gate/up) norm immediately followed by `matmul_pre_f4e2m1_dedup`'s own
+// `quantize_act_e2m1_cutlass` read of that same row (see this fusion's own
+// investigation report for the real call-site trace that confirms nothing
+// else reads the row in between).
+//
+// ---- The real design problem this solves ----
+//
+// `rms_norm_f16_f32`'s strided per-thread load (`i = k*blockDim.x + tid`, `k`
+// in `[0, FP4_RMS_REGS)`) groups elements into runs of `blockDim.x` (always a
+// multiple of 32) per `k` -- which is exactly why `rms_norm_q8_1_f32` could
+// bolt a 32-wide Q8_1 quantize onto it for free (one warp's lanes, for a
+// fixed `k`, are already 32 CONSECUTIVE elements). E2M1's block is 16, not
+// 32 -- half a warp -- but the same trick falls out of the SAME strided
+// assignment with no data movement: for a fixed `k` and half-warp index
+// `hw = tid / F4E2M1_BLOCK`, the 16 lanes `lane16 = tid % F4E2M1_BLOCK` cover
+// `i = k*blockDim.x + hw*F4E2M1_BLOCK + lane16`, which are 16 CONSECUTIVE
+// indices (since `blockDim.x` is already forced to a multiple of 32, hence of
+// `F4E2M1_BLOCK`) -- exactly one E2M1 block, aligned. So phase 3 below needs
+// no block-level loop over blocks-per-row: each thread already owns
+// `FP4_RMS_REGS` elements spanning `FP4_RMS_REGS` separate, already-aligned
+// 16-blocks via its `k` index, and a HALF-WARP shuffle reduction
+// (`__shfl_xor_sync(..., width=16)`) is all phase 3 needs -- no shared memory,
+// the same way `rms_norm_q8_1_f32`'s own per-warp Q8_1 tail needs none.
+//
+// Scale derivation, the asymmetric threshold table and the nibble-pack
+// convention are copied verbatim from `quantize_act_e2m1_f32` above -- same
+// math, same output format, so `matmul_pre_f4e2m1_dedup`'s CUTLASS GEMM
+// consumes it completely unchanged. The partial-last-block masking
+// (`n_in_block`) is ALSO ported verbatim: the block/grid sizing here is
+// driven by `d` rounded up to a multiple of 32 (`rms_block` on the host
+// side), independent of whether `d` itself happens to be a multiple of 16, so
+// an unguarded write at a non-16-aligned `d` would be a real out-of-bounds
+// write past `bytes_per_row`/`blocks_per_row` -- see this fusion's own test
+// for a `d` chosen specifically NOT a multiple of 16.
+//
+// `out` still gets the plain normalized f32 row (same convention as
+// `rms_norm_f16_f32` called with `hout = nullptr`) -- cheap insurance against
+// anything that might legitimately read the unquantized row across the call
+// boundary, not load-bearing for the real call site today (see the
+// investigation's own control-flow trace).
+//
+// Must match `RMS_REGS` in `lib.rs`/`mmvq.cu` -- the host picks the block
+// size assuming this exact register count.
+#define FP4_RMS_REGS 8
+
+extern "C" __global__ void rms_norm_quantize_e2m1_f32(
+        float* __restrict__ out, unsigned char* __restrict__ xq,
+        unsigned char* __restrict__ xq_scale, const float* __restrict__ x,
+        const float* __restrict__ weight, float global_scale, int d, float eps) {
+    const int token = blockIdx.x;
+    const float* row = x + (size_t)token * d;
+    float* orow = out + (size_t)token * d;
+    const int tid = (int)threadIdx.x;
+
+    const int blocks_per_row = (d + F4E2M1_BLOCK - 1) / F4E2M1_BLOCK;
+    const int bytes_per_row = (d + 1) / 2;
+    unsigned char* xqrow = xq + (size_t)token * bytes_per_row;
+    unsigned char* xsrow = xq_scale + (size_t)token * blocks_per_row;
+
+    // Phase 1 (boilerplate, verbatim from `rms_norm_f16_f32`/
+    // `rms_norm_q8_1_f32`): strided load into registers, row's mean-of-squares.
+    float v[FP4_RMS_REGS];
+    float acc = 0.0f;
+#pragma unroll
+    for (int k = 0; k < FP4_RMS_REGS; ++k) {
+        const int i = k * (int)blockDim.x + tid;
+        v[k] = (i < d) ? row[i] : 0.0f;
+        acc += v[k] * v[k];
+    }
+    const float scale = rsqrtf(block_reduce_sum(acc) / (float)d + eps);
+
+    // Phase 2 (boilerplate, verbatim): apply the row scale and the norm
+    // weight, write the plain f32 row.
+#pragma unroll
+    for (int k = 0; k < FP4_RMS_REGS; ++k) {
+        const int i = k * (int)blockDim.x + tid;
+        if (i < d) {
+            v[k] *= scale * weight[i];
+            orow[i] = v[k];
+        }
+    }
+
+    // Phase 3 (new): half-warp (16-lane) NVFP4 quantize of the row this
+    // thread just finished normalizing, still resident in registers -- no
+    // re-read of `out`/`row`.
+    const int lane16 = tid % F4E2M1_BLOCK;
+    const int hw = tid / F4E2M1_BLOCK;
+    const int hws_per_block = (int)blockDim.x / F4E2M1_BLOCK;
+
+#pragma unroll
+    for (int k = 0; k < FP4_RMS_REGS; ++k) {
+        const int b = k * hws_per_block + hw;
+        if (b >= blocks_per_row) continue;
+
+        const int base = b * F4E2M1_BLOCK;
+        const int n_in_block = min(F4E2M1_BLOCK, d - base);
+
+        // Half-warp max-abs reduction: `warp_reduce_max`'s own shuffle tree
+        // (`common.cuh`), just at width 16 instead of 32 -- exactly the
+        // group `__shfl_xor_sync`'s own `width` argument supports natively,
+        // so each half-warp reduces independently within the same warp.
+        float amax = fabsf(v[k]);
+#pragma unroll
+        for (int offset = F4E2M1_BLOCK / 2; offset > 0; offset >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(FULL_MASK, amax, offset, F4E2M1_BLOCK));
+        }
+
+        // scale_f32 -> fp8 -> read back the lossy value, verbatim from
+        // `quantize_act_e2m1_f32`.
+        float scale_f32 = global_scale * amax * (1.0f / 6.0f);
+        scale_f32 = fminf(fmaxf(scale_f32, -448.0f), 448.0f);
+        const unsigned char scale_byte = f32_to_e4m3(scale_f32);
+        if (lane16 == 0) xsrow[b] = scale_byte;
+        const float scale_q = e4m3_to_f32((unsigned int)scale_byte);
+        const float output_scale = (scale_q == 0.0f) ? 0.0f : (global_scale / scale_q);
+
+        const float scaled = v[k] * output_scale;
+        const float clipped = fminf(fmaxf(scaled, -6.0f), 6.0f);
+        const float mag = fabsf(clipped);
+
+        // `cast_to_fp4`'s own asymmetric threshold table, copied verbatim
+        // from `quantize_act_e2m1_f32` above.
+        unsigned int mag_code;
+        if (mag <= 0.25f) mag_code = 0u;
+        else if (mag < 0.75f) mag_code = 1u;
+        else if (mag <= 1.25f) mag_code = 2u;
+        else if (mag < 1.75f) mag_code = 3u;
+        else if (mag <= 2.5f) mag_code = 4u;
+        else if (mag < 3.5f) mag_code = 5u;
+        else if (mag <= 5.0f) mag_code = 6u;
+        else mag_code = 7u;
+        const unsigned int sign_bit = (clipped < 0.0f) ? 0x08u : 0x00u;
+        const unsigned int code = mag_code | sign_bit;
+
+        // Pack: every lane (even AND odd) must execute this shuffle -- both
+        // halves of the pair need to actually issue the same instruction for
+        // `__shfl_xor_sync` to read the other's register legally. Only the
+        // WRITE is gated to the even lane (and the `n_in_block` partial-block
+        // guard), not the shuffle itself.
+        const unsigned int other = __shfl_xor_sync(FULL_MASK, code, 1, F4E2M1_BLOCK);
+        if (lane16 % 2 == 0 && lane16 < n_in_block) {
+            // `base` is always even (F4E2M1_BLOCK is even and a multiple of
+            // it), so lane parity equals element-index parity, and `other`
+            // (the odd neighbor's code) goes in the high nibble -- same
+            // convention as `quantize_act_e2m1_f32`'s `(codes[1] << 4) |
+            // codes[0]`.
+            const unsigned char byte = (unsigned char)((other << 4) | code);
+            xqrow[base / 2 + lane16 / 2] = byte;
+        }
+    }
+}
+
 // ---- CUTLASS NVFP4 scale-factor swizzle (`cutlass` feature only, but this
 // kernel itself is plain NVRTC-compiled CUDA C like everything else in this
 // file -- it feeds the AOT `nvcc`-built `cutlass/fp4_bw_gemm.cu`, but is not

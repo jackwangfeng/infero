@@ -30,6 +30,10 @@ pub mod fp8;
 #[cfg(feature = "nccl")]
 pub mod tp;
 pub mod gdn;
+#[cfg(feature = "triton_aot")]
+pub mod gdn_triton_aot;
+#[cfg(feature = "triton_aot")]
+pub mod gdn_fla_stages;
 pub mod turboquant;
 pub mod vision;
 mod weight;
@@ -363,8 +367,14 @@ fn rms_block(d: usize) -> u32 {
     (d as u32).div_ceil(RMS_REGS).next_multiple_of(32).clamp(32, 1024)
 }
 
-/// Whether a row of `d` fits the register-resident norm at all.
-fn rms_fits(d: usize) -> bool {
+/// Whether a row of `d` fits the register-resident norm at all. `pub`
+/// because `model`'s `feed_forward` needs to decide, before picking which
+/// norm call to make, whether `Kernels::rms_norm_quantize_e2m1_cutlass`'s
+/// fused norm+quantize kernel (which reuses this same scaffold) is even
+/// available for this checkpoint's `d_model` -- the kernel itself already
+/// enforces this via `anyhow::ensure!`, but the caller needs the answer
+/// before committing to the call, not as a runtime error from inside it.
+pub fn rms_fits(d: usize) -> bool {
     d <= 1024 * RMS_REGS as usize
 }
 
@@ -765,7 +775,38 @@ impl Kernels {
         let mut b = self.dev.stream().launch_builder(&f);
         b.arg(out).arg(gate).arg(up).arg(&n_i);
         self.dev.profile().time("silu_mul", self.dev.stream(), || {
-            unsafe { b.launch(elementwise(n as u32)) }.context("silu_mul")?;
+            // Four elements a thread; see `silu_mul_f32`.
+            unsafe { b.launch(elementwise((n as u32).div_ceil(4))) }.context("silu_mul")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Same as [`Self::silu_mul`], also writing an f16 copy of the same
+    /// result -- for a caller about to feed this straight into an f16-input
+    /// quantizer (see `quantize_act_e2m1_cutlass_f16`) rather than re-reading
+    /// the f32 copy and converting separately. Scalar (not vectorized): this
+    /// session's own real profiling found `silu_mul` already bandwidth-bound
+    /// at this checkpoint's real prefill sizes, so vectorizing bought nothing
+    /// measurable there -- no reason to expect otherwise here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn silu_mul_f16(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        hout: &mut ViewMut<'_, f16>,
+        gate: &View<'_, f32>,
+        up: &View<'_, f32>,
+        n: usize,
+    ) -> Result<()> {
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_ops", ops_src(), "silu_mul_f16_f32")?;
+        let n_i = n as i32;
+        let mut b = self.dev.stream().launch_builder(&f);
+        b.arg(out).arg(hout).arg(gate).arg(up).arg(&n_i);
+        self.dev.profile().time("silu_mul_f16", self.dev.stream(), || {
+            unsafe { b.launch(elementwise(n as u32)) }.context("silu_mul_f16")?;
             Ok(())
         })?;
         Ok(())
@@ -822,7 +863,8 @@ impl Kernels {
         let mut bld = self.dev.stream().launch_builder(&f);
         bld.arg(a).arg(b).arg(fused).arg(&a_i).arg(&b_i).arg(&t_i);
         self.dev.profile().time("split2", self.dev.stream(), || {
-            unsafe { bld.launch(elementwise(total as u32)) }.context("split2")?;
+            // Four elements a thread; see `split2_f32`.
+            unsafe { bld.launch(elementwise((total as u32).div_ceil(4))) }.context("split2")?;
             Ok(())
         })?;
         Ok(())

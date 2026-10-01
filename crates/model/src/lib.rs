@@ -6889,6 +6889,52 @@ impl Model {
                         | infero_kernels::WeightType::Q4G128T
                 ) && w.k == d
             });
+        // `ffn_f4e2m1_pair`/`ffn_fused_norm` are computed here, before the
+        // norm, rather than down by the matmul dispatch below (where this
+        // checkpoint's earlier commit originally placed `ffn_f4e2m1_pair`)
+        // specifically so the norm selection just below can see them --
+        // both conditions depend only on this layer's static weight types
+        // (and, for `ffn_fused_norm`, the once-cached CUTLASS weight
+        // metadata), never on anything the norm itself produces, so moving
+        // the check earlier changes nothing about what either condition
+        // means.
+        #[cfg(feature = "cutlass")]
+        let ffn_f4e2m1_pair = l.dense().w_gate.ty == infero_kernels::WeightType::F4E2M1
+            && l.dense().w_up.ty == infero_kernels::WeightType::F4E2M1;
+        #[cfg(not(feature = "cutlass"))]
+        let ffn_f4e2m1_pair = false;
+        // Fuses this group's norm directly with the NVFP4 activation-quantize
+        // pass `matmul_pre_f4e2m1_dedup` would otherwise run separately over
+        // the same row -- one launch instead of two, via
+        // `Kernels::rms_norm_quantize_e2m1_cutlass` (see its own doc comment
+        // for the kernel design). Gated on exactly the same precondition
+        // `matmul_pre_f4e2m1_dedup` already checks before it will skip a
+        // quantize call (`w_gate`/`w_up` resident with one shared CUTLASS
+        // `input_scale`), re-derived here so the norm can commit to the
+        // fused kernel before that function runs; `rms_fits(d)` because the
+        // fused kernel reuses `rms_norm`'s register-resident scaffold, which
+        // only exists up to that row width.
+        //
+        // Precondition re-verified for this call site specifically (not
+        // inherited from the Phase 0 survey that first flagged it): `xb`'s
+        // only write in this function is this norm call, and its only read
+        // before `feed_forward` next writes it is the dedup path's own
+        // quantize step below (the `gemm_shared`/`to_f16` read a few lines
+        // down is `WeightType::Q4K`-gated, mutually exclusive with
+        // `ffn_f4e2m1_pair`'s `F4E2M1`) -- so fusing the two is safe at this
+        // site: nothing else observes `xb` in between, and the fused kernel
+        // still writes `xb` itself (see its `out` parameter), so no reader
+        // of `xb` loses anything either way.
+        #[cfg(feature = "cutlass")]
+        let ffn_fused_norm = ffn_f4e2m1_pair
+            && infero_kernels::rms_fits(d)
+            && l.dense()
+                .w_gate
+                .cutlass_fp4_weight(&self.kern)
+                .zip(l.dense().w_up.cutlass_fp4_weight(&self.kern))
+                .is_some_and(|(a, b)| a.input_scale() == b.input_scale());
+        #[cfg(not(feature = "cutlass"))]
+        let ffn_fused_norm = false;
         // When the norm is the f16-writing one it also adds the attention
         // residual, which `attention` left in `proj` for it. See
         // `ffn_norm_takes_residual`.
@@ -6904,6 +6950,38 @@ impl Model {
                 self.cfg.rms_eps,
             )?;
             (None, true)
+        } else if ffn_fused_norm {
+            #[cfg(feature = "cutlass")]
+            {
+                let blocks = d.div_ceil(infero_kernels::fp4::F4E2M1_BLOCK);
+                let xq_len = n * d.div_ceil(2);
+                let xs_len = n * blocks;
+                anyhow::ensure!(
+                    self.scratch.xq_e2m1.len() >= xq_len && self.scratch.xs_e2m1.len() >= xs_len,
+                    "NVFP4 activation quant scratch too small for {n} tokens at k={d} \
+                     (fused FFN norm)"
+                );
+                let global_scale = 1.0
+                    / l.dense()
+                        .w_gate
+                        .cutlass_fp4_weight(&self.kern)
+                        .expect("ffn_fused_norm already confirmed this is Some")
+                        .input_scale();
+                self.kern.rms_norm_quantize_e2m1_cutlass(
+                    &mut self.act.xb.slice_mut(..n * d),
+                    &mut self.scratch.xq_e2m1.slice_mut(..xq_len),
+                    &mut self.scratch.xs_e2m1.slice_mut(..xs_len),
+                    &self.act.x.slice(..n * d),
+                    &l.ffn_norm.as_view(),
+                    global_scale,
+                    d,
+                    n,
+                    cfg.rms_eps,
+                )?;
+                (None, false)
+            }
+            #[cfg(not(feature = "cutlass"))]
+            unreachable!("ffn_fused_norm is always false without the cutlass feature");
         } else {
             Self::norm_for_group(
                 &self.kern,
@@ -7017,11 +7095,10 @@ impl Model {
                     n * d,
                 )?;
             }
-            #[cfg(feature = "cutlass")]
-            let ffn_f4e2m1_pair = l.dense().w_gate.ty == infero_kernels::WeightType::F4E2M1
-                && l.dense().w_up.ty == infero_kernels::WeightType::F4E2M1;
-            #[cfg(not(feature = "cutlass"))]
-            let ffn_f4e2m1_pair = false;
+            // `ffn_f4e2m1_pair`/`ffn_fused_norm` were already computed above,
+            // before the norm (see that comment) -- reused here rather than
+            // recomputed, so the two sites can never disagree about which
+            // weight types this layer actually has.
             if ffn_f4e2m1_pair {
                 #[cfg(feature = "cutlass")]
                 Self::matmul_pre_f4e2m1_dedup(
@@ -7036,6 +7113,7 @@ impl Model {
                     n,
                     self.use_mmvq,
                     self.use_mmq,
+                    ffn_fused_norm,
                 )?;
                 #[cfg(not(feature = "cutlass"))]
                 unreachable!("ffn_f4e2m1_pair is always false without the cutlass feature");
@@ -8161,6 +8239,16 @@ impl Model {
     /// win. Skips one of `quantize_act_e2m1_cutlass`'s two otherwise-
     /// identical calls -- ~9.8% of a real 27295-token prefill step was spent
     /// in that kernel before this existed.
+    /// `prequantized`: the caller already ran the activation through
+    /// [`infero_kernels::Kernels::rms_norm_quantize_e2m1_cutlass`] (the fused
+    /// FFN norm, in `feed_forward`) and left the result sitting in
+    /// `scratch.xq_e2m1`/`scratch.xs_e2m1` at this same `global_scale`
+    /// already -- so this function's own [`Kernels::quantize_act_e2m1_cutlass`]
+    /// call would just redo that work over the same row. Only ever passed
+    /// `true` when the caller itself already confirmed `w_a`/`w_b` share one
+    /// `input_scale` (the same condition re-derived below), so the
+    /// `debug_assert` catches a caller/callee disagreement rather than
+    /// silently consuming stale scratch contents.
     #[allow(clippy::too_many_arguments)]
     #[cfg(feature = "cutlass")]
     fn matmul_pre_f4e2m1_dedup(
@@ -8175,6 +8263,7 @@ impl Model {
         n_tokens: usize,
         use_mmvq: bool,
         use_mmq: bool,
+        prequantized: bool,
     ) -> Result<()> {
         debug_assert_eq!(w_a.ty, infero_kernels::WeightType::F4E2M1);
         debug_assert_eq!(w_b.ty, infero_kernels::WeightType::F4E2M1);
@@ -8187,6 +8276,12 @@ impl Model {
             .cutlass_fp4_weight(kern)
             .with_context(|| format!("preparing CUTLASS NVFP4 weight for a {}x{} matrix", w_b.n, w_b.k))?;
         if cw_a.input_scale() != cw_b.input_scale() {
+            debug_assert!(
+                !prequantized,
+                "caller claimed the fused FFN norm already quantized this row at a \
+                 shared scale, but w_a/w_b's real CUTLASS input_scales actually \
+                 differ -- its own pre-check should have ruled this fallback out"
+            );
             Self::matmul_pre(
                 kern, scratch, out_a, w_a, stage, x, n_tokens, use_mmvq, use_mmq, None, false, None, false,
             )?;
@@ -8205,14 +8300,16 @@ impl Model {
             w_a.k
         );
         let global_scale = 1.0 / cw_a.input_scale();
-        kern.quantize_act_e2m1_cutlass(
-            &mut scratch.xq_e2m1.slice_mut(..xq_len),
-            &mut scratch.xs_e2m1.slice_mut(..xs_len),
-            x,
-            global_scale,
-            w_a.k,
-            n_tokens,
-        )?;
+        if !prequantized {
+            kern.quantize_act_e2m1_cutlass(
+                &mut scratch.xq_e2m1.slice_mut(..xq_len),
+                &mut scratch.xs_e2m1.slice_mut(..xs_len),
+                x,
+                global_scale,
+                w_a.k,
+                n_tokens,
+            )?;
+        }
         let weights_a = w_a.view(stage)?;
         let ran_a = kern.mma_e2m1_cutlass_sfa_f32out(
             out_a,
