@@ -349,7 +349,15 @@ fn the_f32out_gemm_matches_the_bf16_path() -> Result<()> {
     // plain wide tile above it, so this list exercises both new kernel
     // bodies and the exact boundary between them, not just the unchanged
     // `mma_e4m3_cutlass_sfa` reference path.
-    for n_tokens in [1usize, 2, 3, 5, 8, 9, 17, 32, 64, 65, 127, 128, 129] {
+    //
+    // 8192 and 27295: this round's own investigation (extending `accum`
+    // from `F4E2M1`'s `down_proj` to this unified-layout F8E4M3 path, for
+    // GDN `out_proj`/attention `wo`) found this test topped out at M=129,
+    // two orders of magnitude below the real prefill shape (27295 tokens)
+    // the fused path now runs at in production -- same gap `cutlass_fp4_
+    // gemm.rs`'s own accum test had before `down_proj`'s fusion, and the
+    // same fix: check the assumption at real scale rather than trust it.
+    for n_tokens in [1usize, 2, 3, 5, 8, 9, 17, 32, 64, 65, 127, 128, 129, 8192, 27295] {
         let x: Vec<f32> =
             (0..n_tokens).flat_map(|t| pseudo_random_f32(K, 0xD00D + t as u64, 3.0 + t as f32)).collect();
         let d_x = stream.clone_htod(&x)?;

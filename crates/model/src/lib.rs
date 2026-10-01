@@ -4682,8 +4682,11 @@ impl Model {
         let width = la.conv_channels();
         let heads = la.value_heads;
         // Asked before the activations are borrowed apart, because it takes
-        // `&self`.
+        // `&self`. `tp_active` is asked here for the same reason -- it is
+        // this function's own `fuse_gdn_residual` gate below, mirroring
+        // `feed_forward`'s `fuse_down_residual`.
         let ffn_absorbs = self.ffn_norm_takes_residual(layer, n);
+        let gdn_tp_active = self.tp_active();
         let ordinal = pool
             .gdn()
             .and_then(|g| g.ordinal_of(layer))
@@ -5065,10 +5068,30 @@ impl Model {
         // but has not itself been ground-truth tested) reads.
         probe(&self.kern, layer, "gdn_out_proj_in", &acts.qkv.slice(..n * val_dim));
 
+        // Same fusion `feed_forward`'s `down_proj` already does
+        // (`fuse_down_residual`), extended from `F4E2M1` to the unified-
+        // layout `F8E4M3` accum path this round threaded through
+        // `matmul_pre`: write straight into the residual stream (`x`)
+        // instead of the `proj` scratch buffer, skipping the `add_assign`
+        // below entirely.
+        //  - `fp8_unified_layout()`: the only F8E4M3 dispatch path
+        //    `matmul_pre` has a tested accumulate mode for.
+        //  - `!gdn_tp_active`: under TP, `proj` is only this rank's partial
+        //    sum and needs the all-reduce below *before* it is safe to add
+        //    into the (replicated) residual `x` -- accumulating into `x` per
+        //    rank and then all-reducing would multiply `x`'s old value by
+        //    `tp_size`. Same reasoning as `feed_forward`'s own gate.
+        //  - `!ffn_absorbs`: when true, the next block's fused norm reads
+        //    `proj` directly expecting the pre-residual delta there --
+        //    writing straight into `x` would leave it unpopulated.
+        let fuse_gdn_residual =
+            gw.out_proj.ty == infero_kernels::WeightType::F8E4M3 && crate::weights::fp8_unified_layout() && !gdn_tp_active && !ffn_absorbs;
+        let mut out_view =
+            if fuse_gdn_residual { x.slice_mut(..n * d) } else { proj.slice_mut(..n * d) };
         Self::matmul_pre(
             &self.kern,
             &mut self.scratch,
-            &mut proj.slice_mut(..n * d),
+            &mut out_view,
             &gw.out_proj,
             stage,
             &acts.qkv.slice(..n * val_dim),
@@ -5078,8 +5101,21 @@ impl Model {
             None,
             false,
             None,
-            false,
+            fuse_gdn_residual,
         )?;
+        if fuse_gdn_residual {
+            // No ground-truth probe read here when fused: the GEMM writes
+            // straight into `x`, so there is no distinct pre-residual value
+            // left to read. `INFERO_PROBE=<layer>`'s `gdn_out_proj_out`
+            // capture is only ever populated on the non-fused path below
+            // (TP, or a checkpoint whose GDN `out_proj` isn't unified-layout
+            // F8E4M3) -- same deliberate trade `down_proj`'s own fusion
+            // made, documented there as "no debug probe sits between this
+            // GEMM and the old `add_assign`" (true there because it never
+            // had one; here the probe exists but is only exercised when the
+            // fusion itself doesn't apply).
+            return Ok(());
+        }
         probe(&self.kern, layer, "gdn_out_proj_out", &proj.slice(..n * d));
         // `out_proj` is row-parallel (contracts over `val_dim`, this rank's
         // own head shard) -- `proj` is only this rank's partial sum until
@@ -6743,10 +6779,40 @@ impl Model {
             return Ok(());
         }
 
+        // Same fusion as `feed_forward`'s `down_proj` and `linear_attention`'s
+        // GDN `out_proj`, extended to this site: write straight into the
+        // residual stream (`self.act.x`) instead of `self.act.proj`,
+        // skipping the `add_assign` below. Gated on:
+        //  - `fp8_unified_layout()`: the only F8E4M3 dispatch path
+        //    `matmul_pre` has a tested accumulate mode for.
+        //  - `l.attn().bo.is_none()`: mirrors the fused `mmvq_add` fast
+        //    path's own guard just above. A bias is a pure elementwise add
+        //    and would be logically safe to apply to `self.act.x` directly
+        //    after an accum write, but this checkpoint never exercises
+        //    `bo` (checked directly against the real weight map: no
+        //    `o_proj.bias` key anywhere), so wiring that combination up is
+        //    left as a non-goal here rather than trusted un-exercised --
+        //    the `ensure!` in `matmul_pre` means a future bias-bearing
+        //    checkpoint would still only hit this gate being `false`, not a
+        //    silently dropped bias.
+        //  - `!self.tp_active()`: same partial-sum-vs-all-reduce reasoning
+        //    as every other site this round and last.
+        //  - `!self.ffn_norm_takes_residual(layer, n)`: when true, the
+        //    next block's fused norm reads `self.act.proj` directly.
+        let fuse_wo_residual = l.attn().wo.ty == infero_kernels::WeightType::F8E4M3
+            && crate::weights::fp8_unified_layout()
+            && l.attn().bo.is_none()
+            && !self.tp_active()
+            && !self.ffn_norm_takes_residual(layer, n);
+        let mut out_view = if fuse_wo_residual {
+            self.act.x.slice_mut(..n * d)
+        } else {
+            self.act.proj.slice_mut(..n * d)
+        };
         Self::matmul_pre(
             &self.kern,
             &mut self.scratch,
-            &mut self.act.proj.slice_mut(..n * d),
+            &mut out_view,
             &l.attn().wo,
             stage,
             &self.act.attn.slice(..n * da),
@@ -6756,8 +6822,17 @@ impl Model {
             None,
             attn_f16,
             None,
-            false,
+            fuse_wo_residual,
         )?;
+        if fuse_wo_residual {
+            // No ground-truth probe read here: the GEMM wrote straight into
+            // `self.act.x`, so there is no distinct pre-residual value left
+            // for `o_proj_out` to capture. `INFERO_PROBE=<layer>`'s
+            // `o_proj_out` is only ever populated on the non-fused path
+            // below (TP, a bias-bearing checkpoint, or ffn-norm absorption).
+            probe(&self.kern, layer, "x_after_attn", &self.act.x.slice(..n * d));
+            return Ok(());
+        }
         // `wo` is row-parallel (contracts over `da`, this rank's own head
         // shard) -- `self.act.proj` is only this rank's partial sum until
         // every rank's slice is summed in. Before any bias/residual add
@@ -7624,22 +7699,28 @@ impl Model {
         // Fold the caller's separate `add_assign` into the GEMM's own
         // epilogue by writing straight into `out`'s *existing* contents
         // (CUTLASS `beta=1.0`) instead of overwriting it (`beta=0.0`).
-        // Only the `F4E2M1` branch below actually threads this through to a
-        // tested accumulate path (`cutlass_fp4_gemm.rs`'s own `accum` cases)
+        // Two branches below actually thread this through to a tested
+        // accumulate path: `F4E2M1` (`cutlass_fp4_gemm.rs`'s own `accum`
+        // cases) and `F8E4M3` under the unified plain layout
+        // (`mma_e4m3_cutlass_sfa_f32out`'s and `mmv_f8_plain_g1`'s own
+        // tested `accum` parameters, `cutlass_fp8_gemm.rs`/`fp8_matvec.rs`)
         // -- every other branch (the generic `gemm_f16` tail, the `int_x`/
-        // `mmq` chain, FP8's block-dequant path) has no accumulate mode and
-        // would silently overwrite `out` if asked to accumulate, so this
-        // loud-fails instead of letting a future caller discover that the
-        // hard way. `false` at every call site except `feed_forward`'s
-        // `down_proj`, the one call this task's own investigation found
-        // reads/writes the residual stream directly with no other reader of
-        // the intermediate in between.
+        // `mmq` chain, FP8's non-unified block-dequant path) has no
+        // accumulate mode and would silently overwrite `out` if asked to
+        // accumulate, so this loud-fails instead of letting a future caller
+        // discover that the hard way. `false` at every call site except
+        // `feed_forward`'s `down_proj`, GDN's `out_proj`, and attention's
+        // `wo` -- the calls this task's own investigation (and this round's
+        // follow-up) found read/write the residual stream directly with no
+        // other reader of the intermediate in between.
         accum: bool,
     ) -> Result<()> {
         anyhow::ensure!(
-            !accum || w.ty == infero_kernels::WeightType::F4E2M1,
+            !accum
+                || w.ty == infero_kernels::WeightType::F4E2M1
+                || (w.ty == infero_kernels::WeightType::F8E4M3 && crate::weights::fp8_unified_layout()),
             "matmul_pre called with accum=true for a {:?} matrix, which has no \
-             tested accumulate path -- only F4E2M1 does",
+             tested accumulate path -- only F4E2M1 and unified-layout F8E4M3 do",
             w.ty
         );
         let weights = w.view(stage)?;
@@ -7674,7 +7755,7 @@ impl Model {
                     // to fill the GPU (gate/up, 4352 blocks) up to 1.75x
                     // where it wasn't (the smaller shapes, whose four-row
                     // grid left most of the GPU idle in its own tail wave).
-                    kern.mmv_f8_plain_g1(out, &weights, x, w.k, w.n, false)?;
+                    kern.mmv_f8_plain_g1(out, &weights, x, w.k, w.n, accum)?;
                     return Ok(());
                 }
                 // NOT dispatched here despite being real, tested, and faster
@@ -7749,7 +7830,7 @@ impl Model {
                     w.k,
                     w.n,
                     n_tokens,
-                    false,
+                    accum,
                 )?;
                 anyhow::ensure!(
                     ran,
