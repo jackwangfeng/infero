@@ -34,6 +34,7 @@ pub mod gdn;
 pub mod gdn_triton_aot;
 #[cfg(feature = "triton_aot")]
 pub mod gdn_fla_stages;
+pub mod narrow_gemm;
 pub mod turboquant;
 pub mod vision;
 mod weight;
@@ -84,6 +85,7 @@ const MMA_CUH: &str = include_str!("cu/mma.cuh");
 const MMQ_CU: &str = include_str!("cu/mmq.cu");
 const SAMPLE_CU: &str = include_str!("cu/sample.cu");
 const GDN_CU: &str = include_str!("cu/gdn.cu");
+const NARROW_GEMM_CU: &str = include_str!("cu/narrow_gemm.cu");
 const FP8_CU: &str = include_str!("cu/fp8.cu");
 const FP4_CU: &str = include_str!("cu/fp4.cu");
 const VISION_CU: &str = include_str!("cu/vision.cu");
@@ -221,6 +223,21 @@ fn quant_src() -> &'static str {
 fn quant_src() -> &'static str {
     static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SRC.get_or_init(|| format!("{COMMON_METAL}\n{QUANT_METAL}"))
+}
+
+/// CUDA-only: a shared-memory-tiled mat-vec-batched kernel, no real use for
+/// decode-only backends ([`narrow_gemm::Kernels::narrow_gemm_f16`]'s whole
+/// point is prefill-scale `M`), so the Metal side is the stub rather than a
+/// real port.
+#[cfg(feature = "cuda")]
+fn narrow_gemm_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| format!("{COMMON_CUH}\n{NARROW_GEMM_CU}"))
+}
+#[cfg(not(feature = "cuda"))]
+fn narrow_gemm_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| UNIMPLEMENTED_METAL.to_string())
 }
 
 #[cfg(feature = "cuda")]
