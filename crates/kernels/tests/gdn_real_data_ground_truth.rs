@@ -43,12 +43,17 @@
 //! it -- not a hypothesis, a direct disagreement with an independently
 //! trusted reference. If they agree, the recurrence itself is cleared too.
 //!
-//! No new probe round needed: this reuses the exact same
-//! `eng.gdn_qk_normed.f32`/`eng.gdn_g.f32`/`eng.gdn_beta.f32`/
-//! `eng.gdn_core.f32` dump files the earlier gating-sanity-check round
-//! already captured (see `task8-lmhead-rootcause-report.md`'s Addendum 6),
-//! since `gdn_qk_normed` already carries q, k AND v (the whole packed row)
-//! and `gdn_core` is exactly the value to compare against.
+//! Reuses the same `eng.gdn_qk_normed`/`eng.gdn_g`/`eng.gdn_beta`/
+//! `eng.gdn_core` probe names the earlier gating-sanity-check round already
+//! captured (see `task8-lmhead-rootcause-report.md`'s Addendum 6), since
+//! `gdn_qk_normed` already carries q, k AND v (the whole packed row) and
+//! `gdn_core` is exactly the value to compare against. The file names below
+//! now carry a `.step1.` segment (`probe()`'s dump file names fold in the
+//! real scheduler step, see its doc comment in `crates/model/src/lib.rs`) --
+//! a dump directory captured BEFORE that change exists under the old,
+//! step-less names and needs a fresh single-prefill-request probe round
+//! (still real step 1 either way, a brand-new request's one-and-only
+//! `forward_batch_rows` call) before this test will find its files again.
 //!
 //! Skips (does not fail) when `INFERO_GDN_PROBE_DIR` isn't set -- this
 //! needs real dump files from a real `bw` run, not synthetic data, the same
@@ -118,32 +123,32 @@ fn gdn_core_matches_the_host_reference_on_real_captured_data() -> Result<()> {
         return Ok(());
     };
 
-    let packed = read_f32(&format!("{dir}/eng.gdn_qk_normed.f32"))?;
-    let g = read_f32(&format!("{dir}/eng.gdn_g.f32"))?;
-    let beta = read_f32(&format!("{dir}/eng.gdn_beta.f32"))?;
-    let want = read_f32(&format!("{dir}/eng.gdn_core.f32"))?;
+    let packed = read_f32(&format!("{dir}/eng.gdn_qk_normed.step1.f32"))?;
+    let g = read_f32(&format!("{dir}/eng.gdn_g.step1.f32"))?;
+    let beta = read_f32(&format!("{dir}/eng.gdn_beta.step1.f32"))?;
+    let want = read_f32(&format!("{dir}/eng.gdn_core.step1.f32"))?;
 
     anyhow::ensure!(
         packed.len().is_multiple_of(WIDTH),
-        "eng.gdn_qk_normed.f32: {} elements, not a multiple of WIDTH={WIDTH}",
+        "eng.gdn_qk_normed.step1.f32: {} elements, not a multiple of WIDTH={WIDTH}",
         packed.len()
     );
     let t_len = packed.len() / WIDTH;
     anyhow::ensure!(
         g.len() == t_len * VAL_HEADS,
-        "eng.gdn_g.f32: {} elements, want {} ({t_len} tokens * {VAL_HEADS} heads)",
+        "eng.gdn_g.step1.f32: {} elements, want {} ({t_len} tokens * {VAL_HEADS} heads)",
         g.len(),
         t_len * VAL_HEADS
     );
     anyhow::ensure!(
         beta.len() == t_len * VAL_HEADS,
-        "eng.gdn_beta.f32: {} elements, want {}",
+        "eng.gdn_beta.step1.f32: {} elements, want {}",
         beta.len(),
         t_len * VAL_HEADS
     );
     anyhow::ensure!(
         want.len() == t_len * VAL_DIM,
-        "eng.gdn_core.f32: {} elements, want {} ({t_len} tokens * {VAL_DIM})",
+        "eng.gdn_core.step1.f32: {} elements, want {} ({t_len} tokens * {VAL_DIM})",
         want.len(),
         t_len * VAL_DIM
     );

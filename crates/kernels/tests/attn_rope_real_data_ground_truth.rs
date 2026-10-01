@@ -3,7 +3,10 @@
 //! forward pass on the RadixArk NVFP4 checkpoint (via
 //! `INFERO_PROBE=<layer>`/`INFERO_PROBE_DUMP=<dir>`,
 //! `crates/model/src/lib.rs`'s `Model::attention`), rather than synthetic
-//! data.
+//! data. The real run behind these dumps is a single prefill-only request,
+//! so every dump file is real step 1 -- `eng.<name>.step1.f32` (see
+//! `crates/model/src/lib.rs`'s `probe()` doc comment for why the step is
+//! part of the file name).
 //!
 //! By this point in the investigation, every matmul (`lm_head`, `o_proj`,
 //! GDN's `in_proj_qz`/`out_proj`, Q/K/V's own projections structurally),
@@ -110,8 +113,8 @@ fn attn_q_and_k_match_the_rope_host_reference_on_real_captured_data() -> Result<
     let da = n_heads * D_HEAD;
     let kv_dim = n_kv_heads * D_HEAD;
 
-    let q_pre = read_f32(&format!("{dir}/eng.attn_q_prerope.f32"))?;
-    let q_post = read_f32(&format!("{dir}/eng.attn_q_final.f32"))?;
+    let q_pre = read_f32(&format!("{dir}/eng.attn_q_prerope.step1.f32"))?;
+    let q_post = read_f32(&format!("{dir}/eng.attn_q_final.step1.f32"))?;
     anyhow::ensure!(q_pre.len() == q_post.len(), "attn_q_prerope/attn_q_final length mismatch");
     anyhow::ensure!(q_pre.len().is_multiple_of(da), "attn_q_prerope: {} not a multiple of da={da}", q_pre.len());
     let t_len = q_pre.len() / da;
@@ -133,18 +136,18 @@ fn attn_q_and_k_match_the_rope_host_reference_on_real_captured_data() -> Result<
     // packed [q|k|v] row (attn_qkv_prerope_packed/attn_qkv_packed) --
     // de-interleave on the host side either way, same reasoning as the
     // attention-mechanism check (Addendum 9).
-    let k_pre_path = format!("{dir}/eng.attn_k_prerope.f32");
+    let k_pre_path = format!("{dir}/eng.attn_k_prerope.step1.f32");
     if std::path::Path::new(&k_pre_path).exists() {
         let k_pre = read_f32(&k_pre_path)?;
-        let k_post = read_f32(&format!("{dir}/eng.attn_k_final.f32"))?;
+        let k_post = read_f32(&format!("{dir}/eng.attn_k_final.step1.f32"))?;
         anyhow::ensure!(k_pre.len() == t_len * kv_dim, "attn_k_prerope: {} elements, want {}", k_pre.len(), t_len * kv_dim);
         let mut k = k_pre.clone();
         reference(&mut k, &positions, n_kv_heads);
         compare("K", &k, &k_post);
     } else {
         let fused_w = da + 2 * kv_dim;
-        let packed_pre = read_f32(&format!("{dir}/eng.attn_qkv_prerope_packed.f32"))?;
-        let packed_post = read_f32(&format!("{dir}/eng.attn_qkv_packed.f32"))?;
+        let packed_pre = read_f32(&format!("{dir}/eng.attn_qkv_prerope_packed.step1.f32"))?;
+        let packed_post = read_f32(&format!("{dir}/eng.attn_qkv_packed.step1.f32"))?;
         anyhow::ensure!(packed_pre.len() == t_len * fused_w, "attn_qkv_prerope_packed: {} elements, want {}", packed_pre.len(), t_len * fused_w);
         let mut k_pre = vec![0.0f32; t_len * kv_dim];
         let mut k_post = vec![0.0f32; t_len * kv_dim];

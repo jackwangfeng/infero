@@ -3383,6 +3383,12 @@ impl Model {
         tail: &[usize],
     ) -> Result<usize> {
         let phase = crate::StepPhases::start();
+        // Every real call here is one scheduler step (one prefill chunk or one
+        // decode tick across the batch) -- the same granularity `INFERO_PROBE_DUMP`
+        // needs to tell apart, since a multi-token request drives this function
+        // repeatedly and `probe()`'s dump file name otherwise can't tell decode
+        // step 3 from decode step 7. See `probe()`'s doc comment.
+        PROBE_STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         anyhow::ensure!(!items.is_empty(), "empty batch");
         anyhow::ensure!(
             tail.len() == items.len(),
@@ -8350,6 +8356,25 @@ impl Model {
     }
 }
 
+/// Bumped once per real call to [`Engine::forward_batch_rows`] -- the actual
+/// "one scheduler step" granularity (one prefill chunk, or one decode tick
+/// across the batch). `probe()` reads it to fold the step into
+/// `INFERO_PROBE_DUMP` file names, so a multi-token request (prefill then N
+/// decode ticks, each a separate `forward_batch_rows` call) can't have a
+/// later step's dump silently overwrite an earlier step's -- see `probe()`'s
+/// doc comment for the real incident this fixes.
+///
+/// One real caveat this does NOT solve: it is one process-wide counter, and
+/// speculative decoding's drafter runs as a separate `Model` instance in the
+/// same process with its own `forward_batch_rows` calls -- so one visible
+/// "decode tick" can correspond to more than one `PROBE_STEP` increment
+/// (drafter call(s) plus the target's verify call) when `INFERO_SPEC_K>0`.
+/// Uniqueness still holds (no two real calls share a step), but step numbers
+/// are only directly comparable between two runs with the SAME speculation
+/// config -- don't assume "step3 in both logs" means "the same semantic
+/// point in the request" if one run had speculation on and the other didn't.
+static PROBE_STEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// `INFERO_PROBE=<layer>` reports the RMS of named intermediates inside that
 /// block. Enough to bisect a block against a second implementation of the same
 /// forward pass -- which is the only way the last two composition bugs were
@@ -8373,16 +8398,48 @@ impl Model {
 /// already requires `INFERO_NO_GRAPH=1`, so it was never going to be a fast
 /// path), not something to leave on. `INFERO_PROBE_DUMP=<dir>` still works
 /// in this mode too, with the layer folded into the filename
-/// (`eng.<name>.layer<N>.f32`) so 64 layers' dumps of the same probe name
-/// don't overwrite each other the way the single-layer mode's plain
+/// (`eng.<name>.layer<N>.step<S>.f32`) so 64 layers' dumps of the same probe
+/// name don't overwrite each other the way the single-layer mode's plain
 /// `eng.<name>.f32` name would.
-fn probe(kern: &Kernels, layer: usize, name: &'static str, v: &View<'_, f32>) {
-    #[derive(Clone, Copy, PartialEq)]
-    enum ProbeMode {
-        Disabled,
-        OneLayer(usize),
-        AllLayers,
+///
+/// The `step<S>` suffix (both modes) is `PROBE_STEP` as of the current
+/// `forward_batch_rows` call -- fixing a real false-positive this cost: a
+/// multi-token request calls `forward_batch_rows` once per scheduler step
+/// (prefill, then once per decode tick), and before this suffix existed the
+/// dump file for a given `(layer, name)` was silently OVERWRITTEN by every
+/// one of those calls with no error or warning. Comparing "the dump file's
+/// contents" between two binaries run against the same multi-token request
+/// could therefore silently compare two different steps (e.g. decode step 3
+/// from one binary vs. decode step 7 from the other) instead of the same real
+/// step -- this is exactly what happened bisecting the rms_norm+NVFP4-quantize
+/// fusion (commit 897ee7c): the first comparison showed a spurious large
+/// divergence that took real time to trace back to this, not a real kernel
+/// bug. A single-forward-call comparison (the common case -- one prompt, one
+/// `INFERO_PROBE_DUMP` directory, read right after that one call returns) is
+/// unaffected either way, since `step1` (steps are 1-indexed: `PROBE_STEP`
+/// is incremented before the layer loop that calls `probe()` runs) is the
+/// only file either version ever writes for it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ProbeMode {
+    Disabled,
+    OneLayer(usize),
+    AllLayers,
+}
+
+/// The real `INFERO_PROBE_DUMP` file name for one probe call -- factored out
+/// of `probe()` so the naming scheme (in particular, that `step` is folded in
+/// for BOTH modes) is a plain, unit-testable function rather than logic
+/// buried inside a `std::fs::write` call site. See `probe()`'s doc comment
+/// for why `step` is there at all.
+fn probe_dump_path(dir: &str, name: &str, layer: usize, step: u64, mode: ProbeMode) -> String {
+    if mode == ProbeMode::AllLayers {
+        format!("{dir}/eng.{name}.layer{layer}.step{step}.f32")
+    } else {
+        format!("{dir}/eng.{name}.step{step}.f32")
     }
+}
+
+fn probe(kern: &Kernels, layer: usize, name: &'static str, v: &View<'_, f32>) {
     static MODE: std::sync::OnceLock<ProbeMode> = std::sync::OnceLock::new();
     let mode = *MODE.get_or_init(|| match std::env::var("INFERO_PROBE") {
         Ok(s) if s.eq_ignore_ascii_case("all") => ProbeMode::AllLayers,
@@ -8401,19 +8458,142 @@ fn probe(kern: &Kernels, layer: usize, name: &'static str, v: &View<'_, f32>) {
     let _ = kern.device().synchronize();
     let n = row.len().max(1);
     let rms = (row.iter().map(|x| x * x).sum::<f32>() / n as f32).sqrt();
-    tracing::info!(layer, name, rms, len = row.len(), first = row.first().copied(), "probe");
+    let step = PROBE_STEP.load(std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(layer, name, step, rms, len = row.len(), first = row.first().copied(), "probe");
     // `INFERO_PROBE_DUMP=<dir>` also writes the raw f32, so two implementations
     // of the same forward pass can be diffed element by element rather than
     // through summary statistics. RMS and element zero can both agree while the
     // vectors differ, which is how this cost an hour.
+    //
+    // `step<S>` is folded into the file name in BOTH modes -- see `PROBE_STEP`
+    // and this function's doc comment for the real false-positive this fixes
+    // (a multi-token request's later decode step silently overwriting an
+    // earlier step's dump of the same `(layer, name)`, with no error).
     if let Ok(dir) = std::env::var("INFERO_PROBE_DUMP") {
-        let path = if mode == ProbeMode::AllLayers {
+        let path = probe_dump_path(&dir, name, layer, step, mode);
+        let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let _ = std::fs::write(path, bytes);
+    }
+}
+
+#[cfg(test)]
+mod probe_dump_path_tests {
+    use super::*;
+
+    /// The real bug this whole fix exists for, reproduced directly: the OLD
+    /// naming scheme (what `probe_dump_path` computed before this fix --
+    /// no `step` segment at all) collides across two different real steps of
+    /// the same multi-token request, silently overwriting one dump with the
+    /// other. Written as its own small closure rather than imported, since
+    /// the whole point is that this is the file name the FIXED code no
+    /// longer produces -- there is nothing in the current source to import.
+    fn old_pre_fix_path(dir: &str, name: &str, layer: usize, mode: ProbeMode) -> String {
+        if mode == ProbeMode::AllLayers {
             format!("{dir}/eng.{name}.layer{layer}.f32")
         } else {
             format!("{dir}/eng.{name}.f32")
-        };
-        let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let _ = std::fs::write(path, bytes);
+        }
+    }
+
+    /// Direct reproduction of the real incident from commit 897ee7c's
+    /// integration pass: a multi-token request's decode step 3 and decode
+    /// step 7 (both probing the SAME `(layer, name)`, e.g. `after_ffn` at
+    /// some layer) land on the OLD scheme's identical path -- a silent
+    /// overwrite, not an error -- while the FIXED scheme gives them distinct
+    /// paths.
+    #[test]
+    fn fix_separates_what_the_old_scheme_silently_collided() {
+        let mode = ProbeMode::OneLayer(12);
+        let old_step3 = old_pre_fix_path("/tmp/probe", "after_ffn", 12, mode);
+        let old_step7 = old_pre_fix_path("/tmp/probe", "after_ffn", 12, mode);
+        assert_eq!(
+            old_step3, old_step7,
+            "reproducing the real bug: the pre-fix scheme has no way to tell \
+             decode step 3 and decode step 7 apart at all -- this equality IS \
+             the silent overwrite, not a mistake in this test"
+        );
+
+        let new_step3 = probe_dump_path("/tmp/probe", "after_ffn", 12, 3, mode);
+        let new_step7 = probe_dump_path("/tmp/probe", "after_ffn", 12, 7, mode);
+        assert_ne!(
+            new_step3, new_step7,
+            "the fix must give two different real scheduler steps two \
+             different file names, or it hasn't fixed anything"
+        );
+    }
+
+    /// Same real incident, `INFERO_PROBE=all` (AllLayers) mode: the layer
+    /// was already folded into the old name, which is why this mode's own
+    /// 64-layers-in-one-run use case never collided on LAYER -- but it still
+    /// collided on STEP before this fix, across two different real decode
+    /// ticks probing the same layer.
+    #[test]
+    fn all_layers_mode_also_separates_by_step_not_just_by_layer() {
+        let mode = ProbeMode::AllLayers;
+        let old_l5_step1 = old_pre_fix_path("/tmp/probe", "gdn_core", 5, mode);
+        let old_l5_step2 = old_pre_fix_path("/tmp/probe", "gdn_core", 5, mode);
+        assert_eq!(old_l5_step1, old_l5_step2, "old scheme: same collision, different mode");
+
+        let new_l5_step1 = probe_dump_path("/tmp/probe", "gdn_core", 5, 1, mode);
+        let new_l5_step2 = probe_dump_path("/tmp/probe", "gdn_core", 5, 2, mode);
+        assert_ne!(new_l5_step1, new_l5_step2);
+        // Layer separation (already correct pre-fix) must still hold too --
+        // the fix must be purely additive, not a regression on the one thing
+        // AllLayers mode already got right.
+        let new_l6_step1 = probe_dump_path("/tmp/probe", "gdn_core", 6, 1, mode);
+        assert_ne!(new_l5_step1, new_l6_step1);
+    }
+
+    /// The common, already-working case this fix must NOT regress (the task
+    /// this session was explicitly told to re-check): a single prefill-only
+    /// request makes exactly one `forward_batch_rows` call, so every probe
+    /// in it shares one step number -- the file name is as stable across
+    /// that one request as it always was, just with a fixed, predictable
+    /// `step1` segment appended rather than none.
+    #[test]
+    fn single_forward_call_still_yields_one_stable_path_per_name() {
+        let mode = ProbeMode::OneLayer(3);
+        let a = probe_dump_path("/tmp/probe", "after_ffn", 3, 1, mode);
+        let b = probe_dump_path("/tmp/probe", "after_ffn", 3, 1, mode);
+        assert_eq!(a, b, "two probe() calls within the SAME forward_batch_rows \
+            call (same step) must still agree on one file name");
+        assert_eq!(a, "/tmp/probe/eng.after_ffn.step1.f32");
+    }
+
+    /// `PROBE_STEP` itself, exercised the real way: `fetch_add` once per
+    /// simulated `forward_batch_rows` call (exactly what the real call site
+    /// in `forward_batch_rows` does), `load` from inside simulated `probe()`
+    /// calls. Uses the real production `static`, not a fake counter, so this
+    /// is a real test of the actual mechanism wired into the real code path,
+    /// not a reimplementation of it.
+    ///
+    /// Ignored by default: `PROBE_STEP` is one process-wide static, so this
+    /// test is only meaningful read in isolation (`cargo test -- --ignored
+    /// --test-threads=1`), never alongside other tests that might also bump
+    /// it in the same process.
+    #[test]
+    #[ignore = "shares process-wide PROBE_STEP global state with every other test"]
+    fn real_probe_step_counter_distinguishes_two_simulated_forward_calls() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let before = PROBE_STEP.load(Relaxed);
+
+        // Simulated forward_batch_rows call 1 (e.g. prefill).
+        PROBE_STEP.fetch_add(1, Relaxed);
+        let step_during_call_1 = PROBE_STEP.load(Relaxed);
+        let path_call_1 = probe_dump_path("/tmp/probe", "after_ffn", 0, step_during_call_1, ProbeMode::OneLayer(0));
+
+        // Simulated forward_batch_rows call 2 (e.g. the next decode tick).
+        PROBE_STEP.fetch_add(1, Relaxed);
+        let step_during_call_2 = PROBE_STEP.load(Relaxed);
+        let path_call_2 = probe_dump_path("/tmp/probe", "after_ffn", 0, step_during_call_2, ProbeMode::OneLayer(0));
+
+        assert_eq!(step_during_call_2, step_during_call_1 + 1);
+        assert_ne!(
+            path_call_1, path_call_2,
+            "two real, sequential forward_batch_rows calls probing the same \
+             (layer, name) must land on two different dump files"
+        );
+        assert!(before < step_during_call_1);
     }
 }
 
