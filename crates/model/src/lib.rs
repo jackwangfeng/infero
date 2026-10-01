@@ -4771,6 +4771,7 @@ impl Model {
                 shared,
                 shared_f16,
                 None,
+                false,
             )?;
         }
         if fused_qz {
@@ -5071,6 +5072,7 @@ impl Model {
             None,
             false,
             None,
+            false,
         )?;
         probe(&self.kern, layer, "gdn_out_proj_out", &proj.slice(..n * d));
         // `out_proj` is row-parallel (contracts over `val_dim`, this rank's
@@ -5280,6 +5282,7 @@ impl Model {
                 shared,
                 shared_f16,
                 None,
+                false,
             )?;
             // Nothing has to be unpacked: `rope_qk_packed` reads `q` and `k`
             // out of this row and `store_kv2_packed` reads `k` and `v`, so the
@@ -5339,6 +5342,7 @@ impl Model {
                 shared,
                 shared_f16,
                 None,
+                false,
             )?;
             let Activations {
                 q, gate, attn_gate, ..
@@ -5378,6 +5382,7 @@ impl Model {
                 shared,
                 shared_f16,
                 None,
+                false,
             )?;
             let Activations { k, v, gate, .. } = &mut self.act;
             self.kern.split2(
@@ -5418,6 +5423,7 @@ impl Model {
                 shared,
                 shared_f16,
                 None,
+                false,
             )?;
             if let Some(b) = bias {
                 self.kern
@@ -6744,6 +6750,7 @@ impl Model {
             None,
             attn_f16,
             None,
+            false,
         )?;
         // `wo` is row-parallel (contracts over `da`, this rank's own head
         // shard) -- `self.act.proj` is only this rank's partial sum until
@@ -6952,6 +6959,7 @@ impl Model {
                 shared,
                 shared_f16,
                 None,
+                false,
             )?;
             // `down` is the only reader of this product, and above one token it
             // takes f16 — so the f16 copy can be written here, out of the
@@ -7045,6 +7053,7 @@ impl Model {
                     shared,
                     shared_f16 || gemm_shared,
                     None,
+                    false,
                 )?;
                 Self::matmul_pre(
                     &self.kern,
@@ -7059,6 +7068,7 @@ impl Model {
                     shared,
                     shared_f16 || gemm_shared,
                     None,
+                    false,
                 )?;
             }
         }
@@ -7113,10 +7123,42 @@ impl Model {
 
         let gate_view = self.act.gate.slice(..n * d_ff);
         let up_view = self.act.up.slice(..n * d_ff);
+        // Fold `down_proj`'s own residual add into the GEMM's epilogue
+        // (CUTLASS `beta=1.0`, via `matmul_pre`'s `accum`) instead of
+        // writing a separate `proj` scratch buffer and running `add_assign`
+        // over it afterward -- see `matmul_pre`'s own `accum` doc comment
+        // for why only `F4E2M1` has a tested accumulate path. Gated on
+        // exactly the three conditions this fusion needs to stay correct:
+        //  - `down_is_nvfp4`: the only weight type `accum=true` is valid
+        //    for.
+        //  - `!self.tp_active()`: under TP, `proj` is this rank's *partial*
+        //    sum and needs an all-reduce *before* it is safe to add into the
+        //    (replicated) residual `x` -- accumulating directly into `x` per
+        //    rank and then all-reducing would multiply `x`'s old value by
+        //    `tp_size`. Same reasoning as `residual_fusable`'s own
+        //    `tp_active` guard elsewhere in this file.
+        //  - `!attn_norm_takes_residual(layer + 1, n)`: when true, the next
+        //    layer's fused norm reads `proj` directly, expecting the
+        //    pre-residual delta there -- writing straight into `x` would
+        //    leave `proj` unpopulated and break that read. Always false on
+        //    this checkpoint family today (its `consumer` predicate requires
+        //    `Q4G128`/`Q4G128T`), kept exact so an AWQ checkpoint with an
+        //    NVFP4 `down_proj` would still be handled correctly.
+        //
+        // No debug probe sits between this GEMM and the old `add_assign`
+        // (unlike GDN `out_proj`/attention `wo`'s `*_proj_out` probes), so
+        // there is no ground-truth read to preserve here.
+        let fuse_down_residual =
+            down_is_nvfp4 && !self.tp_active() && !self.attn_norm_takes_residual(layer + 1, n);
+        let mut out_view = if fuse_down_residual {
+            self.act.x.slice_mut(..n * d)
+        } else {
+            self.act.proj.slice_mut(..n * d)
+        };
         Self::matmul_pre(
             &self.kern,
             &mut self.scratch,
-            &mut self.act.proj.slice_mut(..n * d),
+            &mut out_view,
             &l.dense().w_down,
             stage,
             &self.act.ffn.slice(..n * d_ff),
@@ -7137,20 +7179,23 @@ impl Model {
             // default here would silently corrupt `down_proj` the moment a
             // checkpoint combines a stacked gate/up with an NVFP4 down_proj.
             if down_is_nvfp4 && stacked.is_none() { Some((&gate_view, &up_view)) } else { None },
+            fuse_down_residual,
         )?;
-        // `w_down` is row-parallel (contracts over `d_ff`, this rank's own
-        // shard of the FFN hidden width) -- same reasoning as `wo`/GDN's
-        // `out_proj` above.
-        #[cfg(feature = "nccl")]
-        if let Some(comm) = self.comm.clone() {
-            comm.all_reduce_sum_f32(&mut self.act.proj.slice_mut(..n * d), n * d, self.dev.stream())?;
-        }
-        if !self.attn_norm_takes_residual(layer + 1, n) {
-            self.kern.add_assign(
-                &mut self.act.x.slice_mut(..n * d),
-                &self.act.proj.slice(..n * d),
-                n * d,
-            )?;
+        if !fuse_down_residual {
+            // `w_down` is row-parallel (contracts over `d_ff`, this rank's own
+            // shard of the FFN hidden width) -- same reasoning as `wo`/GDN's
+            // `out_proj` above.
+            #[cfg(feature = "nccl")]
+            if let Some(comm) = self.comm.clone() {
+                comm.all_reduce_sum_f32(&mut self.act.proj.slice_mut(..n * d), n * d, self.dev.stream())?;
+            }
+            if !self.attn_norm_takes_residual(layer + 1, n) {
+                self.kern.add_assign(
+                    &mut self.act.x.slice_mut(..n * d),
+                    &self.act.proj.slice(..n * d),
+                    n * d,
+                )?;
+            }
         }
         probe(&self.kern, layer, "after_ffn", &self.act.x.slice(..n * d));
         Ok(())
@@ -7216,6 +7261,7 @@ impl Model {
                 None,
                 false,
                 None,
+                false,
             )?;
         }
         {
@@ -7431,7 +7477,7 @@ impl Model {
         use_mmq: bool,
     ) -> Result<()> {
         Self::matmul_pre(
-            kern, scratch, out, w, stage, x, n_tokens, use_mmvq, use_mmq, None, false, None,
+            kern, scratch, out, w, stage, x, n_tokens, use_mmvq, use_mmq, None, false, None, false,
         )
     }
 
@@ -7491,7 +7537,27 @@ impl Model {
         // skip a redundant f32 read here -- this skips materializing the
         // product's f32 copy in the first place.
         gate_up_for_fusion: Option<(&View<'_, f32>, &View<'_, f32>)>,
+        // Fold the caller's separate `add_assign` into the GEMM's own
+        // epilogue by writing straight into `out`'s *existing* contents
+        // (CUTLASS `beta=1.0`) instead of overwriting it (`beta=0.0`).
+        // Only the `F4E2M1` branch below actually threads this through to a
+        // tested accumulate path (`cutlass_fp4_gemm.rs`'s own `accum` cases)
+        // -- every other branch (the generic `gemm_f16` tail, the `int_x`/
+        // `mmq` chain, FP8's block-dequant path) has no accumulate mode and
+        // would silently overwrite `out` if asked to accumulate, so this
+        // loud-fails instead of letting a future caller discover that the
+        // hard way. `false` at every call site except `feed_forward`'s
+        // `down_proj`, the one call this task's own investigation found
+        // reads/writes the residual stream directly with no other reader of
+        // the intermediate in between.
+        accum: bool,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !accum || w.ty == infero_kernels::WeightType::F4E2M1,
+            "matmul_pre called with accum=true for a {:?} matrix, which has no \
+             tested accumulate path -- only F4E2M1 does",
+            w.ty
+        );
         let weights = w.view(stage)?;
 
         // Block-scaled FP8 has its own pair of paths and neither is the integer
@@ -7815,7 +7881,7 @@ impl Model {
                 w.k,
                 w.n,
                 n_tokens,
-                false,
+                accum,
             )?;
             anyhow::ensure!(
                 ran,
@@ -8122,10 +8188,10 @@ impl Model {
             .with_context(|| format!("preparing CUTLASS NVFP4 weight for a {}x{} matrix", w_b.n, w_b.k))?;
         if cw_a.input_scale() != cw_b.input_scale() {
             Self::matmul_pre(
-                kern, scratch, out_a, w_a, stage, x, n_tokens, use_mmvq, use_mmq, None, false, None,
+                kern, scratch, out_a, w_a, stage, x, n_tokens, use_mmvq, use_mmq, None, false, None, false,
             )?;
             Self::matmul_pre(
-                kern, scratch, out_b, w_b, stage, x, n_tokens, use_mmvq, use_mmq, None, false, None,
+                kern, scratch, out_b, w_b, stage, x, n_tokens, use_mmvq, use_mmq, None, false, None, false,
             )?;
             return Ok(());
         }

@@ -124,7 +124,16 @@ fn the_nvfp4_gemm_matches_the_host_reference() -> Result<()> {
 
     let w_dequant_f64 = dequant_matrix_f64(&w_quants, &w_scale_bytes, WEIGHT_SCALE_2, K, N);
 
-    for n_tokens in [1usize, 2, 8, 16, 32, 64, 65, 127, 128, 129] {
+    // 8192 and 27295: this task's own investigation (folding `add_assign`
+    // into this kernel's `accum=true` epilogue for `Model::feed_forward`'s
+    // `down_proj`) found every existing case here tops out at M=129 -- two
+    // orders of magnitude below the real prefill shape (27295 tokens) the
+    // fused path now runs at in production. The accumulate epilogue is a
+    // per-output-tile beta-scale that shouldn't depend on grid size, but
+    // this project's own history (undersized buffers passing memcheck,
+    // dynamic-index register spills, etc.) is reason enough to check that
+    // assumption at the real scale rather than trust it.
+    for n_tokens in [1usize, 2, 8, 16, 32, 64, 65, 127, 128, 129, 8192, 27295] {
         let x: Vec<f32> =
             (0..n_tokens).flat_map(|t| pseudo_random_f32(K, 0xACE0 + t as u64, 3.0 + t as f32)).collect();
         let d_x = stream.clone_htod(&x)?;
