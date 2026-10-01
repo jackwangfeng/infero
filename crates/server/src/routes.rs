@@ -45,7 +45,8 @@ pub fn router(engine: Arc<Engine>, auth: AuthConfig) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
-        .route("/v1/rerank", post(rerank));
+        .route("/v1/rerank", post(rerank))
+        .route("/v1/systemone", post(systemone));
 
     // Added in the order that puts rate-limiting outermost (it runs first,
     // rejecting a flood before an invalid key is even checked) and API-key
@@ -298,6 +299,127 @@ async fn rerank(
     results.truncate(req.top_k.unwrap_or(results.len()));
 
     Ok(Json(RerankResponse { results }).into_response())
+}
+
+/// `POST /v1/systemone`: Kev-style decision scoring. See
+/// `infero_model::kev`'s module doc for the mechanism and
+/// `crate::api::SystemOne*` for the wire shapes this mirrors from
+/// TypeSafe's own reference format. Tokenizing happens here, same reasoning
+/// as `embeddings`/`rerank` -- the worker thread only ever sees token ids.
+async fn systemone(
+    State(engine): State<Arc<Engine>>,
+    Json(req): Json<SystemOneRequest>,
+) -> Result<Response, ApiError> {
+    if req.questions.is_empty() {
+        return Err(ApiError::bad_request("questions must not be empty"));
+    }
+    let tokenizer = engine.tokenizer();
+    let tok = |text: &str| tokenizer.encode(text, Some(false), false);
+
+    let state_text = kev_render(&req.state, 0);
+    let state_tokens = tok(&state_text);
+    if state_tokens.is_empty() && !state_text.is_empty() {
+        return Err(ApiError::bad_request("state tokenized to nothing"));
+    }
+
+    // One (id, type, keys, legend) alongside each `QuestionInput`, in the
+    // same order -- `infero_model::kev::decide_record` returns probabilities
+    // in input order, and this is what turns row `i` back into a named
+    // answer.
+    struct Meta {
+        id: String,
+        kind: &'static str,
+        keys: Vec<String>,
+        legend: std::collections::BTreeMap<String, serde_json::Value>,
+    }
+    let mut metas = Vec::with_capacity(req.questions.len());
+    let mut inputs = Vec::with_capacity(req.questions.len());
+    for (id, q) in &req.questions {
+        let (instr, options, kind, keys, legend) = match q {
+            SystemOneQuestion::Noul { instructions, criteria } => {
+                let (f, t) = criteria
+                    .as_ref()
+                    .map(|c| (c.get("false").cloned(), c.get("true").cloned()))
+                    .unwrap_or((None, None));
+                (
+                    kev_render(instructions, 0),
+                    vec![kev_option_text("no", f.as_ref()), kev_option_text("yes", t.as_ref())],
+                    "noul",
+                    vec!["false".to_string(), "true".to_string()],
+                    Default::default(),
+                )
+            }
+            SystemOneQuestion::Choice { instructions, criteria } => {
+                if criteria.is_empty() {
+                    return Err(ApiError::bad_request(format!("question {id}: choice needs at least one option")));
+                }
+                let keys: Vec<String> = criteria.keys().cloned().collect();
+                let opts = criteria.iter().map(|(k, v)| kev_option_text(k, Some(v))).collect();
+                (kev_render(instructions, 0), opts, "choice", keys, Default::default())
+            }
+            SystemOneQuestion::Score { instructions, criteria } => {
+                if criteria.is_empty() {
+                    return Err(ApiError::bad_request(format!("question {id}: score needs at least one level")));
+                }
+                let keys: Vec<String> = (0..criteria.len()).map(|i| i.to_string()).collect();
+                let opts: Vec<String> = criteria.iter().map(|v| kev_render(v, 0)).collect();
+                let legend = keys.iter().cloned().zip(criteria.iter().cloned()).collect();
+                (kev_render(instructions, 0), opts.clone(), "score", keys, legend)
+            }
+        };
+        let option_tokens: Vec<Vec<u32>> = options.iter().map(|o| tok(o)).collect();
+        if let Some(i) = option_tokens.iter().position(Vec::is_empty) {
+            return Err(ApiError::bad_request(format!("question {id}, option {i} tokenized to nothing")));
+        }
+        metas.push(Meta { id: id.clone(), kind, keys, legend });
+        inputs.push(infero_model::kev::QuestionInput { instr: tok(&instr), options: option_tokens });
+    }
+
+    let probs = engine.decide(state_tokens, inputs).await?;
+    if probs.len() != metas.len() {
+        return Err(ApiError::internal(format!(
+            "engine returned {} answers for {} questions",
+            probs.len(),
+            metas.len()
+        )));
+    }
+
+    let mut answers = std::collections::BTreeMap::new();
+    for (p, m) in probs.into_iter().zip(metas) {
+        let answer = match m.kind {
+            "noul" => SystemOneAnswer::Noul {
+                kind: "noul",
+                noul: round_prob(p[1]),
+            },
+            "choice" => {
+                let best = p.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i).unwrap_or(0);
+                SystemOneAnswer::Choice {
+                    kind: "choice",
+                    choice: m.keys[best].clone(),
+                    confidence: round_prob(choice_confidence(&p)),
+                    probabilities: m.keys.iter().cloned().zip(p.iter().map(|&v| round_prob(v))).collect(),
+                }
+            }
+            _ => {
+                let score: f32 = p.iter().enumerate().map(|(i, &pi)| i as f32 * pi).sum();
+                SystemOneAnswer::Score {
+                    kind: "score",
+                    score: round_prob(score),
+                    legend: m.legend,
+                    probabilities: m.keys.iter().cloned().zip(p.iter().map(|&v| round_prob(v))).collect(),
+                    confidence: round_prob(score_confidence(&p)),
+                }
+            }
+        };
+        answers.insert(m.id, answer);
+    }
+
+    Ok(Json(SystemOneResponse {
+        model: engine.info.id.clone(),
+        model_version: engine.info.model_version.clone(),
+        answers,
+    })
+    .into_response())
 }
 
 async fn models(State(engine): State<Arc<Engine>>) -> impl IntoResponse {

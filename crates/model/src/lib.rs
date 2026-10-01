@@ -23,6 +23,7 @@ pub mod config;
 pub mod constrained;
 pub mod embed;
 pub mod json_grammar;
+pub mod kev;
 pub mod rerank;
 #[cfg(feature = "nccl")]
 pub mod tp;
@@ -4607,6 +4608,75 @@ impl Model {
         stream.memcpy_dtoh(&self.act.xb.slice(..n), &mut self.hidden_host[..n])?;
         self.dev.synchronize()?;
         Ok(&self.hidden_host[..n])
+    }
+
+    /// `output_norm(x)` at caller-chosen positions within the last
+    /// [`Model::forward_batch_device`]/[`Model::forward_batch_rows`] call's
+    /// own token range -- a generalization of [`Model::hidden_states_host`]
+    /// (one row per item, always its last token) to an arbitrary pick list,
+    /// for a caller that needs more than one position out of a single
+    /// sequence's pass and none of them necessarily last.
+    ///
+    /// Built for [`crate::kev::decide_batch`]: a Kev-style decision
+    /// question's branch needs the hidden state at its `<decide>` token
+    /// *and* every option's `</opt>` token, scattered through the branch --
+    /// not expressible as `wants_logits`/`forward_batch_rows`'s `tail`
+    /// (which only ever means "the last N of this item").
+    ///
+    /// Deliberately does not reuse `take_rows`/`output_norm`'s existing
+    /// shared, capacity-bounded buffers (`act.head_in`/`act.xb`, sized to
+    /// `max_logit_rows == max_seqs.max(spec_k + 1)` -- a cap picked for
+    /// ordinary serving concurrency and speculative-decode candidate counts,
+    /// not for "however many options one question happens to have"). A
+    /// question with more options than `max_logit_rows` would simply fail
+    /// the existing path's own `ensure!`. Instead this allocates its own
+    /// `[picks.len(), d_model]` scratch for this one call, sized to exactly
+    /// what it needs, and reads straight from `act.x` -- the full residual
+    /// stream for every token of the last pass, already sitting there
+    /// post-decoder-layers/pre-`output_norm`, which `take_rows` itself reads
+    /// from too (see the `lmhead_input` probe just above that call). Costs
+    /// one extra small device allocation per call rather than touching
+    /// shared state the normal generate/decode/spec-decode paths also
+    /// depend on -- a correctness-over-throughput trade worth revisiting
+    /// only if this path's own allocation overhead ever shows up in a real
+    /// profile.
+    pub fn hidden_states_at(&mut self, picks: &[i32], n_tokens_in_pass: usize) -> Result<Vec<f32>> {
+        let d = self.cfg.d_model;
+        let n = picks.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        for &p in picks {
+            anyhow::ensure!(
+                p >= 0 && (p as usize) < n_tokens_in_pass,
+                "pick {p} is outside the last pass's {n_tokens_in_pass} tokens"
+            );
+        }
+        let stream = self.dev.stream().clone();
+        let mut rows_dev = stream.alloc_zeros::<i32>(n)?;
+        stream.memcpy_htod(picks, &mut rows_dev.as_view_mut())?;
+
+        let mut gathered = stream.alloc_zeros::<f32>(n * d)?;
+        self.kern.take_rows(
+            &mut gathered.as_view_mut(),
+            &self.act.x.slice(..n_tokens_in_pass * d),
+            &rows_dev.as_view(),
+            n,
+            d,
+        )?;
+        let mut normed = stream.alloc_zeros::<f32>(n * d)?;
+        self.kern.rms_norm(
+            &mut normed.as_view_mut(),
+            &gathered.as_view(),
+            &self.w.output_norm.as_view(),
+            n,
+            d,
+            self.cfg.rms_eps,
+        )?;
+        let mut host = vec![0f32; n * d];
+        stream.memcpy_dtoh(&normed.as_view(), &mut host)?;
+        self.dev.synchronize()?;
+        Ok(host)
     }
 
     /// The forward pass, with the logits brought back to the host.

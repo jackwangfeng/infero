@@ -124,6 +124,14 @@ struct Args {
     /// when no key is presented). Unset disables rate limiting entirely.
     #[arg(long)]
     rate_limit_per_minute: Option<u32>,
+
+    /// Comma-separated API keys the rate limiter never checks -- a trusted
+    /// caller sharing a rate-limited demo instance with the general public,
+    /// rather than standing up a second unlimited instance just for them.
+    /// Still must be one of `--api-keys`'s own keys to authenticate at all;
+    /// this only lifts the rate limit, not the API key requirement.
+    #[arg(long)]
+    rate_limit_exempt_keys: Option<String>,
 }
 
 #[tokio::main]
@@ -231,7 +239,11 @@ async fn main() -> Result<()> {
     if let Some(rpm) = args.rate_limit_per_minute {
         tracing::info!(requests_per_minute = rpm, "rate limiting enabled");
     }
-    let auth = infero_server::auth::AuthConfig::new(api_keys.as_deref(), args.rate_limit_per_minute);
+    let auth = infero_server::auth::AuthConfig::with_exemptions(
+        api_keys.as_deref(),
+        args.rate_limit_per_minute,
+        args.rate_limit_exempt_keys.as_deref(),
+    );
 
     let app = routes::router(engine.clone(), auth)
         .layer(TraceLayer::new_for_http())

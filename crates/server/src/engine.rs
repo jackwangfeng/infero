@@ -120,6 +120,16 @@ pub struct RerankJob {
     pub respond: tokio::sync::oneshot::Sender<Result<Vec<f32>>>,
 }
 
+/// One Kev-style decision-scoring call, and where to send its result. Same
+/// shape as [`EmbedJob`]/[`RerankJob`] and for the same reason: no sampling,
+/// no decode loop, one throwaway forward pass (several, forked from a
+/// shared prefix -- see `infero_model::kev::decide_record`).
+pub struct DecideJob {
+    pub state: Vec<u32>,
+    pub questions: Vec<infero_model::kev::QuestionInput>,
+    pub respond: tokio::sync::oneshot::Sender<Result<Vec<Vec<f32>>>>,
+}
+
 /// One schema-constrained generation call, and where to send its result.
 /// See `infero_model::constrained::generate_json`.
 pub struct ConstrainedJob {
@@ -139,6 +149,7 @@ pub enum WorkItem {
     Generate(Request),
     Embed(EmbedJob),
     Rerank(RerankJob),
+    Decide(DecideJob),
     Constrained(ConstrainedJob),
 }
 
@@ -468,12 +479,41 @@ impl Engine {
 
         let metrics = crate::metrics::new_metrics();
 
+        // Kev-style decision scoring (`POST /v1/systemone`), on by
+        // convention rather than a CLI flag: `scripts/merge_kev_lora.py`
+        // always writes `kev_head.safetensors`/`kev_head.json` beside the
+        // merged backbone it produces, so a checkpoint directory that has
+        // one *is* a Kev checkpoint, and one that doesn't just never tries
+        // to load it -- the same "a file being there says what it is"
+        // convention `load_mtp_head_gguf`'s own sidecar uses.
+        let kev = if std::path::Path::new(path).join("kev_head.safetensors").exists() {
+            match infero_model::kev::KevHead::load(path, scheduler.model_mut().config().d_model) {
+                Ok(h) => match resolve_kev_special(&tokenizer) {
+                    Ok(special) => {
+                        tracing::info!(base = %h.base, "kev decision-model head loaded");
+                        Some(KevRuntime { head: h.head, special })
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "kev_head.safetensors present but this tokenizer is missing a special token it needs; /v1/systemone stays off");
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(error = ?e, "kev_head.safetensors present but failed to load; /v1/systemone stays off");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let worker = Worker {
             scheduler,
             in_flight: in_flight.clone(),
             served: served.clone(),
             prefix_stats: prefix_stats.clone(),
             metrics: metrics.clone(),
+            kev,
         };
         // A dedicated OS thread, not a tokio task: the forward pass blocks on
         // CUDA and would otherwise stall the runtime.
@@ -556,6 +596,19 @@ impl Engine {
             .send(WorkItem::Embed(EmbedJob { token_lists, respond: tx }))
             .map_err(|_| anyhow::anyhow!("inference worker has stopped"))?;
         rx.await.map_err(|_| anyhow::anyhow!("inference worker dropped the embedding job"))?
+    }
+
+    /// One Kev-style decision record -- one state, many questions, scored
+    /// together. Returns one probability vector per question, same order as
+    /// `questions`. Errors if this server was not started with a Kev head
+    /// loaded (`INFERO_KEV_HEAD_DIR`, see `Engine::start`'s own doc comment
+    /// on `kev`).
+    pub async fn decide(&self, state: Vec<u32>, questions: Vec<infero_model::kev::QuestionInput>) -> Result<Vec<Vec<f32>>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.jobs
+            .send(WorkItem::Decide(DecideJob { state, questions, respond: tx }))
+            .map_err(|_| anyhow::anyhow!("inference worker has stopped"))?;
+        rx.await.map_err(|_| anyhow::anyhow!("inference worker dropped the decision job"))?
     }
 
     /// Score a batch of already-tokenized (query, document) pairs. See
@@ -657,6 +710,35 @@ struct Worker {
     served: Arc<AtomicU64>,
     prefix_stats: Option<[Arc<AtomicU64>; 3]>,
     metrics: Arc<Metrics>,
+    /// `None` on any checkpoint without a `kev_head.safetensors` sidecar --
+    /// `/v1/systemone` then answers every request with a clear error
+    /// instead of pretending to score anything.
+    kev: Option<KevRuntime>,
+}
+
+struct KevRuntime {
+    head: infero_model::kev::PointerHead,
+    special: infero_model::kev::SpecialTokens,
+}
+
+/// Resolve Kev's five packing delimiters (`kev/model.py`'s `SPECIAL` list)
+/// against this server's own loaded tokenizer. These are ordinary (if
+/// rarely used) tokens in every Qwen tokenizer, so failing here means the
+/// loaded checkpoint is not Qwen-family at all -- a real reason to refuse
+/// Kev support, not a transient error.
+fn resolve_kev_special(tokenizer: &Tokenizer) -> Result<infero_model::kev::SpecialTokens> {
+    let id = |piece: &str| -> Result<u32> {
+        tokenizer
+            .token_to_id(piece)
+            .with_context(|| format!("this tokenizer has no {piece} token"))
+    };
+    Ok(infero_model::kev::SpecialTokens {
+        state: id("<|fim_prefix|>")?,
+        q: id("<|fim_middle|>")?,
+        opt: id("<|box_start|>")?,
+        opt_close: id("<|box_end|>")?,
+        decide: id("<|fim_suffix|>")?,
+    })
 }
 
 impl Worker {
@@ -696,6 +778,26 @@ impl Worker {
                     job.token_true_id,
                     job.token_false_id,
                 );
+                let _ = job.respond.send(result);
+            }
+            WorkItem::Decide(job) => {
+                let result = match &self.kev {
+                    Some(kev) => {
+                        let max_seq = self.scheduler.model_mut().max_seq();
+                        infero_model::kev::decide_record(
+                            self.scheduler.model_mut(),
+                            &kev.special,
+                            &kev.head,
+                            &job.state,
+                            &job.questions,
+                            max_seq,
+                            max_seq,
+                        )
+                    }
+                    None => Err(anyhow::anyhow!(
+                        "this server has no Kev head loaded (no kev_head.safetensors beside the checkpoint)"
+                    )),
+                };
                 let _ = job.respond.send(result);
             }
             WorkItem::Constrained(job) => {

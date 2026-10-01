@@ -25,18 +25,35 @@ use crate::api::{ErrorBody, ErrorDetail};
 pub struct AuthConfig {
     keys: Option<HashSet<String>>,
     rate_limiter: Option<std::sync::Arc<RateLimiter>>,
+    /// API keys the rate limiter never checks -- a trusted caller (e.g. an
+    /// internal integration partner) sharing a demo instance with the
+    /// general rate-limited public, rather than a second unlimited instance
+    /// just for them. A request with no key at all is never exempt: the
+    /// exemption is keyed to a specific credential, not to "no credential
+    /// presented".
+    exempt_keys: HashSet<String>,
 }
 
 impl AuthConfig {
     pub fn new(api_keys_csv: Option<&str>, rate_limit_per_minute: Option<u32>) -> Self {
-        let keys = api_keys_csv.map(|csv| {
+        Self::with_exemptions(api_keys_csv, rate_limit_per_minute, None)
+    }
+
+    pub fn with_exemptions(
+        api_keys_csv: Option<&str>,
+        rate_limit_per_minute: Option<u32>,
+        rate_limit_exempt_keys_csv: Option<&str>,
+    ) -> Self {
+        let parse_csv = |csv: &str| {
             csv.split(',')
                 .map(|k| k.trim().to_string())
                 .filter(|k| !k.is_empty())
                 .collect::<HashSet<_>>()
-        });
+        };
+        let keys = api_keys_csv.map(parse_csv);
         let rate_limiter = rate_limit_per_minute.map(|limit| std::sync::Arc::new(RateLimiter::new(limit)));
-        Self { keys, rate_limiter }
+        let exempt_keys = rate_limit_exempt_keys_csv.map(parse_csv).unwrap_or_default();
+        Self { keys, rate_limiter, exempt_keys }
     }
 
     pub fn auth_enabled(&self) -> bool {
@@ -152,7 +169,13 @@ pub async fn rate_limit(
     let Some(limiter) = &cfg.rate_limiter else {
         return next.run(request).await;
     };
-    let key = bearer_token(request.headers()).unwrap_or_else(|| peer.ip().to_string());
+    let presented_key = bearer_token(request.headers());
+    if let Some(k) = &presented_key {
+        if cfg.exempt_keys.contains(k) {
+            return next.run(request).await;
+        }
+    }
+    let key = presented_key.unwrap_or_else(|| peer.ip().to_string());
     match limiter.check(&key) {
         Ok(()) => next.run(request).await,
         Err(retry_after) => {

@@ -367,6 +367,95 @@ Not fast — *correct and present*. The bar is the one Keel already measures:
 
 ---
 
+## 5. `/v1/systemone` — Kev decision-model scoring, implemented and real-hardware verified
+
+Keel asked for a third endpoint: typed decisions (yes/no, multiple choice, a
+rating scale) with calibrated probabilities, not generated text — the shape
+[Kev](https://github.com/jaredpalmer/kev) (Apache-2.0, an open-weights
+alternative to TypeSafe's "Jev") and its upstream TypeSafe adapter both call
+`/v1/systemone`. Keel's own stated priority: small checkpoints (0.8B/4B) for
+the online path, sharing a GPU with embeddings at tens of milliseconds a
+call; a larger one (27B) for offline batch labeling is fine to run slower.
+
+**The mechanism, not a rewrite.** Kev's real backbone is the same
+Qwen3.5/3.8 hybrid (GatedDeltaNet + attention) checkpoint family infero
+already runs — the only new things this needed were a classification head in
+place of the vocab projection, and a way to score many questions against one
+shared block of text without recomputing it per question. Both turned out to
+be small once put next to what already existed:
+
+- **State sharing is `KvPool::fork`**, a primitive built for (and already
+  tested by) MTP's speculative tree-draft verification, previously with zero
+  production call sites. Score the shared text once, fork its KV + recurrent
+  GatedDeltaNet state onto a fresh sequence per question (a real device-to-device
+  copy of the recurrent state, ~151 MiB on the 27B per the primitive's own
+  measurement; negligible at 0.8B), run each question as an ordinary causal
+  continuation. No new attention masking, no new batching concept.
+- **The one genuinely new piece**: a question needs the hidden state at its
+  `<decide>` token *and* every option's `</opt>` token, scattered through the
+  branch rather than trailing — not expressible through the existing
+  `wants_logits`/spec-decode readout (which only ever means "the last N
+  tokens of this item"), and that machinery's own buffers are sized for
+  ordinary serving concurrency, not "however many options one question has".
+  `Model::hidden_states_at` reads straight from the full per-pass residual
+  stream into its own small scratch buffer instead — a few dozen lines, zero
+  changes to the existing forward path.
+- **The pointer head itself** (`kev.model.PointerHead`: two small `Linear(d,
+  256)` projections and a scaled dot product) runs on the CPU in
+  `infero_model::kev::PointerHead` — cheap enough at this scale that a CUDA
+  kernel would only add surface area, not speed.
+- **LoRA merging is an offline step**, not engine code: `scripts/merge_kev_lora.py`
+  folds a Kev checkpoint's adapter into its base in fp32 (the same arithmetic
+  Kev's own `LoadOptions.merge` does) and writes a plain safetensors
+  checkpoint infero's existing loader reads completely unmodified, plus a
+  `kev_head.safetensors`/`kev_head.json` sidecar for the pointer head
+  (`head.pt` itself is a raw torch pickle this crate does not parse). A
+  checkpoint directory carrying that sidecar *is* a Kev checkpoint — picked
+  up automatically at load time, no CLI flag.
+
+**Real, not simulated**: `jaredpalmer/kev-0.8b`'s real LoRA adapter (372
+tensors) merged onto a real downloaded `Qwen/Qwen3.5-0.8B-Base` — 186 of 186
+targets matched. Loaded into a real running `infero` server and hit over real
+HTTP:
+
+```
+POST /v1/systemone  state: "This product exceeded my expectations...buy it again."
+  noul "Is this review positive?"            -> 0.9622
+  choice "What is this review about?"        -> quality (0.76), shipping (0.14), price (0.10)
+
+POST /v1/systemone  state: "This product broke after one day...refund immediately."
+  noul (same question)                        -> 0.0186 (i.e. 0.9814 "no")
+  score "Rate customer satisfaction" (5 levels) -> 0.37 (70% mass on "very dissatisfied")
+```
+
+Positive/negative text correctly discriminated on a question the model's
+instructions never hardcode a keyword for, a 3-option `choice` question
+ranked sensibly against text that only clearly supports one of the three, and
+a `score` question's expected value and probability mass both land where a
+human reading the same text would put them. Not cherry-picked from a larger
+run — these are the only two records tried.
+
+**What this does not yet do**: `/v1/systemone` runs the same way
+`/v1/embeddings`/`/v1/rerank` already do — to completion on the worker
+thread, blocking any `Generate` request queued behind it, no cross-request
+batching across separate HTTP calls (one record's own questions *do* batch
+against each other, just not with another request's). A choice question's
+`criteria` object is read back in sorted-key order, not request order (this
+workspace's `serde_json` is not built with `preserve_order` — does not
+affect correctness, since every probability is still keyed by its own option
+name). A 0.8B/4B LoRA checkpoint is exactly what Keel asked for first; the
+27B full-weight path was this project's own original guess at where to
+start and needs no new code, just a download, since the loader never knew
+the difference between a merged-LoRA checkpoint and a native full-weight one.
+
+Test coverage: `crates/model/src/kev.rs`'s own 9 unit tests (packing layout,
+pointer-head math against hand-derived expected values, error cases) plus
+`crates/model/examples/kev_decide_smoke.rs`, a real-checkpoint smoke test in
+the same spirit as this repo's other `INFERO_TEST_*`-gated real-checkpoint
+tests.
+
+---
+
 ## What Keel will hold it to
 
 The Python service had to pass these before it was allowed into the index path.

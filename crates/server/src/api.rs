@@ -547,9 +547,182 @@ pub struct RerankResult {
     pub score: f32,
 }
 
+/// `POST /v1/systemone`: Kev-style decision-model scoring, not text
+/// generation -- see `infero_model::kev`'s module doc for the mechanism and
+/// `docs/kev-decision-model.md` for the full walkthrough. Field shapes
+/// mirror TypeSafe's own wire format exactly (`kev/api.py`'s `SystemOneRequest`
+/// upstream), the one both Jev and every Kev backend (torch/MLX/vLLM) answer
+/// to, so a client written against any of them needs no adapter here.
+///
+/// One real, documented deviation from upstream: a `choice` question's
+/// `criteria` object is read back out in **sorted key order**, not the
+/// order the request JSON had them in -- this workspace's `serde_json` is
+/// not built with the `preserve_order` feature, so `serde_json::Map`'s
+/// iteration order is its `BTreeMap` backing's, not insertion order. This
+/// changes which order the model sees the options in (and so, in
+/// principle, could change which one it favors on a near-tie) but not the
+/// correctness of the answer: every probability in the response is still
+/// keyed by its own option name, not a positional index.
+#[derive(Debug, Deserialize)]
+pub struct SystemOneRequest {
+    pub state: serde_json::Value,
+    #[serde(default = "default_kev_model")]
+    pub model: String,
+    pub questions: std::collections::BTreeMap<String, SystemOneQuestion>,
+}
+
+fn default_kev_model() -> String {
+    "kev-latest".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum SystemOneQuestion {
+    /// Yes/no. `criteria` is `{"false": ..., "true": ...}`, both optional
+    /// descriptions (`kev/api.py`'s `Noul`).
+    Noul {
+        #[serde(default)]
+        instructions: serde_json::Value,
+        #[serde(default)]
+        criteria: Option<serde_json::Map<String, serde_json::Value>>,
+    },
+    /// Multiple choice. `criteria` maps each option's name to an optional
+    /// description (`kev/api.py`'s `Choice`).
+    Choice {
+        #[serde(default)]
+        instructions: serde_json::Value,
+        criteria: serde_json::Map<String, serde_json::Value>,
+    },
+    /// An ordered rating scale. `criteria` is the level descriptions, lowest
+    /// to highest (`kev/api.py`'s `Score`).
+    Score {
+        #[serde(default)]
+        instructions: serde_json::Value,
+        criteria: Vec<serde_json::Value>,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum SystemOneAnswer {
+    Noul {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        noul: f32,
+    },
+    Choice {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        choice: String,
+        confidence: f32,
+        probabilities: std::collections::BTreeMap<String, f32>,
+    },
+    Score {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        score: f32,
+        legend: std::collections::BTreeMap<String, serde_json::Value>,
+        probabilities: std::collections::BTreeMap<String, f32>,
+        confidence: f32,
+    },
+}
+
+#[derive(Debug, Serialize)]
+pub struct SystemOneResponse {
+    pub model: String,
+    pub model_version: String,
+    pub answers: std::collections::BTreeMap<String, SystemOneAnswer>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RerankResponse {
     pub results: Vec<RerankResult>,
+}
+
+/// Flatten `str | object | array | number | bool | null` into text, field
+/// names kept as labels -- port of `kev/api.py`'s `render`. What a `state`
+/// or an option's description actually gets tokenized as.
+pub fn kev_render(v: &serde_json::Value, indent: usize) -> String {
+    let pad = "  ".repeat(indent);
+    match v {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(_) | serde_json::Value::Bool(_) => v.to_string(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|x| format!("{pad}- {}", kev_render(x, indent + 1).trim_start()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(k, x)| {
+                if x.is_object() || x.is_array() {
+                    format!("{pad}{k}:\n{}", kev_render(x, indent + 1))
+                } else {
+                    format!("{pad}{k}: {}", kev_render(x, indent))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+/// Port of `kev/api.py`'s `option_text`: a name alone, or `"name: description"`.
+pub fn kev_option_text(name: &str, desc: Option<&serde_json::Value>) -> String {
+    match desc {
+        None => name.to_string(),
+        Some(serde_json::Value::Null) => name.to_string(),
+        Some(serde_json::Value::String(s)) if s.is_empty() => name.to_string(),
+        Some(v) => format!("{name}: {}", kev_render(v, 0)),
+    }
+}
+
+/// `(p_max - 1/K) / (1 - 1/K)`: 0 at uniform, 1 at certainty. Port of
+/// `kev/api.py`'s `choice_confidence`.
+pub fn choice_confidence(p: &[f32]) -> f32 {
+    let k = p.len();
+    if k <= 1 {
+        return 1.0;
+    }
+    let sum: f32 = p.iter().sum();
+    let max = if sum.abs() < 1e-9 {
+        1.0 / k as f32
+    } else {
+        p.iter().copied().fold(f32::MIN, f32::max) / sum
+    };
+    (max - 1.0 / k as f32) / (1.0 - 1.0 / k as f32)
+}
+
+/// Port of `kev/api.py`'s `score_confidence`: `1` when all mass sits on one
+/// level, `0` at uniform or anything as spread.
+pub fn score_confidence(p: &[f32]) -> f32 {
+    let l = p.len();
+    if l <= 1 {
+        return 1.0;
+    }
+    let sum: f32 = p.iter().sum();
+    let norm: Vec<f32> = if sum.abs() < 1e-9 {
+        vec![1.0 / l as f32; l]
+    } else {
+        p.iter().map(|x| x / sum).collect()
+    };
+    let mode = norm
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let mean = (l - 1) as f32 / 2.0;
+    let d: f32 = (0..l).map(|i| (i as f32 - mean).abs()).sum::<f32>() / l as f32;
+    let spread: f32 = norm.iter().enumerate().map(|(i, &pi)| pi * (i as f32 - mode as f32).abs()).sum();
+    (1.0 - spread / d).max(0.0)
+}
+
+/// 4 decimal places -- `kev/api.py`'s `round_prob`'s own tolerance
+/// reasoning (255 options x 0.00005 rounding error < TypeSafe's 0.02
+/// sum-of-probabilities tolerance).
+pub fn round_prob(x: f32) -> f32 {
+    (x * 10000.0).round() / 10000.0
 }
 
 #[cfg(test)]
