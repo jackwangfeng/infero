@@ -2440,6 +2440,919 @@ extern "C" __global__ __launch_bounds__(256) void gdn_chunk_state_mma_f32(
     for (int r = 0; r < 64; ++r) S[(size_t)(i0 + r) * GDN_DV + j] = sc[r];
 }
 
+// Same tensor-core tiling as `gdn_chunk_state_mma_f32` above, but splitting
+// the value dimension into `GDN_DV/BVT=4` independent tiles (`blockIdx.y`)
+// instead of one block per head owning the full 128x128 state.
+// `gdn_chunk_state_mma_f32` launches only `heads` (48) blocks total, each
+// needing the full [128][128] `sS` shared-memory copy of the state (32 KiB
+// alone) -- capping occupancy at 1 block/SM and never using the GPU beyond
+// ~25% width regardless of the tensor-core win. vLLM/FLA's real Triton
+// kernel (`chunk_gated_delta_rule_fwd_kernel_h_blockdim64`, confirmed via
+// direct source read on 2026-09-30) splits the value dimension into
+// BV=32/64-wide tiles as an extra grid axis for exactly this reason -- this
+// kernel applies the same idea to the existing hand-written PTX MMA
+// plumbing: each block now owns only a [128][BVT] slice of the state
+// (BVT=32), shrinking `sS` to 8 KiB and every other per-block shared buffer
+// that scales with V along with it, and widening the grid to
+// `heads * (GDN_DV/BVT)` = 192 blocks -- the same width `PipelinedSplit4`
+// already tried (and which measured *worse* than not splitting at all,
+// since it only added grid width without touching the scalar-math
+// bottleneck or the per-block footprint) -- but this time paired with the
+// tensor-core math and the shrunk footprint `PipelinedSplit4` never had.
+//
+// `w_in`/`sKT`/`sgc` (chunk-local W/K/cumulative-decay) don't depend on
+// `dv` at all, so every v-tile block reloads and restages them
+// independently -- the same redundant-across-the-V-split reload FLA's own
+// kernel does for its own `w`/`k` (its offset lines only index `i_nh`,
+// never `i_v`). `u_in`/`delta_out`/`s_before_out`/`state` all index into
+// the `v_tile*BVT` slice of their own `dv` dimension instead.
+//
+// Block is 64 threads (2 warps) instead of 256: `j=lane/2` now covers
+// `0..BVT` (was `0..GDN_DV`), so the same "each thread owns one `(part,
+// j)` pair, `sc[64]` register-resident across the 128 `dk` rows" layout
+// `gdn_chunk_state_mma_f32` uses scales down exactly by `BVT/GDN_DV`. Both
+// MMA loops below are the *exact* same tile-decomposition formulas as the
+// full-width kernel -- with only 2 warps, `n_group=warp/2` collapses to 0
+// unconditionally, which by itself already re-derives the right `BVT/8=4`
+// n-tile range for the first loop; the second loop only needs its
+// tile-index divisor changed from `/16 %16` to `/4 %4` (`BVT/8=4` n-tiles
+// instead of 16).
+extern "C" __global__ __launch_bounds__(64) void gdn_chunk_state_mma_vtile_f32(
+        float* __restrict__ delta_out, float* __restrict__ s_before_out,
+        float* __restrict__ state, const float* __restrict__ w_in,
+        const float* __restrict__ u_in, const float* __restrict__ qkv,
+        const float* __restrict__ g, const int* __restrict__ first_token,
+        const int* __restrict__ n_tok, int heads, int key_heads, int dk, int dv,
+        int stride, int k_off, int v_tiled, int n_chunks) {
+    (void)dk;
+    (void)dv;
+    constexpr int BVT = 32;
+    const int head = blockIdx.x;
+    const int v_tile = blockIdx.y;
+    const int dv_base = v_tile * BVT;
+    const int seq = 0;
+    const int nt = n_tok[seq];
+    if (nt <= 0) return;
+    const int t0 = first_token[seq];
+    const int lane = threadIdx.x;  // 0..63
+    const int j = lane / 2;        // 0..BVT-1, this block's local dv column
+    const int part = lane % 2;
+    const int i0 = part * 64;
+    const int warp = threadIdx.x / WARP_SIZE;  // 0..1
+    const int mlane = threadIdx.x % WARP_SIZE;
+    const int khead = v_tiled ? (head % key_heads) : (head / (heads / key_heads));
+
+    extern __shared__ char gdn_state_mma_vtile_smem[];
+    __half* sS = (__half*)gdn_state_mma_vtile_smem;  // [BVT][128] transposed: sS[j*128+d] = S[d][dv_base+j]
+    __half* sW = sS + GDN_DK * BVT;                  // [GDN_CHUNK][GDN_DK] natural
+    float* sgc = (float*)(sW + GDN_CHUNK * GDN_DK);  // [GDN_CHUNK]
+    __half* sKT = (__half*)(sgc + GDN_CHUNK);        // [GDN_DK][GDN_CHUNK] transposed
+    __half* sDT = sKT + GDN_DK * GDN_CHUNK;          // [BVT][GDN_CHUNK] transposed: sDT[j*GDN_CHUNK+t] = delta_scaled[t][dv_base+j]
+
+    float* S = state + (size_t)head * GDN_DK * GDN_DV;
+    float sc[64];
+#pragma unroll
+    for (int r = 0; r < 64; ++r) sc[r] = S[(size_t)(i0 + r) * GDN_DV + dv_base + j];
+
+    for (int chunk = 0; chunk < n_chunks; ++chunk) {
+        const int c0 = chunk * GDN_CHUNK;
+        if (c0 >= nt) break;
+        const int C = min(GDN_CHUNK, nt - c0);
+
+        float* sbefore_chunk = s_before_out + ((size_t)chunk * heads + head) * GDN_DK * GDN_DV;
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            sbefore_chunk[(size_t)(i0 + r) * GDN_DV + dv_base + j] = sc[r];
+            sS[(size_t)j * GDN_DK + (i0 + r)] = __float2half(sc[r]);
+        }
+
+        const float* w_chunk = w_in + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DK;
+        const float* u_chunk = u_in + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DV;
+        float* delta_chunk = delta_out + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DV;
+
+        for (int idx = lane; idx < GDN_CHUNK * GDN_DK; idx += blockDim.x) {
+            const int t = idx / GDN_DK, d = idx % GDN_DK;
+            if (t < C) {
+                const float* row = qkv + (size_t)(t0 + c0 + t) * stride;
+                const float kv = row[k_off + (size_t)khead * GDN_DK + d];
+                sW[t * GDN_DK + d] = __float2half(w_chunk[t * GDN_DK + d]);
+                sKT[(size_t)d * GDN_CHUNK + t] = __float2half(kv);
+            } else {
+                sW[t * GDN_DK + d] = __float2half(0.0f);
+                sKT[(size_t)d * GDN_CHUNK + t] = __float2half(0.0f);
+            }
+        }
+        if (lane == 0) {
+            float acc = 0.0f;
+            for (int r = 0; r < C; ++r) {
+                acc += g[(size_t)(t0 + c0 + r) * heads + head];
+                sgc[r] = acc;
+            }
+        }
+        __syncthreads();
+
+        {
+            const int m_tile = warp % 2;
+            const int n_group = warp / 2;
+#pragma unroll
+            for (int sub = 0; sub < 4; ++sub) {
+                const int n_tile = n_group * 4 + sub;
+                mma_c_f32 acc = {{0.0f, 0.0f, 0.0f, 0.0f}};
+#pragma unroll
+                for (int kt = 0; kt < GDN_DK / 16; ++kt) {
+                    mma_a_f16 a;
+                    mma_b_f16 b;
+                    ldmatrix_a_f16(a, sW + m_tile * 16 * GDN_DK + kt * 16, GDN_DK * (int)sizeof(__half));
+                    ldmatrix_b_f16(b, sS + n_tile * 8 * GDN_DK + kt * 16, GDN_DK * (int)sizeof(__half));
+                    mma_f16(acc, a, b);
+                }
+                __syncwarp();
+                const int cr = mma_c_row(mlane);
+                const int cc = mma_c_col(mlane);
+                const int rows[2] = {m_tile * 16 + cr, m_tile * 16 + cr + 8};
+                const int cols[2] = {n_tile * 8 + cc, n_tile * 8 + cc + 1};
+                const float raw[4] = {acc.x[0], acc.x[1], acc.x[2], acc.x[3]};
+#pragma unroll
+                for (int rr = 0; rr < 2; ++rr) {
+                    const int t = rows[rr];
+#pragma unroll
+                    for (int cci = 0; cci < 2; ++cci) {
+                        const int jj = cols[cci];
+                        if (t < C) {
+                            const float d_val = u_chunk[t * GDN_DV + dv_base + jj] - raw[rr * 2 + cci];
+                            delta_chunk[t * GDN_DV + dv_base + jj] = d_val;
+                            const float decay_row = __expf(sgc[C - 1] - sgc[t]);
+                            sDT[(size_t)jj * GDN_CHUNK + t] = __float2half(d_val * decay_row);
+                        } else {
+                            sDT[(size_t)jj * GDN_CHUNK + t] = __float2half(0.0f);
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        const float decay_whole = __expf(sgc[C - 1]);
+        {
+#pragma unroll
+            for (int sub = 0; sub < 16; ++sub) {
+                const int tile = warp * 16 + sub;
+                const int m_tile = tile / 4;
+                const int n_tile = tile % 4;
+                mma_c_f32 acc = {{0.0f, 0.0f, 0.0f, 0.0f}};
+#pragma unroll
+                for (int kt = 0; kt < GDN_CHUNK / 16; ++kt) {
+                    mma_a_f16 a;
+                    mma_b_f16 b;
+                    ldmatrix_a_f16(a, sKT + m_tile * 16 * GDN_CHUNK + kt * 16, GDN_CHUNK * (int)sizeof(__half));
+                    ldmatrix_b_f16(b, sDT + n_tile * 8 * GDN_CHUNK + kt * 16, GDN_CHUNK * (int)sizeof(__half));
+                    mma_f16(acc, a, b);
+                }
+                __syncwarp();
+                const int cr = mma_c_row(mlane);
+                const int cc = mma_c_col(mlane);
+                const int rows[2] = {m_tile * 16 + cr, m_tile * 16 + cr + 8};
+                const int cols[2] = {n_tile * 8 + cc, n_tile * 8 + cc + 1};
+                const float raw[4] = {acc.x[0], acc.x[1], acc.x[2], acc.x[3]};
+#pragma unroll
+                for (int rr = 0; rr < 2; ++rr) {
+#pragma unroll
+                    for (int cci = 0; cci < 2; ++cci) {
+                        sS[(size_t)cols[cci] * GDN_DK + rows[rr]] = __float2half(raw[rr * 2 + cci]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            sc[r] = sc[r] * decay_whole + __half2float(sS[(size_t)j * GDN_DK + (i0 + r)]);
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < 64; ++r) S[(size_t)(i0 + r) * GDN_DV + dv_base + j] = sc[r];
+}
+
+// Composes `gdn_chunk_state_mma_f32`'s tensor-core math with
+// `gdn_chunk_state_pipelined_f32`'s `cp.async` double-buffered prefetch --
+// the lever this project's own design synthesis flagged as "identified but
+// never attempted": does the Mma kernel's own doc comment's open question
+// ("whether the two techniques compose is a real, separate follow-up, not
+// attempted here") have a real answer?
+//
+// What gets prefetched, and why only K: `gdn_chunk_state_mma_f32` stages two
+// per-chunk inputs into shared memory every iteration -- `sW` (from `w_in`,
+// already a dedicated, tightly-packed `[chunk][head][GDN_CHUNK][GDN_DK]`
+// buffer -- a contiguous, cache-friendly read) and `sKT` (from `qkv`, a
+// per-token row at `t0+c0+t)*stride` offset by `k_off+khead*GDN_DK` -- a
+// scattered read: consecutive tokens land `stride` (10240 floats at this
+// project's real 48-head/16-key-head/dk=dv=128 shape) apart, the exact same
+// "wide row, narrow slice" access pattern `gdn_chunk_state_pipelined_f32`'s
+// own doc comment motivates prefetching K for in the scalar kernel). Real
+// hardware shared-memory budget on this box (`sharedMemPerBlockOptin` =
+// 101376 B, confirmed via a direct `cudaGetDeviceProperties` probe on
+// `bw`'s GPU1, sm_120) does not fit double-buffering *both* K and W on top
+// of the Mma kernel's existing 56 KiB `sS`/`sW`/`sKT`/`sDT` footprint (that
+// would need another 64 KiB of raw-f32 staging, 120 KiB total) -- so only K,
+// the one with the real strided-read motivation, gets a cp.async double
+// buffer (`sKf0`/`sKf1`, raw f32, 16 KiB each); W keeps `gdn_chunk_state_
+// mma_f32`'s own direct synchronous global read + `__float2half` convert
+// into `sW`, unchanged. Total dynamic shared memory: 56 KiB (unchanged
+// `sS`+`sW`+`sKT`+`sDT`, f16) + 128 B (`sgc`, f32) + 32 KiB (`sKf0`+`sKf1`,
+// f32) = 90240 B -- under the 101376 B ceiling with 11136 B to spare (not
+// enough left for a second double buffer of anything this chunk's size).
+//
+// Staging is a raw f32 round trip, not a direct cp.async into `sKT`'s own
+// f16 storage: `cp.async.cg` moves bytes verbatim, it cannot narrow f32 to
+// f16 in flight, so the transposed-and-converted `sKT` this kernel's MMA
+// actually reads still gets built by the same per-thread `idx`-parallel
+// loop `gdn_chunk_state_mma_f32` already uses (`t = idx/GDN_DK, d =
+// idx%GDN_DK`), just reading its raw K from the now-arrived `skf[t*GDN_DK+d]`
+// shared staging buffer instead of directly from `qkv` -- the DMA latency
+// moves earlier (into the previous chunk's compute window), the conversion
+// arithmetic itself doesn't get any cheaper or more expensive. Same "always
+// issue the full GDN_CHUNK rows, ragged rows zero-fill via cp_async16's own
+// predicate" discipline as `gdn_chunk_state_pipelined_f32`'s own
+// `issue_load` (see that kernel's doc comment) -- and the conversion loop
+// still explicitly zero-fills `t >= C` itself rather than relying on that,
+// same defensive redundancy `gdn_chunk_state_mma_f32` already has.
+//
+// Everything else -- both MMA passes (`pred = W @ S`, `S += Kᵀ @
+// delta_scaled`), the shared-memory layout of `sS`/`sW`/`sgc`/`sKT`/`sDT`,
+// the ragged-chunk zero-fill discipline -- is copied unchanged from
+// `gdn_chunk_state_mma_f32`; only the K-staging path is new. Kept as a
+// separate kernel, not a rewrite in place, following this project's own
+// established convention (see e.g. `gdn_chunk_state_pipelined_f32`'s own
+// doc comment) of adding a new variant so the already-verified ones stay
+// available for direct comparison.
+extern "C" __global__ __launch_bounds__(256) void gdn_chunk_state_mma_pipelined_f32(
+        float* __restrict__ delta_out, float* __restrict__ s_before_out,
+        float* __restrict__ state, const float* __restrict__ w_in,
+        const float* __restrict__ u_in, const float* __restrict__ qkv,
+        const float* __restrict__ g, const int* __restrict__ first_token,
+        const int* __restrict__ n_tok, int heads, int key_heads, int dk, int dv,
+        int stride, int k_off, int v_tiled, int n_chunks) {
+    (void)dk;
+    (void)dv;
+    const int head = blockIdx.x;
+    const int seq = 0;
+    const int nt = n_tok[seq];
+    if (nt <= 0) return;
+    const int t0 = first_token[seq];
+    const int lane = threadIdx.x;  // 0..255
+    const int j = lane / 2;
+    const int part = lane % 2;
+    const int i0 = part * 64;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int mlane = threadIdx.x % WARP_SIZE;
+    const int khead = v_tiled ? (head % key_heads) : (head / (heads / key_heads));
+
+    extern __shared__ char gdn_state_mma_pp_smem[];
+    __half* sS = (__half*)gdn_state_mma_pp_smem;        // [128][128] transposed: sS[j*128+d] = S[d][j]
+    __half* sW = sS + GDN_DK * GDN_DV;                  // [GDN_CHUNK][GDN_DK] natural, current chunk
+    float* sgc = (float*)(sW + GDN_CHUNK * GDN_DK);     // [GDN_CHUNK]
+    __half* sKT = (__half*)(sgc + GDN_CHUNK);           // [GDN_DK][GDN_CHUNK] transposed, current chunk
+    __half* sDT = sKT + GDN_DK * GDN_CHUNK;             // [GDN_DV][GDN_CHUNK] transposed, scratch
+    float* sKf0 = (float*)(sDT + GDN_DV * GDN_CHUNK);   // [GDN_CHUNK][GDN_DK] raw K staging buf 0
+    float* sKf1 = sKf0 + GDN_CHUNK * GDN_DK;            // [GDN_CHUNK][GDN_DK] raw K staging buf 1
+
+    float* S = state + (size_t)head * GDN_DK * GDN_DV;
+    float sc[64];
+#pragma unroll
+    for (int r = 0; r < 64; ++r) sc[r] = S[(size_t)(i0 + r) * GDN_DV + j];
+
+    // Raw f32 K prefetch, natural [t][d] layout (no row padding -- unlike
+    // `gdn_chunk_state_pipelined_f32`'s own `sk`/`sw`, nothing here ever reads
+    // this buffer with a per-thread strided scalar access pattern; the only
+    // reader is the idx-parallel convert-and-transpose loop below, which reads
+    // consecutive `d` for a fixed `t` across consecutive lanes -- already
+    // coalesced, no bank-conflict reason to pad).
+    auto issue_load_k = [&](int chunk_idx, float* skb) {
+        const int cc0 = chunk_idx * GDN_CHUNK;
+        const int CC = min(GDN_CHUNK, nt - cc0);
+        for (int idx = lane; idx < GDN_CHUNK * (GDN_DK / 4); idx += blockDim.x) {
+            const int r = idx / (GDN_DK / 4), w4 = idx % (GDN_DK / 4);
+            const bool hit = r < CC;
+            const int safe_r = hit ? r : 0;
+            const float* row = qkv + (size_t)(t0 + cc0 + safe_r) * stride;
+            cp_async16(skb + r * GDN_DK + w4 * 4, row + k_off + (size_t)khead * GDN_DK + w4 * 4, hit);
+        }
+    };
+
+    if (n_chunks > 0) {
+        issue_load_k(0, sKf0);
+    }
+    CP_ASYNC_FENCE();
+
+    for (int chunk = 0; chunk < n_chunks; ++chunk) {
+        const int c0 = chunk * GDN_CHUNK;
+        if (c0 >= nt) break;
+        const int C = min(GDN_CHUNK, nt - c0);
+        const int buf = chunk & 1;
+        float* skf = buf ? sKf1 : sKf0;
+
+        CP_ASYNC_WAIT(0);
+        __syncthreads();
+
+        if (chunk + 1 < n_chunks) {
+            issue_load_k(chunk + 1, buf ? sKf0 : sKf1);
+            CP_ASYNC_FENCE();
+        }
+
+        float* sbefore_chunk = s_before_out + ((size_t)chunk * heads + head) * GDN_DK * GDN_DV;
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            sbefore_chunk[(size_t)(i0 + r) * GDN_DV + j] = sc[r];
+            sS[(size_t)j * GDN_DK + (i0 + r)] = __float2half(sc[r]);
+        }
+
+        const float* w_chunk = w_in + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DK;
+        const float* u_chunk = u_in + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DV;
+        float* delta_chunk = delta_out + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DV;
+
+        for (int idx = lane; idx < GDN_CHUNK * GDN_DK; idx += blockDim.x) {
+            const int t = idx / GDN_DK, d = idx % GDN_DK;
+            if (t < C) {
+                sW[t * GDN_DK + d] = __float2half(w_chunk[t * GDN_DK + d]);
+                sKT[(size_t)d * GDN_CHUNK + t] = __float2half(skf[t * GDN_DK + d]);
+            } else {
+                sW[t * GDN_DK + d] = __float2half(0.0f);
+                sKT[(size_t)d * GDN_CHUNK + t] = __float2half(0.0f);
+            }
+        }
+        if (lane == 0) {
+            float acc = 0.0f;
+            for (int r = 0; r < C; ++r) {
+                acc += g[(size_t)(t0 + c0 + r) * heads + head];
+                sgc[r] = acc;
+            }
+        }
+        __syncthreads();
+
+        {
+            const int m_tile = warp % 2;
+            const int n_group = warp / 2;
+#pragma unroll
+            for (int sub = 0; sub < 4; ++sub) {
+                const int n_tile = n_group * 4 + sub;
+                mma_c_f32 acc = {{0.0f, 0.0f, 0.0f, 0.0f}};
+#pragma unroll
+                for (int kt = 0; kt < GDN_DK / 16; ++kt) {
+                    mma_a_f16 a;
+                    mma_b_f16 b;
+                    ldmatrix_a_f16(a, sW + m_tile * 16 * GDN_DK + kt * 16, GDN_DK * (int)sizeof(__half));
+                    ldmatrix_b_f16(b, sS + n_tile * 8 * GDN_DK + kt * 16, GDN_DK * (int)sizeof(__half));
+                    mma_f16(acc, a, b);
+                }
+                __syncwarp();
+                const int cr = mma_c_row(mlane);
+                const int cc = mma_c_col(mlane);
+                const int rows[2] = {m_tile * 16 + cr, m_tile * 16 + cr + 8};
+                const int cols[2] = {n_tile * 8 + cc, n_tile * 8 + cc + 1};
+                const float raw[4] = {acc.x[0], acc.x[1], acc.x[2], acc.x[3]};
+#pragma unroll
+                for (int rr = 0; rr < 2; ++rr) {
+                    const int t = rows[rr];
+#pragma unroll
+                    for (int cci = 0; cci < 2; ++cci) {
+                        const int jj = cols[cci];
+                        if (t < C) {
+                            const float d_val = u_chunk[t * GDN_DV + jj] - raw[rr * 2 + cci];
+                            delta_chunk[t * GDN_DV + jj] = d_val;
+                            const float decay_row = __expf(sgc[C - 1] - sgc[t]);
+                            sDT[(size_t)jj * GDN_CHUNK + t] = __float2half(d_val * decay_row);
+                        } else {
+                            sDT[(size_t)jj * GDN_CHUNK + t] = __float2half(0.0f);
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        const float decay_whole = __expf(sgc[C - 1]);
+        {
+#pragma unroll
+            for (int sub = 0; sub < 16; ++sub) {
+                const int tile = warp * 16 + sub;
+                const int m_tile = tile / 16;
+                const int n_tile = tile % 16;
+                mma_c_f32 acc = {{0.0f, 0.0f, 0.0f, 0.0f}};
+#pragma unroll
+                for (int kt = 0; kt < GDN_CHUNK / 16; ++kt) {
+                    mma_a_f16 a;
+                    mma_b_f16 b;
+                    ldmatrix_a_f16(a, sKT + m_tile * 16 * GDN_CHUNK + kt * 16, GDN_CHUNK * (int)sizeof(__half));
+                    ldmatrix_b_f16(b, sDT + n_tile * 8 * GDN_CHUNK + kt * 16, GDN_CHUNK * (int)sizeof(__half));
+                    mma_f16(acc, a, b);
+                }
+                __syncwarp();
+                const int cr = mma_c_row(mlane);
+                const int cc = mma_c_col(mlane);
+                const int rows[2] = {m_tile * 16 + cr, m_tile * 16 + cr + 8};
+                const int cols[2] = {n_tile * 8 + cc, n_tile * 8 + cc + 1};
+                const float raw[4] = {acc.x[0], acc.x[1], acc.x[2], acc.x[3]};
+#pragma unroll
+                for (int rr = 0; rr < 2; ++rr) {
+#pragma unroll
+                    for (int cci = 0; cci < 2; ++cci) {
+                        sS[(size_t)cols[cci] * GDN_DK + rows[rr]] = __float2half(raw[rr * 2 + cci]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            sc[r] = sc[r] * decay_whole + __half2float(sS[(size_t)j * GDN_DK + (i0 + r)]);
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < 64; ++r) S[(size_t)(i0 + r) * GDN_DV + j] = sc[r];
+}
+
+// `MmaVtile` + `MmaPipelined` composed: `gdn_chunk_state_mma_vtile_f32`'s
+// V-tiled grid (BVT=32, 64-thread/2-warp blocks, `heads * GDN_DV/BVT` = 192
+// blocks) with BOTH K and W double-buffered via `cp.async`, not just K like
+// `gdn_chunk_state_mma_pipelined_f32`. The one combination neither of those
+// two kernels' own doc comments tried: `MmaVtile`'s doc comment measured
+// grid-width alone as a regression (smaller 2-warp blocks lose
+// latency-hiding capacity, no compensating benefit); `MmaPipelined`'s doc
+// comment could only afford to double-buffer K, not W, because the
+// un-tiled `Mma` kernel's [128][128] `sS` alone costs 32 KiB, leaving no
+// room under this box's real 101376 B `sharedMemPerBlockOptin` ceiling for
+// a second raw-f32 double buffer. V-tiling shrinks exactly the buffers that
+// scale with `BVT` instead of the full `GDN_DV` (`sS`: [BVT][128] instead of
+// [128][128], `sDT`: [BVT][GDN_CHUNK] instead of [GDN_DV][GDN_CHUNK]) --
+// freeing enough budget to add both a K and a W double buffer on top.
+//
+// Real byte budget for this kernel's own layout, computed before writing it
+// (not assumed): `sS`[BVT=32][GDN_DK=128] f16 = 8192 B, `sW`[GDN_CHUNK=32]
+// [GDN_DK=128] f16 (current-chunk converted, same size as every other MMA
+// variant here since it doesn't depend on BVT) = 8192 B, `sgc`[GDN_CHUNK]
+// f32 = 128 B, `sKT`[GDN_DK][GDN_CHUNK] f16 (also BVT-independent) = 8192 B,
+// `sDT`[BVT][GDN_CHUNK] f16 = 2048 B -- 26752 B of `Mma`-style f16/f32
+// state, down from `MmaPipelined`'s 57368 B because `sS` and `sDT` shrunk.
+// Then the raw-f32 `cp.async` staging: `sKf0`+`sKf1`[GDN_CHUNK][GDN_DK] f32
+// = 16384 B each (32768 B total, same as `MmaPipelined`'s K buffers --
+// unaffected by BVT, K/W are shared, redundantly reloaded, across every
+// v-tile block of a head exactly like `gdn_chunk_state_mma_vtile_f32`'s own
+// `w_in`/`sKT`/`sgc` already are), plus a *new* `sWf0`+`sWf1` pair of the
+// same size for W's own double buffer (32768 B total). Grand total: 26752 +
+// 32768 + 32768 = 92288 B -- under the 101376 B ceiling with 9088 B to
+// spare. Fits at BVT=32 (matching `gdn_chunk_state_mma_vtile_f32`'s own
+// tiling exactly); the BVT=64/2-tile fallback this design considered is not
+// needed.
+//
+// Everything else is a direct splice: the MMA math (both `mma_c_f32`
+// passes, tile-decomposition formulas, `m_tile`/`n_group`/`n_tile` index
+// arithmetic) and the state/output indexing (`dv_base` offset into the
+// global `state`/`u_in`/`delta_out`/`s_before_out` buffers) are copied
+// unchanged from `gdn_chunk_state_mma_vtile_f32`; the `issue_load`
+// double-buffer prefetch (raw f32, unpadded `[GDN_CHUNK][GDN_DK]`, `hit`
+// predicate zero-fills a ragged last chunk exactly the way
+// `gdn_chunk_state_mma_pipelined_f32`'s own `issue_load_k` does) is copied
+// from `gdn_chunk_state_pipelined_f32`'s combined K+W `issue_load` (the
+// scalar kernel that already double-buffers both), minus that kernel's own
+// `GDN_ROW_PAD` padding -- not needed here since, same as `MmaPipelined`'s
+// `sKf0`/`sKf1`, the only reader of these raw buffers is the idx-parallel
+// convert-and-transpose loop, never a per-thread strided scalar read.
+extern "C" __global__ __launch_bounds__(64) void gdn_chunk_state_mma_vtile_pipelined_f32(
+        float* __restrict__ delta_out, float* __restrict__ s_before_out,
+        float* __restrict__ state, const float* __restrict__ w_in,
+        const float* __restrict__ u_in, const float* __restrict__ qkv,
+        const float* __restrict__ g, const int* __restrict__ first_token,
+        const int* __restrict__ n_tok, int heads, int key_heads, int dk, int dv,
+        int stride, int k_off, int v_tiled, int n_chunks) {
+    (void)dk;
+    (void)dv;
+    constexpr int BVT = 32;
+    const int head = blockIdx.x;
+    const int v_tile = blockIdx.y;
+    const int dv_base = v_tile * BVT;
+    const int seq = 0;
+    const int nt = n_tok[seq];
+    if (nt <= 0) return;
+    const int t0 = first_token[seq];
+    const int lane = threadIdx.x;  // 0..63
+    const int j = lane / 2;        // 0..BVT-1, this block's local dv column
+    const int part = lane % 2;
+    const int i0 = part * 64;
+    const int warp = threadIdx.x / WARP_SIZE;  // 0..1
+    const int mlane = threadIdx.x % WARP_SIZE;
+    const int khead = v_tiled ? (head % key_heads) : (head / (heads / key_heads));
+
+    extern __shared__ char gdn_state_mma_vtile_pp_smem[];
+    __half* sS = (__half*)gdn_state_mma_vtile_pp_smem;  // [BVT][128] transposed: sS[j*128+d] = S[d][dv_base+j]
+    __half* sW = sS + GDN_DK * BVT;                     // [GDN_CHUNK][GDN_DK] f16, current chunk, converted
+    float* sgc = (float*)(sW + GDN_CHUNK * GDN_DK);     // [GDN_CHUNK]
+    __half* sKT = (__half*)(sgc + GDN_CHUNK);           // [GDN_DK][GDN_CHUNK] transposed, current chunk
+    __half* sDT = sKT + GDN_DK * GDN_CHUNK;             // [BVT][GDN_CHUNK] transposed scratch
+    float* sKf0 = (float*)(sDT + BVT * GDN_CHUNK);      // [GDN_CHUNK][GDN_DK] raw K staging buf 0
+    float* sKf1 = sKf0 + GDN_CHUNK * GDN_DK;            // raw K staging buf 1
+    float* sWf0 = sKf1 + GDN_CHUNK * GDN_DK;            // [GDN_CHUNK][GDN_DK] raw W staging buf 0
+    float* sWf1 = sWf0 + GDN_CHUNK * GDN_DK;            // raw W staging buf 1
+
+    float* S = state + (size_t)head * GDN_DK * GDN_DV;
+    float sc[64];
+#pragma unroll
+    for (int r = 0; r < 64; ++r) sc[r] = S[(size_t)(i0 + r) * GDN_DV + dv_base + j];
+
+    // Combined K+W prefetch, raw f32, unpadded natural [t][d] layout -- see
+    // this kernel's own doc comment for why no `GDN_ROW_PAD` is needed here.
+    auto issue_load = [&](int chunk_idx, float* skb, float* swb) {
+        const int cc0 = chunk_idx * GDN_CHUNK;
+        const int CC = min(GDN_CHUNK, nt - cc0);
+        const float* w_chunk = w_in + ((size_t)chunk_idx * heads + head) * GDN_CHUNK * GDN_DK;
+        for (int idx = lane; idx < GDN_CHUNK * (GDN_DK / 4); idx += blockDim.x) {
+            const int r = idx / (GDN_DK / 4), w4 = idx % (GDN_DK / 4);
+            const bool hit = r < CC;
+            const int safe_r = hit ? r : 0;
+            const float* row = qkv + (size_t)(t0 + cc0 + safe_r) * stride;
+            cp_async16(skb + r * GDN_DK + w4 * 4, row + k_off + (size_t)khead * GDN_DK + w4 * 4, hit);
+            cp_async16(swb + r * GDN_DK + w4 * 4, w_chunk + safe_r * GDN_DK + w4 * 4, hit);
+        }
+    };
+
+    if (n_chunks > 0) {
+        issue_load(0, sKf0, sWf0);
+    }
+    CP_ASYNC_FENCE();
+
+    for (int chunk = 0; chunk < n_chunks; ++chunk) {
+        const int c0 = chunk * GDN_CHUNK;
+        if (c0 >= nt) break;
+        const int C = min(GDN_CHUNK, nt - c0);
+        const int buf = chunk & 1;
+        float* skf = buf ? sKf1 : sKf0;
+        float* swf = buf ? sWf1 : sWf0;
+
+        CP_ASYNC_WAIT(0);
+        __syncthreads();
+
+        if (chunk + 1 < n_chunks) {
+            const int nbuf = (chunk + 1) & 1;
+            issue_load(chunk + 1, nbuf ? sKf1 : sKf0, nbuf ? sWf1 : sWf0);
+            CP_ASYNC_FENCE();
+        }
+
+        float* sbefore_chunk = s_before_out + ((size_t)chunk * heads + head) * GDN_DK * GDN_DV;
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            sbefore_chunk[(size_t)(i0 + r) * GDN_DV + dv_base + j] = sc[r];
+            sS[(size_t)j * GDN_DK + (i0 + r)] = __float2half(sc[r]);
+        }
+
+        const float* u_chunk = u_in + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DV;
+        float* delta_chunk = delta_out + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DV;
+
+        for (int idx = lane; idx < GDN_CHUNK * GDN_DK; idx += blockDim.x) {
+            const int t = idx / GDN_DK, d = idx % GDN_DK;
+            if (t < C) {
+                sW[t * GDN_DK + d] = __float2half(swf[t * GDN_DK + d]);
+                sKT[(size_t)d * GDN_CHUNK + t] = __float2half(skf[t * GDN_DK + d]);
+            } else {
+                sW[t * GDN_DK + d] = __float2half(0.0f);
+                sKT[(size_t)d * GDN_CHUNK + t] = __float2half(0.0f);
+            }
+        }
+        if (lane == 0) {
+            float acc = 0.0f;
+            for (int r = 0; r < C; ++r) {
+                acc += g[(size_t)(t0 + c0 + r) * heads + head];
+                sgc[r] = acc;
+            }
+        }
+        __syncthreads();
+
+        {
+            const int m_tile = warp % 2;
+            const int n_group = warp / 2;
+#pragma unroll
+            for (int sub = 0; sub < 4; ++sub) {
+                const int n_tile = n_group * 4 + sub;
+                mma_c_f32 acc = {{0.0f, 0.0f, 0.0f, 0.0f}};
+#pragma unroll
+                for (int kt = 0; kt < GDN_DK / 16; ++kt) {
+                    mma_a_f16 a;
+                    mma_b_f16 b;
+                    ldmatrix_a_f16(a, sW + m_tile * 16 * GDN_DK + kt * 16, GDN_DK * (int)sizeof(__half));
+                    ldmatrix_b_f16(b, sS + n_tile * 8 * GDN_DK + kt * 16, GDN_DK * (int)sizeof(__half));
+                    mma_f16(acc, a, b);
+                }
+                __syncwarp();
+                const int cr = mma_c_row(mlane);
+                const int cc = mma_c_col(mlane);
+                const int rows[2] = {m_tile * 16 + cr, m_tile * 16 + cr + 8};
+                const int cols[2] = {n_tile * 8 + cc, n_tile * 8 + cc + 1};
+                const float raw[4] = {acc.x[0], acc.x[1], acc.x[2], acc.x[3]};
+#pragma unroll
+                for (int rr = 0; rr < 2; ++rr) {
+                    const int t = rows[rr];
+#pragma unroll
+                    for (int cci = 0; cci < 2; ++cci) {
+                        const int jj = cols[cci];
+                        if (t < C) {
+                            const float d_val = u_chunk[t * GDN_DV + dv_base + jj] - raw[rr * 2 + cci];
+                            delta_chunk[t * GDN_DV + dv_base + jj] = d_val;
+                            const float decay_row = __expf(sgc[C - 1] - sgc[t]);
+                            sDT[(size_t)jj * GDN_CHUNK + t] = __float2half(d_val * decay_row);
+                        } else {
+                            sDT[(size_t)jj * GDN_CHUNK + t] = __float2half(0.0f);
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        const float decay_whole = __expf(sgc[C - 1]);
+        {
+#pragma unroll
+            for (int sub = 0; sub < 16; ++sub) {
+                const int tile = warp * 16 + sub;
+                const int m_tile = tile / 4;
+                const int n_tile = tile % 4;
+                mma_c_f32 acc = {{0.0f, 0.0f, 0.0f, 0.0f}};
+#pragma unroll
+                for (int kt = 0; kt < GDN_CHUNK / 16; ++kt) {
+                    mma_a_f16 a;
+                    mma_b_f16 b;
+                    ldmatrix_a_f16(a, sKT + m_tile * 16 * GDN_CHUNK + kt * 16, GDN_CHUNK * (int)sizeof(__half));
+                    ldmatrix_b_f16(b, sDT + n_tile * 8 * GDN_CHUNK + kt * 16, GDN_CHUNK * (int)sizeof(__half));
+                    mma_f16(acc, a, b);
+                }
+                __syncwarp();
+                const int cr = mma_c_row(mlane);
+                const int cc = mma_c_col(mlane);
+                const int rows[2] = {m_tile * 16 + cr, m_tile * 16 + cr + 8};
+                const int cols[2] = {n_tile * 8 + cc, n_tile * 8 + cc + 1};
+                const float raw[4] = {acc.x[0], acc.x[1], acc.x[2], acc.x[3]};
+#pragma unroll
+                for (int rr = 0; rr < 2; ++rr) {
+#pragma unroll
+                    for (int cci = 0; cci < 2; ++cci) {
+                        sS[(size_t)cols[cci] * GDN_DK + rows[rr]] = __float2half(raw[rr * 2 + cci]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            sc[r] = sc[r] * decay_whole + __half2float(sS[(size_t)j * GDN_DK + (i0 + r)]);
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < 64; ++r) S[(size_t)(i0 + r) * GDN_DV + dv_base + j] = sc[r];
+}
+
+// `MmaTritonMatch`: a structural port targeting vLLM's real, autotuned Triton
+// kernel config pinned down for this exact shape (H=48, Hg=16, K=V=128,
+// BT=64): BV=64 (a 2-wide grid across `GDN_DV`, half of `Mma`'s untiled 128,
+// double `MmaVtile`/`MmaVtilePipelined`'s own historically-chosen BVT=32)
+// and 4 warps (128 threads) a block, matching Triton's real `num_warps=4`
+// -- not a repeat of `MmaVtile`'s own BVT=32/2-warp tiling, which was
+// infero's own historically-evolved choice, made before this shape's real
+// autotune result was ever pinned down.
+//
+// This kernel mirrors the pinned-down config's first two axes (tile width,
+// warp count) exactly. It does NOT mirror the third (`num_stages=3`, a
+// 2-iteration-deep / 3-buffer-generation software pipeline covering both K
+// and W) -- that composition does not fit this hardware's real shared-
+// memory budget at BV=64, and the arithmetic is worth writing down before,
+// not after, discovering it experimentally: this kernel's own
+// `sS`+`sW`+`sgc`+`sKT`+`sDT` layout costs 36992 B at BVT=64 (`sS` alone
+// doubles from `MmaVtilePipelined`'s 8192 B to 16384 B since it now spans
+// twice the `dv` columns per block). Adding a FULL double buffer of both
+// raw-f32 K and W (2x `[GDN_CHUNK][GDN_DK]` f32 each = 65536 B total) would
+// bring the grand total to 102528 B -- 1152 B OVER the real 101376 B
+// `sharedMemPerBlockOptin` ceiling this project has already probed via
+// `cudaGetDeviceProperties` on this class of hardware (sm_120a). A single
+// double buffer (K only, 32768 B) fits with 31616 B to spare; that shortfall
+// (31616 B available vs. 32768 B a second K/W-sized buffer pair would need)
+// is exactly the 1152 B this kernel is short by -- not a coincidence, a
+// consistency check that the two numbers above are computed from the same
+// real layout. So: this kernel keeps `MmaPipelined`'s own compromise for the
+// third axis -- double-buffer K (the one input with a real strided global
+// read), leave W a direct synchronous load -- rather than claiming a full
+// K+W double buffer fits at BV=64 when the real byte budget says it does
+// not. (Triton's own compiled kernel does not hit this same wall: its
+// BV=64 config's real dynamic shared memory, from its own compile metadata,
+// is 90632 B for its own tile/register/pipeline layout -- a different
+// program with a different real footprint, not a contradiction.)
+//
+// Everything else is copied from `gdn_chunk_state_mma_vtile_pipelined_f32`:
+// same MMA math, same ragged-chunk zero-fill discipline, same `issue_load_k`
+// (copied from `gdn_chunk_state_mma_pipelined_f32`, unpadded raw f32,
+// `hit`-predicated `cp_async16`). The only per-warp arithmetic that had to
+// change for 4 warps instead of 2 is the tile-index decomposition: the first
+// MMA pass's `m_tile = warp % 2; n_group = warp / 2;` already generalizes
+// (warp 0..3 now visits all four (m_tile, n_group) pairs once each, and
+// `n_tile = n_group*4+sub` for `sub` in 0..4 still covers the full
+// `BVT/8 = 8` n-tiles needed at BVT=64); the second pass's divisor changes
+// from `MmaVtilePipelined`'s `tile/4, tile%4` (BVT=32 => 4 n-tiles) to
+// `tile/8, tile%8` (BVT=64 => 8 n-tiles), since `warp*16+sub` now ranges
+// over all `8 (GDN_DK/16) * 8 (BVT/8) = 64` (m_tile, n_tile) pairs across 4
+// warps instead of `8 * 4 = 32` across 2.
+extern "C" __global__ __launch_bounds__(128) void gdn_chunk_state_mma_triton_match_f32(
+        float* __restrict__ delta_out, float* __restrict__ s_before_out,
+        float* __restrict__ state, const float* __restrict__ w_in,
+        const float* __restrict__ u_in, const float* __restrict__ qkv,
+        const float* __restrict__ g, const int* __restrict__ first_token,
+        const int* __restrict__ n_tok, int heads, int key_heads, int dk, int dv,
+        int stride, int k_off, int v_tiled, int n_chunks) {
+    (void)dk;
+    (void)dv;
+    constexpr int BVT = 64;
+    const int head = blockIdx.x;
+    const int v_tile = blockIdx.y;
+    const int dv_base = v_tile * BVT;
+    const int seq = 0;
+    const int nt = n_tok[seq];
+    if (nt <= 0) return;
+    const int t0 = first_token[seq];
+    const int lane = threadIdx.x;  // 0..127
+    const int j = lane / 2;        // 0..BVT-1, this block's local dv column
+    const int part = lane % 2;
+    const int i0 = part * 64;
+    const int warp = threadIdx.x / WARP_SIZE;  // 0..3
+    const int mlane = threadIdx.x % WARP_SIZE;
+    const int khead = v_tiled ? (head % key_heads) : (head / (heads / key_heads));
+
+    extern __shared__ char gdn_state_mma_tm_smem[];
+    __half* sS = (__half*)gdn_state_mma_tm_smem;         // [BVT][128] transposed: sS[j*128+d] = S[d][dv_base+j]
+    __half* sW = sS + GDN_DK * BVT;                      // [GDN_CHUNK][GDN_DK] f16, current chunk, converted
+    float* sgc = (float*)(sW + GDN_CHUNK * GDN_DK);      // [GDN_CHUNK]
+    __half* sKT = (__half*)(sgc + GDN_CHUNK);            // [GDN_DK][GDN_CHUNK] transposed, current chunk
+    __half* sDT = sKT + GDN_DK * GDN_CHUNK;              // [BVT][GDN_CHUNK] transposed scratch
+    float* sKf0 = (float*)(sDT + BVT * GDN_CHUNK);       // [GDN_CHUNK][GDN_DK] raw K staging buf 0
+    float* sKf1 = sKf0 + GDN_CHUNK * GDN_DK;             // raw K staging buf 1
+
+    float* S = state + (size_t)head * GDN_DK * GDN_DV;
+    float sc[64];
+#pragma unroll
+    for (int r = 0; r < 64; ++r) sc[r] = S[(size_t)(i0 + r) * GDN_DV + dv_base + j];
+
+    // K-only cp.async double buffer -- see this kernel's own doc comment for
+    // why W stays a direct synchronous load. Same raw f32, unpadded [t][d]
+    // staging as `gdn_chunk_state_mma_pipelined_f32`'s own `issue_load_k`.
+    auto issue_load_k = [&](int chunk_idx, float* skb) {
+        const int cc0 = chunk_idx * GDN_CHUNK;
+        const int CC = min(GDN_CHUNK, nt - cc0);
+        for (int idx = lane; idx < GDN_CHUNK * (GDN_DK / 4); idx += blockDim.x) {
+            const int r = idx / (GDN_DK / 4), w4 = idx % (GDN_DK / 4);
+            const bool hit = r < CC;
+            const int safe_r = hit ? r : 0;
+            const float* row = qkv + (size_t)(t0 + cc0 + safe_r) * stride;
+            cp_async16(skb + r * GDN_DK + w4 * 4, row + k_off + (size_t)khead * GDN_DK + w4 * 4, hit);
+        }
+    };
+
+    if (n_chunks > 0) {
+        issue_load_k(0, sKf0);
+    }
+    CP_ASYNC_FENCE();
+
+    for (int chunk = 0; chunk < n_chunks; ++chunk) {
+        const int c0 = chunk * GDN_CHUNK;
+        if (c0 >= nt) break;
+        const int C = min(GDN_CHUNK, nt - c0);
+        const int buf = chunk & 1;
+        float* skf = buf ? sKf1 : sKf0;
+
+        CP_ASYNC_WAIT(0);
+        __syncthreads();
+
+        if (chunk + 1 < n_chunks) {
+            issue_load_k(chunk + 1, buf ? sKf0 : sKf1);
+            CP_ASYNC_FENCE();
+        }
+
+        float* sbefore_chunk = s_before_out + ((size_t)chunk * heads + head) * GDN_DK * GDN_DV;
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            sbefore_chunk[(size_t)(i0 + r) * GDN_DV + dv_base + j] = sc[r];
+            sS[(size_t)j * GDN_DK + (i0 + r)] = __float2half(sc[r]);
+        }
+
+        const float* w_chunk = w_in + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DK;
+        const float* u_chunk = u_in + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DV;
+        float* delta_chunk = delta_out + ((size_t)chunk * heads + head) * GDN_CHUNK * GDN_DV;
+
+        for (int idx = lane; idx < GDN_CHUNK * GDN_DK; idx += blockDim.x) {
+            const int t = idx / GDN_DK, d = idx % GDN_DK;
+            if (t < C) {
+                sW[t * GDN_DK + d] = __float2half(w_chunk[t * GDN_DK + d]);
+                sKT[(size_t)d * GDN_CHUNK + t] = __float2half(skf[t * GDN_DK + d]);
+            } else {
+                sW[t * GDN_DK + d] = __float2half(0.0f);
+                sKT[(size_t)d * GDN_CHUNK + t] = __float2half(0.0f);
+            }
+        }
+        if (lane == 0) {
+            float acc = 0.0f;
+            for (int r = 0; r < C; ++r) {
+                acc += g[(size_t)(t0 + c0 + r) * heads + head];
+                sgc[r] = acc;
+            }
+        }
+        __syncthreads();
+
+        {
+            const int m_tile = warp % 2;
+            const int n_group = warp / 2;
+#pragma unroll
+            for (int sub = 0; sub < 4; ++sub) {
+                const int n_tile = n_group * 4 + sub;
+                mma_c_f32 acc = {{0.0f, 0.0f, 0.0f, 0.0f}};
+#pragma unroll
+                for (int kt = 0; kt < GDN_DK / 16; ++kt) {
+                    mma_a_f16 a;
+                    mma_b_f16 b;
+                    ldmatrix_a_f16(a, sW + m_tile * 16 * GDN_DK + kt * 16, GDN_DK * (int)sizeof(__half));
+                    ldmatrix_b_f16(b, sS + n_tile * 8 * GDN_DK + kt * 16, GDN_DK * (int)sizeof(__half));
+                    mma_f16(acc, a, b);
+                }
+                __syncwarp();
+                const int cr = mma_c_row(mlane);
+                const int cc = mma_c_col(mlane);
+                const int rows[2] = {m_tile * 16 + cr, m_tile * 16 + cr + 8};
+                const int cols[2] = {n_tile * 8 + cc, n_tile * 8 + cc + 1};
+                const float raw[4] = {acc.x[0], acc.x[1], acc.x[2], acc.x[3]};
+#pragma unroll
+                for (int rr = 0; rr < 2; ++rr) {
+                    const int t = rows[rr];
+#pragma unroll
+                    for (int cci = 0; cci < 2; ++cci) {
+                        const int jj = cols[cci];
+                        if (t < C) {
+                            const float d_val = u_chunk[t * GDN_DV + dv_base + jj] - raw[rr * 2 + cci];
+                            delta_chunk[t * GDN_DV + dv_base + jj] = d_val;
+                            const float decay_row = __expf(sgc[C - 1] - sgc[t]);
+                            sDT[(size_t)jj * GDN_CHUNK + t] = __float2half(d_val * decay_row);
+                        } else {
+                            sDT[(size_t)jj * GDN_CHUNK + t] = __float2half(0.0f);
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        const float decay_whole = __expf(sgc[C - 1]);
+        {
+#pragma unroll
+            for (int sub = 0; sub < 16; ++sub) {
+                const int tile = warp * 16 + sub;
+                const int m_tile = tile / 8;
+                const int n_tile = tile % 8;
+                mma_c_f32 acc = {{0.0f, 0.0f, 0.0f, 0.0f}};
+#pragma unroll
+                for (int kt = 0; kt < GDN_CHUNK / 16; ++kt) {
+                    mma_a_f16 a;
+                    mma_b_f16 b;
+                    ldmatrix_a_f16(a, sKT + m_tile * 16 * GDN_CHUNK + kt * 16, GDN_CHUNK * (int)sizeof(__half));
+                    ldmatrix_b_f16(b, sDT + n_tile * 8 * GDN_CHUNK + kt * 16, GDN_CHUNK * (int)sizeof(__half));
+                    mma_f16(acc, a, b);
+                }
+                __syncwarp();
+                const int cr = mma_c_row(mlane);
+                const int cc = mma_c_col(mlane);
+                const int rows[2] = {m_tile * 16 + cr, m_tile * 16 + cr + 8};
+                const int cols[2] = {n_tile * 8 + cc, n_tile * 8 + cc + 1};
+                const float raw[4] = {acc.x[0], acc.x[1], acc.x[2], acc.x[3]};
+#pragma unroll
+                for (int rr = 0; rr < 2; ++rr) {
+#pragma unroll
+                    for (int cci = 0; cci < 2; ++cci) {
+                        sS[(size_t)cols[cci] * GDN_DK + rows[rr]] = __float2half(raw[rr * 2 + cci]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            sc[r] = sc[r] * decay_whole + __half2float(sS[(size_t)j * GDN_DK + (i0 + r)]);
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < 64; ++r) S[(size_t)(i0 + r) * GDN_DV + dv_base + j] = sc[r];
+}
+
 // Same as `gdn_chunk_state_f32` above, but double-buffered via `cp.async`:
 // chunk `c+1`'s K/W are prefetched while chunk `c`'s pred/delta/state-advance
 // is still computing, instead of the fully synchronous load-sync-compute-
@@ -2835,6 +3748,446 @@ extern "C" __global__ __launch_bounds__(256) void gdn_chunk_output_f32(
     }
 }
 
+// ============================================================================
+// GDN_CHUNK=64 kernel family: the same 3-kernel split as the GDN_CHUNK=32
+// kernels above (`gdn_chunk_uw_f32`, `gdn_chunk_state_f32`,
+// `gdn_chunk_output_f32`), but with chunk size doubled to match FLA's real
+// default (`chunk_scaled_dot_kkt_fwd`'s own docstring: "chunk_size (int):
+// Default: 64", confirmed against the real vendored source) -- halving
+// kernel 2's sequential chunk-loop iteration count is the whole point. New,
+// separate kernels, not an in-place edit of `GDN_CHUNK`: the GDN_CHUNK=32
+// kernels above stay available for direct comparison, this file's own
+// established convention (see e.g. `gdn_chunk_state_pipelined_f32`'s doc
+// comment on why it's a new kernel rather than a rewrite).
+//
+// Kernel 1 (`gdn_chunk_uw_c64_f32`) needs a real algorithmic change, not
+// just a size bump: the GDN_CHUNK=32 kernel's forward-substitution inverse
+// relies on `GDN_CHUNK` being exactly one warp (32 lanes), so its per-row
+// barrier is the near-free `__syncwarp()`, safe only because `lane < C`
+// (`C <= 32`) means just warp 0 is ever active. At C=64 that invariant
+// breaks (lanes 0-63 span warp 0 AND warp 1, and `__syncwarp()` only
+// synchronizes within one warp on this hardware) -- naively raising
+// `GDN_CHUNK` to 64 in place would be a SILENT correctness bug: warp 1's
+// writes to a shared row aren't guaranteed visible to warp 0's reads
+// without a real block-wide barrier, and vice versa.
+//
+// Fix: 2x32 block-recursion (checked against FLA's real `solve_tril.py`,
+// which at BT=64 does a flat 4x16 block decomposition instead --
+// `merge_16x16_to_64x64_inverse_kernel` -- because 16-wide base blocks are
+// an MMA-tile-shape choice Triton's `tl.dot` wants, which doesn't apply to
+// this file's per-lane scalar CUDA code; the same reasoning this file's
+// C=32 kernel already used to justify its own 32-wide-in-one-warp base case
+// over FLA's 16-wide one at BT=32). Split the 64x64 system matrix into two
+// independent 32x32 diagonal blocks -- one per warp, each solved with the
+// EXACT SAME, unmodified, already-reference-checked 32-wide forward-
+// substitution loop the C=32 kernel above uses, just reindexed by a `base`
+// offset -- then combine with one 32x32 off-diagonal block via the
+// standard block-triangular-inverse formula:
+//   Ai_11 = solve32(A_11)            // warp 0, rows/cols [0,32)
+//   Ai_22 = solve32(A_22)            // warp 1, rows/cols [32,64)
+//   Ai_21 = -(Ai_22 @ A_21) @ Ai_11  // whole block, rows [32,64) x cols [0,32)
+// `A_21` (rows 32-63, cols 0-31 of the original system matrix) is never
+// touched by either warp's diagonal-block solve (warp 0 only ever writes
+// columns [0,32), warp 1 only ever writes columns [32,64), both confined to
+// their own `base`), so it's still exactly what the system-matrix build
+// wrote when phase 2 reads it below.
+#define GDN_CHUNK64 64
+#define GDN_A_STRIDE64 (GDN_CHUNK64 + 1)
+
+extern "C" __global__ __launch_bounds__(256) void gdn_chunk_uw_c64_f32(
+        float* __restrict__ w_out, float* __restrict__ u_out,
+        const float* __restrict__ qkv, const float* __restrict__ g,
+        const float* __restrict__ beta, const int* __restrict__ first_token,
+        const int* __restrict__ n_tok, int heads, int key_heads, int dk, int dv,
+        int stride, int k_off, int v_off, int v_tiled) {
+    (void)dk;
+    (void)dv;
+    const int head = blockIdx.x;
+    const int chunk = blockIdx.y;
+    const int seq = 0;
+    const int nt = n_tok[seq];
+    const int c0 = chunk * GDN_CHUNK64;
+    if (c0 >= nt) return;
+    const int t0 = first_token[seq];
+    const int C = min(GDN_CHUNK64, nt - c0);
+    const int lane = threadIdx.x;
+    const int khead = v_tiled ? (head % key_heads) : (head / (heads / key_heads));
+
+    extern __shared__ char gdn_uw64_smem[];
+    float* sk = (float*)gdn_uw64_smem;                      // [64][GDN_ROW_PAD]
+    float* sv = sk + GDN_CHUNK64 * GDN_ROW_PAD;             // [64][GDN_ROW_PAD]
+    float* sgc = sv + GDN_CHUNK64 * GDN_ROW_PAD;            // [64]
+    float* sbeta = sgc + GDN_CHUNK64;                       // [64]
+    float* sbg = sbeta + GDN_CHUNK64;                       // [64]
+    float* sA = sbg + GDN_CHUNK64;                          // [64][GDN_A_STRIDE64]
+    float* tmp = sA + GDN_CHUNK64 * GDN_A_STRIDE64;         // [32][32] scratch, phase 2 only
+
+    for (int idx = lane; idx < C * GDN_DK; idx += blockDim.x) {
+        const int r = idx / GDN_DK, d = idx % GDN_DK;
+        const float* row = qkv + (size_t)(t0 + c0 + r) * stride;
+        sk[r * GDN_ROW_PAD + d] = row[k_off + (size_t)khead * GDN_DK + d];
+    }
+    for (int idx = lane; idx < C * GDN_DV; idx += blockDim.x) {
+        const int r = idx / GDN_DV, d = idx % GDN_DV;
+        const float* row = qkv + (size_t)(t0 + c0 + r) * stride;
+        sv[r * GDN_ROW_PAD + d] = row[v_off + (size_t)head * GDN_DV + d];
+    }
+    if (lane < C) {
+        sbeta[lane] = beta[(size_t)(t0 + c0 + lane) * heads + head];
+    }
+    if (lane == 0) {
+        float acc = 0.0f;
+        for (int r = 0; r < C; ++r) {
+            acc += g[(size_t)(t0 + c0 + r) * heads + head];
+            sgc[r] = acc;
+        }
+    }
+    __syncthreads();
+
+    if (lane < C) {
+        sbg[lane] = sbeta[lane] * __expf(sgc[lane]);
+    }
+
+    // A[i][kk] = beta_i * exp(gc_i - gc_kk) * (k_i . k_kk), strictly i > kk --
+    // same build as the GDN_CHUNK=32 kernel above, just over a 64x64 grid of
+    // (i, kk) pairs instead of 32x32 (4096 fixed iterations, 16 a thread at
+    // 256 threads).
+    for (int idx = lane; idx < GDN_CHUNK64 * GDN_CHUNK64; idx += blockDim.x) {
+        const int i = idx / GDN_CHUNK64, kk = idx % GDN_CHUNK64;
+        if (i >= C || kk >= C) continue;
+        float v = 0.0f;
+        if (i > kk) {
+            float dot = 0.0f;
+#pragma unroll
+            for (int d = 0; d < GDN_DK; ++d) {
+                dot += sk[i * GDN_ROW_PAD + d] * sk[kk * GDN_ROW_PAD + d];
+            }
+            v = sbeta[i] * __expf(sgc[i] - sgc[kk]) * dot;
+        }
+        sA[i * GDN_A_STRIDE64 + kk] = v;
+    }
+    __syncthreads();
+
+    // Phase 1: two independent 32-wide diagonal-block solves, each confined
+    // to its own warp -- byte-for-byte the GDN_CHUNK=32 kernel's own
+    // forward-substitution loop, just reindexed by `base` (0 for warp 0, 32
+    // for warp 1) and bounded by `Csub` (this sub-block's real row count,
+    // ragged-tail aware: 0 if the chunk doesn't reach this sub-block at
+    // all).
+    {
+        const int wid = lane / 32;
+        const int sub = lane % 32;
+        if (wid < 2) {
+            const int base = wid * 32;
+            const int Csub = (C > base) ? min(32, C - base) : 0;
+            for (int i = 0; i < Csub; ++i) {
+                const bool active = (sub < Csub && sub <= i);
+                float acc = 0.0f;
+                if (active) {
+                    const int kk = sub;
+                    acc = (i == kk) ? 1.0f : 0.0f;
+                    for (int m = kk; m < i; ++m) {
+                        acc -= sA[(base + i) * GDN_A_STRIDE64 + (base + m)] *
+                               sA[(base + m) * GDN_A_STRIDE64 + (base + kk)];
+                    }
+                }
+                __syncwarp();
+                if (active) {
+                    sA[(base + i) * GDN_A_STRIDE64 + (base + sub)] = acc;
+                }
+                __syncwarp();
+            }
+        }
+    }
+    // BLOCK-WIDE barrier: warp 0's Ai_11 and warp 1's Ai_22 must both be
+    // visible to every warp (not just their own) before phase 2 reads
+    // across the sub-block boundary -- the one new cross-warp
+    // synchronization this design adds versus the GDN_CHUNK=32 kernel,
+    // which never needs one here.
+    __syncthreads();
+
+    // Phase 2: one 32x32 off-diagonal block, Ai_21 = -(Ai_22 @ A_21) @ Ai_11,
+    // computed by the whole block (all 8 warps) -- only meaningful if the
+    // chunk actually reaches the second sub-block (C > 32). `A_21`
+    // (original, not-yet-overwritten) is read straight out of
+    // `sA[32+r][c]`: phase 1 above only ever writes
+    // `sA[(base+i)*STRIDE + (base+col)]` for a single shared `base`, so
+    // warp 1's diagonal solve (base=32) never touches column range [0,32),
+    // and `A_21` -- rows [32,64), cols [0,32) -- is still exactly what the
+    // system-matrix build wrote.
+    if (C > 32) {
+        for (int idx = lane; idx < 32 * 32; idx += blockDim.x) {
+            const int r = idx / 32, c = idx % 32;
+            float acc = 0.0f;
+#pragma unroll
+            for (int kk = 0; kk < 32; ++kk) {
+                acc += sA[(32 + r) * GDN_A_STRIDE64 + (32 + kk)] *  // Ai_22[r][kk]
+                       sA[(32 + kk) * GDN_A_STRIDE64 + c];          // A_21[kk][c]
+            }
+            tmp[r * 32 + c] = acc;
+        }
+        __syncthreads();
+        for (int idx = lane; idx < 32 * 32; idx += blockDim.x) {
+            const int r = idx / 32, c = idx % 32;
+            float acc = 0.0f;
+#pragma unroll
+            for (int kk = 0; kk < 32; ++kk) {
+                acc += tmp[r * 32 + kk] * sA[kk * GDN_A_STRIDE64 + c];  // Ai_11[kk][c]
+            }
+            sA[(32 + r) * GDN_A_STRIDE64 + c] = -acc;
+        }
+        __syncthreads();
+    }
+    // Ai_12 (i<32, kk>=32) is never populated: the W/U loop below only ever
+    // reads `sA[i][kk]` for `kk <= i`, and for `i < 32` that range never
+    // reaches `kk >= 32`.
+
+    float* w_chunk = w_out + ((size_t)chunk * heads + head) * GDN_CHUNK64 * GDN_DK;
+    float* u_chunk = u_out + ((size_t)chunk * heads + head) * GDN_CHUNK64 * GDN_DV;
+    for (int idx = lane; idx < C * GDN_DK; idx += blockDim.x) {
+        const int i = idx / GDN_DK, d = idx % GDN_DK;
+        float wacc = 0.0f, uacc = 0.0f;
+        for (int kk = 0; kk <= i; ++kk) {
+            const float aik = sA[i * GDN_A_STRIDE64 + kk];
+            wacc += aik * sbg[kk] * sk[kk * GDN_ROW_PAD + d];
+            uacc += aik * sbeta[kk] * sv[kk * GDN_ROW_PAD + d];
+        }
+        w_chunk[i * GDN_DK + d] = wacc;
+        u_chunk[i * GDN_DV + d] = uacc;  // GDN_DV == GDN_DK == 128 here
+    }
+}
+
+// Kernel 2 of 3 at GDN_CHUNK=64: same sequential per-chunk state pass as
+// `gdn_chunk_state_f32` above, needing no algorithmic change at all --
+// confirmed against FLA's own `chunk_delta_h.py`, whose K-dimension tiling
+// is driven by `DK` (128 here), not by `BT` -- only every `GDN_CHUNK`-sized
+// array/loop bound below grows to `GDN_CHUNK64`. This is the entire point
+// of the GDN_CHUNK=64 family: the outer sequential `chunk` loop's iteration
+// count -- the one genuinely serial cost this whole 3-kernel split can't
+// parallelize away -- halves for free here, with zero correctness risk,
+// unlike kernel 1's forward-substitution invariant break above. `dt_cache`
+// doubles in size to `GDN_CHUNK64` floats (256 bytes/thread) -- the same
+// array whose runtime-bound indexing once forced a real 128-byte register
+// spill in the GDN_CHUNK=32 kernel before that loop bound was made a
+// compile-time constant (see that fix's own comment above); re-check
+// `gdn_kernel_registers` on this kernel for the same failure mode before
+// trusting its performance.
+extern "C" __global__ __launch_bounds__(256) void gdn_chunk_state_c64_f32(
+        float* __restrict__ delta_out, float* __restrict__ s_before_out,
+        float* __restrict__ state, const float* __restrict__ w_in,
+        const float* __restrict__ u_in, const float* __restrict__ qkv,
+        const float* __restrict__ g, const int* __restrict__ first_token,
+        const int* __restrict__ n_tok, int heads, int key_heads, int dk, int dv,
+        int stride, int k_off, int v_tiled, int n_chunks) {
+    (void)dk;
+    (void)dv;
+    const int head = blockIdx.x;
+    const int seq = 0;
+    const int nt = n_tok[seq];
+    if (nt <= 0) return;
+    const int t0 = first_token[seq];
+    const int lane = threadIdx.x;  // 0..255
+    const int j = lane / 2;
+    const int part = lane % 2;
+    const int i0 = part * 64;
+    const int khead = v_tiled ? (head % key_heads) : (head / (heads / key_heads));
+
+    extern __shared__ char gdn_state64_smem[];
+    float* sk = (float*)gdn_state64_smem;               // [64][GDN_ROW_PAD]
+    float* sgc = sk + GDN_CHUNK64 * GDN_ROW_PAD;        // [64]
+    float* sw = sgc + GDN_CHUNK64;                      // [64][GDN_ROW_PAD]
+
+    float* S = state + (size_t)head * GDN_DK * GDN_DV;
+    float sc[64];
+#pragma unroll
+    for (int r = 0; r < 64; ++r) sc[r] = S[(size_t)(i0 + r) * GDN_DV + j];
+
+    for (int chunk = 0; chunk < n_chunks; ++chunk) {
+        const int c0 = chunk * GDN_CHUNK64;
+        if (c0 >= nt) break;
+        const int C = min(GDN_CHUNK64, nt - c0);
+
+        float* sbefore_chunk = s_before_out + ((size_t)chunk * heads + head) * GDN_DK * GDN_DV;
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            sbefore_chunk[(size_t)(i0 + r) * GDN_DV + j] = sc[r];
+        }
+
+        const float* w_chunk = w_in + ((size_t)chunk * heads + head) * GDN_CHUNK64 * GDN_DK;
+        const float* u_chunk = u_in + ((size_t)chunk * heads + head) * GDN_CHUNK64 * GDN_DV;
+        float* delta_chunk = delta_out + ((size_t)chunk * heads + head) * GDN_CHUNK64 * GDN_DV;
+
+        for (int idx = lane; idx < C * GDN_DK; idx += blockDim.x) {
+            const int r = idx / GDN_DK, d = idx % GDN_DK;
+            const float* row = qkv + (size_t)(t0 + c0 + r) * stride;
+            sk[r * GDN_ROW_PAD + d] = row[k_off + (size_t)khead * GDN_DK + d];
+            sw[r * GDN_ROW_PAD + d] = w_chunk[r * GDN_DK + d];
+        }
+        // Zero the ragged last chunk's unwritten `sk` rows -- same reason
+        // as the GDN_CHUNK=32 kernel's own identical fill loop above.
+        for (int idx = C * GDN_DK + lane; idx < GDN_CHUNK64 * GDN_DK; idx += blockDim.x) {
+            const int r = idx / GDN_DK, d = idx % GDN_DK;
+            sk[r * GDN_ROW_PAD + d] = 0.0f;
+        }
+        if (lane == 0) {
+            float acc = 0.0f;
+            for (int r = 0; r < C; ++r) {
+                acc += g[(size_t)(t0 + c0 + r) * heads + head];
+                sgc[r] = acc;
+            }
+        }
+        __syncthreads();
+
+        for (int i = 0; i < C; ++i) {
+            float pp = 0.0f;
+#pragma unroll
+            for (int r = 0; r < 64; ++r) {
+                pp += sc[r] * sw[i * GDN_ROW_PAD + i0 + r];
+            }
+            pp += __shfl_xor_sync(0xffffffffu, pp, 1, 32);
+            if (part == 0) {
+                delta_chunk[i * GDN_DV + j] = u_chunk[i * GDN_DV + j] - pp;
+            }
+        }
+        __syncthreads();
+
+        const float decay_whole = __expf(sgc[C - 1]);
+        // `dt_cache` split into two 32-wide HALVES, processed one at a time,
+        // rather than one 64-wide array read by every `r` iteration (the
+        // straightforward port of the GDN_CHUNK=32 kernel's own pattern,
+        // just with a 64-wide array). That direct port measured a REAL
+        // 2376 B/thread register spill (`the_c64_chunk_state_register_state_does_not_spill`)
+        // -- `sc[64]` (persists across the whole outer chunk loop) plus a
+        // full `dt_cache[64]` (live across the entire inner `r` sweep) is
+        // apparently past whatever threshold lets ptxas's allocator keep a
+        // ~4096-statement fully-unrolled double loop's live ranges in
+        // registers here, even though the ~150 registers that would need is
+        // well under this hardware's 255/thread budget -- confirmed by
+        // trying, not assumed (dropping to two 32-wide halves, each fully
+        // unrolled the same way, but keeping only 32 of `dt_cache`'s
+        // elements live at once alongside `sc[64]`, brought it back to 0 B
+        // spill). Same total FMA count either way, same compile-time-index
+        // technique the GDN_CHUNK=32 kernel already established (see
+        // `gdn_chunk_state_f32`'s own `dt_cache` comment above) -- just
+        // halving the peak simultaneous register footprint of the register
+        // array that grew with this change.
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int tbase = half * 32;
+            float dt_half[32];
+#pragma unroll
+            for (int tt = 0; tt < 32; ++tt) {
+                const int t = tbase + tt;
+                dt_half[tt] = (t < C) ? delta_chunk[t * GDN_DV + j] * __expf(sgc[C - 1] - sgc[t]) : 0.0f;
+            }
+#pragma unroll
+            for (int r = 0; r < 64; ++r) {
+                float acc = (half == 0) ? sc[r] * decay_whole : sc[r];
+#pragma unroll
+                for (int tt = 0; tt < 32; ++tt) {
+                    acc += dt_half[tt] * sk[(tbase + tt) * GDN_ROW_PAD + i0 + r];
+                }
+                sc[r] = acc;
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < 64; ++r) S[(size_t)(i0 + r) * GDN_DV + j] = sc[r];
+}
+
+// Kernel 3 of 3 at GDN_CHUNK=64: same intra-chunk causal output pass as
+// `gdn_chunk_output_f32` above, no algorithmic change needed (the causal
+// score build is a plain masked dense build, not an inverse, so it has none
+// of kernel 1's block-recursion concern) -- only the chunk-size-dependent
+// bounds grow to `GDN_CHUNK64`/`GDN_A_STRIDE64`.
+extern "C" __global__ __launch_bounds__(256) void gdn_chunk_output_c64_f32(
+        float* __restrict__ out, const float* __restrict__ delta_in,
+        const float* __restrict__ s_before_in, const float* __restrict__ qkv,
+        const float* __restrict__ g, const int* __restrict__ first_token,
+        const int* __restrict__ n_tok, int heads, int key_heads, int dk, int dv,
+        int stride, int q_off, int k_off, int v_tiled) {
+    (void)dk;
+    (void)dv;
+    const int head = blockIdx.x;
+    const int chunk = blockIdx.y;
+    const int seq = 0;
+    const int nt = n_tok[seq];
+    const int c0 = chunk * GDN_CHUNK64;
+    if (c0 >= nt) return;
+    const int t0 = first_token[seq];
+    const int C = min(GDN_CHUNK64, nt - c0);
+    const int lane = threadIdx.x;
+    const int j = lane / 2;
+    const int part = lane % 2;
+    const int i0 = part * 64;
+    const int khead = v_tiled ? (head % key_heads) : (head / (heads / key_heads));
+
+    extern __shared__ char gdn_out64_smem[];
+    float* sk = (float*)gdn_out64_smem;                 // [64][GDN_ROW_PAD]
+    float* sq = sk + GDN_CHUNK64 * GDN_ROW_PAD;         // [64][GDN_ROW_PAD]
+    float* sgc = sq + GDN_CHUNK64 * GDN_ROW_PAD;        // [64]
+    float* sAi2 = sgc + GDN_CHUNK64;                    // [64][GDN_A_STRIDE64]
+
+    for (int idx = lane; idx < C * GDN_DK; idx += blockDim.x) {
+        const int r = idx / GDN_DK, d = idx % GDN_DK;
+        const float* row = qkv + (size_t)(t0 + c0 + r) * stride;
+        sk[r * GDN_ROW_PAD + d] = row[k_off + (size_t)khead * GDN_DK + d];
+        sq[r * GDN_ROW_PAD + d] = row[q_off + (size_t)khead * GDN_DK + d];
+    }
+    if (lane == 0) {
+        float acc = 0.0f;
+        for (int r = 0; r < C; ++r) {
+            acc += g[(size_t)(t0 + c0 + r) * heads + head];
+            sgc[r] = acc;
+        }
+    }
+    __syncthreads();
+
+    const float* sbefore = s_before_in + ((size_t)chunk * heads + head) * GDN_DK * GDN_DV;
+    const float* delta_chunk = delta_in + ((size_t)chunk * heads + head) * GDN_CHUNK64 * GDN_DV;
+
+    for (int i = 0; i < C; ++i) {
+        float oh = 0.0f;
+#pragma unroll
+        for (int r = 0; r < 64; ++r) {
+            oh += sbefore[(size_t)(i0 + r) * GDN_DV + j] * sq[i * GDN_ROW_PAD + i0 + r];
+        }
+        oh += __shfl_xor_sync(0xffffffffu, oh, 1, 32);
+        if (part == 0) {
+            out[((size_t)(t0 + c0 + i) * heads + head) * GDN_DV + j] = __expf(sgc[i]) * oh;
+        }
+    }
+    __syncthreads();
+
+    for (int idx = lane; idx < GDN_CHUNK64 * GDN_CHUNK64; idx += blockDim.x) {
+        const int i = idx / GDN_CHUNK64, kk = idx % GDN_CHUNK64;
+        if (i >= C || kk >= C) continue;
+        float v = 0.0f;
+        if (i >= kk) {
+            float dot = 0.0f;
+#pragma unroll
+            for (int d = 0; d < GDN_DK; ++d) {
+                dot += sq[i * GDN_ROW_PAD + d] * sk[kk * GDN_ROW_PAD + d];
+            }
+            v = __expf(sgc[i] - sgc[kk]) * dot;
+        }
+        sAi2[i * GDN_A_STRIDE64 + kk] = v;
+    }
+    __syncthreads();
+
+    for (int i = 0; i < C; ++i) {
+        if (part == 0) {
+            float acc = 0.0f;
+            for (int kk = 0; kk <= i; ++kk) {
+                acc += sAi2[i * GDN_A_STRIDE64 + kk] * delta_chunk[kk * GDN_DV + j];
+            }
+            out[((size_t)(t0 + c0 + i) * heads + head) * GDN_DV + j] += acc;
+        }
+    }
+}
+
 // Sequential reference: one warp, both stages, every iteration -- exactly
 // today's real kernel's own per-timestep order, just without the real
 // memory layout.
@@ -3004,5 +4357,143 @@ extern "C" __global__ void gdn_pp_pipelined_batched_probe(float* __restrict__ ou
 #pragma unroll
         for (int r = 0; r < 64; ++r) s += last_sc[r];
         if (lane == 0) out_checksum[1] = s;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Glue kernels for `gdn_fla_stages.rs`'s "Route B" pipeline: real, AOT-compiled
+// FLA/Triton kernels (see `gdn_triton_aot.rs`) want their own real
+// `(B=1, T, heads, dim)` bf16 tensor layout, not this engine's packed
+// `[total_tokens, stride]` f32 row with a persistent `[heads, dk, dv]` f32
+// state. These four kernels ARE the "real, correctness-critical conversion
+// step" that pipeline's own doc comment calls for — plain elementwise
+// gather/cast/transpose, not a numerical approximation, so they add real
+// launch/bandwidth cost but no precision loss beyond the f32->bf16 rounding
+// FLA's own kernels need anyway.
+//
+// bf16 (not f16, not TF32) is a distinct 2-byte format from anything else in
+// this file — round-to-nearest-even on the upper 16 bits of the f32 bit
+// pattern, matching `__float2bfloat16_rn`/PyTorch's own conversion. No
+// `cuda_bf16.h` needed (this file is NVRTC-JIT'd; not worth verifying that
+// header is on this JIT's include path when the format is one intrinsic-free
+// helper).
+__device__ __forceinline__ unsigned short gdn_f32_to_bf16(float f) {
+    unsigned int u = __float_as_uint(f);
+    // NaN must stay NaN after truncation (round-to-nearest-even on an all-1s
+    // exponent + non-zero mantissa can otherwise carry into the exponent and
+    // produce +/-inf) -- force the top mantissa bit on instead of rounding.
+    if ((u & 0x7fffffffu) > 0x7f800000u) {
+        return (unsigned short)((u >> 16) | 0x0040u);
+    }
+    const unsigned int lsb = (u >> 16) & 1u;
+    const unsigned int rounded = u + 0x7fffu + lsb;
+    return (unsigned short)(rounded >> 16);
+}
+
+__device__ __forceinline__ float gdn_bf16_to_f32(unsigned short h) {
+    return __uint_as_float(((unsigned int)h) << 16);
+}
+
+// Extracts one of q/k's `[T, Hg, K]` bf16 tensor from infero's packed
+// `[T, stride]` f32 row buffer at a given column offset -- launched once for
+// q (with `q_off`) and once for k (with `k_off`); `Hg * K` is `key_heads *
+// dk`, always 16*128=2048 at this checkpoint's shape but not hardcoded here.
+//
+// `scale`: a real, necessary convention reconciliation, not a no-op knob.
+// infero's own `gdn_qk_l2norm_f32` already scales q (not k) by `1/sqrt(dk)`
+// as part of L2-normalizing it -- every OTHER GDN entry point in this crate
+// expects that and applies no scale of its own. But the AOT-compiled
+// `chunk_o` kernel this pipeline calls has its own `scale = K**-0.5` baked in
+// as a compile-time literal (see `gdn_fla_stages.rs`'s own doc comment on
+// `chunk_o_4401e9ec_...`) -- FLA's real convention is an UNSCALED q into
+// `chunk_gated_delta_rule`, with `chunk_o` applying the one real scale
+// itself. Feeding infero's already-scaled q straight through would apply
+// `1/sqrt(dk)` TWICE (confirmed the hard way: an early version of this
+// pipeline measured its output ~0.088x the host reference, and
+// `1/sqrt(128) == 0.08838...` to five figures) -- so the caller passes
+// `scale = sqrt(dk)` for q (undoing infero's own pre-scale before this
+// kernel's cast) and `scale = 1.0` for k.
+extern "C" __global__ void gdn_fla_extract_qk_f32_to_bf16(
+    const float* __restrict__ qkv,
+    unsigned short* __restrict__ out,
+    int stride,
+    int off,
+    int hg_k, // Hg * K, the row width of the slice being extracted
+    long long n, // T * hg_k
+    float scale
+) {
+    for (long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x; idx < n;
+         idx += (long long)gridDim.x * blockDim.x) {
+        const long long t = idx / hg_k;
+        const int rem = (int)(idx % hg_k);
+        out[idx] = gdn_f32_to_bf16(qkv[t * stride + off + rem] * scale);
+    }
+}
+
+// Same extraction for v -- kept as its own entry point rather than reused via
+// a runtime branch on `Hg*K` vs `H*V` because the two calls run back to back
+// on independent data with no shared state; a single kernel would just be
+// this one with a renamed argument.
+extern "C" __global__ void gdn_fla_extract_v_f32_to_bf16(
+    const float* __restrict__ qkv,
+    unsigned short* __restrict__ out,
+    int stride,
+    int off,
+    int h_v, // H * V
+    long long n // T * h_v
+) {
+    for (long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x; idx < n;
+         idx += (long long)gridDim.x * blockDim.x) {
+        const long long t = idx / h_v;
+        const int rem = (int)(idx % h_v);
+        out[idx] = gdn_f32_to_bf16(qkv[t * stride + off + rem]);
+    }
+}
+
+// Flat elementwise f32->bf16 cast, no gather -- `beta` and the raw
+// (pre-cumsum) gate `g` are already their own contiguous `[T, H]` buffers in
+// this engine's convention, unlike q/k/v, which live inside the packed row.
+extern "C" __global__ void gdn_fla_cast_f32_to_bf16(
+    const float* __restrict__ src, unsigned short* __restrict__ dst, long long n
+) {
+    for (long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x; idx < n;
+         idx += (long long)gridDim.x * blockDim.x) {
+        dst[idx] = gdn_f32_to_bf16(src[idx]);
+    }
+}
+
+// The inverse cast, for the final output: `chunk_o`'s real `o` is bf16
+// `[T, H, V]`, laid out identically to this engine's own `out` (`[total_tokens,
+// heads, dv]` f32, see `gdn_delta_rule`'s own doc comment) -- same shape, same
+// element order, so unpacking the output is a pure cast with no gather/permute.
+extern "C" __global__ void gdn_fla_cast_bf16_to_f32(
+    const unsigned short* __restrict__ src, float* __restrict__ dst, long long n
+) {
+    for (long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x; idx < n;
+         idx += (long long)gridDim.x * blockDim.x) {
+        dst[idx] = gdn_bf16_to_f32(src[idx]);
+    }
+}
+
+// The one real layout mismatch between infero's own persistent GatedDeltaNet
+// state and FLA's real `h0`/`ht`: both are f32 and both are `[heads, 128,
+// 128]`, but infero's own kernels index a head's state `S[k * GDN_DV + v]`
+// (see `gdn_chunk_state_f32`'s own `S[(size_t)(i0 + r) * GDN_DV + j]`) while
+// FLA's `h`/`h0`/`ht` are `[..., V, K]` (confirmed from `gdn_fla_stage_check.py`'s
+// own `h = torch.randn(B, NT, H, V, K, ...)`) -- `S[v * K + k]`, the transpose.
+// `dk == dv == 128` at this checkpoint, so one kernel serves both directions
+// (`src`/`dst` swapped at the call site): `dst[h][b][a] = src[h][a][b]`.
+extern "C" __global__ void gdn_fla_transpose_hab_to_hba_f32(
+    const float* __restrict__ src, float* __restrict__ dst, int heads, int a_dim, int b_dim
+) {
+    const long long ab = (long long)a_dim * b_dim;
+    const long long n = (long long)heads * ab;
+    for (long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x; idx < n;
+         idx += (long long)gridDim.x * blockDim.x) {
+        const int h = (int)(idx / ab);
+        const int rem = (int)(idx % ab);
+        const int a = rem / b_dim;
+        const int b = rem % b_dim;
+        dst[(long long)h * ab + (long long)b * a_dim + a] = src[idx];
     }
 }

@@ -38,3 +38,9 @@ cpu = ["infero-kernels/cpu", "infero-gpu/cpu"]
 cutlass = ["infero-kernels/cutlass"]
 flash_attn2 = ["infero-kernels/flash_attn2"]
 nccl = ["infero-kernels/nccl"]
+# Forwards to infero-kernels/triton_aot -- see that feature's own doc comment
+# in crates/kernels/Cargo.toml. Purely additive: with this off (the default),
+# `Model` has no `gdn_fla_scratch` field and `linear_attention` never
+# references `gdn_full_triton_pipeline` at all, so a normal build is
+# unaffected byte-for-byte in behavior.
+triton_aot = ["infero-kernels/triton_aot"]

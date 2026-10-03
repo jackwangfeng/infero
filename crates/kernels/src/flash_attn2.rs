@@ -279,23 +279,36 @@ impl AttentionBackend for FlashAttn2Ffi {
         let mut lse_view = lse.slice_mut(..n_lse_elems);
         let (lse_ptr, _g5) = lse_view.device_ptr_mut(ctx.stream);
 
-        let rc = unsafe {
-            infero_flash_attn2_fwd_causal_f16(
-                q_ptr as *const std::ffi::c_void,
-                k_ptr as *const std::ffi::c_void,
-                v_ptr as *const std::ffi::c_void,
-                out_ptr as *mut std::ffi::c_void,
-                lse_ptr as *mut std::ffi::c_void,
-                ctx.run_tokens as i32,
-                ctx.kv_len as i32,
-                ctx.dims.n_heads as i32,
-                ctx.dims.n_kv_heads as i32,
-                d_head as i32,
-                ctx.dims.n_slots as i32,
-                ctx.scale,
-                ctx.stream.cu_stream(),
-            )
-        };
+        // TEMPORARY instrumentation (2026-10-01 prefill-attention-cost
+        // investigation): this crate's own profiler never wrapped this call
+        // -- every prior `prefill_profile` run attributed it to the
+        // unaccounted gap alongside `to_f16`/`from_f16` (which *were*
+        // wrapped) above/below it. Isolating just the vendored kernel launch
+        // here answers directly what fraction of that gap is the real FA2
+        // forward kernel vs. the f32<->f16 conversion traffic around it.
+        let rc = ctx.kern.device().profile().time(
+            "flash_attn2_fwd_kernel_only",
+            ctx.stream,
+            || {
+                Ok(unsafe {
+                    infero_flash_attn2_fwd_causal_f16(
+                        q_ptr as *const std::ffi::c_void,
+                        k_ptr as *const std::ffi::c_void,
+                        v_ptr as *const std::ffi::c_void,
+                        out_ptr as *mut std::ffi::c_void,
+                        lse_ptr as *mut std::ffi::c_void,
+                        ctx.run_tokens as i32,
+                        ctx.kv_len as i32,
+                        ctx.dims.n_heads as i32,
+                        ctx.dims.n_kv_heads as i32,
+                        d_head as i32,
+                        ctx.dims.n_slots as i32,
+                        ctx.scale,
+                        ctx.stream.cu_stream(),
+                    )
+                })
+            },
+        )?;
         // `_g2` (and the rest) hold `SyncOnDrop`-style guards whose `Drop`
         // impl is presumably what actually waits for the launch above to be
         // safe to reuse the buffer -- drop it explicitly here (rather than

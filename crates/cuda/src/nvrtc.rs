@@ -107,7 +107,8 @@ impl KernelCache {
 
         // Only on a miss, and only to name the cache file: the hash is what
         // makes an edited kernel recompile instead of loading stale PTX.
-        let key = self.source_key(src);
+        let src = with_target_prelude(self.arch, src);
+        let key = self.source_key(&src);
         let path = self
             .dir
             .join(format!("{label}-sm{}-{key:016x}.ptx", self.arch));
@@ -118,7 +119,7 @@ impl KernelCache {
             }
             Err(_) => {
                 let started = std::time::Instant::now();
-                let ptx = cudarc::nvrtc::compile_ptx_with_opts(src, self.compile_options())
+                let ptx = cudarc::nvrtc::compile_ptx_with_opts(&src, self.compile_options())
                     .with_context(|| format!("nvrtc failed to compile `{label}`"))?;
                 tracing::debug!(
                     kernel = label,
@@ -166,6 +167,71 @@ impl KernelCache {
         eat(env!("CARGO_PKG_VERSION").as_bytes());
         h
     }
+}
+
+/// `nv/target` hides `NV_IF_ELSE_TARGET` from NVRTC, and nvrtc only
+/// predefines those macros for some architectures. On compute 7.5
+/// (Turing, e.g. 2080 Ti) they are absent, so `cuda_fp16.h` fails to
+/// parse. Each macro is guarded so an nvrtc that already defines them
+/// (Ampere and newer) keeps the compiler's own values.
+fn with_target_prelude(arch: u32, src: &str) -> String {
+    let provides = |sm: u32| if arch >= sm { 1 } else { 0 };
+    format!(
+        r#"
+#ifndef NV_IF_ELSE_TARGET
+#define NV_IF_ELSE_TARGET(cond, t, f) NV_IF_ELSE_TARGET_IMPL(cond, t, f)
+#define NV_IF_ELSE_TARGET_IMPL(cond, t, f) NV_IF_ELSE_TARGET_##cond(t, f)
+#define NV_IF_ELSE_TARGET_0(t, f) f
+#define NV_IF_ELSE_TARGET_1(t, f) t
+#endif
+#ifndef NV_IF_TARGET
+#define NV_IF_TARGET(cond, ...) NV_IF_TARGET_IMPL(cond, __VA_ARGS__)
+#define NV_IF_TARGET_IMPL(cond, ...) NV_IF_TARGET_##cond(__VA_ARGS__)
+#define NV_IF_TARGET_0(...)
+#define NV_IF_TARGET_1(...) __VA_ARGS__
+#endif
+#ifndef NV_IS_DEVICE
+#define NV_IS_DEVICE 1
+#endif
+#ifndef NV_IS_HOST
+#define NV_IS_HOST 0
+#endif
+#ifndef NV_PROVIDES_SM_35
+#define NV_PROVIDES_SM_35 {sm35}
+#endif
+#ifndef NV_PROVIDES_SM_50
+#define NV_PROVIDES_SM_50 {sm50}
+#endif
+#ifndef NV_PROVIDES_SM_53
+#define NV_PROVIDES_SM_53 {sm53}
+#endif
+#ifndef NV_PROVIDES_SM_60
+#define NV_PROVIDES_SM_60 {sm60}
+#endif
+#ifndef NV_PROVIDES_SM_70
+#define NV_PROVIDES_SM_70 {sm70}
+#endif
+#ifndef NV_PROVIDES_SM_75
+#define NV_PROVIDES_SM_75 {sm75}
+#endif
+#ifndef NV_PROVIDES_SM_80
+#define NV_PROVIDES_SM_80 {sm80}
+#endif
+#ifndef NV_PROVIDES_SM_90
+#define NV_PROVIDES_SM_90 {sm90}
+#endif
+{src}
+"#,
+        sm35 = provides(35),
+        sm50 = provides(50),
+        sm53 = provides(53),
+        sm60 = provides(60),
+        sm70 = provides(70),
+        sm75 = provides(75),
+        sm80 = provides(80),
+        sm90 = provides(90),
+        src = src,
+    )
 }
 
 fn cache_dir() -> PathBuf {

@@ -125,6 +125,22 @@ pub fn silu_mul_ref(gate: &[f32], up: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+/// CPU reference for `split2_f32`: scatter one `[tokens][width_a + width_b]`
+/// row into two `[tokens][width_a]` / `[tokens][width_b]` tensors.
+pub fn split2_ref(fused: &[f32], width_a: usize, width_b: usize) -> (Vec<f32>, Vec<f32>) {
+    let row_w = width_a + width_b;
+    assert_eq!(fused.len() % row_w, 0);
+    let tokens = fused.len() / row_w;
+    let mut a = vec![0f32; tokens * width_a];
+    let mut b = vec![0f32; tokens * width_b];
+    for t in 0..tokens {
+        let row = &fused[t * row_w..(t + 1) * row_w];
+        a[t * width_a..(t + 1) * width_a].copy_from_slice(&row[..width_a]);
+        b[t * width_b..(t + 1) * width_b].copy_from_slice(&row[width_a..]);
+    }
+    (a, b)
+}
+
 pub fn softmax_ref(row: &[f32]) -> Vec<f32> {
     let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f64> = row.iter().map(|v| ((*v - m) as f64).exp()).collect();

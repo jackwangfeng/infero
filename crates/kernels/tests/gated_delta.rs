@@ -1181,6 +1181,18 @@ fn the_three_kernel_split_matches_the_reference() -> Result<()> {
         total_tokens: t_len,
     };
 
+    // `gdn_chunk_split3_delta_rule`'s own cross-kernel scratch -- allocated
+    // once here and reused across every variant below, the same
+    // allocate-once-at-load-reuse-every-call contract the function's own doc
+    // comment in `gdn.rs` describes (`t_len` is fixed for the whole test, so
+    // one `n_chunks`-sized allocation covers every call).
+    const GDN_CHUNK: usize = 32;
+    let n_chunks = t_len.div_ceil(GDN_CHUNK).max(1);
+    let mut w_buf = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DK)?;
+    let mut u_buf = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DV)?;
+    let mut delta_buf = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DV)?;
+    let mut s_before_buf = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * DK * DV)?;
+
     use infero_kernels::gdn::GdnChunkStateVariant;
     for (label, k2) in [
         ("plain", GdnChunkStateVariant::Plain),
@@ -1203,6 +1215,10 @@ fn the_three_kernel_split_matches_the_reference() -> Result<()> {
             off,
             false,
             k2,
+            &mut w_buf.as_view_mut(),
+            &mut u_buf.as_view_mut(),
+            &mut delta_buf.as_view_mut(),
+            &mut s_before_buf.as_view_mut(),
         )?;
         k.device().synchronize()?;
         let got = stream.clone_dtoh(&out)?;
@@ -1222,6 +1238,90 @@ fn the_three_kernel_split_matches_the_reference() -> Result<()> {
             "three-kernel split ({label}) left a state {sworst:.2e} from the reference's at {sat}"
         );
     }
+    Ok(())
+}
+
+/// `GDN_CHUNK=64` counterpart of `the_three_kernel_split_matches_the_reference`
+/// above -- same host reference, same `t_len`/seeds (0xc001-0xc005), only the
+/// chunk size differs. Deliberately reuses this exact known-safe test data
+/// rather than inventing new seeds/lengths: a different adhoc probe found
+/// that other seeds/longer lengths can produce exploding non-finite values
+/// even in the most-trusted existing (`GDN_CHUNK=32`) kernel, a synthetic-
+/// test-data artifact (weak random decay gate) unrelated to kernel
+/// correctness, not worth chasing here.
+#[test]
+fn the_c64_three_kernel_split_matches_the_reference() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    let t_len = 70;
+
+    let q_small = pseudo_random(t_len * KEY_HEADS * DK, 0xc001);
+    let k_small = pseudo_random(t_len * KEY_HEADS * DK, 0xc002);
+    let v = pseudo_random(t_len * VAL_HEADS * DV, 0xc003);
+    let g = decaying(t_len * VAL_HEADS, 0xc004, 0.7);
+    let beta = betas(t_len * VAL_HEADS, 0xc005);
+    let (row, off) = packed(&q_small, &k_small, &v, t_len);
+    let (want, want_state) = reference(&q_small, &k_small, &v, &g, &beta, t_len);
+
+    let peak = want.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    let speak = want_state.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+
+    let chunk = stream.clone_htod(&row)?;
+    let hg = stream.clone_htod(&g)?;
+    let hb = stream.clone_htod(&beta)?;
+    let f = stream.clone_htod(&[0i32])?;
+    let n = stream.clone_htod(&[t_len as i32])?;
+    let seqs = infero_kernels::gdn::SeqLayout {
+        first_token: &f.as_view(),
+        n_tokens: &n.as_view(),
+        n_seqs: 1,
+        total_tokens: t_len,
+    };
+
+    const GDN_CHUNK: usize = 64;
+    let n_chunks = t_len.div_ceil(GDN_CHUNK).max(1);
+    let mut w_buf = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DK)?;
+    let mut u_buf = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DV)?;
+    let mut delta_buf = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DV)?;
+    let mut s_before_buf = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * DK * DV)?;
+
+    let mut out = stream.alloc_zeros::<f32>(t_len * VAL_HEADS * DV)?;
+    let mut state = stream.alloc_zeros::<f32>(VAL_HEADS * DK * DV)?;
+    k.gdn_chunk_split3_delta_rule_c64(
+        &mut out.as_view_mut(),
+        &mut state.as_view_mut(),
+        &chunk.as_view(),
+        &hg.as_view(),
+        &hb.as_view(),
+        &seqs,
+        VAL_HEADS,
+        KEY_HEADS,
+        DK,
+        DV,
+        off,
+        false,
+        &mut w_buf.as_view_mut(),
+        &mut u_buf.as_view_mut(),
+        &mut delta_buf.as_view_mut(),
+        &mut s_before_buf.as_view_mut(),
+    )?;
+    k.device().synchronize()?;
+    let got = stream.clone_dtoh(&out)?;
+    let got_state = stream.clone_dtoh(&state)?;
+
+    let (worst, at) = max_abs_diff(&got, &want);
+    assert!(
+        worst < 1e-4 * peak.max(1e-6),
+        "c64 three-kernel split diverged from the reference by {worst:.2e} at {at}: \
+         got {}, reference {}",
+        got[at],
+        want[at]
+    );
+    let (sworst, sat) = max_abs_diff(&got_state, &want_state);
+    assert!(
+        sworst < 1e-4 * speak.max(1e-6),
+        "c64 three-kernel split left a state {sworst:.2e} from the reference's at {sat}"
+    );
     Ok(())
 }
 
@@ -1718,6 +1818,430 @@ fn the_mma_chunk_state_matches_gdn_chunk_state_f32() -> Result<()> {
         got_state_mma[stat],
         got_state_ref[stat]
     );
+    Ok(())
+}
+
+/// `gdn_chunk_state_mma_pipelined_f32` -- `Mma` + `Pipelined` composed,
+/// checked the exact same way `the_mma_chunk_state_matches_gdn_chunk_state_f32`
+/// checks the plain `Mma` kernel: directly against the already-trusted
+/// `gdn_chunk_state_f32` on identical `w`/`u`/`qkv`/`g` and a real non-zero
+/// initial state, same `t_len = 200` (7 chunks, last one ragged at 8 real
+/// tokens) so the same K/W ragged-chunk zero-fill discipline gets exercised.
+/// Same 1e-2-relative tolerance as the plain `Mma` test (f16-operand round
+/// trip) -- not the three-kernel-split reference test's tighter 1e-4 bar,
+/// which is why neither `Mma` nor `MmaVtile` are in that test's variant list
+/// either.
+#[test]
+fn the_mma_pipelined_chunk_state_matches_gdn_chunk_state_f32() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    let t_len = 200usize;
+    const GDN_CHUNK: usize = 32;
+    const DKC: usize = 128;
+    const DVC: usize = 128;
+    let n_chunks = t_len.div_ceil(GDN_CHUNK);
+
+    let q_small = pseudo_random(t_len * KEY_HEADS * DK, 0xB001);
+    let k_small = pseudo_random(t_len * KEY_HEADS * DK, 0xB002);
+    let v = pseudo_random(t_len * VAL_HEADS * DV, 0xB003);
+    let g = decaying(t_len * VAL_HEADS, 0xB004, 0.7);
+    let beta = betas(t_len * VAL_HEADS, 0xB005);
+    let (row, off) = packed(&q_small, &k_small, &v, t_len);
+
+    let chunk = stream.clone_htod(&row)?;
+    let hg = stream.clone_htod(&g)?;
+    let hb = stream.clone_htod(&beta)?;
+    let f = stream.clone_htod(&[0i32])?;
+    let n = stream.clone_htod(&[t_len as i32])?;
+    let seqs = infero_kernels::gdn::SeqLayout {
+        first_token: &f.as_view(),
+        n_tokens: &n.as_view(),
+        n_seqs: 1,
+        total_tokens: t_len,
+    };
+
+    let mut w = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DK)?;
+    let mut u = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DV)?;
+    k.gdn_chunk_uw_only(
+        &mut w.as_view_mut(),
+        &mut u.as_view_mut(),
+        &chunk.as_view(),
+        &hg.as_view(),
+        &hb.as_view(),
+        &seqs,
+        VAL_HEADS,
+        KEY_HEADS,
+        DK,
+        DV,
+        off,
+        false,
+    )?;
+    k.device().synchronize()?;
+
+    let s_init = pseudo_random(VAL_HEADS * DKC * DVC, 0xB006);
+
+    let mut delta_ref = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DV)?;
+    let mut s_before_ref = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * DKC * DVC)?;
+    let mut state_ref = stream.clone_htod(&s_init)?;
+    k.gdn_chunk_state_only(
+        &mut delta_ref.as_view_mut(),
+        &mut s_before_ref.as_view_mut(),
+        &mut state_ref.as_view_mut(),
+        &w.as_view(),
+        &u.as_view(),
+        &chunk.as_view(),
+        &hg.as_view(),
+        &seqs,
+        VAL_HEADS,
+        KEY_HEADS,
+        DK,
+        DV,
+        off,
+        false,
+    )?;
+
+    let mut delta_mp = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DV)?;
+    let mut s_before_mp = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * DKC * DVC)?;
+    let mut state_mp = stream.clone_htod(&s_init)?;
+    k.gdn_chunk_state_mma_pipelined_only(
+        &mut delta_mp.as_view_mut(),
+        &mut s_before_mp.as_view_mut(),
+        &mut state_mp.as_view_mut(),
+        &w.as_view(),
+        &u.as_view(),
+        &chunk.as_view(),
+        &hg.as_view(),
+        &seqs,
+        VAL_HEADS,
+        KEY_HEADS,
+        DK,
+        DV,
+        off,
+        false,
+    )?;
+    k.device().synchronize()?;
+
+    let got_delta_ref = stream.clone_dtoh(&delta_ref)?;
+    let got_sbefore_ref = stream.clone_dtoh(&s_before_ref)?;
+    let got_state_ref = stream.clone_dtoh(&state_ref)?;
+    let got_delta_mp = stream.clone_dtoh(&delta_mp)?;
+    let got_sbefore_mp = stream.clone_dtoh(&s_before_mp)?;
+    let got_state_mp = stream.clone_dtoh(&state_mp)?;
+
+    let (dworst, dat) = max_abs_diff(&got_delta_mp, &got_delta_ref);
+    let dpeak = got_delta_ref.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(
+        dworst < 1e-2 * dpeak.max(1e-6),
+        "delta diverged from gdn_chunk_state_f32 by {dworst:.2e} at {dat}: got {}, want {}",
+        got_delta_mp[dat],
+        got_delta_ref[dat]
+    );
+    let (sbworst, sbat) = max_abs_diff(&got_sbefore_mp, &got_sbefore_ref);
+    let sbpeak = got_sbefore_ref.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(
+        sbworst < 1e-2 * sbpeak.max(1e-6),
+        "s_before diverged from gdn_chunk_state_f32 by {sbworst:.2e} at {sbat}: got {}, want {}",
+        got_sbefore_mp[sbat],
+        got_sbefore_ref[sbat]
+    );
+    let (stworst, stat) = max_abs_diff(&got_state_mp, &got_state_ref);
+    let stpeak = got_state_ref.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(
+        stworst < 1e-2 * stpeak.max(1e-6),
+        "final state diverged from gdn_chunk_state_f32 by {stworst:.2e} at {stat}: got {}, want {}",
+        got_state_mp[stat],
+        got_state_ref[stat]
+    );
+    Ok(())
+}
+
+/// `gdn_chunk_state_mma_vtile_pipelined_f32` -- `MmaVtile` + `MmaPipelined`
+/// composed, checked the exact same way
+/// `the_mma_pipelined_chunk_state_matches_gdn_chunk_state_f32` checks plain
+/// `MmaPipelined`: directly against the already-trusted `gdn_chunk_state_f32`
+/// on identical `w`/`u`/`qkv`/`g` and a real non-zero initial state, same
+/// `t_len = 200` (7 chunks, last one ragged at 8 real tokens) so the same
+/// K/W ragged-chunk zero-fill discipline gets exercised across all 4 v-tile
+/// blocks. Same 1e-2-relative tolerance as the other MMA-variant tests
+/// (f16-operand round trip).
+#[test]
+fn the_mma_vtile_pipelined_chunk_state_matches_gdn_chunk_state_f32() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    let t_len = 200usize;
+    const GDN_CHUNK: usize = 32;
+    const DKC: usize = 128;
+    const DVC: usize = 128;
+    let n_chunks = t_len.div_ceil(GDN_CHUNK);
+
+    let q_small = pseudo_random(t_len * KEY_HEADS * DK, 0xC101);
+    let k_small = pseudo_random(t_len * KEY_HEADS * DK, 0xC102);
+    let v = pseudo_random(t_len * VAL_HEADS * DV, 0xC103);
+    let g = decaying(t_len * VAL_HEADS, 0xC104, 0.7);
+    let beta = betas(t_len * VAL_HEADS, 0xC105);
+    let (row, off) = packed(&q_small, &k_small, &v, t_len);
+
+    let chunk = stream.clone_htod(&row)?;
+    let hg = stream.clone_htod(&g)?;
+    let hb = stream.clone_htod(&beta)?;
+    let f = stream.clone_htod(&[0i32])?;
+    let n = stream.clone_htod(&[t_len as i32])?;
+    let seqs = infero_kernels::gdn::SeqLayout {
+        first_token: &f.as_view(),
+        n_tokens: &n.as_view(),
+        n_seqs: 1,
+        total_tokens: t_len,
+    };
+
+    let mut w = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DK)?;
+    let mut u = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DV)?;
+    k.gdn_chunk_uw_only(
+        &mut w.as_view_mut(),
+        &mut u.as_view_mut(),
+        &chunk.as_view(),
+        &hg.as_view(),
+        &hb.as_view(),
+        &seqs,
+        VAL_HEADS,
+        KEY_HEADS,
+        DK,
+        DV,
+        off,
+        false,
+    )?;
+    k.device().synchronize()?;
+
+    let s_init = pseudo_random(VAL_HEADS * DKC * DVC, 0xC106);
+
+    let mut delta_ref = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DV)?;
+    let mut s_before_ref = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * DKC * DVC)?;
+    let mut state_ref = stream.clone_htod(&s_init)?;
+    k.gdn_chunk_state_only(
+        &mut delta_ref.as_view_mut(),
+        &mut s_before_ref.as_view_mut(),
+        &mut state_ref.as_view_mut(),
+        &w.as_view(),
+        &u.as_view(),
+        &chunk.as_view(),
+        &hg.as_view(),
+        &seqs,
+        VAL_HEADS,
+        KEY_HEADS,
+        DK,
+        DV,
+        off,
+        false,
+    )?;
+
+    let mut delta_mvp = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DV)?;
+    let mut s_before_mvp = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * DKC * DVC)?;
+    let mut state_mvp = stream.clone_htod(&s_init)?;
+    k.gdn_chunk_state_mma_vtile_pipelined_only(
+        &mut delta_mvp.as_view_mut(),
+        &mut s_before_mvp.as_view_mut(),
+        &mut state_mvp.as_view_mut(),
+        &w.as_view(),
+        &u.as_view(),
+        &chunk.as_view(),
+        &hg.as_view(),
+        &seqs,
+        VAL_HEADS,
+        KEY_HEADS,
+        DK,
+        DV,
+        off,
+        false,
+    )?;
+    k.device().synchronize()?;
+
+    let got_delta_ref = stream.clone_dtoh(&delta_ref)?;
+    let got_sbefore_ref = stream.clone_dtoh(&s_before_ref)?;
+    let got_state_ref = stream.clone_dtoh(&state_ref)?;
+    let got_delta_mvp = stream.clone_dtoh(&delta_mvp)?;
+    let got_sbefore_mvp = stream.clone_dtoh(&s_before_mvp)?;
+    let got_state_mvp = stream.clone_dtoh(&state_mvp)?;
+
+    let (dworst, dat) = max_abs_diff(&got_delta_mvp, &got_delta_ref);
+    let dpeak = got_delta_ref.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(
+        dworst < 1e-2 * dpeak.max(1e-6),
+        "delta diverged from gdn_chunk_state_f32 by {dworst:.2e} at {dat}: got {}, want {}",
+        got_delta_mvp[dat],
+        got_delta_ref[dat]
+    );
+    let (sbworst, sbat) = max_abs_diff(&got_sbefore_mvp, &got_sbefore_ref);
+    let sbpeak = got_sbefore_ref.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(
+        sbworst < 1e-2 * sbpeak.max(1e-6),
+        "s_before diverged from gdn_chunk_state_f32 by {sbworst:.2e} at {sbat}: got {}, want {}",
+        got_sbefore_mvp[sbat],
+        got_sbefore_ref[sbat]
+    );
+    let (stworst, stat) = max_abs_diff(&got_state_mvp, &got_state_ref);
+    let stpeak = got_state_ref.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(
+        stworst < 1e-2 * stpeak.max(1e-6),
+        "final state diverged from gdn_chunk_state_f32 by {stworst:.2e} at {stat}: got {}, want {}",
+        got_state_mvp[stat],
+        got_state_ref[stat]
+    );
+    Ok(())
+}
+
+/// `gdn_chunk_state_mma_triton_match_f32` ("`MmaTritonMatch`") -- the
+/// structural port targeting vLLM's real, pinned-down Triton autotune config
+/// (`BV=64`, `num_warps=4`) for this project's exact shape, checked the same
+/// way `the_mma_vtile_pipelined_chunk_state_matches_gdn_chunk_state_f32`
+/// checks `MmaVtilePipelined`: directly against the already-trusted
+/// `gdn_chunk_state_f32` on identical `w`/`u`/`qkv`/`g` and a real non-zero
+/// initial state.
+///
+/// Three `t_len`s, not one, specifically because this is a NEW pipelined
+/// kernel at a NEW tile width/warp count -- exactly the class of kernel this
+/// project has already found a real bug in once (`cp.async`'s `pred=false`
+/// path does not self-zero a destination, so a ragged last chunk's unwritten
+/// tail rows can leak stale shared memory into the MMA if the zero-fill
+/// discipline is missed at a new tile shape):
+/// - `t_len = 200`: 7 chunks, the last one ragged at 8 real tokens -- the
+///   general multi-chunk case, same length every other MMA-variant test in
+///   this file already uses.
+/// - `t_len = GDN_CHUNK` (32) exactly: a single, exactly-full chunk with no
+///   ragged tail at all -- the boundary the `if (chunk + 1 < n_chunks)`
+///   prefetch-issue guard and the `CC = min(GDN_CHUNK, nt - cc0)` ragged-fill
+///   guard both have to get right at `n_chunks == 1`.
+/// - `t_len = GDN_CHUNK + 1` (33): one token into a second chunk -- the
+///   ragged-tail path exercised at its narrowest (`C = 1` real row in the
+///   last chunk), the shape most likely to expose an off-by-one in either
+///   guard above.
+///
+/// Same 1e-2-relative tolerance as the other MMA-variant tests (f16-operand
+/// round trip).
+#[test]
+fn the_mma_triton_match_chunk_state_matches_gdn_chunk_state_f32() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    const GDN_CHUNK: usize = 32;
+    const DKC: usize = 128;
+    const DVC: usize = 128;
+
+    for t_len in [200usize, GDN_CHUNK, GDN_CHUNK + 1] {
+        let n_chunks = t_len.div_ceil(GDN_CHUNK);
+
+        let q_small = pseudo_random(t_len * KEY_HEADS * DK, 0xC201 + t_len as u64);
+        let k_small = pseudo_random(t_len * KEY_HEADS * DK, 0xC202 + t_len as u64);
+        let v = pseudo_random(t_len * VAL_HEADS * DV, 0xC203 + t_len as u64);
+        let g = decaying(t_len * VAL_HEADS, 0xC204 + t_len as u64, 0.7);
+        let beta = betas(t_len * VAL_HEADS, 0xC205 + t_len as u64);
+        let (row, off) = packed(&q_small, &k_small, &v, t_len);
+
+        let chunk = stream.clone_htod(&row)?;
+        let hg = stream.clone_htod(&g)?;
+        let hb = stream.clone_htod(&beta)?;
+        let f = stream.clone_htod(&[0i32])?;
+        let n = stream.clone_htod(&[t_len as i32])?;
+        let seqs = infero_kernels::gdn::SeqLayout {
+            first_token: &f.as_view(),
+            n_tokens: &n.as_view(),
+            n_seqs: 1,
+            total_tokens: t_len,
+        };
+
+        let mut w = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DK)?;
+        let mut u = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DV)?;
+        k.gdn_chunk_uw_only(
+            &mut w.as_view_mut(),
+            &mut u.as_view_mut(),
+            &chunk.as_view(),
+            &hg.as_view(),
+            &hb.as_view(),
+            &seqs,
+            VAL_HEADS,
+            KEY_HEADS,
+            DK,
+            DV,
+            off,
+            false,
+        )?;
+        k.device().synchronize()?;
+
+        let s_init = pseudo_random(VAL_HEADS * DKC * DVC, 0xC206 + t_len as u64);
+
+        let mut delta_ref = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DV)?;
+        let mut s_before_ref = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * DKC * DVC)?;
+        let mut state_ref = stream.clone_htod(&s_init)?;
+        k.gdn_chunk_state_only(
+            &mut delta_ref.as_view_mut(),
+            &mut s_before_ref.as_view_mut(),
+            &mut state_ref.as_view_mut(),
+            &w.as_view(),
+            &u.as_view(),
+            &chunk.as_view(),
+            &hg.as_view(),
+            &seqs,
+            VAL_HEADS,
+            KEY_HEADS,
+            DK,
+            DV,
+            off,
+            false,
+        )?;
+
+        let mut delta_tm = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * GDN_CHUNK * DV)?;
+        let mut s_before_tm = stream.alloc_zeros::<f32>(n_chunks * VAL_HEADS * DKC * DVC)?;
+        let mut state_tm = stream.clone_htod(&s_init)?;
+        k.gdn_chunk_state_mma_triton_match_only(
+            &mut delta_tm.as_view_mut(),
+            &mut s_before_tm.as_view_mut(),
+            &mut state_tm.as_view_mut(),
+            &w.as_view(),
+            &u.as_view(),
+            &chunk.as_view(),
+            &hg.as_view(),
+            &seqs,
+            VAL_HEADS,
+            KEY_HEADS,
+            DK,
+            DV,
+            off,
+            false,
+        )?;
+        k.device().synchronize()?;
+
+        let got_delta_ref = stream.clone_dtoh(&delta_ref)?;
+        let got_sbefore_ref = stream.clone_dtoh(&s_before_ref)?;
+        let got_state_ref = stream.clone_dtoh(&state_ref)?;
+        let got_delta_tm = stream.clone_dtoh(&delta_tm)?;
+        let got_sbefore_tm = stream.clone_dtoh(&s_before_tm)?;
+        let got_state_tm = stream.clone_dtoh(&state_tm)?;
+
+        let (dworst, dat) = max_abs_diff(&got_delta_tm, &got_delta_ref);
+        let dpeak = got_delta_ref.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(
+            dworst < 1e-2 * dpeak.max(1e-6),
+            "t_len={t_len}: delta diverged from gdn_chunk_state_f32 by {dworst:.2e} at {dat}: \
+             got {}, want {}",
+            got_delta_tm[dat],
+            got_delta_ref[dat]
+        );
+        let (sbworst, sbat) = max_abs_diff(&got_sbefore_tm, &got_sbefore_ref);
+        let sbpeak = got_sbefore_ref.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(
+            sbworst < 1e-2 * sbpeak.max(1e-6),
+            "t_len={t_len}: s_before diverged from gdn_chunk_state_f32 by {sbworst:.2e} at {sbat}: \
+             got {}, want {}",
+            got_sbefore_tm[sbat],
+            got_sbefore_ref[sbat]
+        );
+        let (stworst, stat) = max_abs_diff(&got_state_tm, &got_state_ref);
+        let stpeak = got_state_ref.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(
+            stworst < 1e-2 * stpeak.max(1e-6),
+            "t_len={t_len}: final state diverged from gdn_chunk_state_f32 by {stworst:.2e} at \
+             {stat}: got {}, want {}",
+            got_state_tm[stat],
+            got_state_ref[stat]
+        );
+    }
     Ok(())
 }
 
@@ -2469,6 +2993,42 @@ fn the_chunked_kernels_register_state_does_not_spill() -> Result<()> {
     Ok(())
 }
 
+/// Same check, for `gdn_chunk_state_c64_f32` -- specifically re-run per the
+/// `GDN_CHUNK=64` design's own note: `dt_cache` doubles from `GDN_CHUNK` (32)
+/// to `GDN_CHUNK64` (64) floats, the exact array whose runtime-bound
+/// indexing once forced a real 128-byte spill in `gdn_chunk_state_f32`
+/// before that loop bound was made a compile-time constant (see that fix's
+/// own comment in `gdn.cu`) -- doubling a register array that was already at
+/// the edge of spilling once is exactly the failure mode that bit this
+/// kernel before, so this is not assumed clean by analogy, it's measured.
+#[test]
+fn the_c64_chunk_state_register_state_does_not_spill() -> Result<()> {
+    let k = kernels()?;
+    const GDN_CHUNK64: usize = 64;
+    const GDN_ROW_PAD: usize = DK + 4;
+    let shared = (2 * GDN_CHUNK64 * GDN_ROW_PAD * 4) + (GDN_CHUNK64 * 4); // sk+sw, f32; sgc, f32
+    let (regs, stat, spill) = k.gdn_kernel_registers("gdn_chunk_state_c64_f32")?;
+    let blocks = k.gdn_occupancy_blocks("gdn_chunk_state_c64_f32", 2 * DV as u32, shared)?;
+    eprintln!(
+        "  gdn_chunk_state_c64_f32: {regs} regs, {stat} B static shared, \
+         {spill} B spill, {blocks} blocks/SM ({shared} B dynamic shared)"
+    );
+    assert_eq!(
+        spill, 0,
+        "gdn_chunk_state_c64_f32 spills {spill} bytes a thread -- doubling \
+         `dt_cache` to GDN_CHUNK64 (64) floats likely knocked it (or `sc[64]`) \
+         back into local memory, the same silent regression the GDN_CHUNK=32 \
+         kernel's own dt_cache fix exists to avoid"
+    );
+    assert!(
+        blocks >= 1,
+        "gdn_chunk_state_c64_f32 fits no block an SM at all: {regs} registers \
+         over 2 * {DV} threads plus {shared} B shared is past this device's \
+         budget"
+    );
+    Ok(())
+}
+
 /// Same check as `the_chunked_kernels_register_state_does_not_spill`, for
 /// `gdn_chunk_state_mma_f32`'s `sc[64]` -- the MMA rewrite touches every use
 /// of `sc` (staged into `sS` each chunk, read back from it each chunk) but
@@ -2567,5 +3127,276 @@ fn the_gate_reads_a_and_b_at_a_stride() -> Result<()> {
         beta_sep.iter().any(|v| *v > 0.01 && *v < 0.99) && g_sep.iter().any(|v| *v < -0.01),
         "the gate produced degenerate values, so the comparison proves nothing"
     );
+    Ok(())
+}
+
+/// The full FLA-native Triton-AOT pipeline (`gdn_full_triton_pipeline`)
+/// against the SAME host reference every other kernel variant in this file
+/// is checked against -- see `reference`'s own doc comment.
+///
+/// Deliberately does NOT reuse `packed`/`reference` above: those are hardcoded
+/// to this file's default lightweight test shape (`KEY_HEADS=4, VAL_HEADS=12`,
+/// fast to run everywhere else in this file), but the AOT-compiled FLA
+/// kernels this pipeline calls bake `H=48, Hg=16, K=128, V=128, BT=64` in as
+/// compile-time constants (see `gdn_fla_stages.rs`'s own doc comment) -- they
+/// cannot run at any other shape, so this test builds its own inputs at the
+/// real production shape directly (`infero_kernels::gdn_triton_aot`'s own
+/// `H`/`HG`/`K`/`V` constants), the same seeds/t_len convention
+/// (`0xc001..0xc005`, t_len=70) as `the_three_kernel_split_matches_the_reference`.
+#[cfg(feature = "triton_aot")]
+#[test]
+fn the_full_triton_pipeline_matches_the_reference() -> Result<()> {
+    use infero_kernels::gdn_triton_aot::{H as FH, HG as FHG, K as FDK, V as FDV};
+
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    let t_len = 70; // ragged against BT=64 (70 % 64 == 6), same as this
+                     // file's other 3-kernel-split tests.
+
+    let q_small = pseudo_random(t_len * FHG * FDK, 0xc001);
+    let k_small = pseudo_random(t_len * FHG * FDK, 0xc002);
+    let v = pseudo_random(t_len * FH * FDV, 0xc003);
+    let g = decaying(t_len * FH, 0xc004, 0.7);
+    let beta = betas(t_len * FH, 0xc005);
+
+    let key_dim = FHG * FDK;
+    let val_dim = FH * FDV;
+    let stride = 2 * key_dim + val_dim;
+    let mut qn = q_small.clone();
+    let mut kn = k_small.clone();
+    qwen35::l2norm_rows(&mut qn, FDK, 1e-6);
+    qwen35::l2norm_rows(&mut kn, FDK, 1e-6);
+    for x in qn.iter_mut() {
+        *x *= (FDK as f32).sqrt().recip();
+    }
+    let mut row = vec![0.0f32; t_len * stride];
+    for t in 0..t_len {
+        let base = t * stride;
+        row[base..base + key_dim].copy_from_slice(&qn[t * key_dim..(t + 1) * key_dim]);
+        row[base + key_dim..base + 2 * key_dim].copy_from_slice(&kn[t * key_dim..(t + 1) * key_dim]);
+        row[base + 2 * key_dim..base + stride].copy_from_slice(&v[t * val_dim..(t + 1) * val_dim]);
+    }
+    let off = (stride, 0usize, key_dim, 2 * key_dim);
+
+    let rep = FH / FHG;
+    let q_full = repeat_interleave(&q_small, t_len, FHG, rep, FDK);
+    let k_full = repeat_interleave(&k_small, t_len, FHG, rep, FDK);
+    let mut want_state = vec![0.0f32; FH * FDK * FDV];
+    let want =
+        qwen35::gated_delta_rule(&q_full, &k_full, &v, &g, &beta, &mut want_state, t_len, FH, FDK, FDV, 1e-6);
+
+    let d_row = stream.clone_htod(&row)?;
+    let d_g = stream.clone_htod(&g)?;
+    let d_beta = stream.clone_htod(&beta)?;
+    let d_first = stream.clone_htod(&[0i32])?;
+    let d_ntok = stream.clone_htod(&[t_len as i32])?;
+    let mut d_out = stream.alloc_zeros::<f32>(t_len * FH * FDV)?;
+    let mut d_state = stream.alloc_zeros::<f32>(FH * FDK * FDV)?;
+
+    let seqs = infero_kernels::gdn::SeqLayout {
+        first_token: &d_first.as_view(),
+        n_tokens: &d_ntok.as_view(),
+        n_seqs: 1,
+        total_tokens: t_len,
+    };
+    let mut scratch = infero_kernels::gdn_fla_stages::GdnFlaScratch::new(k.device(), t_len)?;
+    k.gdn_full_triton_pipeline(
+        &mut d_out.as_view_mut(),
+        &mut d_state.as_view_mut(),
+        &d_row.as_view(),
+        &d_g.as_view(),
+        &d_beta.as_view(),
+        &seqs,
+        FH,
+        FHG,
+        FDK,
+        FDV,
+        off,
+        false,
+        &mut scratch,
+    )?;
+    k.device().synchronize()?;
+
+    let got = stream.clone_dtoh(&d_out)?;
+    let got_state = stream.clone_dtoh(&d_state)?;
+
+    // Optional: dump this test's exact inputs/output as raw f32 binaries, so
+    // a standalone script can cross-check this Rust pipeline's own `got`
+    // directly against FLA's real Python `chunk_gated_delta_rule_fwd` on the
+    // identical input -- the task's own second, independent correctness
+    // check (isolating "wired together correctly" from "matches the host
+    // reference"). Off by default; not needed for the test itself to pass.
+    if let Ok(dir) = std::env::var("GDN_FULL_PIPELINE_FIXTURE_DIR") {
+        std::fs::create_dir_all(&dir)?;
+        let dump = |name: &str, xs: &[f32]| -> Result<()> {
+            let bytes: Vec<u8> = xs.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(format!("{dir}/{name}.bin"), bytes)?;
+            Ok(())
+        };
+        dump("q_small", &q_small)?;
+        dump("k_small", &k_small)?;
+        dump("v", &v)?;
+        dump("g", &g)?;
+        dump("beta", &beta)?;
+        dump("got", &got)?;
+        dump("got_state", &got_state)?;
+        dump("want", &want)?;
+        dump("want_state", &want_state)?;
+        println!("dumped fixture to {dir}");
+    }
+
+    let peak = want.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    let speak = want_state.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    let (worst, at) = max_abs_diff(&got, &want);
+    // bf16 precision through most of this pipeline (q/k/v/beta/g, A's
+    // inverse, w/u, h, v_new, o are all bf16 -- only A itself and the
+    // persistent state stay f32) -- a real, expected looser bar than
+    // reg128's own 1e-4, not a relaxed test.
+    assert!(
+        worst < 5e-2 * peak.max(1e-6),
+        "full Triton pipeline diverged from the host reference by {worst:.2e} at {at} (peak {peak:.3e}): \
+         got {}, reference {}",
+        got[at],
+        want[at]
+    );
+    let (sworst, sat) = max_abs_diff(&got_state, &want_state);
+    assert!(
+        sworst < 5e-2 * speak.max(1e-6),
+        "full Triton pipeline left a state {sworst:.2e} from the reference's at {sat} (peak {speak:.3e})"
+    );
+    Ok(())
+}
+
+/// `gdn_full_triton_pipeline`'s own counterpart of
+/// `the_three_delta_rule_kernels_agree_with_each_other_and_the_reference`'s
+/// "one call" / "one token at a time" / "5 then 8" pattern: the same total
+/// sequence, split across a different number of separate calls with the
+/// persistent state (`GdnFlaScratch`'s own `h0_f32`/`ht_f32`, threaded through
+/// `state`) carried between them, must give the same final output and state
+/// regardless of how the calls were split. Real chunked prefill is exactly
+/// this -- a sequence's tokens rarely all arrive in one call -- and this
+/// pipeline's own AOT-compiled kernel-2 (`chunk_gated_delta_rule_fwd_h`) does
+/// take an `h0`/`ht` pair, but nothing in this crate had exercised calling it
+/// more than once for the same sequence until this test.
+///
+/// Deliberately splits at boundaries that do NOT align with the pipeline's
+/// own internal `BT=64` chunking (`40, 30` and single tokens): the chunked
+/// GDN algorithm's cross-chunk decay is computed from `cumsum`'s own
+/// chunk-local gate, which resets at `BT`-token boundaries *within whichever
+/// buffer a single call was given* -- so a call spanning global tokens
+/// `[40,70)` chunks its own gate as if token 40 were position 0, not
+/// continuing the first call's `[64,70)` chunk boundary. If the state
+/// carried between calls were anything other than the exact running `S[v][k]`
+/// (e.g. if the pipeline silently assumed every call starts at the
+/// sequence's own token 0), this specific misalignment is what would expose
+/// it -- a split that happened to land on a BT=64 boundary would not.
+#[cfg(feature = "triton_aot")]
+#[test]
+fn the_full_triton_pipeline_carries_state_across_calls() -> Result<()> {
+    use infero_kernels::gdn_fla_stages::GdnFlaScratch;
+    use infero_kernels::gdn_triton_aot::{H as FH, HG as FHG, K as FDK, V as FDV};
+
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+    let t_len = 70; // ragged against BT=64, same shape as the single-call test.
+
+    let q_small = pseudo_random(t_len * FHG * FDK, 0xc001);
+    let k_small = pseudo_random(t_len * FHG * FDK, 0xc002);
+    let v = pseudo_random(t_len * FH * FDV, 0xc003);
+    let g = decaying(t_len * FH, 0xc004, 0.7);
+    let beta = betas(t_len * FH, 0xc005);
+
+    let key_dim = FHG * FDK;
+    let val_dim = FH * FDV;
+    let stride = 2 * key_dim + val_dim;
+    let mut qn = q_small.clone();
+    let mut kn = k_small.clone();
+    qwen35::l2norm_rows(&mut qn, FDK, 1e-6);
+    qwen35::l2norm_rows(&mut kn, FDK, 1e-6);
+    for x in qn.iter_mut() {
+        *x *= (FDK as f32).sqrt().recip();
+    }
+    let mut row = vec![0.0f32; t_len * stride];
+    for t in 0..t_len {
+        let base = t * stride;
+        row[base..base + key_dim].copy_from_slice(&qn[t * key_dim..(t + 1) * key_dim]);
+        row[base + key_dim..base + 2 * key_dim].copy_from_slice(&kn[t * key_dim..(t + 1) * key_dim]);
+        row[base + 2 * key_dim..base + stride].copy_from_slice(&v[t * val_dim..(t + 1) * val_dim]);
+    }
+    let off = (stride, 0usize, key_dim, 2 * key_dim);
+
+    // Runs `chunks` (a list of `(start, count)` pairs covering `0..t_len`
+    // exactly once each, in order) through `gdn_full_triton_pipeline`, one
+    // call a chunk, with one `state` buffer and one `GdnFlaScratch` carried
+    // across the whole run -- the real production convention (state buffer
+    // read then written in place; scratch sized once, reused).
+    let run = |chunks: &[(usize, usize)]| -> Result<(Vec<f32>, Vec<f32>)> {
+        let mut state = stream.alloc_zeros::<f32>(FH * FDK * FDV)?;
+        let mut scratch = GdnFlaScratch::new(k.device(), t_len)?;
+        let mut collected = vec![0.0f32; t_len * FH * FDV];
+        for &(start, count) in chunks {
+            let d_row = stream.clone_htod(&row[start * stride..(start + count) * stride])?;
+            let d_g = stream.clone_htod(&g[start * FH..(start + count) * FH])?;
+            let d_beta = stream.clone_htod(&beta[start * FH..(start + count) * FH])?;
+            let d_first = stream.clone_htod(&[0i32])?;
+            let d_ntok = stream.clone_htod(&[count as i32])?;
+            let mut d_out = stream.alloc_zeros::<f32>(count * FH * FDV)?;
+            let seqs = infero_kernels::gdn::SeqLayout {
+                first_token: &d_first.as_view(),
+                n_tokens: &d_ntok.as_view(),
+                n_seqs: 1,
+                total_tokens: count,
+            };
+            k.gdn_full_triton_pipeline(
+                &mut d_out.as_view_mut(),
+                &mut state.as_view_mut(),
+                &d_row.as_view(),
+                &d_g.as_view(),
+                &d_beta.as_view(),
+                &seqs,
+                FH,
+                FHG,
+                FDK,
+                FDV,
+                off,
+                false,
+                &mut scratch,
+            )?;
+            k.device().synchronize()?;
+            let piece = stream.clone_dtoh(&d_out)?;
+            collected[start * FH * FDV..(start + count) * FH * FDV].copy_from_slice(&piece);
+        }
+        Ok((collected, stream.clone_dtoh(&state)?))
+    };
+
+    let (whole, whole_state) = run(&[(0, t_len)])?;
+    let peak = whole.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    let speak = whole_state.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(peak > 0.0 && speak > 0.0, "degenerate reference run: everything is zero");
+
+    for (label, chunks) in [
+        ("40 then 30", vec![(0usize, 40usize), (40, 30)]),
+        ("one token at a time", (0..t_len).map(|t| (t, 1)).collect::<Vec<_>>()),
+    ] {
+        let (out, state) = run(&chunks)?;
+        let (worst, at) = max_abs_diff(&out, &whole);
+        assert!(
+            worst < 1e-2 * peak.max(1e-6),
+            "{label} gave a different output from one call, by {worst:.2e} at {at} \
+             (peak {peak:.3e}): got {}, one-call {}; the carried state is wrong, \
+             which makes real chunked prefill a different model from one-shot \
+             prefill",
+            out[at],
+            whole[at]
+        );
+        let (sworst, sat) = max_abs_diff(&state, &whole_state);
+        assert!(
+            sworst < 1e-2 * speak.max(1e-6),
+            "{label} left a different final state from one call, by {sworst:.2e} \
+             at {sat} (peak {speak:.3e}): got {}, one-call {}",
+            state[sat],
+            whole_state[sat]
+        );
+    }
     Ok(())
 }

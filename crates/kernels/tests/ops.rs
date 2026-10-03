@@ -345,6 +345,152 @@ fn silu_mul_matches_reference() -> Result<()> {
     Ok(())
 }
 
+/// `silu_mul_f32`'s float4 fast path against its own scalar fallback: a size
+/// that isn't a multiple of 4 (forces the tail loop) with every buffer's
+/// device pointer offset by one `f32` (16 bytes not aligned, so even the
+/// leading elements take the scalar path).
+#[test]
+fn silu_mul_matches_reference_odd_size_and_unaligned() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+
+    // 4864 * 3 is a multiple of 4; +1 makes both the count and (once offset)
+    // every pointer's alignment adversarial.
+    let n = 4864 * 3 + 1;
+    let gate = pseudo_random(n, 0xD4);
+    let up = pseudo_random(n, 0xE5);
+
+    let mut dg = stream.alloc_zeros::<f32>(n + 1)?;
+    let mut du = stream.alloc_zeros::<f32>(n + 1)?;
+    let mut dout = stream.alloc_zeros::<f32>(n + 1)?;
+    stream.memcpy_htod(&gate, &mut dg.slice_mut(1..n + 1))?;
+    stream.memcpy_htod(&up, &mut du.slice_mut(1..n + 1))?;
+
+    k.silu_mul(
+        &mut dout.slice_mut(1..n + 1),
+        &dg.slice(1..n + 1),
+        &du.slice(1..n + 1),
+        n,
+    )?;
+    let mut got = vec![0f32; n];
+    stream.memcpy_dtoh(&dout.slice(1..n + 1), &mut got)?;
+    k.device().synchronize()?;
+
+    let want = silu_mul_ref(&gate, &up);
+    let (abs, at) = max_abs_diff(&got, &want);
+    assert!(abs < 1e-5, "max abs diff {abs} at {at}");
+    Ok(())
+}
+
+/// `add_assign_f32`'s float4 fast path against its own scalar fallback, same
+/// adversarial shape as the `silu_mul` case above: a count that isn't a
+/// multiple of 4, with both buffers' device pointers offset by one `f32`.
+#[test]
+fn add_assign_matches_reference_odd_size_and_unaligned() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+
+    let n = 4096 * 5 + 3;
+    let a = pseudo_random(n, 0x39);
+    let b = pseudo_random(n, 0x4A);
+
+    let mut da = stream.alloc_zeros::<f32>(n + 1)?;
+    let mut db = stream.alloc_zeros::<f32>(n + 1)?;
+    stream.memcpy_htod(&a, &mut da.slice_mut(1..n + 1))?;
+    stream.memcpy_htod(&b, &mut db.slice_mut(1..n + 1))?;
+
+    k.add_assign(&mut da.slice_mut(1..n + 1), &db.slice(1..n + 1), n)?;
+    let mut got = vec![0f32; n];
+    stream.memcpy_dtoh(&da.slice(1..n + 1), &mut got)?;
+    k.device().synchronize()?;
+
+    let want: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x + y).collect();
+    let (abs, at) = max_abs_diff(&got, &want);
+    assert!(abs < 1e-5, "max abs diff {abs} at {at}");
+    Ok(())
+}
+
+/// `split2_f32`'s float4 fast path against its own scalar fallback, with
+/// `width_a`/`width_b` chosen so a row's width (`width_a + width_b`) is *not*
+/// a multiple of 4 and `width_a` itself is not either — so some threads' 4
+/// consecutive flat indices straddle the `width_a`/`width_b` boundary and
+/// others straddle a row boundary, both of which must fall back to the
+/// scalar per-element form rather than mis-scattering with a float4 store.
+/// Every buffer's device pointer is also offset by one `f32`.
+#[test]
+fn split2_matches_reference_odd_widths_and_unaligned() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+
+    let (tokens, width_a, width_b) = (11usize, 5usize, 6usize);
+    let row_w = width_a + width_b;
+    let fused = pseudo_random(tokens * row_w, 0x5B);
+
+    let mut da = stream.alloc_zeros::<f32>(tokens * width_a + 1)?;
+    let mut db = stream.alloc_zeros::<f32>(tokens * width_b + 1)?;
+    let mut dfused = stream.alloc_zeros::<f32>(tokens * row_w + 1)?;
+    stream.memcpy_htod(&fused, &mut dfused.slice_mut(1..tokens * row_w + 1))?;
+
+    k.split2(
+        &mut da.slice_mut(1..tokens * width_a + 1),
+        &mut db.slice_mut(1..tokens * width_b + 1),
+        &dfused.slice(1..tokens * row_w + 1),
+        width_a,
+        width_b,
+        tokens,
+    )?;
+    let mut got_a = vec![0f32; tokens * width_a];
+    let mut got_b = vec![0f32; tokens * width_b];
+    stream.memcpy_dtoh(&da.slice(1..tokens * width_a + 1), &mut got_a)?;
+    stream.memcpy_dtoh(&db.slice(1..tokens * width_b + 1), &mut got_b)?;
+    k.device().synchronize()?;
+
+    let (want_a, want_b) = split2_ref(&fused, width_a, width_b);
+    let (abs_a, at_a) = max_abs_diff(&got_a, &want_a);
+    let (abs_b, at_b) = max_abs_diff(&got_b, &want_b);
+    assert!(abs_a == 0.0, "a: max abs diff {abs_a} at {at_a}");
+    assert!(abs_b == 0.0, "b: max abs diff {abs_b} at {at_b}");
+    Ok(())
+}
+
+/// The same kernel at the real production shape (Qwen3.8-27B-NVFP4's
+/// GatedDeltaNet `in_proj_qz` split: `width_a = conv_channels = 10240`,
+/// `width_b = value_dim = 6144`), where both widths and their sum are
+/// multiples of 4 and the fast path covers every element — the case the
+/// adversarial test above deliberately avoids.
+#[test]
+fn split2_matches_reference_real_production_shape() -> Result<()> {
+    let k = kernels()?;
+    let stream = k.device().stream().clone();
+
+    let (tokens, width_a, width_b) = (3usize, 10240usize, 6144usize);
+    let row_w = width_a + width_b;
+    let fused = pseudo_random(tokens * row_w, 0x6C);
+
+    let dfused = stream.clone_htod(&fused)?;
+    let mut da = stream.alloc_zeros::<f32>(tokens * width_a)?;
+    let mut db = stream.alloc_zeros::<f32>(tokens * width_b)?;
+
+    k.split2(
+        &mut da.as_view_mut(),
+        &mut db.as_view_mut(),
+        &dfused.as_view(),
+        width_a,
+        width_b,
+        tokens,
+    )?;
+    let got_a = stream.clone_dtoh(&da)?;
+    let got_b = stream.clone_dtoh(&db)?;
+    k.device().synchronize()?;
+
+    let (want_a, want_b) = split2_ref(&fused, width_a, width_b);
+    let (abs_a, at_a) = max_abs_diff(&got_a, &want_a);
+    let (abs_b, at_b) = max_abs_diff(&got_b, &want_b);
+    assert!(abs_a == 0.0, "a: max abs diff {abs_a} at {at_a}");
+    assert!(abs_b == 0.0, "b: max abs diff {abs_b} at {at_b}");
+    Ok(())
+}
+
 #[test]
 fn add_and_bias() -> Result<()> {
     let k = kernels()?;

@@ -15,6 +15,7 @@ fn main() {
     let have_cutlass = std::env::var_os("CARGO_FEATURE_CUTLASS").is_some();
     let have_flash_attn2 = std::env::var_os("CARGO_FEATURE_FLASH_ATTN2").is_some();
     let have_nccl = std::env::var_os("CARGO_FEATURE_NCCL").is_some();
+    let have_triton_aot = std::env::var_os("CARGO_FEATURE_TRITON_AOT").is_some();
     if have_nccl {
         // NCCL ships its own prebuilt `.so` -- no AOT compile of our own
         // source, just a link-search/link-lib, so this doesn't need `nvcc`
@@ -26,7 +27,7 @@ fn main() {
         println!("cargo:rustc-link-search=native={}", nccl_lib.display());
         println!("cargo:rustc-link-lib=dylib=nccl");
     }
-    if !have_cutlass && !have_flash_attn2 {
+    if !have_cutlass && !have_flash_attn2 && !have_triton_aot {
         return;
     }
     println!("cargo:rerun-if-env-changed=INFERO_NVCC");
@@ -126,6 +127,49 @@ fn main() {
             &[&fa_src, &cutlass_include],
         );
         archive_and_link(&nvcc, &out_dir, &[obj], "infero_flash_attn2");
+    }
+
+    if have_triton_aot {
+        // Not vendored into this repo -- see gdn_triton_aot.rs's own doc
+        // comment for what this directory holds and how it's produced.
+        //
+        // Originally one `gdn_h.<hash>.c` (kernel-2 alone). `gdn_fla_stages.rs`
+        // adds 5 more real Triton-AOT-compiled kernels (cumsum, kkt,
+        // solve_tril64, wy_fast, chunk_o) -- each `triton.tools.compile`'s own
+        // `.c` file, with its own hash-derived name, in the SAME directory
+        // (see that module's own doc comment for where they come from and
+        // `INFERO_TRITON_AOT_DIR`'s own doc comment below for the expected
+        // directory layout). All of them get compiled and archived together
+        // now, not just the one kernel-2 file.
+        println!("cargo:rerun-if-env-changed=INFERO_TRITON_AOT_DIR");
+        let aot_dir = resolve_triton_aot_dir();
+        let srcs = find_triton_aot_cs(&aot_dir);
+        // No device code to compile here (Triton already produced each
+        // cubin, embedded as a byte array in each `src`) -- a plain C
+        // compiler, not `nvcc`, and `cuda.h` from the same Toolkit checkout
+        // `nvcc` itself lives under (`resolve_nvcc`'s own doc comment: a full
+        // Toolkit, not just the driver/NVRTC `vendor/cuda` normally
+        // provides).
+        let cc = resolve_cc();
+        let cuda_include = nvcc.parent().and_then(|bin| bin.parent()).map(|root| root.join("include"));
+        let mut objs = Vec::new();
+        for src in &srcs {
+            println!("cargo:rerun-if-changed={}", src.display());
+            let stem = src.file_stem().unwrap().to_string_lossy();
+            let obj = out_dir.join(format!("gdn_triton_aot_{stem}.o"));
+            compile_c(&cc, src, cuda_include.as_deref(), &obj);
+            objs.push(obj);
+        }
+        // Reuses `archive_and_link` (finds `ar` next to `nvcc`, links
+        // `cudart_static` alongside) even though these objects need none of
+        // that -- harmless when both `cutlass`-family and `triton_aot`
+        // features are enabled in the same build, and not worth a second
+        // near-identical function for the one real difference below.
+        archive_and_link(&nvcc, &out_dir, &objs, "infero_gdn_triton_aot");
+        // The one real difference: these objects' own undefined symbols
+        // (`cuModuleLoadData`, `cuLaunchKernel`, ...) are the CUDA *driver*
+        // API, which `cudart_static` does not provide.
+        println!("cargo:rustc-link-lib=dylib=cuda");
     }
 }
 
@@ -238,6 +282,70 @@ fn resolve_nccl_dir() -> PathBuf {
          include/nccl.h and lib/libnccl.so (e.g. /usr after \
          `apt install libnccl2 libnccl-dev`)"
     );
+}
+
+fn resolve_triton_aot_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("INFERO_TRITON_AOT_DIR") {
+        return PathBuf::from(p);
+    }
+    panic!(
+        "the `triton_aot` feature needs INFERO_TRITON_AOT_DIR set to the directory \
+         `python3 -m triton.tools.compile` wrote its output into (a generated \
+         `gdn_h.<hash>.c`/`.h` pair, e.g. /home/jeff/infero-gdn-bench/aot on `bw`) -- see \
+         crates/kernels/src/gdn_triton_aot.rs's own doc comment for how that artifact is \
+         produced and its own README_repro.sh for the exact triton.tools.compile invocation"
+    );
+}
+
+/// Finds every `*.c` file `triton.tools.compile` wrote into `dir` -- one a
+/// kernel (kernel-2's own `gdn_h.<hash>.c`, plus `gdn_fla_stages.rs`'s
+/// `cumsum.<hash>.c`/`kkt.<hash>.c`/`solve_tril64.<hash>.c`/`wu.<hash>.c`/
+/// `chunk_o.<hash>.c`). Each hash depends on that kernel's own exact
+/// signature/config, so this globs rather than hardcoding names (the `extern
+/// "C"` symbol names in `gdn_triton_aot.rs`/`gdn_fla_stages.rs` still
+/// hardcode the *current* hashes, since that's the whole point of these being
+/// fixed compiled artifacts -- a regenerated hash needs updating there too,
+/// not just here). Every `.c` in the directory is expected to be one of these
+/// generated files -- nothing else belongs there.
+fn find_triton_aot_cs(dir: &Path) -> Vec<PathBuf> {
+    let mut matches: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("reading INFERO_TRITON_AOT_DIR {}: {e}", dir.display()))
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "c"))
+        .collect();
+    matches.sort();
+    if matches.is_empty() {
+        panic!(
+            "no *.c found in {} -- run that directory's own README_repro.sh (and \
+             gdn_fla_stages.rs's aot2/compile_all.sh counterpart) first",
+            dir.display()
+        );
+    }
+    matches
+}
+
+/// A plain host C compiler for `triton_aot`'s generated `.c` file -- no
+/// device code, so no `nvcc` needed for this compile step (only for locating
+/// `cuda.h`/`ar`, via `resolve_nvcc`).
+fn resolve_cc() -> PathBuf {
+    if let Ok(p) = std::env::var("INFERO_CC") {
+        return PathBuf::from(p);
+    }
+    PathBuf::from("cc")
+}
+
+fn compile_c(cc: &Path, src: &Path, cuda_include: Option<&Path>, obj: &Path) {
+    let mut cmd = Command::new(cc);
+    cmd.args(["-c", "-fPIC", "-O2"]);
+    if let Some(inc) = cuda_include {
+        cmd.arg("-I").arg(inc);
+    }
+    cmd.arg(src).arg("-o").arg(obj);
+    let status = cmd.status().unwrap_or_else(|e| panic!("failed to run {}: {e}", cc.display()));
+    if !status.success() {
+        panic!("{} failed compiling {}", cc.display(), src.display());
+    }
 }
 
 fn resolve_flash_attn_dir() -> PathBuf {

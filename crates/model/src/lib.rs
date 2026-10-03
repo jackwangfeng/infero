@@ -2165,6 +2165,19 @@ pub struct Model {
     vision: Option<weights::VisionTower>,
     /// One vision call's activations, sized by the largest image admitted.
     vision_scratch: Option<infero_kernels::vision::VisionScratch>,
+    /// Caller-owned scratch for [`infero_kernels::Kernels::gdn_full_triton_pipeline`]
+    /// -- the real AOT-compiled-Triton/FLA GDN prefill pipeline, ~1.6-2.2x
+    /// faster than the hand-written kernel it can replace at this
+    /// checkpoint's real shape (see `linear_attention`'s dispatch). `None`
+    /// whenever the `triton_aot` feature is not compiled in, or this model's
+    /// linear-attention dimensions don't match the one shape the compiled
+    /// artifacts support (`H=48, Hg=16, K=V=128` -- checked once here at load
+    /// rather than every call). Its *use* is gated a second time per call on
+    /// `single_seq_slot` and `v_heads_tiled` (loader convention), because
+    /// those can't be known until a real batch is planned -- see
+    /// `linear_attention`.
+    #[cfg(feature = "triton_aot")]
+    gdn_fla_scratch: Option<infero_kernels::gdn_fla_stages::GdnFlaScratch>,
 }
 
 /// Device-side scratch for sampling. Sized once, at the batch and vocabulary
@@ -2903,6 +2916,34 @@ impl Model {
             );
         }
 
+        // Only allocated when this model's real linear-attention dimensions
+        // are the one shape the compiled Triton/FLA artifacts support --
+        // `gdn_full_triton_pipeline`'s own `ensure!` would reject anything
+        // else at call time anyway, but checking once here means a
+        // differently-shaped linear-attention model (or one with none at
+        // all) pays no VRAM for scratch it can never use. The loader
+        // convention (`v_heads_tiled`) is deliberately NOT part of this
+        // check: it can't change the *shape* of the scratch buffers (those
+        // are sized off `heads`/`key_heads`/`dk`/`dv` and `batch_tokens`
+        // alone), only whether a given call is allowed to use it -- so that
+        // stays a per-call check in `linear_attention`, same place
+        // `single_seq_slot` already is.
+        #[cfg(feature = "triton_aot")]
+        let gdn_fla_scratch = match cfg.linear_attn {
+            Some(la)
+                if la.value_heads == infero_kernels::gdn_triton_aot::H
+                    && la.key_heads == infero_kernels::gdn_triton_aot::HG
+                    && la.key_head_dim == infero_kernels::gdn_triton_aot::K
+                    && la.value_head_dim == infero_kernels::gdn_triton_aot::V =>
+            {
+                Some(infero_kernels::gdn_fla_stages::GdnFlaScratch::new(
+                    &dev,
+                    batch_tokens,
+                )?)
+            }
+            _ => None,
+        };
+
         Ok(Self {
             dev: dev.clone(),
             kern,
@@ -2951,6 +2992,8 @@ impl Model {
             gdn_rollback: None,
             vision: None,
             vision_scratch: None,
+            #[cfg(feature = "triton_aot")]
+            gdn_fla_scratch,
         })
     }
 
@@ -5092,6 +5135,82 @@ impl Model {
                 }
                 None => (&seqs, state),
             };
+        // Real, AOT-compiled-Triton/FLA GDN prefill pipeline
+        // (`gdn_full_triton_pipeline`), ~1.6-2.2x faster than the
+        // hand-written kernel below at this checkpoint's real shape --
+        // dispatched only when every one of its real constraints holds:
+        //   - `single_seq_slot` is `Some` (its compiled artifacts are
+        //     single-sequence, `B=1` only -- see its own `ensure!`), which
+        //     also means this call's whole `n`-row buffer belongs to that
+        //     one sequence, satisfying the pipeline's own unstated
+        //     assumption that a sequence's rows start at buffer row 0 (it
+        //     never reads `first_token`, unlike `gdn_delta_rule`).
+        //   - `!la.v_heads_tiled` -- the HF-loader convention
+        //     (`crates/model/src/config.rs`) the compiled stages were built
+        //     against; the GGUF-loader's tiled convention is not supported.
+        //   - This model's real dims match the one shape the artifacts were
+        //     compiled for (`H=48, Hg=16, K=V=128`).
+        //   - `gdn_fla_scratch` was actually allocated at load (implies the
+        //     `triton_aot` feature is compiled in and the dims above already
+        //     matched once, at load time).
+        // Falls back to the existing hand-written `gdn_delta_rule` path
+        // otherwise -- unconditionally so when the `triton_aot` feature
+        // isn't compiled in at all, which is what keeps a normal build
+        // completely unaffected.
+        #[cfg(feature = "triton_aot")]
+        let use_triton_pipeline = single_seq_slot.is_some()
+            && !la.v_heads_tiled
+            && heads == infero_kernels::gdn_triton_aot::H
+            && la.key_heads == infero_kernels::gdn_triton_aot::HG
+            && la.key_head_dim == infero_kernels::gdn_triton_aot::K
+            && la.value_head_dim == infero_kernels::gdn_triton_aot::V
+            && self.gdn_fla_scratch.is_some();
+
+        #[cfg(feature = "triton_aot")]
+        if use_triton_pipeline {
+            // Once a layer, not once a token: cheap, and the one signal an
+            // operator has (short of `strings`-ing the binary, the way
+            // `attn_backend_name`'s own detection trick works) that this
+            // real dispatch actually took the Triton-AOT path on a given
+            // call rather than silently falling back.
+            tracing::debug!(layer, n, "gdn: dispatched to the Triton-AOT FLA pipeline");
+            let scratch = self
+                .gdn_fla_scratch
+                .as_mut()
+                .expect("use_triton_pipeline checked gdn_fla_scratch.is_some() above");
+            self.kern.gdn_full_triton_pipeline(
+                &mut acts.core.slice_mut(..n * val_dim),
+                state_for_delta,
+                &acts.qkv_conv.slice(..n * width),
+                &acts.g.slice(..n * heads),
+                &acts.beta.slice(..n * heads),
+                seqs_for_delta,
+                heads,
+                la.key_heads,
+                la.key_head_dim,
+                la.value_head_dim,
+                (width, 0, key_dim, 2 * key_dim),
+                la.v_heads_tiled,
+                scratch,
+            )?;
+        } else {
+            self.kern.gdn_delta_rule(
+                &mut acts.core.slice_mut(..n * val_dim),
+                state_for_delta,
+                &acts.qkv_conv.slice(..n * width),
+                &acts.g.slice(..n * heads),
+                &acts.beta.slice(..n * heads),
+                seqs_for_delta,
+                heads,
+                la.key_heads,
+                la.key_head_dim,
+                la.value_head_dim,
+                (width, 0, key_dim, 2 * key_dim),
+                la.v_heads_tiled,
+            )?;
+        }
+
+        #[cfg(not(feature = "triton_aot"))]
         self.kern.gdn_delta_rule(
             &mut acts.core.slice_mut(..n * val_dim),
             state_for_delta,
@@ -5104,7 +5223,7 @@ impl Model {
             la.key_head_dim,
             la.value_head_dim,
             (width, 0, key_dim, 2 * key_dim),
-                    la.v_heads_tiled,
+            la.v_heads_tiled,
         )?;
         // `staged` borrowed the journal for the launch above; letting it fall out
         // of scope here rather than at the end of the function keeps the journal

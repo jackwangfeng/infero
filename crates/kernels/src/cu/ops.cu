@@ -103,13 +103,51 @@ extern "C" __global__ void add_bias_f32(float* __restrict__ out,
 }
 
 // SwiGLU: out = silu(gate) * up, elementwise.
+//
+// Four elements a thread, the same `add_assign_f32` pattern: `out`/`gate`/`up`
+// are the same kind of large, contiguous, alignment-friendly `[tokens, d_ff]`
+// f32 buffer that kernel already proved benefits from float4 loads/stores,
+// with a scalar fallback for the unaligned tail.
 extern "C" __global__ void silu_mul_f32(float* __restrict__ out,
                                         const float* __restrict__ gate,
                                         const float* __restrict__ up, int n) {
+    const int base = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (base >= n) return;
+    const bool aligned = ((unsigned long long)out % 16 == 0) &&
+        ((unsigned long long)gate % 16 == 0) && ((unsigned long long)up % 16 == 0);
+    if (aligned && base + 3 < n) {
+        const float4 g = *(const float4*)(const void*)(gate + base);
+        const float4 u = *(const float4*)(const void*)(up + base);
+        float4 o;
+        o.x = (g.x / (1.0f + __expf(-g.x))) * u.x;
+        o.y = (g.y / (1.0f + __expf(-g.y))) * u.y;
+        o.z = (g.z / (1.0f + __expf(-g.z))) * u.z;
+        o.w = (g.w / (1.0f + __expf(-g.w))) * u.w;
+        *(float4*)(void*)(out + base) = o;
+        return;
+    }
+    for (int j = base; j < base + 4 && j < n; ++j) {
+        const float g = gate[j];
+        out[j] = (g / (1.0f + __expf(-g))) * up[j];
+    }
+}
+
+// Same as `silu_mul_f32`, also writing the f16 copy the NVFP4 down_proj
+// quantizer is about to read -- the non-split counterpart to
+// `silu_mul_split_f16_f32` below, for the (separate `gate`/`up` tensors, not
+// one fused row) shape this codebase's NVFP4 FFN path actually uses. Same
+// reasoning: the value is already in a register here, so writing both forms
+// costs one extra `__float2half` and store, not a second kernel launch.
+extern "C" __global__ void silu_mul_f16_f32(float* __restrict__ out,
+                                            __half* __restrict__ hout,
+                                            const float* __restrict__ gate,
+                                            const float* __restrict__ up, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float g = gate[i];
-    out[i] = (g / (1.0f + __expf(-g))) * up[i];
+    const float v = (g / (1.0f + __expf(-g))) * up[i];
+    out[i] = v;
+    hout[i] = __float2half(v);
 }
 
 // Scatter one fused `q ++ k ++ v` row back into three tensors.
@@ -143,20 +181,49 @@ extern "C" __global__ void split_qkv_f32(float* __restrict__ q,
 // matmul against a weight stacked the same way `split_qkv_f32` unstacks
 // three. GatedDeltaNet's `in_proj_qkv` and `in_proj_z` are the pair this
 // scatters — see `GdnWeights::in_proj_qz`.
+//
+// Four elements a thread, the same `add_assign_f32` pattern, but with a real
+// complication that kernel doesn't have: a run of 4 consecutive flat indices
+// into `fused` can straddle the `width_a`/`width_b` boundary within a row (or,
+// when `row_w` itself isn't a multiple of 4, a row boundary), and a float4
+// store from a straddling read would land in the wrong tensor or the wrong
+// row. The fast path only fires when all 4 elements share one row *and* land
+// entirely inside one of the two halves; anything else — including plain
+// pointer misalignment — falls back to the original per-element form, which
+// is correct unconditionally.
 extern "C" __global__ void split2_f32(float* __restrict__ a,
                                        float* __restrict__ b,
                                        const float* __restrict__ fused,
                                        int width_a, int width_b, int total) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= total) return;
     const int row_w = width_a + width_b;
-    const int row = i / row_w;
-    const int col = i - row * row_w;
-    const float x = fused[i];
-    if (col < width_a) {
-        a[(size_t)row * width_a + col] = x;
-    } else {
-        b[(size_t)row * width_b + (col - width_a)] = x;
+    const int base = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (base >= total) return;
+    const int row = base / row_w;
+    const int col = base - row * row_w;
+    const bool aligned = ((unsigned long long)fused % 16 == 0) &&
+        ((unsigned long long)a % 16 == 0) && ((unsigned long long)b % 16 == 0);
+    if (aligned && base + 3 < total && col + 3 < row_w) {
+        const float4 v = *(const float4*)(const void*)(fused + base);
+        if (col + 3 < width_a) {
+            *(float4*)(void*)(a + (size_t)row * width_a + col) = v;
+            return;
+        }
+        if (col >= width_a) {
+            *(float4*)(void*)(b + (size_t)row * width_b + (col - width_a)) = v;
+            return;
+        }
+        // Else: this float4 straddles width_a/width_b exactly -- fall through
+        // to the scalar form below.
+    }
+    for (int j = base; j < base + 4 && j < total; ++j) {
+        const int r = j / row_w;
+        const int c = j - r * row_w;
+        const float x = fused[j];
+        if (c < width_a) {
+            a[(size_t)r * width_a + c] = x;
+        } else {
+            b[(size_t)r * width_b + (c - width_a)] = x;
+        }
     }
 }
 
@@ -5230,7 +5297,7 @@ extern "C" __global__ void attn_prefill_mma_ws4_rowsplit_regcheck_f32(
 // (the axis that always cost either redundant QK^T or redundant K/V
 // streaming) -- instead, shrink what EACH tile costs to store, by
 // accumulating PV in fp16 instead of fp32. `m16n8k16` supports an
-// `f16.f16.f16.f16` accumulate variant (Turing+, same shape as the
+// `f16.f16.f16.f16` accumulate variant (Ampere / sm_80+, same shape as the
 // `f32` accumulate `ws4` already uses, just packing the C/D fragment as 2
 // half2 registers instead of 4 floats) -- same warp, same single QK^T,
 // same single K/V stream, HALF the persistent storage for the one array
@@ -5242,7 +5309,7 @@ extern "C" __global__ void attn_prefill_mma_ws4_rowsplit_regcheck_f32(
 // be worth attempting one.
 __device__ __forceinline__ void mma_f16_acc16(unsigned* dx0, unsigned* dx1,
                                               const mma_a_f16& a, const mma_b_f16& b) {
-#if __CUDA_ARCH__ >= 750
+#if __CUDA_ARCH__ >= 800
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
         "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};"

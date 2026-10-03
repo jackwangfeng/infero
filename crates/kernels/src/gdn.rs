@@ -52,6 +52,43 @@ pub enum GdnChunkStateVariant {
     /// same 48-block (`heads`-only) grid as `Plain`. See that kernel's own
     /// doc comment in `gdn.cu`.
     Mma,
+    /// `gdn_chunk_state_mma_vtile_f32` -- `Mma`'s tensor-core math, but with
+    /// `GDN_DV` split 4 ways across the grid like `PipelinedSplit4` (192
+    /// blocks instead of 48) *and* the per-block shared-memory footprint
+    /// shrunk to match (8 KiB `sS` instead of 32 KiB) -- unlike
+    /// `PipelinedSplit4`, which only added grid width to the scalar kernel
+    /// and measured worse. See that kernel's own doc comment in `gdn.cu`.
+    MmaVtile,
+    /// `gdn_chunk_state_mma_pipelined_f32` -- `Mma`'s tensor-core math, plus
+    /// a `cp.async` double buffer for K (the one input with a real strided
+    /// global-memory access pattern; W stays a direct synchronous load, a
+    /// real-shared-memory-budget-driven scope reduction -- see that kernel's
+    /// own doc comment in `gdn.cu` for why). Composes `Pipelined`'s prefetch
+    /// technique with `Mma`'s tensor-core math -- the lever this project's
+    /// own design synthesis flagged as identified but never attempted.
+    MmaPipelined,
+    /// `gdn_chunk_state_mma_vtile_pipelined_f32` -- `MmaVtile` + `MmaPipelined`
+    /// composed: the V-tiled 192-block grid (`BVT=32`, 64-thread blocks)
+    /// *and* a `cp.async` double buffer for BOTH K and W (not just K --
+    /// V-tiling shrinks `sS`/`sDT` enough to fit both under the real
+    /// 101376 B `sharedMemPerBlockOptin` ceiling). See that kernel's own
+    /// doc comment in `gdn.cu` for the exact byte budget and why this
+    /// combination, unlike either half alone, was never attempted before.
+    MmaVtilePipelined,
+    /// `gdn_chunk_state_mma_triton_match_f32` -- a structural port of vLLM's
+    /// real, autotuned Triton kernel config pinned down for this project's
+    /// exact shape: `BV=64` (a 2-wide grid across `GDN_DV`, double
+    /// `MmaVtile`/`MmaVtilePipelined`'s own BVT=32) and 4 warps (128
+    /// threads) a block, matching Triton's real `num_warps=4` -- not
+    /// another recombination of infero's own historically-evolved kernel-2
+    /// variants. Double-buffers K only (not W, unlike the pin-down phase's
+    /// `num_stages=3`, which double-buffers both): the full K+W double
+    /// buffer this kernel would need to fully mirror that third axis does
+    /// not fit this hardware's real shared-memory budget at BV=64 -- see
+    /// that kernel's own doc comment in `gdn.cu` for the exact byte
+    /// arithmetic (1152 B over the real ceiling) behind that scope
+    /// reduction.
+    MmaTritonMatch,
 }
 
 /// Which delta-rule kernel to run.
@@ -1195,6 +1232,280 @@ impl Kernels {
         Ok(())
     }
 
+    /// `Mma` + `Pipelined` composed -- see `gdn_chunk_state_mma_pipelined_f32`'s
+    /// own doc comment in `gdn.cu` for the real shared-memory layout and why
+    /// only K (not W) gets a `cp.async` double buffer on this box.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_chunk_state_mma_pipelined_only(
+        &self,
+        delta: &mut ViewMut<'_, f32>,
+        s_before: &mut ViewMut<'_, f32>,
+        state: &mut ViewMut<'_, f32>,
+        w: &View<'_, f32>,
+        u: &View<'_, f32>,
+        qkv: &View<'_, f32>,
+        g: &View<'_, f32>,
+        seqs: &SeqLayout<'_>,
+        heads: usize,
+        key_heads: usize,
+        dk: usize,
+        dv: usize,
+        offsets: (usize, usize, usize, usize),
+        v_tiled: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(seqs.n_seqs == 1, "gdn_chunk_state_mma_pipelined_only: single sequence only");
+        anyhow::ensure!(
+            dk == 128 && dv == 128,
+            "gdn_chunk_state_mma_pipelined_only is instantiated for dk = dv = 128, got {dk}x{dv}"
+        );
+        let (stride, _q_off, k_off, _v_off) = offsets;
+        const GDN_CHUNK: usize = 32;
+        const GDN_DK: usize = 128;
+        const GDN_DV: usize = 128;
+        let n_chunks = seqs.total_tokens.div_ceil(GDN_CHUNK).max(1);
+        let f32_size = std::mem::size_of::<f32>();
+        let f16_size = std::mem::size_of::<u16>();
+
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_gdn", gdn_src(), "gdn_chunk_state_mma_pipelined_f32")?;
+        // sS[128][128] + sW[GDN_CHUNK][128] + sKT[128][GDN_CHUNK] + sDT[128][GDN_CHUNK], all f16,
+        // plus sgc[GDN_CHUNK] f32, plus 2x sKf[GDN_CHUNK][128] f32 (K's cp.async double buffer) --
+        // see gdn_chunk_state_mma_pipelined_f32's own shared-memory layout comment.
+        let shared = (GDN_DK * GDN_DV + GDN_CHUNK * GDN_DK + GDN_DK * GDN_CHUNK + GDN_DV * GDN_CHUNK)
+            * f16_size
+            + GDN_CHUNK * f32_size
+            + 2 * GDN_CHUNK * GDN_DK * f32_size;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared as u32)?;
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (heads as u32, 1, 1),
+            block_dim: (2 * dv as u32, 1, 1),
+            shared_mem_bytes: shared as u32,
+        };
+        let (h, kh) = (heads as i32, key_heads as i32);
+        let (dka, dva) = (dk as i32, dv as i32);
+        let (st, ko) = (stride as i32, k_off as i32);
+        let vt = i32::from(v_tiled);
+        let nc = n_chunks as i32;
+        let mut bl = self.dev.stream().launch_builder(&f);
+        bl.arg(&mut *delta)
+            .arg(&mut *s_before)
+            .arg(&mut *state)
+            .arg(w)
+            .arg(u)
+            .arg(qkv)
+            .arg(g)
+            .arg(seqs.first_token)
+            .arg(seqs.n_tokens)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dka)
+            .arg(&dva)
+            .arg(&st)
+            .arg(&ko)
+            .arg(&vt)
+            .arg(&nc);
+        self.dev
+            .profile()
+            .time("gdn_chunk_state_mma_pipelined_only", self.dev.stream(), || {
+                unsafe { bl.launch(cfg) }.context("gdn_chunk_state_mma_pipelined_only")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// `MmaVtile` + `MmaPipelined` composed -- see
+    /// `gdn_chunk_state_mma_vtile_pipelined_f32`'s own doc comment in
+    /// `gdn.cu` for the real shared-memory byte budget (why V-tiling frees
+    /// enough room to double-buffer both K and W, unlike `MmaPipelined`
+    /// alone). `grid.y = GDN_DV/BVT = 4`, `block = 64` threads (2 warps) --
+    /// same launch geometry as `gdn_chunk_state_mma_vtile_f32`, which has no
+    /// `_only` launcher of its own to mirror (only exercised through
+    /// [`Self::gdn_chunk_split3_delta_rule`]'s `k2` dispatch); this one is
+    /// modeled on `gdn_chunk_state_mma_pipelined_only` above instead so it
+    /// can be tested directly against `gdn_chunk_state_f32`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_chunk_state_mma_vtile_pipelined_only(
+        &self,
+        delta: &mut ViewMut<'_, f32>,
+        s_before: &mut ViewMut<'_, f32>,
+        state: &mut ViewMut<'_, f32>,
+        w: &View<'_, f32>,
+        u: &View<'_, f32>,
+        qkv: &View<'_, f32>,
+        g: &View<'_, f32>,
+        seqs: &SeqLayout<'_>,
+        heads: usize,
+        key_heads: usize,
+        dk: usize,
+        dv: usize,
+        offsets: (usize, usize, usize, usize),
+        v_tiled: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            seqs.n_seqs == 1,
+            "gdn_chunk_state_mma_vtile_pipelined_only: single sequence only"
+        );
+        anyhow::ensure!(
+            dk == 128 && dv == 128,
+            "gdn_chunk_state_mma_vtile_pipelined_only is instantiated for dk = dv = 128, got {dk}x{dv}"
+        );
+        let (stride, _q_off, k_off, _v_off) = offsets;
+        const GDN_CHUNK: usize = 32;
+        const GDN_DK: usize = 128;
+        const BVT: usize = 32;
+        let n_chunks = seqs.total_tokens.div_ceil(GDN_CHUNK).max(1);
+        let f32_size = std::mem::size_of::<f32>();
+        let f16_size = std::mem::size_of::<u16>();
+
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_gdn", gdn_src(), "gdn_chunk_state_mma_vtile_pipelined_f32")?;
+        // sS[BVT][128] + sW[GDN_CHUNK][128] + sKT[128][GDN_CHUNK] + sDT[BVT][GDN_CHUNK], f16,
+        // plus sgc[GDN_CHUNK] f32, plus 2x sKf + 2x sWf [GDN_CHUNK][128] f32 (K and W double
+        // buffers) -- see gdn_chunk_state_mma_vtile_pipelined_f32's own shared-memory comment.
+        let shared = (GDN_DK * BVT + GDN_CHUNK * GDN_DK + GDN_DK * GDN_CHUNK + BVT * GDN_CHUNK)
+            * f16_size
+            + GDN_CHUNK * f32_size
+            + 4 * GDN_CHUNK * GDN_DK * f32_size;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared as u32)?;
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (heads as u32, (dv / BVT) as u32, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: shared as u32,
+        };
+        let (h, kh) = (heads as i32, key_heads as i32);
+        let (dka, dva) = (dk as i32, dv as i32);
+        let (st, ko) = (stride as i32, k_off as i32);
+        let vt = i32::from(v_tiled);
+        let nc = n_chunks as i32;
+        let mut bl = self.dev.stream().launch_builder(&f);
+        bl.arg(&mut *delta)
+            .arg(&mut *s_before)
+            .arg(&mut *state)
+            .arg(w)
+            .arg(u)
+            .arg(qkv)
+            .arg(g)
+            .arg(seqs.first_token)
+            .arg(seqs.n_tokens)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dka)
+            .arg(&dva)
+            .arg(&st)
+            .arg(&ko)
+            .arg(&vt)
+            .arg(&nc);
+        self.dev
+            .profile()
+            .time("gdn_chunk_state_mma_vtile_pipelined_only", self.dev.stream(), || {
+                unsafe { bl.launch(cfg) }.context("gdn_chunk_state_mma_vtile_pipelined_only")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// `MmaTritonMatch` -- structural port of vLLM's real, pinned-down
+    /// Triton autotune config (`BV=64`, `num_warps=4`) for this project's
+    /// exact shape. `grid.y = GDN_DV/BVT = 2`, `block = 128` threads (4
+    /// warps) -- see `gdn_chunk_state_mma_triton_match_f32`'s own doc
+    /// comment in `gdn.cu` for the full design (and the real shared-memory
+    /// arithmetic behind K-only, not K+W, double buffering at this tile
+    /// width). Modeled on `gdn_chunk_state_mma_vtile_pipelined_only` above
+    /// so it can be tested directly against `gdn_chunk_state_f32` and every
+    /// other kernel-2 variant.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_chunk_state_mma_triton_match_only(
+        &self,
+        delta: &mut ViewMut<'_, f32>,
+        s_before: &mut ViewMut<'_, f32>,
+        state: &mut ViewMut<'_, f32>,
+        w: &View<'_, f32>,
+        u: &View<'_, f32>,
+        qkv: &View<'_, f32>,
+        g: &View<'_, f32>,
+        seqs: &SeqLayout<'_>,
+        heads: usize,
+        key_heads: usize,
+        dk: usize,
+        dv: usize,
+        offsets: (usize, usize, usize, usize),
+        v_tiled: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            seqs.n_seqs == 1,
+            "gdn_chunk_state_mma_triton_match_only: single sequence only"
+        );
+        anyhow::ensure!(
+            dk == 128 && dv == 128,
+            "gdn_chunk_state_mma_triton_match_only is instantiated for dk = dv = 128, got {dk}x{dv}"
+        );
+        let (stride, _q_off, k_off, _v_off) = offsets;
+        const GDN_CHUNK: usize = 32;
+        const GDN_DK: usize = 128;
+        const BVT: usize = 64;
+        let n_chunks = seqs.total_tokens.div_ceil(GDN_CHUNK).max(1);
+        let f32_size = std::mem::size_of::<f32>();
+        let f16_size = std::mem::size_of::<u16>();
+
+        let f = self
+            .dev
+            .kernels()
+            .get("infero_gdn", gdn_src(), "gdn_chunk_state_mma_triton_match_f32")?;
+        // sS[BVT][128] + sW[GDN_CHUNK][128] + sKT[128][GDN_CHUNK] + sDT[BVT][GDN_CHUNK], f16,
+        // plus sgc[GDN_CHUNK] f32, plus 2x sKf[GDN_CHUNK][128] f32 (K's cp.async double
+        // buffer only -- see gdn_chunk_state_mma_triton_match_f32's own shared-memory comment).
+        let shared = (GDN_DK * BVT + GDN_CHUNK * GDN_DK + GDN_DK * GDN_CHUNK + BVT * GDN_CHUNK)
+            * f16_size
+            + GDN_CHUNK * f32_size
+            + 2 * GDN_CHUNK * GDN_DK * f32_size;
+        if shared > 48 * 1024 {
+            infero_gpu::set_max_dynamic_shared(&f, shared as u32)?;
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (heads as u32, (dv / BVT) as u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: shared as u32,
+        };
+        let (h, kh) = (heads as i32, key_heads as i32);
+        let (dka, dva) = (dk as i32, dv as i32);
+        let (st, ko) = (stride as i32, k_off as i32);
+        let vt = i32::from(v_tiled);
+        let nc = n_chunks as i32;
+        let mut bl = self.dev.stream().launch_builder(&f);
+        bl.arg(&mut *delta)
+            .arg(&mut *s_before)
+            .arg(&mut *state)
+            .arg(w)
+            .arg(u)
+            .arg(qkv)
+            .arg(g)
+            .arg(seqs.first_token)
+            .arg(seqs.n_tokens)
+            .arg(&h)
+            .arg(&kh)
+            .arg(&dka)
+            .arg(&dva)
+            .arg(&st)
+            .arg(&ko)
+            .arg(&vt)
+            .arg(&nc);
+        self.dev
+            .profile()
+            .time("gdn_chunk_state_mma_triton_match_only", self.dev.stream(), || {
+                unsafe { bl.launch(cfg) }.context("gdn_chunk_state_mma_triton_match_only")?;
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     /// Three-kernel split of the chunked delta rule -- see the doc comment
     /// on `gdn_chunk_uw_f32` in `gdn.cu` for the full architecture and why
     /// it's a real, independent re-derivation of SGLang's own real
@@ -1211,6 +1522,29 @@ impl Kernels {
     /// comment in `gdn.cu` for why kernel 2, not kernels 1 or 3, was the
     /// whole pipeline's real remaining bottleneck, and what each of these
     /// three real, measured fixes did about it.
+    ///
+    /// `w_buf`/`u_buf`/`delta_buf`/`s_before_buf` are kernel-1/kernel-2's own
+    /// cross-kernel scratch (sized `n_chunks*heads*GDN_CHUNK*dk`,
+    /// `n_chunks*heads*GDN_CHUNK*dv`, `n_chunks*heads*GDN_CHUNK*dv` and
+    /// `n_chunks*heads*dk*dv` respectively, where `n_chunks =
+    /// total_tokens.div_ceil(32)`; only the first `n_chunks` chunks of a
+    /// larger buffer are read/written, so a caller may pass one sized for a
+    /// larger bound and reuse it across calls). The caller owns these now,
+    /// on purpose: every kernel here only ever reads a ragged last chunk's
+    /// real `C < GDN_CHUNK` rows and self-zeros whatever *shared*-memory
+    /// padding it needs internally (see the "ragged rows zero-fill" comments
+    /// in `gdn.cu`, e.g. on `gdn_chunk_state_f32`'s own `sk` fill) -- no
+    /// kernel here ever reads one of these four buffers' padding past a
+    /// chunk's real row count, so they need not be zeroed, only sized large
+    /// enough and written before they're read within a call (which kernel
+    /// 1 -> kernel 2 -> kernel 3's ordering already guarantees). That means a
+    /// caller allocating these once (e.g. at load time, the way `GdnActs` in
+    /// `crates/model/src/lib.rs` allocates its own per-call scratch once and
+    /// reuses it, sized by `chunk == batch_tokens()`) and reusing them across
+    /// calls is correct, and avoids the real, measured cost this function
+    /// used to pay every call: `stream.alloc_zeros` on all four is a real
+    /// memset, not free -- ~5 GB a call at this pipeline's 30552-token
+    /// benchmark shape.
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_chunk_split3_delta_rule(
         &self,
@@ -1227,6 +1561,10 @@ impl Kernels {
         offsets: (usize, usize, usize, usize),
         v_tiled: bool,
         k2: GdnChunkStateVariant,
+        w_buf: &mut ViewMut<'_, f32>,
+        u_buf: &mut ViewMut<'_, f32>,
+        delta_buf: &mut ViewMut<'_, f32>,
+        s_before_buf: &mut ViewMut<'_, f32>,
     ) -> Result<()> {
         anyhow::ensure!(seqs.n_seqs == 1, "gdn_chunk_split3_delta_rule: single sequence only");
         anyhow::ensure!(
@@ -1241,11 +1579,10 @@ impl Kernels {
         let n_chunks = seqs.total_tokens.div_ceil(GDN_CHUNK).max(1);
         let f32_size = std::mem::size_of::<f32>();
 
-        let stream = self.dev.stream();
-        let mut w_buf = stream.alloc_zeros::<f32>(n_chunks * heads * GDN_CHUNK * GDN_DK)?;
-        let mut u_buf = stream.alloc_zeros::<f32>(n_chunks * heads * GDN_CHUNK * dv)?;
-        let mut delta_buf = stream.alloc_zeros::<f32>(n_chunks * heads * GDN_CHUNK * dv)?;
-        let mut s_before_buf = stream.alloc_zeros::<f32>(n_chunks * heads * GDN_DK * dv)?;
+        debug_assert!(w_buf.len() >= n_chunks * heads * GDN_CHUNK * GDN_DK);
+        debug_assert!(u_buf.len() >= n_chunks * heads * GDN_CHUNK * dv);
+        debug_assert!(delta_buf.len() >= n_chunks * heads * GDN_CHUNK * dv);
+        debug_assert!(s_before_buf.len() >= n_chunks * heads * GDN_DK * dv);
 
         let (h, kh) = (heads as i32, key_heads as i32);
         let (a, b_) = (dk as i32, dv as i32);
@@ -1265,8 +1602,8 @@ impl Kernels {
                 shared_mem_bytes: shared as u32,
             };
             let mut bl = self.dev.stream().launch_builder(&f);
-            bl.arg(&mut w_buf)
-                .arg(&mut u_buf)
+            bl.arg(&mut *w_buf)
+                .arg(&mut *u_buf)
                 .arg(qkv)
                 .arg(g)
                 .arg(beta)
@@ -1300,14 +1637,53 @@ impl Kernels {
                     ("gdn_chunk_state_pipelined_split4_f32", 4, dv / 2)
                 }
                 GdnChunkStateVariant::Mma => ("gdn_chunk_state_mma_f32", 1, 2 * dv),
+                GdnChunkStateVariant::MmaVtile => ("gdn_chunk_state_mma_vtile_f32", 4, 64),
+                GdnChunkStateVariant::MmaPipelined => ("gdn_chunk_state_mma_pipelined_f32", 1, 2 * dv),
+                GdnChunkStateVariant::MmaVtilePipelined => {
+                    ("gdn_chunk_state_mma_vtile_pipelined_f32", 4, 64)
+                }
+                GdnChunkStateVariant::MmaTritonMatch => {
+                    ("gdn_chunk_state_mma_triton_match_f32", 2, 128)
+                }
             };
             let f = self.dev.kernels().get("infero_gdn", gdn_src(), name)?;
             let f16_size = std::mem::size_of::<u16>();
+            const BVT: usize = 32;
             let shared = if matches!(k2, GdnChunkStateVariant::Mma) {
                 // sS[128][128]+sW[GDN_CHUNK][128]+sKT[128][GDN_CHUNK]+sDT[128][GDN_CHUNK], f16,
                 // plus sgc[GDN_CHUNK] f32 -- see gdn_chunk_state_mma_f32's own shared-memory comment.
                 (GDN_DK * GDN_DK + GDN_CHUNK * GDN_DK + GDN_DK * GDN_CHUNK + GDN_DK * GDN_CHUNK) * f16_size
                     + GDN_CHUNK * f32_size
+            } else if matches!(k2, GdnChunkStateVariant::MmaVtile) {
+                // sS[BVT][128]+sW[GDN_CHUNK][128]+sKT[128][GDN_CHUNK]+sDT[BVT][GDN_CHUNK], f16,
+                // plus sgc[GDN_CHUNK] f32 -- see gdn_chunk_state_mma_vtile_f32's own comment.
+                (GDN_DK * BVT + GDN_CHUNK * GDN_DK + GDN_DK * GDN_CHUNK + BVT * GDN_CHUNK) * f16_size
+                    + GDN_CHUNK * f32_size
+            } else if matches!(k2, GdnChunkStateVariant::MmaPipelined) {
+                // Same f16 layout as `Mma` (sS+sW+sKT+sDT, plus sgc f32), plus
+                // 2x sKf[GDN_CHUNK][128] f32 for K's cp.async double buffer --
+                // see gdn_chunk_state_mma_pipelined_f32's own comment.
+                (GDN_DK * GDN_DK + GDN_CHUNK * GDN_DK + GDN_DK * GDN_CHUNK + GDN_DK * GDN_CHUNK) * f16_size
+                    + GDN_CHUNK * f32_size
+                    + 2 * GDN_CHUNK * GDN_DK * f32_size
+            } else if matches!(k2, GdnChunkStateVariant::MmaVtilePipelined) {
+                // Same f16 layout as `MmaVtile` (sS[BVT][128]+sW+sKT+sDT[BVT][GDN_CHUNK],
+                // plus sgc f32), plus 2x sKf[GDN_CHUNK][128] f32 (K) + 2x sWf[GDN_CHUNK][128]
+                // f32 (W) -- see gdn_chunk_state_mma_vtile_pipelined_f32's own comment.
+                (GDN_DK * BVT + GDN_CHUNK * GDN_DK + GDN_DK * GDN_CHUNK + BVT * GDN_CHUNK) * f16_size
+                    + GDN_CHUNK * f32_size
+                    + 4 * GDN_CHUNK * GDN_DK * f32_size
+            } else if matches!(k2, GdnChunkStateVariant::MmaTritonMatch) {
+                // Same f16 layout as `MmaVtile`/`MmaVtilePipelined` but at BVT64=64
+                // (sS[64][128]+sW+sKT+sDT[64][GDN_CHUNK], plus sgc f32), plus only
+                // 2x sKf[GDN_CHUNK][128] f32 (K, not K+W -- see
+                // gdn_chunk_state_mma_triton_match_f32's own comment for the real
+                // shared-memory arithmetic that rules out a second W buffer pair here).
+                const BVT64: usize = 64;
+                (GDN_DK * BVT64 + GDN_CHUNK * GDN_DK + GDN_DK * GDN_CHUNK + BVT64 * GDN_CHUNK)
+                    * f16_size
+                    + GDN_CHUNK * f32_size
+                    + 2 * GDN_CHUNK * GDN_DK * f32_size
             } else if matches!(k2, GdnChunkStateVariant::Plain) {
                 (2 * GDN_CHUNK * ROW_PAD + GDN_CHUNK) * f32_size
             } else {
@@ -1322,12 +1698,17 @@ impl Kernels {
                 shared_mem_bytes: shared as u32,
             };
             let nc = n_chunks as i32;
+            // Named so the temporary outlives the launch below -- inline
+            // `&w_buf.as_view()` drops at the end of the `bl.arg(...)` chain,
+            // before `bl.launch` (inside the `.time()` closure) reads it.
+            let w_view = w_buf.as_view();
+            let u_view = u_buf.as_view();
             let mut bl = self.dev.stream().launch_builder(&f);
-            bl.arg(&mut delta_buf)
-                .arg(&mut s_before_buf)
+            bl.arg(&mut *delta_buf)
+                .arg(&mut *s_before_buf)
                 .arg(&mut *state)
-                .arg(&w_buf)
-                .arg(&u_buf)
+                .arg(&w_view)
+                .arg(&u_view)
                 .arg(qkv)
                 .arg(g)
                 .arg(seqs.first_token)
@@ -1360,10 +1741,12 @@ impl Kernels {
                 block_dim: (2 * dv as u32, 1, 1),
                 shared_mem_bytes: shared as u32,
             };
+            let delta_view = delta_buf.as_view();
+            let s_before_view = s_before_buf.as_view();
             let mut bl = self.dev.stream().launch_builder(&f);
             bl.arg(&mut *out)
-                .arg(&delta_buf)
-                .arg(&s_before_buf)
+                .arg(&delta_view)
+                .arg(&s_before_view)
                 .arg(qkv)
                 .arg(g)
                 .arg(seqs.first_token)
@@ -1380,6 +1763,206 @@ impl Kernels {
                 .profile()
                 .time("gdn_chunk_output", self.dev.stream(), || {
                     unsafe { bl.launch(cfg) }.context("gdn_chunk_output")?;
+                    Ok(())
+                })?;
+        }
+        Ok(())
+    }
+
+    /// `GDN_CHUNK=64` counterpart of [`Self::gdn_chunk_split3_delta_rule`]:
+    /// same 3-kernel split, same single-sequence/`dk=dv=128`-only
+    /// restriction, same caller-owned scratch-buffer contract, just chunk
+    /// size doubled to match FLA's real default (`FLA_CHUNK_SIZE`/
+    /// `chunk_scaled_dot_kkt_fwd`'s docstring, confirmed 64) so kernel 2's
+    /// sequential chunk loop runs half as many iterations. Kernel 1
+    /// (`gdn_chunk_uw_c64_f32`) uses a real, different algorithm from its
+    /// `GDN_CHUNK=32` counterpart (2x32 block-recursive forward
+    /// substitution, not a naive 64-wide single-warp loop, which would be
+    /// silently wrong at this chunk size) -- see that kernel's own doc
+    /// comment in `gdn.cu` for why. Kernels 2 and 3 need no algorithmic
+    /// change, only every `GDN_CHUNK`-sized bound growing to 64.
+    ///
+    /// `w_buf`/`u_buf`/`delta_buf`/`s_before_buf` follow the exact same
+    /// caller-owned sizing contract as the `GDN_CHUNK=32` version, just with
+    /// `n_chunks = total_tokens.div_ceil(64)` instead of `div_ceil(32)` --
+    /// half as many chunks, so these buffers are correspondingly smaller for
+    /// the same `total_tokens`, not a different formula.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_chunk_split3_delta_rule_c64(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        state: &mut ViewMut<'_, f32>,
+        qkv: &View<'_, f32>,
+        g: &View<'_, f32>,
+        beta: &View<'_, f32>,
+        seqs: &SeqLayout<'_>,
+        heads: usize,
+        key_heads: usize,
+        dk: usize,
+        dv: usize,
+        offsets: (usize, usize, usize, usize),
+        v_tiled: bool,
+        w_buf: &mut ViewMut<'_, f32>,
+        u_buf: &mut ViewMut<'_, f32>,
+        delta_buf: &mut ViewMut<'_, f32>,
+        s_before_buf: &mut ViewMut<'_, f32>,
+    ) -> Result<()> {
+        anyhow::ensure!(seqs.n_seqs == 1, "gdn_chunk_split3_delta_rule_c64: single sequence only");
+        anyhow::ensure!(
+            dk == 128 && dv == 128,
+            "gdn_chunk_split3_delta_rule_c64 is instantiated for dk = dv = 128, got {dk}x{dv}"
+        );
+        let (stride, q_off, k_off, v_off) = offsets;
+        const GDN_CHUNK: usize = 64;
+        const GDN_DK: usize = 128;
+        const ROW_PAD: usize = GDN_DK + 4;
+        const A_STRIDE: usize = GDN_CHUNK + 1;
+        // Kernel 1's extra 32x32 scratch (`tmp` in `gdn_chunk_uw_c64_f32`)
+        // for the off-diagonal block-recursion step (see that kernel's own
+        // shared-memory layout comment).
+        const UW_SCRATCH: usize = 32 * 32;
+        let n_chunks = seqs.total_tokens.div_ceil(GDN_CHUNK).max(1);
+        let f32_size = std::mem::size_of::<f32>();
+
+        debug_assert!(w_buf.len() >= n_chunks * heads * GDN_CHUNK * GDN_DK);
+        debug_assert!(u_buf.len() >= n_chunks * heads * GDN_CHUNK * dv);
+        debug_assert!(delta_buf.len() >= n_chunks * heads * GDN_CHUNK * dv);
+        debug_assert!(s_before_buf.len() >= n_chunks * heads * GDN_DK * dv);
+
+        let (h, kh) = (heads as i32, key_heads as i32);
+        let (a, b_) = (dk as i32, dv as i32);
+        let (st, qo, ko, vo) = (stride as i32, q_off as i32, k_off as i32, v_off as i32);
+        let vt = i32::from(v_tiled);
+
+        // Kernel 1: parallel (head, chunk), no state dependency.
+        {
+            let f = self.dev.kernels().get("infero_gdn", gdn_src(), "gdn_chunk_uw_c64_f32")?;
+            // `gdn_chunk_uw_c64_f32` (kernel 1) only stages `sk`/`sv` (two
+            // `ROW_PAD`-wide arrays), unlike the fused `gdn_chunk_delta_rule_f32`
+            // kernel the `GDN_CHUNK=32` version's own formula above was
+            // written against (which also stages `sq`, hence its `3 *
+            // GDN_CHUNK * ROW_PAD` -- harmless over-allocation there, since
+            // 55,296 bytes is still well under the real ~100 KiB ceiling, but
+            // NOT harmless at C=64, where the same over-count would request
+            // 122,880 bytes -- confirmed by trying: a real
+            // `CUDA_ERROR_INVALID_VALUE` refusal on this hardware).
+            let shared =
+                (2 * GDN_CHUNK * ROW_PAD + 3 * GDN_CHUNK + GDN_CHUNK * A_STRIDE + UW_SCRATCH)
+                    * f32_size;
+            if shared > 48 * 1024 {
+                infero_gpu::set_max_dynamic_shared(&f, shared as u32)?;
+            }
+            let cfg = LaunchConfig {
+                grid_dim: (heads as u32, n_chunks as u32, 1),
+                block_dim: (2 * dv as u32, 1, 1),
+                shared_mem_bytes: shared as u32,
+            };
+            let mut bl = self.dev.stream().launch_builder(&f);
+            bl.arg(&mut *w_buf)
+                .arg(&mut *u_buf)
+                .arg(qkv)
+                .arg(g)
+                .arg(beta)
+                .arg(seqs.first_token)
+                .arg(seqs.n_tokens)
+                .arg(&h)
+                .arg(&kh)
+                .arg(&a)
+                .arg(&b_)
+                .arg(&st)
+                .arg(&ko)
+                .arg(&vo)
+                .arg(&vt);
+            self.dev
+                .profile()
+                .time("gdn_chunk_uw_c64", self.dev.stream(), || {
+                    unsafe { bl.launch(cfg) }.context("gdn_chunk_uw_c64")?;
+                    Ok(())
+                })?;
+        }
+
+        // Kernel 2: sequential over chunks, plain/synchronous only (no
+        // pipelined/mma c64 variant yet).
+        {
+            let f = self
+                .dev
+                .kernels()
+                .get("infero_gdn", gdn_src(), "gdn_chunk_state_c64_f32")?;
+            let shared = (2 * GDN_CHUNK * ROW_PAD + GDN_CHUNK) * f32_size;
+            if shared > 48 * 1024 {
+                infero_gpu::set_max_dynamic_shared(&f, shared as u32)?;
+            }
+            let cfg = LaunchConfig {
+                grid_dim: (heads as u32, 1, 1),
+                block_dim: (2 * dv as u32, 1, 1),
+                shared_mem_bytes: shared as u32,
+            };
+            let nc = n_chunks as i32;
+            let w_view = w_buf.as_view();
+            let u_view = u_buf.as_view();
+            let mut bl = self.dev.stream().launch_builder(&f);
+            bl.arg(&mut *delta_buf)
+                .arg(&mut *s_before_buf)
+                .arg(&mut *state)
+                .arg(&w_view)
+                .arg(&u_view)
+                .arg(qkv)
+                .arg(g)
+                .arg(seqs.first_token)
+                .arg(seqs.n_tokens)
+                .arg(&h)
+                .arg(&kh)
+                .arg(&a)
+                .arg(&b_)
+                .arg(&st)
+                .arg(&ko)
+                .arg(&vt)
+                .arg(&nc);
+            self.dev
+                .profile()
+                .time("gdn_chunk_state_c64", self.dev.stream(), || {
+                    unsafe { bl.launch(cfg) }.context("gdn_chunk_state_c64")?;
+                    Ok(())
+                })?;
+        }
+
+        // Kernel 3: parallel (head, chunk) again, no cross-chunk dependency.
+        {
+            let f = self
+                .dev
+                .kernels()
+                .get("infero_gdn", gdn_src(), "gdn_chunk_output_c64_f32")?;
+            let shared = (2 * GDN_CHUNK * ROW_PAD + GDN_CHUNK + GDN_CHUNK * A_STRIDE) * f32_size;
+            if shared > 48 * 1024 {
+                infero_gpu::set_max_dynamic_shared(&f, shared as u32)?;
+            }
+            let cfg = LaunchConfig {
+                grid_dim: (heads as u32, n_chunks as u32, 1),
+                block_dim: (2 * dv as u32, 1, 1),
+                shared_mem_bytes: shared as u32,
+            };
+            let delta_view = delta_buf.as_view();
+            let s_before_view = s_before_buf.as_view();
+            let mut bl = self.dev.stream().launch_builder(&f);
+            bl.arg(&mut *out)
+                .arg(&delta_view)
+                .arg(&s_before_view)
+                .arg(qkv)
+                .arg(g)
+                .arg(seqs.first_token)
+                .arg(seqs.n_tokens)
+                .arg(&h)
+                .arg(&kh)
+                .arg(&a)
+                .arg(&b_)
+                .arg(&st)
+                .arg(&qo)
+                .arg(&ko)
+                .arg(&vt);
+            self.dev
+                .profile()
+                .time("gdn_chunk_output_c64", self.dev.stream(), || {
+                    unsafe { bl.launch(cfg) }.context("gdn_chunk_output_c64")?;
                     Ok(())
                 })?;
         }

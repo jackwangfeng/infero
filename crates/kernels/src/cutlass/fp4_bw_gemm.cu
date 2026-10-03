@@ -163,7 +163,10 @@ using ElementCompute = float;
 // (`sm120_bs_gemm_nvf4_nvf4_f32_f32.cu`'s `kernel_1`), used verbatim per
 // this task's own "do not guess a tile shape" instruction -- K=256 (not
 // `fp8_bw_gemm.cu`'s K=128) because e2m1 packs 2 elements/byte, so the same
-// byte footprint along K covers twice the elements.
+// byte footprint along K covers twice the elements. This is now
+// `default_tile`'s own shape specifically -- see `wide_m` below for why a
+// second one exists.
+namespace default_tile {
 using MmaTileShape_MNK = Shape<_128, _128, _256>;
 using ClusterShape_MNK = Shape<_1, _1, _1>;
 
@@ -206,8 +209,58 @@ using StrideD = typename Gemm::GemmKernel::StrideD;
 // `LayoutSFB` aliases, lines ~170-173/361), not assumed to exist under
 // these exact names.
 using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+}  // namespace default_tile
+
+// Second real tile instantiation, for large-M (prefill-scale) calls --
+// mirrors vLLM's own real SM120 NVFP4 dispatch exactly (`gh api` against
+// vllm-project/vllm main, `csrc/libtorch_stable/quantization/fp4/
+// nvfp4_scaled_mm_sm120_kernels.cu`'s `sm120_fp4_config_default`, the
+// config it picks whenever `next_pow_2(m) > 256` -- covers every real
+// prefill `M` this file sees): `MmaTileShape<256,128,128>` (a WIDER M, an
+// M=2048 call tiles into 8 CTAs along M instead of `default_tile`'s 16 --
+// half as many launches, each doing twice the work) rather than
+// `default_tile`'s `<128,128,256>` (copied from a real CUTLASS unit test
+// that was never chosen with prefill-scale M in mind, just "a shape that
+// compiles and passes for NVFP4 on this arch"), `KernelScheduleAuto`
+// (vLLM lets CUTLASS pick, rather than this file's own explicit Pingpong)
+// and `PersistentScheduler` as the TILE scheduler (`default_tile` passes
+// `void`, i.e. `GemmUniversal`'s own per-arch default) -- a real,
+// previously-untried combination this codebase's own FP8 GEMM work never
+// had a reason to try (FP8's own wide tile is already close to vLLM's
+// number at prefill scale; FP4's is not, per `fp4_gemm_vs_vllm_probe.rs`'s
+// own real ~21.5%-slower finding). Real per-shape timing decides whether
+// this replaces `default_tile` at large M or turns out not to matter,
+// exactly the discipline this file's own history (`small_m`/`small_m_swap`
+// in `fp8_bw_gemm.cu`) already established -- see
+// `examples/fp4_wide_m_vs_default_probe.rs`, not wired into any production
+// dispatch yet.
+namespace wide_m {
+using MmaTileShape_MNK = Shape<_256, _128, _128>;
+using ClusterShape_MNK = Shape<_1, _1, _1>;
+
+using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+    cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, MmaTileShape_MNK, ClusterShape_MNK,
+    cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementCompute, ElementC, LayoutC,
+    AlignmentC, ElementD, LayoutD, AlignmentD, cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+
+using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+    cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp, ElementA, LayoutA, AlignmentA, ElementB,
+    LayoutB, AlignmentB, ElementAccumulator, MmaTileShape_MNK, ClusterShape_MNK,
+    cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+    cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+
+using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop,
+                                                         CollectiveEpilogue, cutlass::gemm::PersistentScheduler>;
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+using StrideA = typename Gemm::GemmKernel::StrideA;
+using StrideB = typename Gemm::GemmKernel::StrideB;
+using StrideD = typename Gemm::GemmKernel::StrideD;
+using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+}  // namespace wide_m
 
 extern "C" size_t infero_cutlass_fp4_bw_gemm_f32out_workspace(int m, int n, int k) {
+  using namespace default_tile;
   auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
   auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
   auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(m, n, 1));
@@ -233,6 +286,56 @@ extern "C" size_t infero_cutlass_fp4_bw_gemm_f32out_workspace(int m, int n, int 
 extern "C" int32_t infero_cutlass_fp4_bw_gemm_f32out(const void* a, const void* b, const void* sfa, const void* sfb,
                                                       float* d, void* workspace, int m, int n, int k, float alpha,
                                                       int accum, cudaStream_t stream) {
+  using namespace default_tile;
+  auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
+  auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
+  auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(m, n, 1));
+  auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(m, n, k, 1));
+  auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, 1));
+
+  typename Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {m, n, k, 1},
+      {static_cast<const ElementA::DataType*>(a), stride_A, static_cast<const ElementB::DataType*>(b), stride_B,
+       static_cast<const ElementA::ScaleFactorType*>(sfa), layout_SFA,
+       static_cast<const ElementB::ScaleFactorType*>(sfb), layout_SFB},
+      {{}, d, stride_D, d, stride_D}};
+  arguments.epilogue.thread.alpha = alpha;
+  arguments.epilogue.thread.beta = accum ? 1.0f : 0.0f;
+
+  Gemm gemm;
+  auto status = gemm.can_implement(arguments);
+  if (status != cutlass::Status::kSuccess) return static_cast<int32_t>(status);
+  status = gemm.initialize(arguments, workspace, stream);
+  if (status != cutlass::Status::kSuccess) return static_cast<int32_t>(status);
+  status = gemm.run(arguments, workspace, stream);
+  return static_cast<int32_t>(status);
+}
+
+// `wide_m`'s own entry points -- identical contract and argument order to
+// `infero_cutlass_fp4_bw_gemm_f32out(_workspace)` above, just the
+// `wide_m::` tile/scheduler instead of `default_tile::`'s. See `wide_m`'s
+// own doc comment (above) for why this exists and what it's being measured
+// against before (if ever) replacing `default_tile` at large M.
+extern "C" size_t infero_cutlass_fp4_bw_gemm_f32out_wide_m_workspace(int m, int n, int k) {
+  using namespace wide_m;
+  auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
+  auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
+  auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(m, n, 1));
+  auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(m, n, k, 1));
+  auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, 1));
+  typename Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {m, n, k, 1},
+      {nullptr, stride_A, nullptr, stride_B, nullptr, layout_SFA, nullptr, layout_SFB},
+      {{}, nullptr, stride_D, nullptr, stride_D}};
+  return Gemm::get_workspace_size(arguments);
+}
+
+extern "C" int32_t infero_cutlass_fp4_bw_gemm_f32out_wide_m(const void* a, const void* b, const void* sfa,
+                                                             const void* sfb, float* d, void* workspace, int m, int n,
+                                                             int k, float alpha, int accum, cudaStream_t stream) {
+  using namespace wide_m;
   auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
   auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
   auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(m, n, 1));

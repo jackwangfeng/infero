@@ -303,6 +303,25 @@ mod ffi {
             accum: i32,
             stream: cudarc::driver::sys::CUstream,
         ) -> i32;
+        // `wide_m`'s own entry points -- see `fp4_bw_gemm.cu`'s `wide_m`
+        // namespace doc comment. Bench-only for now (`mma_e2m1_cutlass_sfa_f32out_wide_m_bench`
+        // below), not called from the real dispatch.
+        pub fn infero_cutlass_fp4_bw_gemm_f32out_wide_m_workspace(m: i32, n: i32, k: i32) -> usize;
+        #[allow(clippy::too_many_arguments)]
+        pub fn infero_cutlass_fp4_bw_gemm_f32out_wide_m(
+            a: *const c_void,
+            b: *const c_void,
+            sfa: *const c_void,
+            sfb: *const c_void,
+            d: *mut f32,
+            workspace: *mut c_void,
+            m: i32,
+            n: i32,
+            k: i32,
+            alpha: f32,
+            accum: i32,
+            stream: cudarc::driver::sys::CUstream,
+        ) -> i32;
     }
 }
 
@@ -343,6 +362,84 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn mma_e2m1_cutlass_sfa_f32out(
         &self,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
+        cw: &CutlassFp4Weight,
+        xq: &View<'_, u8>,
+        sfa: &View<'_, u8>,
+        k: usize,
+        n: usize,
+        n_tokens: usize,
+        accum: bool,
+    ) -> Result<bool> {
+        self.mma_e2m1_cutlass_sfa_f32out_with(
+            ffi::infero_cutlass_fp4_bw_gemm_f32out_workspace,
+            ffi::infero_cutlass_fp4_bw_gemm_f32out,
+            out,
+            w,
+            cw,
+            xq,
+            sfa,
+            k,
+            n,
+            n_tokens,
+            accum,
+        )
+    }
+
+    /// Benchmarking-only entry point: forces the `wide_m` tile
+    /// (`fp4_bw_gemm.cu`'s own doc comment) instead of
+    /// [`Self::mma_e2m1_cutlass_sfa_f32out`]'s always-`default_tile` choice,
+    /// so a probe can time the two head to head at the same real shape
+    /// without rebuilding the crate twice. Not called from the real
+    /// dispatch -- see that namespace's doc comment for why it's not wired
+    /// in yet.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mma_e2m1_cutlass_sfa_f32out_wide_m_bench(
+        &self,
+        out: &mut ViewMut<'_, f32>,
+        w: &View<'_, u8>,
+        cw: &CutlassFp4Weight,
+        xq: &View<'_, u8>,
+        sfa: &View<'_, u8>,
+        k: usize,
+        n: usize,
+        n_tokens: usize,
+        accum: bool,
+    ) -> Result<bool> {
+        self.mma_e2m1_cutlass_sfa_f32out_with(
+            ffi::infero_cutlass_fp4_bw_gemm_f32out_wide_m_workspace,
+            ffi::infero_cutlass_fp4_bw_gemm_f32out_wide_m,
+            out,
+            w,
+            cw,
+            xq,
+            sfa,
+            k,
+            n,
+            n_tokens,
+            accum,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn mma_e2m1_cutlass_sfa_f32out_with(
+        &self,
+        workspace_fn: unsafe extern "C" fn(i32, i32, i32) -> usize,
+        gemm_fn: unsafe extern "C" fn(
+            *const std::ffi::c_void,
+            *const std::ffi::c_void,
+            *const std::ffi::c_void,
+            *const std::ffi::c_void,
+            *mut f32,
+            *mut std::ffi::c_void,
+            i32,
+            i32,
+            i32,
+            f32,
+            i32,
+            cudarc::driver::sys::CUstream,
+        ) -> i32,
         out: &mut ViewMut<'_, f32>,
         w: &View<'_, u8>,
         cw: &CutlassFp4Weight,
@@ -421,7 +518,7 @@ impl Kernels {
 
         let stream = self.dev.stream();
         let sfa_bytes = swizzled_sf_bytes(n_tokens, blocks);
-        let ws_bytes = unsafe { ffi::infero_cutlass_fp4_bw_gemm_f32out_workspace(n_tokens as i32, n as i32, k as i32) };
+        let ws_bytes = unsafe { workspace_fn(n_tokens as i32, n as i32, k as i32) };
 
         CUTLASS_FP4_SFA.with(stream, sfa_bytes, |sfa_swizzled| {
             launch_swizzle(self, sfa_swizzled, sfa, n_tokens, blocks)?;
@@ -440,7 +537,7 @@ impl Kernels {
                     .profile()
                     .time("cutlass_fp4_gemm_f32out", stream, || {
                         let st = unsafe {
-                            ffi::infero_cutlass_fp4_bw_gemm_f32out(
+                            gemm_fn(
                                 a_ptr as *const std::ffi::c_void,
                                 b_ptr as *const std::ffi::c_void,
                                 sfa_ptr as *const std::ffi::c_void,

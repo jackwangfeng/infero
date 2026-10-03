@@ -54,7 +54,26 @@ flash_attn2 = ["cuda"]
 # with `include/nccl.h` and `lib/libnccl.so` (e.g. `/usr` after
 # `apt install libnccl2 libnccl-dev`); see build.rs.
 nccl = ["cuda"]
+# Links a Triton-AOT-compiled kernel (`python3 -m triton.tools.compile`'s
+# generated `.c`, embedding a cubin byte array + CUDA driver-API launch glue)
+# in against `-lcuda`. Unlike `cutlass`/`flash_attn2` above, there is no
+# device-code compile here -- Triton already produced the cubin -- so this
+# only needs a plain C compiler + cuda.h + libcuda, not nvcc's device-code
+# path; it still reuses INFERO_NVCC to locate the CUDA Toolkit checkout those
+# come from (for cuda.h and `ar`). Needs INFERO_TRITON_AOT_DIR pointing at the
+# directory holding that generated `gdn_h.<hash>.c`/`.h` (not vendored into
+# this repo -- see crates/kernels/src/gdn_triton_aot.rs's own doc comment for
+# how it's produced and why). See that same file for what this binds.
+triton_aot = ["cuda"]
 
 [[example]]
 name = "cutlass_vs_block"
 required-features = ["cutlass"]
+
+[[example]]
+name = "gdn_triton_aot_probe"
+required-features = ["triton_aot"]
+
+[[example]]
+name = "gdn_full_triton_pipeline_bench"
+required-features = ["triton_aot"]

@@ -1538,13 +1538,53 @@ impl Scheduler {
         // window was meant to keep prefills out of a lifetime average; it has
         // to keep them out of the window too.
         let decode_only = plan.iter().all(|(_, w)| matches!(w, Work::Decode));
+        // Any chunk of a still-in-progress prefill sits in `plan` as at least
+        // one `Work::Prefill` row (mixed with `Decode` rows from other
+        // sequences under continuous batching, or alone in a single-request
+        // run). This never overlaps `decode_only` above -- a step is one or
+        // the other -- so it gets its own, unwindowed report instead of
+        // sharing that block's 200-step average: a whole prefill of a long
+        // prompt is only a handful of `batch_tokens`-sized chunks, nowhere
+        // near enough steps to fill that window.
+        let has_prefill = plan.iter().any(|(_, w)| matches!(w, Work::Prefill { .. }));
         if let (Some(t0), Some(t1), Some(t2)) = (t0, t1, t2) {
             let t3 = std::time::Instant::now();
             // `last_end` advances on every step, prefill included, or the next
             // decode's gap would swallow the prefill step whole and report it
             // as time the engine spent doing nothing.
             let prev = self.last_end.replace(t3);
-            if decode_only {
+            if has_prefill {
+                // The real answer to "does building chunk N+1's `BatchItem`s
+                // (prompt/mrope slicing, the vision-pad-token count, `plan()`
+                // itself) overlap chunk N's GPU work, or block it": `plan_ms`
+                // is host time spent between this step's very first
+                // instruction (`step_start`, before `admit`/`plan`/`items`)
+                // and the moment the forward pass is actually launched
+                // (`t0`) -- work this scheduler always does serially, on the
+                // same thread, before `forward_batch_rows`, so a nonzero
+                // `plan_ms` is real, measured blocking time, not a sampling
+                // artifact. `gap_ms` is the separate, pre-existing question
+                // the decode block below answers for decode: idle time
+                // between one step returning and the next one being called
+                // at all (outside `step()` entirely). Both are printed every
+                // chunk, not averaged, since a whole prefill call is only a
+                // few chunks.
+                if let Some(s0) = step_start {
+                    tracing::warn!(
+                        plan_ms = format!("{:.2}", (t0 - s0).as_secs_f64() * 1e3),
+                        issue_ms = format!("{:.2}", (t1 - t0).as_secs_f64() * 1e3),
+                        sample_ms = format!("{:.2}", (t2 - t1).as_secs_f64() * 1e3),
+                        advance_ms = format!("{:.2}", (t3 - t2).as_secs_f64() * 1e3),
+                        step_ms = format!("{:.2}", (t3 - s0).as_secs_f64() * 1e3),
+                        gap_ms = format!(
+                            "{:.2}",
+                            prev.map(|p| (s0 - p).as_secs_f64() * 1e3).unwrap_or(0.0)
+                        ),
+                        batch = plan.len(),
+                        "per-step timing (prefill chunk)"
+                    );
+                }
+            } else if decode_only {
                 self.t_issue += (t1 - t0).as_secs_f64() * 1e3;
                 self.t_sample += (t2 - t1).as_secs_f64() * 1e3;
                 self.t_advance += (t3 - t2).as_secs_f64() * 1e3;
